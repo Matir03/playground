@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package playground.game.v1;
+
+// GameId identifies which game rule set is in play. The payload bytes in
+// GameState and Move are only interpretable in the context of a GameId.
+enum GameId {
+  GAME_ID_UNSPECIFIED = 0;
+  GAME_ID_CONNECT4 = 1;
+  GAME_ID_GO9 = 2;
+  GAME_ID_AMAZONS = 3;
+  GAME_ID_ARIMAA = 4;
+}
+
+enum Player {
+  PLAYER_UNSPECIFIED = 0;
+  PLAYER_FIRST = 1;   // e.g. Yellow in Connect 4, Black in Go, White in Amazons, Gold in Arimaa
+  PLAYER_SECOND = 2;
+}
+
+enum Outcome {
+  OUTCOME_UNSPECIFIED = 0;
+  OUTCOME_IN_PROGRESS = 1;
+  OUTCOME_FIRST_WINS = 2;
+  OUTCOME_SECOND_WINS = 3;
+  OUTCOME_DRAW = 4;
+}
+
+// Opaque concrete game state. Interpretation belongs to the game-specific
+// crate.
+message GameState {
+  GameId game_id = 1;
+  bytes payload = 2;
+  Player to_move = 3;
+  Outcome outcome = 4;
+  // Monotonic ply counter from the start of this game (0 before first move).
+  uint32 ply = 5;
+}
+
+// Opaque move. Interpretation belongs to the game-specific crate.
+message Move {
+  GameId game_id = 1;
+  bytes payload = 2;
+}
+
+// Latent game-state encoding. Layout is owned by the model that produced it;
+// only the model server and model-client crate interpret the bytes.
+message Gs {
+  bytes payload = 1;
+  // Optional shape hint, e.g. [batch, channels, h, w] or [d]. Consumers may
+  // ignore if they already know the layout.
+  repeated int32 shape = 2;
+  // Version of the encoder that produced this GS. Older GS are unusable
+  // with a newer encoder and vice versa.
+  string model_version = 3;
+}
+
+message GameHandle {
+  string handle_id = 1;
+  GameId game_id = 2;
+}

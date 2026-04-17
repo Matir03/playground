@@ -1,0 +1,22 @@
+[package]
+name = "playground-engine-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+playground-core.workspace = true
+playground-protocol.workspace = true
+
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tonic-web.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+prost.workspace = true

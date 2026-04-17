@@ -1,0 +1,21 @@
+version: v2
+inputs:
+  - directory: proto
+plugins:
+  # TypeScript (ES) types + Connect-ES clients for the web frontend.
+  - remote: buf.build/bufbuild/es
+    out: ../web/src/gen
+    opt:
+      - target=ts
+  - remote: buf.build/connectrpc/es
+    out: ../web/src/gen
+    opt:
+      - target=ts
+
+  # Python types + grpcio stubs for orchestrator / model server / training.
+  - remote: buf.build/protocolbuffers/python
+    out: ../python/src/playground/gen
+  - remote: buf.build/protocolbuffers/pyi
+    out: ../python/src/playground/gen
+  - remote: buf.build/grpc/python
+    out: ../python/src/playground/gen

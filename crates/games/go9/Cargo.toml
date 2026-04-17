@@ -1,0 +1,23 @@
+[package]
+name = "go9-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "go9-engine"
+path = "src/main.rs"
+
+[dependencies]
+playground-core.workspace = true
+playground-engine-server.workspace = true
+playground-model-client.workspace = true
+playground-protocol.workspace = true
+
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+async-trait.workspace = true

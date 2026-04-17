@@ -1,0 +1,48 @@
+# -- Rust --------------------------------------------------------------------
+/target/
+**/*.rs.bk
+# Cargo.lock IS committed: this workspace builds binaries, so a locked
+# dependency set makes builds reproducible.
+
+# -- Python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+python/dist/
+python/build/
+
+# -- Web ---------------------------------------------------------------------
+web/node_modules/
+web/dist/
+web/.vite/
+
+# -- Generated protobuf ------------------------------------------------------
+# TS:     web/src/gen/                                  (scripts/gen-proto.sh)
+# Python: python/src/playground/gen/playground/         (scripts/gen-proto.sh)
+# Rust:   OUT_DIR under target/                         (crates/protocol/build.rs)
+web/src/gen/
+python/src/playground/gen/playground/
+
+# -- Data, models, runs (may grow large) -------------------------------------
+/data/
+/runs/
+/models/
+*.sqlite
+*.sqlite-journal
+*.parquet
+*.safetensors
+*.pt
+*.onnx
+# Length-delimited proto record shards (see docs/schemas.md).
+*.pb
+
+# -- Editor / OS -------------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+*.swp

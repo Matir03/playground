@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+package playground.record.v1;
+
+import "playground/game/v1/game.proto";
+
+// A node in the GS-level MCTS tree that ran during play.
+message MctsNode {
+  uint32 node_id = 1;           // tree-local id
+  uint32 parent_id = 2;          // 0 if root
+  playground.game.v1.Gs gs = 3;
+
+  uint32 visits = 10;
+  double value_sum = 11;         // sum of backed-up values (so mean = sum/visits)
+  double prior = 12;             // prior from policy head at expansion
+
+  // Children in GS-space (policy state-head outputs attached as priors).
+  repeated uint32 child_ids = 20;
+
+  // Reifications: each time this node's edge-to-child was reified, a record.
+  repeated Reification reifications = 30;
+}
+
+// A concrete move hypothesized by the reifier (or sampled with noise) and
+// applied against the concrete game, giving us a concrete child state.
+message Reification {
+  uint32 reified_node_id = 1;    // the node that got concrete-state attached
+  playground.game.v1.Move move = 2;
+  playground.game.v1.GameState resulting_state = 3;
+
+  // The action-head output used to seed the reification.
+  bytes action_vector = 10;
+  double noise_scale = 11;       // magnitude of noise applied (0 for canonical)
+  uint32 sibling_index = 12;     // 0 for the first reified, 1 for first noisy sibling, ...
+}
+
+// A full game as recorded by the engine.
+message GameRecord {
+  string record_id = 1;
+  string run_id = 2;
+  string model_version = 3;       // version in effect when this game started
+  playground.game.v1.GameId game_id = 4;
+
+  // Starting position (usually the game's canonical initial state, but
+  // explicit for flexibility).
+  playground.game.v1.GameState initial_state = 10;
+
+  // Sequence of plies actually played.
+  repeated PlyRecord plies = 11;
+
+  // Final outcome (ground truth).
+  playground.game.v1.Outcome outcome = 20;
+  int64 started_unix_ms = 21;
+  int64 ended_unix_ms = 22;
+}
+
+// One played ply: the tree the engine searched, and the move it played.
+message PlyRecord {
+  uint32 ply = 1;
+  playground.game.v1.GameState state_before = 2;
+  playground.game.v1.Move move_played = 3;
+
+  // The GS-level tree as of when the move was chosen. Root is nodes[0].
+  repeated MctsNode nodes = 10;
+
+  // Time spent thinking (informational).
+  uint32 think_ms = 20;
+}

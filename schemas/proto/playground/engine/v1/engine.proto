@@ -1,0 +1,131 @@
+syntax = "proto3";
+
+package playground.engine.v1;
+
+import "playground/game/v1/game.proto";
+
+service EngineService {
+  // Interactive mode
+  rpc NewGame(NewGameRequest) returns (playground.game.v1.GameHandle);
+  rpc GetState(playground.game.v1.GameHandle) returns (playground.game.v1.GameState);
+  rpc ApplyMove(ApplyMoveRequest) returns (playground.game.v1.GameState);
+  rpc RequestMove(RequestMoveRequest) returns (stream MoveProgress);
+
+  // Engine-vs-engine / engine-vs-model match
+  rpc PlayMatch(MatchSpec) returns (stream MatchProgress);
+
+  // Batched self-play. Engine internally runs many games; streams
+  // notifications as each game completes.
+  rpc StartSelfPlay(SelfPlaySpec) returns (stream SelfPlayProgress);
+
+  // Health / capabilities
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message NewGameRequest {
+  playground.game.v1.GameId game_id = 1;
+  // Optional non-default starting position.
+  optional playground.game.v1.GameState initial_state = 2;
+}
+
+message ApplyMoveRequest {
+  playground.game.v1.GameHandle handle = 1;
+  playground.game.v1.Move move = 2;
+}
+
+message RequestMoveRequest {
+  playground.game.v1.GameHandle handle = 1;
+  SearchBudget budget = 2;
+}
+
+message SearchBudget {
+  // Set exactly one of these.
+  optional uint32 max_visits = 1;
+  optional uint32 max_millis = 2;
+  optional uint32 max_nodes = 3;
+}
+
+// Streamed intermediate updates while the engine thinks.
+message MoveProgress {
+  oneof kind {
+    SearchStats stats = 1;
+    playground.game.v1.Move chosen = 2;
+  }
+}
+
+message SearchStats {
+  uint32 visits = 1;
+  uint32 reifications = 2;
+  double best_value = 3;
+}
+
+message MatchSpec {
+  playground.game.v1.GameId game_id = 1;
+  string first_player_uri = 2;     // "model://name@v", "engine://host:port", "human://session"
+  string second_player_uri = 3;
+  uint32 num_games = 4;
+  SearchBudget budget = 5;
+}
+
+message MatchProgress {
+  oneof kind {
+    MatchMove move = 1;
+    MatchGameEnd game_end = 2;
+    MatchMatchEnd match_end = 3;
+  }
+}
+
+message MatchMove {
+  uint32 game_index = 1;
+  playground.game.v1.Player by = 2;
+  playground.game.v1.Move move = 3;
+}
+
+message MatchGameEnd {
+  uint32 game_index = 1;
+  playground.game.v1.Outcome outcome = 2;
+}
+
+message MatchMatchEnd {
+  uint32 first_wins = 1;
+  uint32 second_wins = 2;
+  uint32 draws = 3;
+}
+
+message SelfPlaySpec {
+  playground.game.v1.GameId game_id = 1;
+  string run_id = 2;
+  string model_version = 3;        // pinned version; engine refuses to start if server disagrees
+  uint32 parallel_games = 4;
+  uint32 target_games = 5;         // 0 = until stopped
+  SearchBudget per_move_budget = 6;
+  // Where to write GameRecord files.
+  string records_dir = 7;
+}
+
+message SelfPlayProgress {
+  oneof kind {
+    SelfPlayGameComplete game_complete = 1;
+    SelfPlayStats stats = 2;
+  }
+}
+
+message SelfPlayGameComplete {
+  string record_id = 1;
+  string record_path = 2;
+  playground.game.v1.Outcome outcome = 3;
+  uint32 plies = 4;
+}
+
+message SelfPlayStats {
+  uint32 games_in_flight = 1;
+  uint32 games_completed = 2;
+  double games_per_second = 3;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string version = 1;
+  repeated playground.game.v1.GameId supported_games = 2;
+}

@@ -1,0 +1,100 @@
+syntax = "proto3";
+
+package playground.orchestrator.v1;
+
+import "playground/game/v1/game.proto";
+
+service OrchestratorService {
+  rpc ListRuns(ListRunsRequest) returns (ListRunsResponse);
+  rpc GetRun(GetRunRequest) returns (Run);
+  rpc StartRun(StartRunRequest) returns (Run);
+  rpc StopRun(StopRunRequest) returns (Run);
+
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+  rpc GetModel(GetModelRequest) returns (ModelVersion);
+  rpc PromoteModel(PromoteModelRequest) returns (ModelVersion);
+
+  rpc ListEvals(ListEvalsRequest) returns (ListEvalsResponse);
+  rpc StartEval(StartEvalRequest) returns (EvalRun);
+  rpc GetEloHistory(GetEloHistoryRequest) returns (GetEloHistoryResponse);
+}
+
+enum RunStatus {
+  RUN_STATUS_UNSPECIFIED = 0;
+  RUN_STATUS_PENDING = 1;
+  RUN_STATUS_RUNNING = 2;
+  RUN_STATUS_PAUSED = 3;
+  RUN_STATUS_COMPLETED = 4;
+  RUN_STATUS_FAILED = 5;
+}
+
+message Run {
+  string run_id = 1;
+  playground.game.v1.GameId game_id = 2;
+  RunStatus status = 3;
+  string current_model_version = 4;
+  uint32 games_played = 5;
+  int64 started_unix_ms = 6;
+  int64 updated_unix_ms = 7;
+  // Free-form run config (YAML/JSON blob).
+  string config_json = 8;
+}
+
+message ListRunsRequest { optional playground.game.v1.GameId game_id = 1; }
+message ListRunsResponse { repeated Run runs = 1; }
+message GetRunRequest { string run_id = 1; }
+message StartRunRequest {
+  playground.game.v1.GameId game_id = 1;
+  string config_json = 2;
+}
+message StopRunRequest { string run_id = 1; }
+
+message ModelVersion {
+  string name = 1;
+  string version = 2;
+  playground.game.v1.GameId game_id = 3;
+  optional string parent_version = 4;
+  string run_id = 5;
+  uint64 training_step = 6;
+  int64 created_unix_ms = 7;
+  // Path relative to data/models.
+  string path = 8;
+}
+
+message ListModelsRequest {
+  optional playground.game.v1.GameId game_id = 1;
+  optional string name = 2;
+}
+message ListModelsResponse { repeated ModelVersion models = 1; }
+message GetModelRequest { string name = 1; string version = 2; }
+message PromoteModelRequest { string name = 1; string version = 2; }
+
+message EvalRun {
+  string eval_id = 1;
+  playground.game.v1.GameId game_id = 2;
+  repeated string player_uris = 3;
+  uint32 total_games = 4;
+  uint32 games_completed = 5;
+  RunStatus status = 6;
+}
+
+message ListEvalsRequest { optional playground.game.v1.GameId game_id = 1; }
+message ListEvalsResponse { repeated EvalRun evals = 1; }
+message StartEvalRequest {
+  playground.game.v1.GameId game_id = 1;
+  repeated string player_uris = 2;
+  uint32 games_per_pair = 3;
+}
+
+message GetEloHistoryRequest {
+  playground.game.v1.GameId game_id = 1;
+  optional string model_name = 2;
+}
+message GetEloHistoryResponse { repeated EloPoint points = 1; }
+message EloPoint {
+  string model_version = 1;
+  uint64 training_step = 2;
+  double elo = 3;
+  double elo_stddev = 4;
+  int64 measured_unix_ms = 5;
+}

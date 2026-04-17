@@ -1,0 +1,90 @@
+syntax = "proto3";
+
+package playground.model.v1;
+
+import "playground/game/v1/game.proto";
+
+service ModelService {
+  // Unary (convenience; batched variants below are the hot path).
+  rpc Encode(EncodeRequest) returns (EncodeResponse);
+  rpc Eval(EvalRequest) returns (EvalResponse);
+  rpc Policy(PolicyRequest) returns (PolicyResponse);
+  rpc Reify(ReifyRequest) returns (ReifyResponse);
+
+  // Batched variants. model-client in Rust micro-batches into these.
+  rpc EncodeBatch(EncodeBatchRequest) returns (EncodeBatchResponse);
+  rpc EvalBatch(EvalBatchRequest) returns (EvalBatchResponse);
+  rpc PolicyBatch(PolicyBatchRequest) returns (PolicyBatchResponse);
+  rpc ReifyBatch(ReifyBatchRequest) returns (ReifyBatchResponse);
+
+  rpc ReloadWeights(ReloadWeightsRequest) returns (ReloadWeightsResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message EncodeRequest { playground.game.v1.GameState state = 1; }
+message EncodeResponse { playground.game.v1.Gs gs = 1; }
+message EncodeBatchRequest { repeated playground.game.v1.GameState states = 1; }
+message EncodeBatchResponse { repeated playground.game.v1.Gs gs = 1; }
+
+message EvalRequest { playground.game.v1.Gs gs = 1; }
+message EvalResponse {
+  // Expected outcome for the player to move, in [-1, 1].
+  double value = 1;
+}
+message EvalBatchRequest { repeated playground.game.v1.Gs gs = 1; }
+message EvalBatchResponse { repeated double values = 1; }
+
+message PolicyRequest {
+  playground.game.v1.Gs gs = 1;
+  // Number of (action, next_gs) pairs requested (B). Server may return fewer.
+  uint32 top_b = 2;
+}
+message PolicyResponse {
+  // Ordered by decreasing prior. priors are normalized over the returned set.
+  repeated PolicyCandidate candidates = 1;
+}
+message PolicyCandidate {
+  double prior = 1;
+  // Raw action head output for this candidate (used by reifier as a seed).
+  bytes action_vector = 2;
+  // Predicted next GS (used for MCTS expansion without reification).
+  playground.game.v1.Gs next_gs = 3;
+}
+message PolicyBatchRequest { repeated PolicyRequest requests = 1; }
+message PolicyBatchResponse { repeated PolicyResponse responses = 1; }
+
+message ReifyRequest {
+  playground.game.v1.Gs from_gs = 1;
+  playground.game.v1.Gs to_gs = 2;
+  // Concrete state that from_gs corresponds to. The reifier produces a move
+  // that is legal from this state (if possible).
+  playground.game.v1.GameState from_state = 3;
+  // Optional action-vector seed (from policy head or perturbed sibling).
+  optional bytes action_vector = 4;
+  // Optional noise to apply to the seed before decoding.
+  optional double noise_scale = 5;
+}
+message ReifyResponse {
+  playground.game.v1.Move move = 1;
+  // Decoder's confidence or distance metric, for diagnostics.
+  double score = 2;
+}
+message ReifyBatchRequest { repeated ReifyRequest requests = 1; }
+message ReifyBatchResponse { repeated ReifyResponse responses = 1; }
+
+message ReloadWeightsRequest {
+  // Filesystem path, model registry URI, or version id understood by the
+  // model server.
+  string source = 1;
+}
+message ReloadWeightsResponse {
+  string loaded_version = 1;
+}
+
+message HealthRequest {}
+message HealthResponse {
+  string model_version = 1;
+  bool ready = 2;
+  // Which game this model server is configured for. One server per game.
+  playground.game.v1.GameId game_id = 3;
+}
