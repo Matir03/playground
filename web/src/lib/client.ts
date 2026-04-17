@@ -10,13 +10,7 @@
 
 import { createClient } from "@connectrpc/connect";
 import { createGrpcWebTransport } from "@connectrpc/connect-web";
-
-// These imports resolve once codegen has been run.
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-// @ts-ignore — generated module only exists after `scripts/gen-proto.sh`.
 import { EngineService } from "../gen/playground/engine/v1/engine_pb";
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-// @ts-ignore — generated module only exists after `scripts/gen-proto.sh`.
 import { OrchestratorService } from "../gen/playground/orchestrator/v1/orchestrator_pb";
 
 export function engineClientFor(baseUrl: string) {

@@ -2,12 +2,11 @@ version: v2
 inputs:
   - directory: proto
 plugins:
-  # TypeScript (ES) types + Connect-ES clients for the web frontend.
+  # TypeScript types + Connect v2 service descriptors for the web frontend.
+  # The bufbuild/es plugin emits GenService descriptors in _pb.ts, which is
+  # what Connect v2's createClient expects — no separate connectrpc/es plugin
+  # needed.
   - remote: buf.build/bufbuild/es
-    out: ../web/src/gen
-    opt:
-      - target=ts
-  - remote: buf.build/connectrpc/es
     out: ../web/src/gen
     opt:
       - target=ts

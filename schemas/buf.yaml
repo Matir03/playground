@@ -4,6 +4,13 @@ modules:
 lint:
   use:
     - STANDARD
+  except:
+    # Allow shared request/response message types across RPCs (e.g. GameHandle,
+    # GameState, Run, ModelVersion are reused intentionally). Standard naming
+    # would force per-RPC wrapper messages with no semantic value.
+    - RPC_REQUEST_RESPONSE_UNIQUE
+    - RPC_REQUEST_STANDARD_NAME
+    - RPC_RESPONSE_STANDARD_NAME
 breaking:
   use:
     - FILE
