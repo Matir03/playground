@@ -1,14 +1,14 @@
 syntax = "proto3";
 
-package playground.engine.v1;
+package playground.engine;
 
-import "playground/game/v1/game.proto";
+import "playground/game/game.proto";
 
 service EngineService {
   // Interactive mode
-  rpc NewGame(NewGameRequest) returns (playground.game.v1.GameHandle);
-  rpc GetState(playground.game.v1.GameHandle) returns (playground.game.v1.GameState);
-  rpc ApplyMove(ApplyMoveRequest) returns (playground.game.v1.GameState);
+  rpc NewGame(NewGameRequest) returns (playground.game.GameHandle);
+  rpc GetState(playground.game.GameHandle) returns (playground.game.GameState);
+  rpc ApplyMove(ApplyMoveRequest) returns (playground.game.GameState);
   rpc RequestMove(RequestMoveRequest) returns (stream MoveProgress);
 
   // Engine-vs-engine / engine-vs-model match
@@ -23,18 +23,18 @@ service EngineService {
 }
 
 message NewGameRequest {
-  playground.game.v1.GameId game_id = 1;
+  playground.game.GameId game_id = 1;
   // Optional non-default starting position.
-  optional playground.game.v1.GameState initial_state = 2;
+  optional playground.game.GameState initial_state = 2;
 }
 
 message ApplyMoveRequest {
-  playground.game.v1.GameHandle handle = 1;
-  playground.game.v1.Move move = 2;
+  playground.game.GameHandle handle = 1;
+  playground.game.Move move = 2;
 }
 
 message RequestMoveRequest {
-  playground.game.v1.GameHandle handle = 1;
+  playground.game.GameHandle handle = 1;
   SearchBudget budget = 2;
 }
 
@@ -49,7 +49,7 @@ message SearchBudget {
 message MoveProgress {
   oneof kind {
     SearchStats stats = 1;
-    playground.game.v1.Move chosen = 2;
+    playground.game.Move chosen = 2;
   }
 }
 
@@ -60,7 +60,7 @@ message SearchStats {
 }
 
 message MatchSpec {
-  playground.game.v1.GameId game_id = 1;
+  playground.game.GameId game_id = 1;
   string first_player_uri = 2;     // "model://name@v", "engine://host:port", "human://session"
   string second_player_uri = 3;
   uint32 num_games = 4;
@@ -77,13 +77,13 @@ message MatchProgress {
 
 message MatchMove {
   uint32 game_index = 1;
-  playground.game.v1.Player by = 2;
-  playground.game.v1.Move move = 3;
+  playground.game.Player by = 2;
+  playground.game.Move move = 3;
 }
 
 message MatchGameEnd {
   uint32 game_index = 1;
-  playground.game.v1.Outcome outcome = 2;
+  playground.game.Outcome outcome = 2;
 }
 
 message MatchMatchEnd {
@@ -93,7 +93,7 @@ message MatchMatchEnd {
 }
 
 message SelfPlaySpec {
-  playground.game.v1.GameId game_id = 1;
+  playground.game.GameId game_id = 1;
   string run_id = 2;
   string model_version = 3;        // pinned version; engine refuses to start if server disagrees
   uint32 parallel_games = 4;
@@ -113,7 +113,7 @@ message SelfPlayProgress {
 message SelfPlayGameComplete {
   string record_id = 1;
   string record_path = 2;
-  playground.game.v1.Outcome outcome = 3;
+  playground.game.Outcome outcome = 3;
   uint32 plies = 4;
 }
 
@@ -127,5 +127,5 @@ message HealthRequest {}
 
 message HealthResponse {
   string version = 1;
-  repeated playground.game.v1.GameId supported_games = 2;
+  repeated playground.game.GameId supported_games = 2;
 }

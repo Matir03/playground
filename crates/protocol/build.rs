@@ -6,11 +6,11 @@ use std::path::PathBuf;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_root: PathBuf = PathBuf::from("../../schemas/proto");
     let files: Vec<PathBuf> = vec![
-        proto_root.join("playground/game/v1/game.proto"),
-        proto_root.join("playground/record/v1/record.proto"),
-        proto_root.join("playground/engine/v1/engine.proto"),
-        proto_root.join("playground/model/v1/model.proto"),
-        proto_root.join("playground/orchestrator/v1/orchestrator.proto"),
+        proto_root.join("playground/game/game.proto"),
+        proto_root.join("playground/record/record.proto"),
+        proto_root.join("playground/engine/engine.proto"),
+        proto_root.join("playground/model/model.proto"),
+        proto_root.join("playground/orchestrator/orchestrator.proto"),
     ];
 
     for f in &files {

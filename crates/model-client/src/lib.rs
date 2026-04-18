@@ -9,8 +9,8 @@ use std::marker::PhantomData;
 
 use async_trait::async_trait;
 use playground_core::{Game, Gs, ModelClient, PolicyCandidate};
-use playground_protocol::model_v1 as pb;
-use playground_protocol::model_v1::model_service_client::ModelServiceClient;
+use playground_protocol::model_pb as pb;
+use playground_protocol::model_pb::model_service_client::ModelServiceClient;
 use tonic::transport::Channel;
 
 pub struct RemoteModelClient<G: Game> {
@@ -33,7 +33,7 @@ impl<G: Game> ModelClient<G> for RemoteModelClient<G> {
     async fn encode(&self, state: &G::State) -> anyhow::Result<Gs> {
         let payload = G::encode_state(state);
         let req = pb::EncodeRequest {
-            state: Some(playground_protocol::game_v1::GameState {
+            state: Some(playground_protocol::game_pb::GameState {
                 game_id: G::id() as i32,
                 payload,
                 to_move: 0,
@@ -86,7 +86,7 @@ impl<G: Game> ModelClient<G> for RemoteModelClient<G> {
         let req = pb::ReifyRequest {
             from_gs: Some(to_proto_gs(from_gs)),
             to_gs: Some(to_proto_gs(to_gs)),
-            from_state: Some(playground_protocol::game_v1::GameState {
+            from_state: Some(playground_protocol::game_pb::GameState {
                 game_id: G::id() as i32,
                 payload: G::encode_state(from_state),
                 to_move: 0,
@@ -109,14 +109,14 @@ impl<G: Game> ModelClient<G> for RemoteModelClient<G> {
     }
 }
 
-fn to_proto_gs(gs: &Gs) -> playground_protocol::game_v1::Gs {
-    playground_protocol::game_v1::Gs {
+fn to_proto_gs(gs: &Gs) -> playground_protocol::game_pb::Gs {
+    playground_protocol::game_pb::Gs {
         payload: gs.payload.to_vec(),
         shape: gs.shape.clone(),
         model_version: gs.model_version.clone(),
     }
 }
 
-fn from_proto_gs(gs: playground_protocol::game_v1::Gs) -> Gs {
+fn from_proto_gs(gs: playground_protocol::game_pb::Gs) -> Gs {
     Gs::new(gs.payload, gs.shape, gs.model_version)
 }

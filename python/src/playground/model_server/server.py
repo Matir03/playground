@@ -23,7 +23,7 @@ def main() -> None:
     log.info("model server stub: game=%s port=%d checkpoint=%s", args.game, args.port, args.checkpoint)
 
     # TODO(M2): wire up grpcio server and register the generated ModelService servicer.
-    #   from playground.gen.playground.model.v1 import model_pb2_grpc
+    #   from playground.gen.playground.model import model_pb2_grpc
     #   server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
     #   model_pb2_grpc.add_ModelServiceServicer_to_server(ModelServicer(...), server)
     #   server.add_insecure_port(f"[::]:{args.port}")

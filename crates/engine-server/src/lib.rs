@@ -7,9 +7,9 @@ use std::marker::PhantomData;
 use std::net::SocketAddr;
 
 use playground_core::{Game, ModelClient};
-use playground_protocol::engine_v1::engine_service_server::{EngineService, EngineServiceServer};
-use playground_protocol::engine_v1::*;
-use playground_protocol::game_v1::{GameHandle, GameState};
+use playground_protocol::engine_pb::engine_service_server::{EngineService, EngineServiceServer};
+use playground_protocol::engine_pb::*;
+use playground_protocol::game_pb::{GameHandle, GameState};
 use tonic::{Request, Response, Status};
 
 /// Long-running engine server. Holds a ModelClient and supports the three

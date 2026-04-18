@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package playground.game.v1;
+package playground.game;
 
 // GameId identifies which game rule set is in play. The payload bytes in
 // GameState and Move are only interpretable in the context of a GameId.

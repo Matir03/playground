@@ -10,8 +10,8 @@
 
 import { createClient } from "@connectrpc/connect";
 import { createGrpcWebTransport } from "@connectrpc/connect-web";
-import { EngineService } from "../gen/playground/engine/v1/engine_pb";
-import { OrchestratorService } from "../gen/playground/orchestrator/v1/orchestrator_pb";
+import { EngineService } from "../gen/playground/engine/engine_pb";
+import { OrchestratorService } from "../gen/playground/orchestrator/orchestrator_pb";
 
 export function engineClientFor(baseUrl: string) {
   const transport = createGrpcWebTransport({ baseUrl });

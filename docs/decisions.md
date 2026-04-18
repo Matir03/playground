@@ -117,17 +117,22 @@ mock `ModelClient`.
 
 ---
 
-## D7 — Milestone-driven schema and algorithm stability
+## D7 — No package versioning in schemas
 
-**Context.** `record.proto` in particular will evolve as we learn what the
-training loop actually uses. We don't want to over-fit the schema before
-we've trained anything.
+**Context.** The usual protobuf pattern tacks `.v1` on every package so
+breaking changes can introduce `.v2` without disturbing old consumers. That
+assumes consumers you don't control. We don't have any — it's a monorepo,
+all three language bindings are generated from the same source, and a
+breaking schema change reves the Rust server, the Python services, and the
+web bundle in the same PR.
 
-**Decision.** Keep everything at `v1` through M2 (Connect 4 training end to
-end). After M2, re-evaluate and freeze `v1` against the known use cases.
-After that, use `buf breaking` + the evolution rules in
-[schemas.md](schemas.md#evolution-rules-buf-breaking-compatible).
+**Decision.** Packages are unversioned (`playground.engine`, not
+`playground.engine.v1`). Evolution rules (never reuse field numbers,
+additive-only over the wire for on-disk records) still apply, but the
+"keep v1 frozen, introduce v2" dance doesn't.
 
 **Consequences.**
-- Freedom to iterate pre-M2.
-- Discipline from M2 onwards; every schema change is a conscious decision.
+- One less path segment in every import.
+- No `buf breaking` gate — intentional. If we ever publish a client anyone
+  else consumes, reintroduce versioning at that boundary only.
+- Schema changes are just code changes; review them on the merits.

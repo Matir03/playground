@@ -47,7 +47,7 @@
 
 ### `crates/protocol` (Rust)
 - tonic-build-generated types from `schemas/proto/**/*.proto`.
-- Thin re-exports so downstream crates say `use playground_protocol::engine::v1::*`.
+- Thin re-exports so downstream crates say `use playground_protocol::engine_pb::*`.
 
 ### `crates/engine-server` (Rust)
 - Implements `EngineService` generically over `G: Game + ModelClient`.

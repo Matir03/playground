@@ -51,7 +51,7 @@ pub trait Game: Send + Sync + 'static {
     type State: Clone + Debug + Send + Sync;
     type Move: Clone + Debug + Send + Sync;
 
-    /// Stable identifier (matches `playground.game.v1.GameId`).
+    /// Stable identifier (matches `playground.game.GameId`).
     fn id() -> u32;
 
     fn initial_state() -> Self::State;

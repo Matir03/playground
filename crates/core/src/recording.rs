@@ -1,6 +1,6 @@
 //! Conversion from in-memory search trees to on-disk `GameRecord`s.
 //!
-//! The on-disk schema lives in `schemas/proto/playground/record/v1`.
+//! The on-disk schema lives in `schemas/proto/playground/record`.
 //! Actual proto↔in-memory conversion is implemented by `playground-protocol`,
 //! which owns the generated types; this module keeps transport-independent
 //! helpers (e.g. length-delimited writers, shard path layout).

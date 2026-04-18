@@ -14,7 +14,7 @@ Source of truth: [`schemas/proto`](../schemas/proto).
 | `ModelService`       | Python model server     | Rust engine binaries (via `model-client`) |
 | `OrchestratorService`| Python orchestrator     | Web UI (admin)                    |
 
-### `EngineService` (v1)
+### `EngineService`
 
 - `NewGame(NewGameRequest) → GameHandle` — start a new interactive game.
 - `ApplyMove(ApplyMoveRequest) → GameState` — play one move.
@@ -27,7 +27,7 @@ Source of truth: [`schemas/proto`](../schemas/proto).
   mode; streams completed-game notifications; writes `GameRecord`s to a path
   specified in the request.
 
-### `ModelService` (v1)
+### `ModelService`
 
 - `Encode(EncodeRequest) → EncodeResponse` — concrete state → GS.
 - `Eval(EvalRequest) → EvalResponse` — GS → scalar value.
@@ -39,15 +39,14 @@ Source of truth: [`schemas/proto`](../schemas/proto).
   new checkpoint in-place. Returns the loaded version id.
 - `Health(Empty) → HealthResponse` — liveness + current model version.
 
-### `OrchestratorService` (v1)
+### `OrchestratorService`
 
 Admin surface — not called on the hot path. Used by the web UI.
 - `ListRuns`, `GetRun`, `StartRun`, `StopRun`
 - `ListModels`, `GetModel`, `PromoteModel`
 - `ListEvals`, `StartEval`, `GetEloHistory`
 
-Exact shapes evolve; keep the service at `v1` until we hit a real
-break; see [schemas.md](schemas.md) for evolution rules.
+Exact shapes evolve; see [schemas.md](schemas.md) for evolution rules.
 
 ## Engine binary CLI
 

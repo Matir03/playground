@@ -6,17 +6,18 @@ All wire and on-disk formats are protobuf. Source of truth: [`schemas/proto`](..
 
 ```
 schemas/proto/playground/
-  game/v1/game.proto             # shared: GameState, Move, Player, Outcome, GameId
-  record/v1/record.proto         # on-disk training records
-  engine/v1/engine.proto         # EngineService + its message types
-  model/v1/model.proto           # ModelService + its message types
-  orchestrator/v1/orchestrator.proto
+  game/game.proto                # shared: GameState, Move, Player, Outcome, GameId
+  record/record.proto            # on-disk training records
+  engine/engine.proto            # EngineService + its message types
+  model/model.proto              # ModelService + its message types
+  orchestrator/orchestrator.proto
 ```
 
 ## Conventions
 
-- **Versioned packages.** Every package ends in `.vN`. Breaking changes bump N.
-- **Split service from shared types.** `game/v1` holds types that *multiple*
+- **No package versioning.** This is a monorepo; all clients rev with the
+  schemas. See [decisions.md#d7](decisions.md) for the rationale.
+- **Split service from shared types.** `game` holds types that *multiple*
   services use (GameState, Move). Service-specific RPC messages live under
   the service's own package. Rationale: record format and RPC surface evolve
   at different rates; keeping them in separate files means changing one
@@ -30,16 +31,17 @@ schemas/proto/playground/
 - **Bytes for GS.** The GS encoding is `bytes` + shape hint; only the model
   server and `model-client` know the tensor layout.
 
-## Evolution rules (buf-breaking compatible)
+## Evolution rules
 
 - Never reuse a field number.
 - Never change the wire type of an existing field.
 - New fields are always `optional` (proto3 presence) unless clearly required
   for all future records.
-- When we truly need a break, create `v2` and keep `v1` until consumers
-  migrate. Do not edit `v1` after first production use.
-- `buf breaking` is our gatekeeper; run it in CI before we merge PRs that
-  touch `schemas/proto`.
+- Because everything rev's together, breaking changes are fine — just update
+  all callers in the same PR. `buf breaking` is *not* gating us here; its job
+  would be to protect external consumers, and we have none.
+- If/when we grow an external consumer, introduce versioned packages at
+  that boundary only.
 
 ## Training record format
 
@@ -52,7 +54,7 @@ The `GameRecord` message is how self-play feeds training. Key design points:
   vector that was sampled (plus noise scale) to reify it.
 - The final game **Outcome** is the ground-truth signal for the eval head.
 
-The exact proto is in [`record/v1/record.proto`](../schemas/proto/playground/record/v1/record.proto). Revisit the schema
+The exact proto is in [`record/record.proto`](../schemas/proto/playground/record/record.proto). Revisit the schema
 after M2 (Connect 4 training) when we have a concrete sense of what the
 training loop actually uses.
 

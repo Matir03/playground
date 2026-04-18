@@ -76,7 +76,7 @@ cargo run --release -p connect4-engine -- match \
     --num-games 20
 
 # Check a running engine is alive (requires grpcurl).
-grpcurl -plaintext 127.0.0.1:7100 playground.engine.v1.EngineService/Health
+grpcurl -plaintext 127.0.0.1:7100 playground.engine.EngineService/Health
 ```
 
 Full protocol surface is in [docs/protocols.md](docs/protocols.md).
