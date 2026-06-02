@@ -177,6 +177,10 @@ impl Game for Amazons {
         next
     }
 
+    fn ply(state: &Self::State) -> u32 {
+        state.ply as u32
+    }
+
     fn to_features(state: &Self::State) -> Vec<u8> {
         // Planes: first queens | second queens | arrows | side-to-move constant
         let mut out = Vec::with_capacity(4 * N * N);

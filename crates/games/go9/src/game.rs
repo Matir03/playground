@@ -122,6 +122,10 @@ impl Game for Go9 {
         next
     }
 
+    fn ply(state: &Self::State) -> u32 {
+        state.ply as u32
+    }
+
     fn to_features(state: &Self::State) -> Vec<u8> {
         // Planes: [own stones, opp stones, to-move constant]
         let own = state.to_move;

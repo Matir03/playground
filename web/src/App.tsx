@@ -1,17 +1,21 @@
 import { useEffect, useState } from "react";
 import { engineClientFor } from "./lib/client";
+import { Connect4Board } from "./games/connect4/Board";
 
 const GAMES = [
-  { id: "connect4", label: "Connect 4", engineUrl: "http://127.0.0.1:7100" },
-  { id: "go9",      label: "Go 9×9",     engineUrl: "http://127.0.0.1:7101" },
-  { id: "amazons",  label: "Amazons",    engineUrl: "http://127.0.0.1:7102" },
-  { id: "arimaa",   label: "Arimaa",     engineUrl: "http://127.0.0.1:7103" },
+  { id: "connect4", label: "Connect 4", engineUrl: "http://127.0.0.1:7100", playable: true },
+  { id: "go9",      label: "Go 9×9",     engineUrl: "http://127.0.0.1:7101", playable: false },
+  { id: "amazons",  label: "Amazons",    engineUrl: "http://127.0.0.1:7102", playable: false },
+  { id: "arimaa",   label: "Arimaa",     engineUrl: "http://127.0.0.1:7103", playable: false },
 ] as const;
 
 type EngineHealth =
   | { status: "unknown" }
   | { status: "ok"; version: string }
   | { status: "error"; message: string };
+
+const connect4 = GAMES[0];
+const connect4Client = engineClientFor(connect4.engineUrl);
 
 export function App() {
   const [healths, setHealths] = useState<Record<string, EngineHealth>>(
@@ -39,20 +43,32 @@ export function App() {
   }, []);
 
   return (
-    <main style={{ fontFamily: "system-ui, sans-serif", padding: "2rem", maxWidth: 640 }}>
+    <main style={{ fontFamily: "system-ui, sans-serif", padding: "2rem", maxWidth: 720 }}>
       <h1>playground</h1>
-      <p>MuZero-variant research playground. Engines:</p>
+
+      <h2 style={{ marginBottom: "0.5rem" }}>Connect 4</h2>
+      <p style={{ marginTop: 0, color: "#555" }}>
+        Hot-seat — two humans, one board. The Rust engine enforces the rules.{" "}
+        <Health h={healths.connect4} />
+      </p>
+      {healths.connect4.status === "error" ? (
+        <p style={{ color: "crimson" }}>
+          Engine not reachable at {connect4.engineUrl}. Start it with{" "}
+          <code>cargo run --bin connect4-engine -- serve</code>.
+        </p>
+      ) : (
+        <Connect4Board client={connect4Client} />
+      )}
+
+      <h2 style={{ marginTop: "2rem" }}>Engines</h2>
       <ul>
         {GAMES.map((g) => (
           <li key={g.id}>
             <strong>{g.label}</strong> @ {g.engineUrl} — <Health h={healths[g.id]} />
+            {!g.playable && <span style={{ color: "#888" }}> (UI pending)</span>}
           </li>
         ))}
       </ul>
-      <p style={{ color: "#888" }}>
-        Scaffolding only — boards and gameplay UIs land starting at M1.
-        See <code>docs/</code>.
-      </p>
     </main>
   );
 }

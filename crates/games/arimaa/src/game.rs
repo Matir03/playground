@@ -311,6 +311,10 @@ impl Game for Arimaa {
         next
     }
 
+    fn ply(state: &Self::State) -> u32 {
+        state.ply
+    }
+
     fn to_features(state: &Self::State) -> Vec<u8> {
         // 12 planes (one per piece type × player) + 1 side-to-move plane, each 64 bytes.
         let mut out = Vec::with_capacity(13 * 64);

@@ -62,6 +62,9 @@ pub trait Game: Send + Sync + 'static {
     fn legal_moves(state: &Self::State) -> Vec<Self::Move>;
     fn apply(state: &Self::State, mv: &Self::Move) -> Self::State;
 
+    /// Monotonic ply counter (matches `GameState.ply` in the proto).
+    fn ply(state: &Self::State) -> u32;
+
     /// Feature bytes for the encoder input. Layout is game-specific and
     /// must match what the Python model server expects.
     fn to_features(state: &Self::State) -> Vec<u8>;

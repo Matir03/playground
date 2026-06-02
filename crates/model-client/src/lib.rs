@@ -20,7 +20,9 @@ pub struct RemoteModelClient<G: Game> {
 
 impl<G: Game> RemoteModelClient<G> {
     pub async fn connect(uri: &str) -> anyhow::Result<Self> {
-        let channel = Channel::from_shared(uri.to_string())?.connect().await?;
+        // connect_lazy defers the actual TCP connection until the first RPC;
+        // this lets the engine start without a model server running (human play).
+        let channel = Channel::from_shared(uri.to_string())?.connect_lazy();
         Ok(Self {
             client: tokio::sync::Mutex::new(ModelServiceClient::new(channel)),
             _game: PhantomData,

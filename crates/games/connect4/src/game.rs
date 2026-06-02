@@ -81,6 +81,10 @@ impl Game for Connect4 {
         panic!("illegal Connect4 move: column {col} is full");
     }
 
+    fn ply(state: &Self::State) -> u32 {
+        state.ply as u32
+    }
+
     fn to_features(state: &Self::State) -> Vec<u8> {
         let mut out = Vec::with_capacity(2 * C4_ROWS * C4_COLS);
         for piece in [1u8, 2] {

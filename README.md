@@ -18,7 +18,22 @@ Most commands below are milestone-gated and will exit with a "implement at Mx"
 message until the corresponding milestone lands (see
 [docs/overview.md](docs/overview.md)). What *is* working today: the Rust
 workspace builds, generated bindings for all three languages, the engines'
-`Health` RPC, and the web app's health check.
+`Health` RPC, the full interactive-play surface (`NewGame` / `GetState` /
+`ApplyMove`, with server-side legality + win detection), and a playable
+Connect 4 board in the web app. No model server is required for human play —
+the engine connects to it lazily.
+
+### Play Connect 4 end-to-end (no Python needed)
+
+```bash
+# Terminal A — engine (human play needs no model server)
+cargo run -p connect4-engine -- serve --addr 127.0.0.1:7100
+
+# Terminal B — web UI, then open http://127.0.0.1:5173
+cd web && npm install && npm run dev
+```
+
+Two humans share the board (hot-seat); the Rust engine owns the rules.
 
 ### Prerequisites
 
