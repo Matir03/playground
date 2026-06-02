@@ -2,7 +2,9 @@
 //!
 //! See docs/protocols.md for subcommand semantics.
 
+mod book;
 mod game;
+mod solver;
 
 use std::net::SocketAddr;
 
@@ -25,6 +27,11 @@ enum Cmd {
         addr: SocketAddr,
         #[arg(long, default_value = "http://127.0.0.1:7200")]
         model_uri: String,
+        /// Path to the Connect 4 opening book. Defaults to the bundled
+        /// `data/7x6.book`; the perfect engine still works without it but is
+        /// slow in the opening.
+        #[arg(long)]
+        book: Option<String>,
     },
     /// As Serve, but also accepts StartSelfPlay requests.
     SelfPlay {
@@ -34,6 +41,8 @@ enum Cmd {
         model_uri: String,
         #[arg(long, default_value_t = 16)]
         workers: u32,
+        #[arg(long)]
+        book: Option<String>,
     },
     /// Client-side match runner.
     Match {
@@ -56,7 +65,11 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Serve { addr, model_uri } | Cmd::SelfPlay { addr, model_uri, .. } => {
+        Cmd::Serve { addr, model_uri, book } | Cmd::SelfPlay { addr, model_uri, book, .. } => {
+            if let Some(path) = book {
+                // The solver reads this on first use (see solver::book()).
+                std::env::set_var("CONNECT4_BOOK", path);
+            }
             let model = RemoteModelClient::<Connect4>::connect(&model_uri).await?;
             playground_engine_server::run::<Connect4, _>(addr, model).await?;
         }

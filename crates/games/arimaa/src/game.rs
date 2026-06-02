@@ -20,7 +20,7 @@
 //!   4. Second has no rabbits  → FirstWins.
 //!   5. At start of a player's turn (steps_left==4): no legal steps → opponent wins.
 
-use playground_core::{Game, Outcome, Player};
+use playground_core::{Game, Outcome, Player, SearchOutcome, Solver};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -375,6 +375,18 @@ impl Game for Arimaa {
             [3] => Ok(ArimaaMove::EndTurn),
             _ => anyhow::bail!("invalid arimaa move bytes (len={})", bytes.len()),
         }
+    }
+}
+
+// Placeholder built-in engine: plays the first legal move. No strong solver
+// for Arimaa yet — this only exists so the engine can answer RequestMove.
+impl Solver for Arimaa {
+    fn choose_move(state: &Self::State) -> SearchOutcome<Self::Move> {
+        let best_move = Self::legal_moves(state)
+            .into_iter()
+            .next()
+            .expect("non-terminal position has a legal move");
+        SearchOutcome { best_move, value: 0.0, nodes: 0 }
     }
 }
 

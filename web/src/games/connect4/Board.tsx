@@ -1,6 +1,7 @@
 /**
- * Connect 4 play surface. Hot-seat human vs human; the Rust engine owns the
- * rules (legality, win detection) and is the single source of truth for state.
+ * Connect 4 play surface. Each seat is a human or the built-in perfect engine;
+ * the Rust engine owns the rules (legality, win detection) and, for engine
+ * seats, picks the move via the perfect solver (EngineService.RequestMove).
  *
  * Wire format (must match crates/games/connect4/src/game.rs):
  *   GameState.payload = 42 cell bytes (row-major, row 0 = bottom) + 2 ply bytes.
@@ -8,7 +9,7 @@
  *   Move.payload   = 1 byte: the column index.
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { create } from "@bufbuild/protobuf";
 import type { Client } from "@connectrpc/connect";
 import { ConnectError } from "@connectrpc/connect";
@@ -16,6 +17,7 @@ import {
   GameId,
   type GameHandle,
   type GameState,
+  type Move,
   MoveSchema,
   Outcome,
   Player,
@@ -24,12 +26,15 @@ import {
   type EngineService,
   NewGameRequestSchema,
   ApplyMoveRequestSchema,
+  RequestMoveRequestSchema,
+  type SearchStats,
 } from "../../gen/playground/engine/engine_pb";
 
 const ROWS = 6;
 const COLS = 7;
 
 type Cell = 0 | 1 | 2;
+type Seat = "human" | "engine";
 
 /** Decode the engine's opaque payload into a [row][col] grid (row 0 = bottom). */
 function decodeBoard(payload: Uint8Array): Cell[][] {
@@ -64,19 +69,27 @@ export function Connect4Board({
 }) {
   const [handle, setHandle] = useState<GameHandle | null>(null);
   const [state, setState] = useState<GameState | null>(null);
+  const [firstSeat, setFirstSeat] = useState<Seat>("human");
+  const [secondSeat, setSecondSeat] = useState<Seat>("engine");
+  const [thinking, setThinking] = useState(false);
+  const [lastStats, setLastStats] = useState<SearchStats | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  // Guards the engine's auto-move so it fires exactly once per position, even
+  // under React StrictMode's double-invoked effects (refs persist across them).
+  const engineTurnRef = useRef<string | null>(null);
 
   const newGame = useCallback(async () => {
     setError(null);
     setBusy(true);
+    setLastStats(null);
     try {
       const h = await client.newGame(
         create(NewGameRequestSchema, { gameId: GameId.CONNECT4 }),
       );
       setHandle(h);
-      const s = await client.getState(h);
-      setState(s);
+      setState(await client.getState(h));
     } catch (e) {
       setError(e instanceof ConnectError ? e.message : String(e));
     } finally {
@@ -88,10 +101,14 @@ export function Connect4Board({
     void newGame();
   }, [newGame]);
 
+  const seatToMove = (s: GameState): Seat =>
+    s.toMove === Player.FIRST ? firstSeat : secondSeat;
+
   const drop = useCallback(
     async (col: number) => {
-      if (!handle || !state || busy) return;
+      if (!handle || !state || busy || thinking) return;
       if (state.outcome !== Outcome.IN_PROGRESS) return;
+      if (seatToMove(state) !== "human") return;
       setError(null);
       setBusy(true);
       try {
@@ -111,38 +128,108 @@ export function Connect4Board({
         setBusy(false);
       }
     },
-    [client, handle, state, busy],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [client, handle, state, busy, thinking, firstSeat, secondSeat],
   );
+
+  // Engine auto-move: when it's an engine seat's turn, ask the server to think.
+  useEffect(() => {
+    if (!handle || !state) return;
+    if (state.outcome !== Outcome.IN_PROGRESS) return;
+    if (seatToMove(state) !== "engine") return;
+
+    const tag = `${handle.handleId}:${state.ply}`;
+    if (engineTurnRef.current === tag) return;
+    engineTurnRef.current = tag;
+
+    const fromPly = state.ply;
+    (async () => {
+      setThinking(true);
+      setError(null);
+      // A brief pace before moving: makes engine-vs-engine watchable, gives
+      // human-vs-engine a natural feel, and spaces out gRPC-Web calls so a
+      // dropped-trailer hiccup can't cascade on a reused HTTP/1.1 connection.
+      await new Promise((r) => setTimeout(r, 250));
+      // Browser gRPC-Web over HTTP/1.1 occasionally drops a response trailer
+      // ("missing trailer") on rapid calls; the underlying RPC still works, so
+      // retry, reconciling against server state to avoid double-applying.
+      for (let attempt = 0; attempt < 4; attempt++) {
+        try {
+          let chosen: Move | undefined;
+          try {
+            // Timeout guards against a browser gRPC-Web stream that hangs
+            // waiting for a dropped trailer (the solver itself is ~instant).
+            for await (const prog of client.requestMove(
+              create(RequestMoveRequestSchema, { handle }),
+              { signal: AbortSignal.timeout(8000) },
+            )) {
+              if (prog.kind.case === "stats") setLastStats(prog.kind.value);
+              else if (prog.kind.case === "chosen") chosen = prog.kind.value;
+            }
+          } catch (streamErr) {
+            if (!chosen) throw streamErr; // only fatal if no move arrived
+          }
+          if (!chosen) throw new Error("engine returned no move");
+          const next = await client.applyMove(
+            create(ApplyMoveRequestSchema, { handle, move: chosen }),
+            { signal: AbortSignal.timeout(8000) },
+          );
+          setState(next);
+          break;
+        } catch (e) {
+          // Maybe the move applied server-side despite a client-side parse error.
+          const cur = await client
+            .getState(handle, { signal: AbortSignal.timeout(8000) })
+            .catch(() => null);
+          if (cur && cur.ply > fromPly) {
+            setState(cur);
+            break;
+          }
+          if (attempt === 3) {
+            setError(e instanceof ConnectError ? e.message : String(e));
+          }
+        }
+      }
+      setThinking(false);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [handle, state, firstSeat, secondSeat, client]);
 
   const board = state ? decodeBoard(state.payload) : null;
   const inProgress = state?.outcome === Outcome.IN_PROGRESS;
+  const humanTurn = !!state && inProgress && seatToMove(state) === "human";
   const toMove = state?.toMove === Player.FIRST ? "Yellow" : "Red";
   const colFull = (c: number) => !!board && board[ROWS - 1][c] !== 0;
 
   return (
     <section>
-      <div style={{ display: "flex", alignItems: "center", gap: "1rem", marginBottom: "0.75rem" }}>
-        <strong>
-          {state == null
-            ? "Loading…"
-            : inProgress
-              ? `${toMove} to move`
-              : outcomeLabel(state.outcome)}
-        </strong>
+      <div style={{ display: "flex", gap: "1.5rem", marginBottom: "0.75rem", flexWrap: "wrap" }}>
+        <SeatPicker label="Yellow (first)" seat={firstSeat} onChange={setFirstSeat} />
+        <SeatPicker label="Red (second)" seat={secondSeat} onChange={setSecondSeat} />
         <button onClick={() => void newGame()} disabled={busy}>
           New game
         </button>
       </div>
 
-      <div
-        style={{
-          display: "inline-block",
-          background: "#1d4ed8",
-          padding: 8,
-          borderRadius: 8,
-        }}
-      >
-        {/* Render top row first (row index ROWS-1 .. 0). */}
+      <div style={{ marginBottom: "0.5rem", minHeight: "1.5em" }}>
+        <strong>
+          {state == null
+            ? "Loading…"
+            : inProgress
+              ? thinking
+                ? `${toMove} (engine) thinking…`
+                : `${toMove} to move`
+              : outcomeLabel(state.outcome)}
+        </strong>
+        {lastStats && (
+          <span style={{ color: "#888", marginLeft: "0.75rem" }}>
+            last search: {lastStats.visits.toLocaleString()} nodes, eval{" "}
+            {lastStats.bestValue.toFixed(2)}
+          </span>
+        )}
+      </div>
+
+      <div style={{ display: "inline-block", background: "#1d4ed8", padding: 8, borderRadius: 8 }}>
         {board &&
           Array.from({ length: ROWS }, (_, i) => ROWS - 1 - i).map((r) => (
             <div key={r} style={{ display: "flex" }}>
@@ -152,19 +239,18 @@ export function Connect4Board({
             </div>
           ))}
 
-        {/* Column drop buttons. */}
         <div style={{ display: "flex" }}>
           {Array.from({ length: COLS }, (_, c) => (
             <button
               key={c}
               onClick={() => void drop(c)}
-              disabled={busy || !inProgress || colFull(c)}
+              disabled={!humanTurn || busy || colFull(c)}
               title={`Drop in column ${c + 1}`}
               style={{
                 width: 44,
                 height: 28,
                 margin: 2,
-                cursor: busy || !inProgress || colFull(c) ? "default" : "pointer",
+                cursor: humanTurn && !colFull(c) ? "pointer" : "default",
               }}
             >
               ↓
@@ -173,10 +259,28 @@ export function Connect4Board({
         </div>
       </div>
 
-      {error && (
-        <p style={{ color: "crimson", marginTop: "0.75rem" }}>Error: {error}</p>
-      )}
+      {error && <p style={{ color: "crimson", marginTop: "0.75rem" }}>Error: {error}</p>}
     </section>
+  );
+}
+
+function SeatPicker({
+  label,
+  seat,
+  onChange,
+}: {
+  label: string;
+  seat: Seat;
+  onChange: (s: Seat) => void;
+}) {
+  return (
+    <label style={{ display: "flex", flexDirection: "column", fontSize: "0.85rem", color: "#555" }}>
+      {label}
+      <select value={seat} onChange={(e) => onChange(e.target.value as Seat)}>
+        <option value="human">Human</option>
+        <option value="engine">Perfect engine</option>
+      </select>
+    </label>
   );
 }
 

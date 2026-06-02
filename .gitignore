@@ -46,6 +46,8 @@ python/src/playground/gen/playground/
 *.onnx
 # Length-delimited proto record shards (see docs/schemas.md).
 *.pb
+# Connect 4 opening book (~32 MB; fetch via scripts/fetch-connect4-book.sh).
+*.book
 
 # -- Editor / OS -------------------------------------------------------------
 .DS_Store

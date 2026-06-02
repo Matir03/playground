@@ -5,7 +5,7 @@
 //! empty square (the queen's origin square counts as empty for arrow purposes).
 //! Arrows are permanent blockers.
 
-use playground_core::{Game, Outcome, Player};
+use playground_core::{Game, Outcome, Player, SearchOutcome, Solver};
 
 pub const N: usize = 10;
 
@@ -249,6 +249,18 @@ impl Game for Amazons {
             arrow_r: bytes[4],
             arrow_c: bytes[5],
         })
+    }
+}
+
+// Placeholder built-in engine: plays the first legal move. No strong solver
+// for Amazons yet — this only exists so the engine can answer RequestMove.
+impl Solver for Amazons {
+    fn choose_move(state: &Self::State) -> SearchOutcome<Self::Move> {
+        let best_move = Self::legal_moves(state)
+            .into_iter()
+            .next()
+            .expect("non-terminal position has a legal move");
+        SearchOutcome { best_move, value: 0.0, nodes: 0 }
     }
 }
 

@@ -8,7 +8,9 @@ pub mod gs;
 pub mod model;
 pub mod mcts;
 pub mod recording;
+pub mod solver;
 
 pub use game::{Game, Outcome, Player};
 pub use gs::Gs;
 pub use model::{ModelClient, PolicyCandidate};
+pub use solver::{SearchOutcome, Solver};

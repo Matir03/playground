@@ -8,7 +8,7 @@ use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use playground_core::{Game, ModelClient, Outcome, Player};
+use playground_core::{Game, ModelClient, Outcome, Player, Solver};
 use playground_protocol::engine_pb::engine_service_server::{EngineService, EngineServiceServer};
 use playground_protocol::engine_pb::*;
 use playground_protocol::game_pb::{self, GameHandle, GameState};
@@ -90,7 +90,7 @@ where
 #[tonic::async_trait]
 impl<G, M> EngineService for EngineServer<G, M>
 where
-    G: Game,
+    G: Solver,
     M: ModelClient<G> + 'static,
 {
     async fn new_game(&self, req: Request<NewGameRequest>) -> Result<Response<GameHandle>, Status> {
@@ -164,9 +164,56 @@ where
     type RequestMoveStream = tokio_stream::wrappers::ReceiverStream<Result<MoveProgress, Status>>;
     async fn request_move(
         &self,
-        _req: Request<RequestMoveRequest>,
+        req: Request<RequestMoveRequest>,
     ) -> Result<Response<Self::RequestMoveStream>, Status> {
-        Err(Status::unimplemented("RequestMove: implement in M2"))
+        let handle = req
+            .into_inner()
+            .handle
+            .ok_or_else(|| Status::invalid_argument("missing handle"))?;
+        let handle_id = handle.handle_id;
+
+        let bytes = self
+            .games
+            .read()
+            .await
+            .get(&handle_id)
+            .cloned()
+            .ok_or_else(|| Status::not_found(format!("unknown handle {handle_id}")))?;
+
+        let state = G::decode_state(&bytes).map_err(|e| Status::internal(e.to_string()))?;
+        if G::outcome(&state).is_terminal() {
+            return Err(Status::failed_precondition("game is already over"));
+        }
+
+        // The solve can be CPU-heavy (a full Connect 4 solve is millions of
+        // nodes); keep it off the async runtime's worker threads.
+        let outcome = tokio::task::spawn_blocking(move || G::choose_move(&state))
+            .await
+            .map_err(|e| Status::internal(format!("solver panicked: {e}")))?;
+
+        let chosen = game_pb::Move {
+            game_id: G::id() as i32,
+            payload: G::encode_move(&outcome.best_move),
+        };
+        let stats = SearchStats {
+            visits: outcome.nodes.min(u32::MAX as u64) as u32,
+            reifications: 0,
+            best_value: outcome.value,
+        };
+
+        // Buffer both messages synchronously and close the channel before
+        // returning — a deterministic, already-complete stream (no spawn race),
+        // which produces cleaner gRPC-Web framing for browser clients.
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let _ = tx.try_send(Ok(MoveProgress {
+            kind: Some(move_progress::Kind::Stats(stats)),
+        }));
+        let _ = tx.try_send(Ok(MoveProgress {
+            kind: Some(move_progress::Kind::Chosen(chosen)),
+        }));
+        drop(tx);
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 
     type PlayMatchStream = tokio_stream::wrappers::ReceiverStream<Result<MatchProgress, Status>>;
@@ -203,7 +250,7 @@ where
 /// browser can call it directly.
 pub async fn run<G, M>(addr: SocketAddr, model: M) -> anyhow::Result<()>
 where
-    G: Game,
+    G: Solver,
     M: ModelClient<G> + 'static,
 {
     let svc = EngineServiceServer::new(EngineServer::<G, M>::new(model));

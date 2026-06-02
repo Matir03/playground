@@ -4,7 +4,7 @@
 //! uses flood-fill area counting (stones + empty points surrounded by one
 //! colour).
 
-use playground_core::{Game, Outcome, Player};
+use playground_core::{Game, Outcome, Player, SearchOutcome, Solver};
 
 pub const N: usize = 9;
 pub const KOMI: f64 = 7.5;
@@ -361,6 +361,18 @@ fn score_area(board: &Board) -> (u32, u32) {
         }
     }
     (black, white)
+}
+
+// Placeholder built-in engine: plays the first legal move. No strong solver
+// for Go yet — this only exists so the engine can answer RequestMove.
+impl Solver for Go9 {
+    fn choose_move(state: &Self::State) -> SearchOutcome<Self::Move> {
+        let best_move = Self::legal_moves(state)
+            .into_iter()
+            .next()
+            .expect("non-terminal position has a legal move");
+        SearchOutcome { best_move, value: 0.0, nodes: 0 }
+    }
 }
 
 #[cfg(test)]

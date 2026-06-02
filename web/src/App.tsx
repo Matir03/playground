@@ -48,7 +48,8 @@ export function App() {
 
       <h2 style={{ marginBottom: "0.5rem" }}>Connect 4</h2>
       <p style={{ marginTop: 0, color: "#555" }}>
-        Hot-seat — two humans, one board. The Rust engine enforces the rules.{" "}
+        Set each seat to a human or the built-in perfect solver. The Rust engine
+        enforces the rules and, for engine seats, plays optimally.{" "}
         <Health h={healths.connect4} />
       </p>
       {healths.connect4.status === "error" ? (

@@ -19,21 +19,42 @@ message until the corresponding milestone lands (see
 [docs/overview.md](docs/overview.md)). What *is* working today: the Rust
 workspace builds, generated bindings for all three languages, the engines'
 `Health` RPC, the full interactive-play surface (`NewGame` / `GetState` /
-`ApplyMove`, with server-side legality + win detection), and a playable
-Connect 4 board in the web app. No model server is required for human play —
-the engine connects to it lazily.
+`ApplyMove` / `RequestMove`, with server-side legality + win detection), a
+playable Connect 4 board in the web app, and a **perfect Connect 4 engine**
+you can play against. No model server is required — the engine connects to it
+lazily, and `RequestMove` is served by the built-in solver.
 
 ### Play Connect 4 end-to-end (no Python needed)
 
 ```bash
-# Terminal A — engine (human play needs no model server)
-cargo run -p connect4-engine -- serve --addr 127.0.0.1:7100
+# One-time: fetch the opening book (~32 MB; makes opening play instant).
+scripts/fetch-connect4-book.sh
+
+# Terminal A — engine (human/perfect-engine play needs no model server)
+cargo run --release -p connect4-engine -- serve --addr 127.0.0.1:7100
 
 # Terminal B — web UI, then open http://127.0.0.1:5173
 cd web && npm install && npm run dev
 ```
 
-Two humans share the board (hot-seat); the Rust engine owns the rules.
+In the UI each seat (Yellow / Red) is a **human** or the **perfect engine**.
+The Rust engine owns the rules; engine seats play optimally.
+
+### The perfect Connect 4 engine
+
+`RequestMove` is answered by a bitboard negamax solver (alpha-beta +
+transposition table + move ordering) — the algorithm from Pascal Pons'
+[Connect 4 tutorial](http://blog.gamesolver.org). It is **result-perfect**:
+it always takes a win, blocks every immediate threat, and never loses a
+position it can hold. Proving the value of a near-empty board is intractable
+in real time, so the engine consults a precomputed [opening book][book]
+(`data/7x6.book`, depth 14) for shallow positions and solves the rest live
+(fast once the board is past the opening). Run `--release`; the book is
+gitignored — fetch it with `scripts/fetch-connect4-book.sh` (or point at your
+own copy with `--book <path>`). Without a book the engine still plays
+perfectly but is very slow in the first ~14 plies.
+
+[book]: https://github.com/PascalPons/connect4
 
 ### Prerequisites
 
