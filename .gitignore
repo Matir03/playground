@@ -20,6 +20,12 @@ python/build/
 web/node_modules/
 web/dist/
 web/.vite/
+# tsc --build incremental cache
+*.tsbuildinfo
+
+# -- Root node tooling (protolint, etc.) -------------------------------------
+# package.json / package-lock.json ARE tracked (protolint toolchain).
+/node_modules/
 
 # -- Generated protobuf ------------------------------------------------------
 # TS:     web/src/gen/                                  (scripts/gen-proto.sh)

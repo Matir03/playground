@@ -1,0 +1,5 @@
+{
+  "devDependencies": {
+    "protolint": "^0.56.4"
+  }
+}
