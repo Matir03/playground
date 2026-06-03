@@ -66,7 +66,7 @@ where
     G: Game,
     M: ModelClient<G> + 'static,
 {
-    _model: Arc<M>,
+    model: Arc<M>,
     games:  Registry,
     _game:  PhantomData<G>,
 }
@@ -78,11 +78,51 @@ where
 {
     pub fn new(model: M) -> Self {
         Self {
-            _model: Arc::new(model),
+            model: Arc::new(model),
             games:  Arc::new(RwLock::new(HashMap::new())),
             _game:  PhantomData,
         }
     }
+}
+
+/// Result of picking a move: serialized move payload, value for the side to
+/// move in [-1, 1], and a node/visit count for telemetry.
+struct Chosen {
+    payload: Vec<u8>,
+    value: f64,
+    nodes: u64,
+}
+
+/// Neural-net move: 1-ply lookahead using the model's encode+eval. Terminal
+/// children use their exact value; others are evaluated by the NN. With random
+/// weights this plays weakly but exercises the full engine↔model-server path.
+/// (The full KR-UCT MCTS over GS arrives with M4 — see docs/algorithm.md.)
+async fn nn_choose_move<G, M>(model: &M, state: &G::State) -> anyhow::Result<Chosen>
+where
+    G: Game,
+    M: ModelClient<G>,
+{
+    let mover = G::to_move(state);
+    let mut best: Option<G::Move> = None;
+    let mut best_value = f64::NEG_INFINITY;
+    let mut nodes = 0u64;
+    for mv in G::legal_moves(state) {
+        let child = G::apply(state, &mv);
+        let value = if G::outcome(&child).is_terminal() {
+            G::outcome(&child).value_for(mover)
+        } else {
+            let gs = model.encode(&child).await?;
+            // eval is from the child's side-to-move (the opponent) perspective.
+            -model.eval(&gs).await?
+        };
+        nodes += 1;
+        if value > best_value {
+            best_value = value;
+            best = Some(mv);
+        }
+    }
+    let mv = best.ok_or_else(|| anyhow::anyhow!("no legal moves"))?;
+    Ok(Chosen { payload: G::encode_move(&mv), value: best_value, nodes })
 }
 
 // ── RPC implementations ───────────────────────────────────────────────────────
@@ -166,8 +206,9 @@ where
         &self,
         req: Request<RequestMoveRequest>,
     ) -> Result<Response<Self::RequestMoveStream>, Status> {
-        let handle = req
-            .into_inner()
+        let inner = req.into_inner();
+        let player = inner.player();
+        let handle = inner
             .handle
             .ok_or_else(|| Status::invalid_argument("missing handle"))?;
         let handle_id = handle.handle_id;
@@ -185,20 +226,32 @@ where
             return Err(Status::failed_precondition("game is already over"));
         }
 
-        // The solve can be CPU-heavy (a full Connect 4 solve is millions of
-        // nodes); keep it off the async runtime's worker threads.
-        let outcome = tokio::task::spawn_blocking(move || G::choose_move(&state))
+        let chosen_move = match player {
+            EnginePlayer::Nn => nn_choose_move::<G, M>(&self.model, &state)
+                .await
+                .map_err(|e| Status::internal(format!("nn move failed: {e}")))?,
+            // Default / Solver: the built-in perfect solver. The solve can be
+            // CPU-heavy, so keep it off the async runtime's worker threads.
+            _ => tokio::task::spawn_blocking(move || {
+                let out = G::choose_move(&state);
+                Chosen {
+                    payload: G::encode_move(&out.best_move),
+                    value: out.value,
+                    nodes: out.nodes,
+                }
+            })
             .await
-            .map_err(|e| Status::internal(format!("solver panicked: {e}")))?;
+            .map_err(|e| Status::internal(format!("solver panicked: {e}")))?,
+        };
 
         let chosen = game_pb::Move {
             game_id: G::id() as i32,
-            payload: G::encode_move(&outcome.best_move),
+            payload: chosen_move.payload,
         };
         let stats = SearchStats {
-            visits: outcome.nodes.min(u32::MAX as u64) as u32,
+            visits: chosen_move.nodes.min(u32::MAX as u64) as u32,
             reifications: 0,
-            best_value: outcome.value,
+            best_value: chosen_move.value,
         };
 
         // Buffer both messages synchronously and close the channel before

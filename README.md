@@ -56,6 +56,29 @@ perfectly but is very slow in the first ~14 plies.
 
 [book]: https://github.com/PascalPons/connect4
 
+### The neural-net engine (random weights)
+
+Each seat in the UI can also be a **neural net** instead of the solver. NN
+moves are served by `RequestMove` doing a 1-ply lookahead over the model's
+`Encode` + `Eval` heads, so they need the Python **model server** running:
+
+```bash
+cd python
+python -m venv .venv && . .venv/bin/activate
+pip install -e '.[model]'
+playground-model-server --game connect4 --port 7200   # random weights
+
+# engine must point at it (this is the default --model-uri):
+cargo run --release -p connect4-engine -- serve \
+    --addr 127.0.0.1:7100 --model-uri http://127.0.0.1:7200
+```
+
+The net is **untrained** (random init), so it plays weakly — the point is to
+exercise the full engine ↔ model-server path. The reification-based MuZero
+variant (`Policy`/`Reify` heads + KR-UCT MCTS over GS) is wired in the proto
+and model server but not yet used for move selection; that lands with M4 (see
+[docs/algorithm.md](docs/algorithm.md)).
+
 ### Prerequisites
 
 | Tool     | Used for                                 | Install                    |
@@ -120,7 +143,8 @@ Full protocol surface is in [docs/protocols.md](docs/protocols.md).
 ### Python — model server
 
 One process per game (the server is configured for a specific game and
-architecture). Stub today; wire RPCs at M2.
+architecture). Connect 4 is implemented today with **random initial weights**
+(torch); all `ModelService` RPCs respond. Other games are not wired yet.
 
 ```bash
 cd python

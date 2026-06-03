@@ -11,6 +11,8 @@ lint:
     - RPC_REQUEST_RESPONSE_UNIQUE
     - RPC_REQUEST_STANDARD_NAME
     - RPC_RESPONSE_STANDARD_NAME
+    # We deliberately dropped the v1 package suffix (see "get rid of v1").
+    - PACKAGE_VERSION_SUFFIX
 breaking:
   use:
     - FILE

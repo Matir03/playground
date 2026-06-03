@@ -1,15 +1,144 @@
-"""ModelService server. Stub — fill in when we have a first NN architecture.
+"""ModelService gRPC server.
 
-Run with `playground-model-server --port 7200 --game connect4`.
+Serves the reification-based MuZero variant's four heads (encoder / eval /
+policy / reifier) for a single game. Today only Connect 4 is wired, with
+*random* initial weights — no training yet (see docs/algorithm.md and
+``net.py``). This is enough to play against the NN end-to-end from the web UI.
+
+Run with ``playground-model-server --port 7200 --game connect4``.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import threading
 from concurrent import futures
 
+import grpc
+import torch
+
+from playground.gen.playground.game import game_pb2
+from playground.gen.playground.model import model_pb2, model_pb2_grpc
+
+from .net import (
+    GS_DIM,
+    ConnectFourModel,
+    connect4_legal_columns,
+    connect4_planes,
+    gs_from_bytes,
+    gs_to_bytes,
+)
+
 log = logging.getLogger(__name__)
+
+# Default policy width (Connect 4 has at most 7 legal moves).
+C4_DEFAULT_B = 7
+
+
+class ModelServicer(model_pb2_grpc.ModelServiceServicer):
+    def __init__(self, game: str, seed: int = 0) -> None:
+        if game != "connect4":
+            raise SystemExit(f"model server: only 'connect4' is wired today (got {game!r})")
+        self.game = game
+        self.game_id = game_pb2.GAME_ID_CONNECT4
+        self._lock = threading.Lock()
+        self._version = 0
+        self._load(seed)
+
+    def _load(self, seed: int) -> None:
+        torch.manual_seed(seed)
+        net = ConnectFourModel()
+        net.eval()
+        for p in net.parameters():
+            p.requires_grad_(False)
+        self.net = net
+        self._version += 1
+        self.model_version = f"connect4-random-v{self._version}"
+        log.info("loaded model %s (random weights, seed=%d)", self.model_version, seed)
+
+    def _gs_msg(self, gs_tensor) -> game_pb2.Gs:
+        return game_pb2.Gs(
+            payload=gs_to_bytes(gs_tensor),
+            shape=[GS_DIM],
+            model_version=self.model_version,
+        )
+
+    # — unary —
+    def Encode(self, request, context):
+        planes = connect4_planes(request.state.payload)
+        with self._lock:
+            gs = self.net.encode(planes)
+        return model_pb2.EncodeResponse(gs=self._gs_msg(gs))
+
+    def Eval(self, request, context):
+        gs = gs_from_bytes(request.gs.payload)
+        with self._lock:
+            value = self.net.value(gs)
+        return model_pb2.EvalResponse(value=value)
+
+    def Policy(self, request, context):
+        gs = gs_from_bytes(request.gs.payload)
+        with self._lock:
+            cands = self.net.policy(gs, request.top_b or C4_DEFAULT_B)
+        resp = model_pb2.PolicyResponse()
+        for prior, action, next_gs in cands:
+            resp.candidates.append(
+                model_pb2.PolicyCandidate(
+                    prior=prior,
+                    action_vector=gs_to_bytes(action),
+                    next_gs=self._gs_msg(next_gs),
+                )
+            )
+        return resp
+
+    def Reify(self, request, context):
+        from_gs = gs_from_bytes(request.from_gs.payload)
+        to_gs = gs_from_bytes(request.to_gs.payload)
+        legal = connect4_legal_columns(request.from_state.payload)
+        with self._lock:
+            col = self.net.reify_column(from_gs, to_gs, legal)
+        move = game_pb2.Move(game_id=self.game_id, payload=bytes([col]))
+        return model_pb2.ReifyResponse(move=move, score=0.0)
+
+    # — batched (simple fan-out over the unary heads) —
+    def EncodeBatch(self, request, context):
+        resp = model_pb2.EncodeBatchResponse()
+        for state in request.states:
+            resp.gs.append(self.Encode(model_pb2.EncodeRequest(state=state), context).gs)
+        return resp
+
+    def EvalBatch(self, request, context):
+        resp = model_pb2.EvalBatchResponse()
+        for gs in request.gs:
+            resp.values.append(self.Eval(model_pb2.EvalRequest(gs=gs), context).value)
+        return resp
+
+    def PolicyBatch(self, request, context):
+        resp = model_pb2.PolicyBatchResponse()
+        for req in request.requests:
+            resp.responses.append(self.Policy(req, context))
+        return resp
+
+    def ReifyBatch(self, request, context):
+        resp = model_pb2.ReifyBatchResponse()
+        for req in request.requests:
+            resp.responses.append(self.Reify(req, context))
+        return resp
+
+    def ReloadWeights(self, request, context):
+        # No registry yet: re-seed from the requested source string.
+        seed = abs(hash(request.source)) % (2**31) if request.source else 0
+        with self._lock:
+            self._load(seed)
+        return model_pb2.ReloadWeightsResponse(loaded_version=self.model_version)
+
+    def Health(self, request, context):
+        return model_pb2.HealthResponse(
+            model_version=self.model_version,
+            ready=True,
+            game_id=self.game_id,
+        )
 
 
 def main() -> None:
@@ -17,19 +146,20 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=7200)
     parser.add_argument("--game", required=True, choices=["connect4", "go9", "amazons", "arimaa"])
     parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--max-workers", type=int, default=8)
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO)
-    log.info("model server stub: game=%s port=%d checkpoint=%s", args.game, args.port, args.checkpoint)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    torch.set_num_threads(1)
 
-    # TODO(M2): wire up grpcio server and register the generated ModelService servicer.
-    #   from playground.gen.playground.model import model_pb2_grpc
-    #   server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
-    #   model_pb2_grpc.add_ModelServiceServicer_to_server(ModelServicer(...), server)
-    #   server.add_insecure_port(f"[::]:{args.port}")
-    #   server.start()
-    #   server.wait_for_termination()
-    raise SystemExit("model server is a stub — implement at M2")
+    servicer = ModelServicer(args.game, seed=args.seed)
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=args.max_workers))
+    model_pb2_grpc.add_ModelServiceServicer_to_server(servicer, server)
+    server.add_insecure_port(f"[::]:{args.port}")
+    server.start()
+    log.info("model server listening on :%d (game=%s, %s)", args.port, args.game, servicer.model_version)
+    server.wait_for_termination()
 
 
 if __name__ == "__main__":

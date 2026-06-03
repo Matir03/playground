@@ -33,9 +33,17 @@ message ApplyMoveRequest {
   playground.game.Move move = 2;
 }
 
+// Which built-in mover answers a RequestMove. Lets the UI pick per move.
+enum EnginePlayer {
+  ENGINE_PLAYER_UNSPECIFIED = 0;  // engine default (perfect solver)
+  ENGINE_PLAYER_SOLVER = 1;       // perfect solver / opening book
+  ENGINE_PLAYER_NN = 2;           // neural-network model (via model server)
+}
+
 message RequestMoveRequest {
   playground.game.GameHandle handle = 1;
   SearchBudget budget = 2;
+  EnginePlayer player = 3;
 }
 
 message SearchBudget {

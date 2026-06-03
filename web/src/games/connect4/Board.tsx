@@ -24,6 +24,7 @@ import {
 } from "../../gen/playground/game/game_pb";
 import {
   type EngineService,
+  EnginePlayer,
   NewGameRequestSchema,
   ApplyMoveRequestSchema,
   RequestMoveRequestSchema,
@@ -34,7 +35,17 @@ const ROWS = 6;
 const COLS = 7;
 
 type Cell = 0 | 1 | 2;
-type Seat = "human" | "engine";
+type Seat = "human" | "solver" | "nn";
+
+const SEAT_LABELS: Record<Seat, string> = {
+  human: "Human",
+  solver: "Perfect solver",
+  nn: "Neural net (random)",
+};
+
+function seatToPlayer(seat: Seat): EnginePlayer {
+  return seat === "nn" ? EnginePlayer.NN : EnginePlayer.SOLVER;
+}
 
 /** Decode the engine's opaque payload into a [row][col] grid (row 0 = bottom). */
 function decodeBoard(payload: Uint8Array): Cell[][] {
@@ -70,7 +81,7 @@ export function Connect4Board({
   const [handle, setHandle] = useState<GameHandle | null>(null);
   const [state, setState] = useState<GameState | null>(null);
   const [firstSeat, setFirstSeat] = useState<Seat>("human");
-  const [secondSeat, setSecondSeat] = useState<Seat>("engine");
+  const [secondSeat, setSecondSeat] = useState<Seat>("solver");
   const [thinking, setThinking] = useState(false);
   const [lastStats, setLastStats] = useState<SearchStats | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -136,7 +147,9 @@ export function Connect4Board({
   useEffect(() => {
     if (!handle || !state) return;
     if (state.outcome !== Outcome.IN_PROGRESS) return;
-    if (seatToMove(state) !== "engine") return;
+    const seat = seatToMove(state);
+    if (seat === "human") return;
+    const player = seatToPlayer(seat);
 
     const tag = `${handle.handleId}:${state.ply}`;
     if (engineTurnRef.current === tag) return;
@@ -160,7 +173,7 @@ export function Connect4Board({
             // Timeout guards against a browser gRPC-Web stream that hangs
             // waiting for a dropped trailer (the solver itself is ~instant).
             for await (const prog of client.requestMove(
-              create(RequestMoveRequestSchema, { handle }),
+              create(RequestMoveRequestSchema, { handle, player }),
               { signal: AbortSignal.timeout(8000) },
             )) {
               if (prog.kind.case === "stats") setLastStats(prog.kind.value);
@@ -277,8 +290,11 @@ function SeatPicker({
     <label style={{ display: "flex", flexDirection: "column", fontSize: "0.85rem", color: "#555" }}>
       {label}
       <select value={seat} onChange={(e) => onChange(e.target.value as Seat)}>
-        <option value="human">Human</option>
-        <option value="engine">Perfect engine</option>
+        {(Object.keys(SEAT_LABELS) as Seat[]).map((s) => (
+          <option key={s} value={s}>
+            {SEAT_LABELS[s]}
+          </option>
+        ))}
       </select>
     </label>
   );
