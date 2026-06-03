@@ -59,8 +59,11 @@ perfectly but is very slow in the first ~14 plies.
 ### The neural-net engine (random weights)
 
 Each seat in the UI can also be a **neural net** instead of the solver. NN
-moves are served by `RequestMove` doing a 1-ply lookahead over the model's
-`Encode` + `Eval` heads, so they need the Python **model server** running:
+moves run the reification-based MCTS from [docs/algorithm.md](docs/algorithm.md):
+search proceeds in GS (game-state latent) space — `policy` expands children,
+`eval` scores leaves, and promising edges are **reified** (`reify`) into concrete
+moves that advance the real game and are re-`encode`d. So NN play needs the
+Python **model server** running:
 
 ```bash
 cd python
@@ -74,10 +77,12 @@ cargo run --release -p connect4-engine -- serve \
 ```
 
 The net is **untrained** (random init), so it plays weakly — the point is to
-exercise the full engine ↔ model-server path. The reification-based MuZero
-variant (`Policy`/`Reify` heads + KR-UCT MCTS over GS) is wired in the proto
-and model server but not yet used for move selection; that lands with M4 (see
-[docs/algorithm.md](docs/algorithm.md)).
+exercise the full search ↔ model-server path; the UI shows per-move visit and
+reification counts. The MCTS itself lives in `crates/core/src/mcts.rs`; budget
+defaults to 160 simulations (override via `RequestMove`'s `max_visits`).
+Selection is currently PUCT and each edge is reified once — KR-UCT and noisy
+reified siblings / progressive widening (see docs/algorithm.md) are the next
+refinements and only matter once the network is trained.
 
 ### Prerequisites
 

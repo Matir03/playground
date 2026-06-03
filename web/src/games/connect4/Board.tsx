@@ -236,8 +236,9 @@ export function Connect4Board({
         </strong>
         {lastStats && (
           <span style={{ color: "#888", marginLeft: "0.75rem" }}>
-            last search: {lastStats.visits.toLocaleString()} nodes, eval{" "}
-            {lastStats.bestValue.toFixed(2)}
+            last search: {lastStats.visits.toLocaleString()} visits
+            {lastStats.reifications > 0 && `, ${lastStats.reifications} reified`}
+            , eval {lastStats.bestValue.toFixed(2)}
           </span>
         )}
       </div>

@@ -86,43 +86,34 @@ where
 }
 
 /// Result of picking a move: serialized move payload, value for the side to
-/// move in [-1, 1], and a node/visit count for telemetry.
+/// move in [-1, 1], a node/visit count, and a reification count (NN only).
 struct Chosen {
     payload: Vec<u8>,
     value: f64,
     nodes: u64,
+    reifications: u32,
 }
 
-/// Neural-net move: 1-ply lookahead using the model's encode+eval. Terminal
-/// children use their exact value; others are evaluated by the NN. With random
-/// weights this plays weakly but exercises the full engine↔model-server path.
-/// (The full KR-UCT MCTS over GS arrives with M4 — see docs/algorithm.md.)
-async fn nn_choose_move<G, M>(model: &M, state: &G::State) -> anyhow::Result<Chosen>
+/// Neural-net move: GS-space MCTS with on-demand reification, using the model's
+/// encode/eval/policy/reify heads (see playground_core::mcts and
+/// docs/algorithm.md). With random weights it plays weakly, but exercises the
+/// full planned search path rather than a 1-ply lookahead.
+async fn nn_choose_move<G, M>(model: &M, state: &G::State, budget: Option<&SearchBudget>) -> anyhow::Result<Chosen>
 where
     G: Game,
     M: ModelClient<G>,
 {
-    let mover = G::to_move(state);
-    let mut best: Option<G::Move> = None;
-    let mut best_value = f64::NEG_INFINITY;
-    let mut nodes = 0u64;
-    for mv in G::legal_moves(state) {
-        let child = G::apply(state, &mv);
-        let value = if G::outcome(&child).is_terminal() {
-            G::outcome(&child).value_for(mover)
-        } else {
-            let gs = model.encode(&child).await?;
-            // eval is from the child's side-to-move (the opponent) perspective.
-            -model.eval(&gs).await?
-        };
-        nodes += 1;
-        if value > best_value {
-            best_value = value;
-            best = Some(mv);
-        }
+    let mut config = playground_core::mcts::SearchConfig::default();
+    if let Some(v) = budget.and_then(|b| b.max_visits).filter(|&v| v > 0) {
+        config.simulations = v;
     }
-    let mv = best.ok_or_else(|| anyhow::anyhow!("no legal moves"))?;
-    Ok(Chosen { payload: G::encode_move(&mv), value: best_value, nodes })
+    let result = playground_core::mcts::search::<G, M>(model, state, &config).await?;
+    Ok(Chosen {
+        payload: G::encode_move(&result.chosen),
+        value: result.root_value,
+        nodes: result.visits as u64,
+        reifications: result.reifications,
+    })
 }
 
 // ── RPC implementations ───────────────────────────────────────────────────────
@@ -227,7 +218,7 @@ where
         }
 
         let chosen_move = match player {
-            EnginePlayer::Nn => nn_choose_move::<G, M>(&self.model, &state)
+            EnginePlayer::Nn => nn_choose_move::<G, M>(&self.model, &state, inner.budget.as_ref())
                 .await
                 .map_err(|e| Status::internal(format!("nn move failed: {e}")))?,
             // Default / Solver: the built-in perfect solver. The solve can be
@@ -238,6 +229,7 @@ where
                     payload: G::encode_move(&out.best_move),
                     value: out.value,
                     nodes: out.nodes,
+                    reifications: 0,
                 }
             })
             .await
@@ -250,7 +242,7 @@ where
         };
         let stats = SearchStats {
             visits: chosen_move.nodes.min(u32::MAX as u64) as u32,
-            reifications: 0,
+            reifications: chosen_move.reifications,
             best_value: chosen_move.value,
         };
 
