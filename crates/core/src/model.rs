@@ -5,7 +5,7 @@
 //! Tests use a deterministic mock that returns fixed outputs.
 
 use crate::game::Game;
-use crate::gs::Gs;
+use crate::latent_state::LatentGameState;
 use async_trait::async_trait;
 use bytes::Bytes;
 
@@ -13,14 +13,14 @@ use bytes::Bytes;
 pub struct PolicyCandidate {
     pub prior: f64,
     pub action_vector: Bytes,
-    pub next_gs: Gs,
+    pub next_gs: LatentGameState,
 }
 
 #[async_trait]
 pub trait ModelClient<G: Game>: Send + Sync {
-    async fn encode(&self, state: &G::State) -> anyhow::Result<Gs>;
-    async fn eval(&self, gs: &Gs) -> anyhow::Result<f64>;
-    async fn policy(&self, gs: &Gs, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>>;
+    async fn encode(&self, state: &G::State) -> anyhow::Result<LatentGameState>;
+    async fn eval(&self, gs: &LatentGameState) -> anyhow::Result<f64>;
+    async fn policy(&self, gs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>>;
 
     /// Given `from_state` (whose encoding is `from_gs`) and a target GS,
     /// produce a concrete move that approximately realizes the transition.
@@ -29,8 +29,8 @@ pub trait ModelClient<G: Game>: Send + Sync {
     async fn reify(
         &self,
         from_state: &G::State,
-        from_gs: &Gs,
-        to_gs: &Gs,
+        from_gs: &LatentGameState,
+        to_gs: &LatentGameState,
         action_seed: Option<&[u8]>,
         noise_scale: Option<f64>,
     ) -> anyhow::Result<G::Move>;

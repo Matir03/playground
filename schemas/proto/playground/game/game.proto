@@ -45,7 +45,7 @@ message Move {
 
 // Latent game-state encoding. Layout is owned by the model that produced it;
 // only the model server and model-client crate interpret the bytes.
-message Gs {
+message LatentGameState {
   bytes payload = 1;
   // Optional shape hint, e.g. [batch, channels, h, w] or [d]. Consumers may
   // ignore if they already know the layout.

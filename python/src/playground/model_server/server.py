@@ -57,8 +57,8 @@ class ModelServicer(model_pb2_grpc.ModelServiceServicer):
         self.model_version = f"connect4-random-v{self._version}"
         log.info("loaded model %s (random weights, seed=%d)", self.model_version, seed)
 
-    def _gs_msg(self, gs_tensor) -> game_pb2.Gs:
-        return game_pb2.Gs(
+    def _gs_msg(self, gs_tensor) -> game_pb2.LatentGameState:
+        return game_pb2.LatentGameState(
             payload=gs_to_bytes(gs_tensor),
             shape=[GS_DIM],
             model_version=self.model_version,

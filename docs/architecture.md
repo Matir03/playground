@@ -40,7 +40,8 @@
 - `Game` trait: move type, state type, legal moves, apply, terminal, features.
 - MCTS over GS: tree node structure, selection/expansion/backprop, KR-UCT,
   progressive widening. Generic over `Game` and `ModelClient`.
-- Game-state encoding abstraction (`Gs`) — opaque byte buffer + shape metadata.
+- Game-state encoding abstraction (`LatentGameState`, the GS) — opaque byte
+  buffer + shape metadata.
 - Recording schema (converts in-memory tree → `record.proto` messages).
 - `ModelClient` trait: async methods mirroring `ModelService` RPCs.
 - **No I/O, no tokio runtime, no tonic.** Keeps the algorithm unit-testable.

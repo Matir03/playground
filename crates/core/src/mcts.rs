@@ -27,7 +27,7 @@
 use bytes::Bytes;
 
 use crate::game::Game;
-use crate::gs::Gs;
+use crate::latent_state::LatentGameState;
 use crate::model::ModelClient;
 
 /// Search configuration. Field list will grow as the algorithm solidifies.
@@ -80,14 +80,14 @@ struct Edge {
     prior: f64,
     action_vector: Bytes,
     /// Policy state-head prediction of the child GS (before reification).
-    predicted_gs: Gs,
+    predicted_gs: LatentGameState,
     child: usize,
     /// Concrete move, set once this edge is reified.
     mv: Option<()>, // presence flag; the move lives on the child node
 }
 
 struct Node<G: Game> {
-    gs: Gs,
+    gs: LatentGameState,
     /// Concrete state — `Some` once the node is reified. The root is reified.
     state: Option<G::State>,
     /// Move that reached this node from its parent (set on reification).
@@ -102,7 +102,7 @@ struct Node<G: Game> {
 }
 
 impl<G: Game> Node<G> {
-    fn latent(gs: Gs) -> Self {
+    fn latent(gs: LatentGameState) -> Self {
         Self {
             gs,
             state: None,
@@ -115,7 +115,7 @@ impl<G: Game> Node<G> {
             edges: Vec::new(),
         }
     }
-    fn reified(gs: Gs, state: G::State) -> Self {
+    fn reified(gs: LatentGameState, state: G::State) -> Self {
         let mut n = Self::latent(gs);
         n.state = Some(state);
         n
@@ -411,19 +411,19 @@ mod tests {
     // enumerate real children and reify can decode the action seed to a move.
     struct MockModel;
 
-    fn gs_of(state: &State) -> Gs {
-        Gs::new(Countdown::encode_state(state), vec![], "mock".into())
+    fn gs_of(state: &State) -> LatentGameState {
+        LatentGameState::new(Countdown::encode_state(state), vec![], "mock".into())
     }
 
     #[async_trait]
     impl ModelClient<Countdown> for MockModel {
-        async fn encode(&self, state: &State) -> anyhow::Result<Gs> {
+        async fn encode(&self, state: &State) -> anyhow::Result<LatentGameState> {
             Ok(gs_of(state))
         }
-        async fn eval(&self, _gs: &Gs) -> anyhow::Result<f64> {
+        async fn eval(&self, _gs: &LatentGameState) -> anyhow::Result<f64> {
             Ok(0.0)
         }
-        async fn policy(&self, gs: &Gs, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>> {
+        async fn policy(&self, gs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>> {
             let state = Countdown::decode_state(&gs.payload)?;
             let moves = Countdown::legal_moves(&state);
             let n = moves.len().max(1) as f64;
@@ -440,8 +440,8 @@ mod tests {
         async fn reify(
             &self,
             from_state: &State,
-            _from_gs: &Gs,
-            _to_gs: &Gs,
+            _from_gs: &LatentGameState,
+            _to_gs: &LatentGameState,
             action_seed: Option<&[u8]>,
             _noise: Option<f64>,
         ) -> anyhow::Result<u8> {
