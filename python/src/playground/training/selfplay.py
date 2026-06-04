@@ -227,12 +227,22 @@ def selfplay_train(
 
         net.eval()
         wr = eval_vs(net, baseline, eval_games, sims, rng) if baseline is not None else float("nan")
+
+        # Keep every generation's checkpoint separately (for the rating curve),
+        # and mirror the latest into the top-level dir for serving convenience.
+        gen_dir = os.path.join(out_dir, f"gen{gen + 1:03d}")
+        os.makedirs(gen_dir, exist_ok=True)
+        gen_cfg = {"arch": arch_of(net), "generation": gen + 1, "winrate_vs_random": wr}
+        save_checkpoint(net, os.path.join(gen_dir, "checkpoint.safetensors"))
+        with open(os.path.join(gen_dir, "config.json"), "w") as f:
+            json.dump(gen_cfg, f, indent=2)
         save_checkpoint(net, ckpt)
         with open(os.path.join(out_dir, "config.json"), "w") as f:
-            json.dump({"arch": arch_of(net), "generation": gen + 1}, f, indent=2)
+            json.dump(gen_cfg, f, indent=2)
         print(
             f"gen {gen + 1}/{generations}  games {games_per_gen}  examples {len(data)}  "
-            f"winrate_vs_random {wr:.2f}  ({time.time() - t0:.0f}s)"
+            f"winrate_vs_random {wr:.2f}  ({time.time() - t0:.0f}s)",
+            flush=True,
         )
 
     with open(os.path.join(out_dir, "meta.json"), "w") as f:
