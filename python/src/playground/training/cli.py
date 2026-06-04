@@ -67,6 +67,24 @@ def main() -> None:
     gd.add_argument("--seed", type=int, default=0)
     gd.add_argument("--out", default="data/datasets/connect4_perfect.npz")
 
+    sp = sub.add_parser("selfplay", help="train a larger net by pure self-play (no solver)")
+    sp.add_argument("--out", default="data/models/connect4/selfplay")
+    sp.add_argument("--channels", type=int, default=64)
+    sp.add_argument("--blocks", type=int, default=5)
+    sp.add_argument("--generations", type=int, default=8)
+    sp.add_argument("--games-per-gen", type=int, default=120)
+    sp.add_argument("--sims", type=int, default=60)
+    sp.add_argument("--epochs", type=int, default=4)
+    sp.add_argument("--batch-size", type=int, default=256)
+    sp.add_argument("--lr", type=float, default=1e-3)
+    sp.add_argument("--buffer-gens", type=int, default=4)
+    sp.add_argument("--c-puct", type=float, default=1.5)
+    sp.add_argument("--dir-alpha", type=float, default=1.0)
+    sp.add_argument("--dir-eps", type=float, default=0.25)
+    sp.add_argument("--temp-moves", type=int, default=10)
+    sp.add_argument("--eval-games", type=int, default=20)
+    sp.add_argument("--seed", type=int, default=0)
+
     tr = sub.add_parser("train", help="behavioral-clone the perfect bot")
     tr.add_argument("--data", default="data/datasets/connect4_perfect.npz")
     tr.add_argument("--out", default="data/models/connect4/bc-perfect")
@@ -82,6 +100,14 @@ def main() -> None:
         _save_random(args.out, args.seed)
     elif args.cmd == "gen-data":
         _gen_data(args)
+    elif args.cmd == "selfplay":
+        from .selfplay import selfplay_train
+
+        selfplay_train(
+            args.out, args.channels, args.blocks, args.generations, args.games_per_gen,
+            args.sims, args.epochs, args.batch_size, args.lr, args.buffer_gens,
+            args.c_puct, args.dir_alpha, args.dir_eps, args.temp_moves, args.eval_games, args.seed,
+        )
     elif args.cmd == "train":
         from .train import train
 

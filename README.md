@@ -70,19 +70,26 @@ cd python
 python -m venv .venv && . .venv/bin/activate
 pip install -e '.[model]'
 
-# One model server per net (random weights here; a trained one alongside).
+# One model server per net (different ports / checkpoints).
 playground-model-server --game connect4 --port 7200 \
     --checkpoint data/models/connect4/random/checkpoint.safetensors &
 playground-model-server --game connect4 --port 7201 \
     --checkpoint data/models/connect4/bc-perfect/checkpoint.safetensors &
+playground-model-server --game connect4 --port 7202 \
+    --checkpoint data/models/connect4/selfplay/checkpoint.safetensors &
 
-# One engine, wired to both under names the UI selects ("random" / "trained").
+# One engine, wired to all three under names the UI selects.
 cargo run --release -p connect4-engine -- serve --addr 127.0.0.1:7100 \
-    --model random=http://127.0.0.1:7200 --model trained=http://127.0.0.1:7201
+    --model random=http://127.0.0.1:7200 \
+    --model trained=http://127.0.0.1:7201 \
+    --model selfplay=http://127.0.0.1:7202
 ```
 
-In the UI each seat can be `NN — random` or `NN — trained`; the engine routes
-the move to the matching model server.
+In the UI each seat can be `NN — random`, `NN — trained (cloned solver)`, or
+`NN — self-play`; the engine routes the move to the matching model server. The
+model server reads the net's architecture from a sibling `config.json` (the
+larger self-play ResNet vs the small cloned/random nets), so one server binary
+serves any checkpoint.
 
 The net is **untrained** (random init), so it plays weakly — the point is to
 exercise the full search ↔ model-server path; the UI shows per-move visit and
@@ -208,6 +215,20 @@ checkpoint; reify is a structural column decode for Connect 4, so the trained
 policy+value heads are what drive the NN's MCTS. Serve the random and trained
 nets side by side (see "the neural-net engine" above) to pick between them in
 the UI.
+
+There is also a **pure self-play** trainer (AlphaZero-style, no solver): a
+larger residual net plays itself with an in-process PUCT MCTS and trains on its
+own games — policy target = MCTS visit counts, value target = game outcome —
+iterated over generations from random init. It saves a `config.json` recording
+the architecture so the model server can serve the bigger net.
+
+```bash
+playground-train selfplay --generations 10 --games-per-gen 120 --sims 60 \
+    --channels 64 --blocks 5     # -> data/models/connect4/selfplay/checkpoint.safetensors
+```
+
+Each generation prints its win rate against the random baseline. This is a
+separate, larger network; the random and cloned-solver nets are untouched.
 
 ### Python — eval
 

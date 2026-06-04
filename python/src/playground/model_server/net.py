@@ -68,26 +68,28 @@ def decode_column(action_seed: bytes) -> int | None:
     return int(round(float(arr[0]))) if arr.size else None
 
 
-class ConnectFourModel(nn.Module):
-    def __init__(self) -> None:
+class _C4Base(nn.Module):
+    """Shared heads + inference over a `_trunk(planes) -> (B, trunk_features)`.
+
+    Subclasses pick the trunk (a small 2-conv net or a ResNet); the encoder fc,
+    eval head, and policy heads (prior over columns + predicted next-GS) are
+    common, so checkpoints differ only in trunk weights.
+    """
+
+    def __init__(self, trunk_features: int) -> None:
         super().__init__()
-        # Encoder: 2×6×7 -> GS_DIM
-        self.enc_conv1 = nn.Conv2d(2, 32, 3, padding=1)
-        self.enc_conv2 = nn.Conv2d(32, 32, 3, padding=1)
-        self.enc_fc = nn.Linear(32 * C4_CELLS, GS_DIM)
-        # Eval: GS -> scalar
+        self.enc_fc = nn.Linear(trunk_features, GS_DIM)
         self.val_fc1 = nn.Linear(GS_DIM, 64)
         self.val_fc2 = nn.Linear(64, 1)
-        # Policy: per-column prior + predicted next-GS (state head).
         self.pol_prior = nn.Linear(GS_DIM, C4_COLS)
         self.pol_next = nn.Linear(GS_DIM, C4_COLS * GS_DIM)
 
-    # — batched (training) —
+    def _trunk(self, planes: torch.Tensor) -> torch.Tensor:  # pragma: no cover
+        raise NotImplementedError
+
+    # — batched —
     def encode_batch(self, planes: torch.Tensor) -> torch.Tensor:
-        x = F.relu(self.enc_conv1(planes))
-        x = F.relu(self.enc_conv2(x))
-        x = x.flatten(1)
-        return torch.tanh(self.enc_fc(x))
+        return torch.tanh(self.enc_fc(self._trunk(planes)))
 
     def value_batch(self, gs: torch.Tensor) -> torch.Tensor:
         x = F.relu(self.val_fc1(gs))
@@ -98,7 +100,12 @@ class ConnectFourModel(nn.Module):
         gs = self.encode_batch(planes)
         return self.value_batch(gs), self.pol_prior(gs)
 
-    # — single-example (inference / model server) —
+    def policy_value(self, planes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(B,2,6,7) -> (value (B,), policy probs (B,7)). Used by self-play MCTS."""
+        gs = self.encode_batch(planes)
+        return self.value_batch(gs), F.softmax(self.pol_prior(gs), dim=-1)
+
+    # — single-example (model server inference) —
     def encode(self, planes: torch.Tensor) -> torch.Tensor:
         return self.encode_batch(planes.unsqueeze(0)).squeeze(0)
 
@@ -122,13 +129,72 @@ class ConnectFourModel(nn.Module):
         return legal[0] if legal else 0
 
 
-def save_checkpoint(model: ConnectFourModel, path: str) -> None:
+class ConnectFourModel(_C4Base):
+    """Small net (2 conv layers). Used by the random + bc-perfect checkpoints."""
+
+    def __init__(self) -> None:
+        super().__init__(32 * C4_CELLS)
+        self.enc_conv1 = nn.Conv2d(2, 32, 3, padding=1)
+        self.enc_conv2 = nn.Conv2d(32, 32, 3, padding=1)
+
+    def _trunk(self, planes: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.enc_conv1(planes))
+        x = F.relu(self.enc_conv2(x))
+        return x.flatten(1)
+
+
+class _ResBlock(nn.Module):
+    def __init__(self, c: int) -> None:
+        super().__init__()
+        self.c1 = nn.Conv2d(c, c, 3, padding=1)
+        self.b1 = nn.BatchNorm2d(c)
+        self.c2 = nn.Conv2d(c, c, 3, padding=1)
+        self.b2 = nn.BatchNorm2d(c)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = F.relu(self.b1(self.c1(x)))
+        y = self.b2(self.c2(y))
+        return F.relu(x + y)
+
+
+class ConnectFourResNet(_C4Base):
+    """Larger residual net for self-play training (AlphaZero-style trunk)."""
+
+    def __init__(self, channels: int = 64, blocks: int = 5) -> None:
+        super().__init__(channels * C4_CELLS)
+        self.channels = channels
+        self.blocks_n = blocks
+        self.stem = nn.Conv2d(2, channels, 3, padding=1)
+        self.stem_bn = nn.BatchNorm2d(channels)
+        self.blocks = nn.ModuleList(_ResBlock(channels) for _ in range(blocks))
+
+    def _trunk(self, planes: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.stem_bn(self.stem(planes)))
+        for blk in self.blocks:
+            x = blk(x)
+        return x.flatten(1)
+
+
+def build_model(arch: dict | None) -> _C4Base:
+    """Construct a net from an architecture descriptor (see arch_of)."""
+    if arch and arch.get("kind") == "resnet":
+        return ConnectFourResNet(channels=int(arch.get("channels", 64)), blocks=int(arch.get("blocks", 5)))
+    return ConnectFourModel()
+
+
+def arch_of(model: _C4Base) -> dict:
+    if isinstance(model, ConnectFourResNet):
+        return {"kind": "resnet", "channels": model.channels, "blocks": model.blocks_n}
+    return {"kind": "small"}
+
+
+def save_checkpoint(model: _C4Base, path: str) -> None:
     from safetensors.torch import save_file
 
     save_file(model.state_dict(), path)
 
 
-def load_checkpoint(model: ConnectFourModel, path: str) -> None:
+def load_checkpoint(model: _C4Base, path: str) -> None:
     from safetensors.torch import load_file
 
     model.load_state_dict(load_file(path))

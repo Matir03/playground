@@ -35,13 +35,14 @@ const ROWS = 6;
 const COLS = 7;
 
 type Cell = 0 | 1 | 2;
-type Seat = "human" | "solver" | "nn-random" | "nn-trained";
+type Seat = "human" | "solver" | "nn-random" | "nn-trained" | "nn-selfplay";
 
 const SEAT_LABELS: Record<Seat, string> = {
   human: "Human",
   solver: "Perfect solver",
   "nn-random": "NN — random",
-  "nn-trained": "NN — trained",
+  "nn-trained": "NN — trained (cloned solver)",
+  "nn-selfplay": "NN — self-play",
 };
 
 function seatToPlayer(seat: Seat): EnginePlayer {
@@ -52,6 +53,7 @@ function seatToPlayer(seat: Seat): EnginePlayer {
 function seatToModel(seat: Seat): string {
   if (seat === "nn-random") return "random";
   if (seat === "nn-trained") return "trained";
+  if (seat === "nn-selfplay") return "selfplay";
   return "";
 }
 

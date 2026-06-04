@@ -21,11 +21,13 @@ import torch
 from playground.gen.playground.game import game_pb2
 from playground.gen.playground.model import model_pb2, model_pb2_grpc
 
+import json
 import os
 
 from .net import (
     GS_DIM,
     ConnectFourModel,
+    build_model,
     connect4_legal_columns,
     connect4_planes,
     gs_from_bytes,
@@ -51,9 +53,18 @@ class ModelServicer(model_pb2_grpc.ModelServiceServicer):
 
     def _load(self, seed: int, checkpoint: str | None = None) -> None:
         torch.manual_seed(seed)
-        net = ConnectFourModel()
         if checkpoint:
+            # Build the architecture recorded next to the checkpoint (a sibling
+            # config.json with {"arch": ...}); default to the small net.
+            arch = None
+            cfg = os.path.join(os.path.dirname(checkpoint), "config.json")
+            if os.path.exists(cfg):
+                with open(cfg) as f:
+                    arch = json.load(f).get("arch")
+            net = build_model(arch)
             load_checkpoint(net, checkpoint)
+        else:
+            net = ConnectFourModel()
         net.eval()
         for p in net.parameters():
             p.requires_grad_(False)
