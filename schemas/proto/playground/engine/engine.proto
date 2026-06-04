@@ -44,6 +44,9 @@ message RequestMoveRequest {
   playground.game.GameHandle handle = 1;
   SearchBudget budget = 2;
   EnginePlayer player = 3;
+  // Which NN model to use when player = NN (engine-defined name, e.g.
+  // "random" / "trained"). Empty = the engine's default model.
+  string model = 4;
 }
 
 message SearchBudget {

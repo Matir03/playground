@@ -41,7 +41,7 @@ def _gen_data(args) -> None:
     from .generate import generate
 
     states, cols, values = generate(
-        args.engine, args.games, args.max_opening, args.nn_visits, args.seed
+        args.engine, args.games, args.max_opening, args.nn_visits, args.nn_model, args.seed
     )
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     np.savez(args.out, states=states, cols=cols, values=values)
@@ -56,11 +56,14 @@ def main() -> None:
     sr.add_argument("--out", default="data/models/connect4/random/checkpoint.safetensors")
     sr.add_argument("--seed", type=int, default=0)
 
-    gd = sub.add_parser("gen-data", help="record perfect-bot moves from perfect-vs-random games")
+    gd = sub.add_parser(
+        "gen-data", help="annotate random-net self-play with the perfect bot's policy + value"
+    )
     gd.add_argument("--engine", default="127.0.0.1:7100")
     gd.add_argument("--games", type=int, default=300)
     gd.add_argument("--max-opening", type=int, default=8)
     gd.add_argument("--nn-visits", type=int, default=16)
+    gd.add_argument("--nn-model", default="random", help="engine model name for self-play moves")
     gd.add_argument("--seed", type=int, default=0)
     gd.add_argument("--out", default="data/datasets/connect4_perfect.npz")
 

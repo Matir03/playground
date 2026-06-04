@@ -35,16 +35,24 @@ const ROWS = 6;
 const COLS = 7;
 
 type Cell = 0 | 1 | 2;
-type Seat = "human" | "solver" | "nn";
+type Seat = "human" | "solver" | "nn-random" | "nn-trained";
 
 const SEAT_LABELS: Record<Seat, string> = {
   human: "Human",
   solver: "Perfect solver",
-  nn: "Neural net (random)",
+  "nn-random": "NN — random",
+  "nn-trained": "NN — trained",
 };
 
 function seatToPlayer(seat: Seat): EnginePlayer {
-  return seat === "nn" ? EnginePlayer.NN : EnginePlayer.SOLVER;
+  return seat.startsWith("nn") ? EnginePlayer.NN : EnginePlayer.SOLVER;
+}
+
+// Engine-side model name for NN seats (see connect4-engine --model NAME=URI).
+function seatToModel(seat: Seat): string {
+  if (seat === "nn-random") return "random";
+  if (seat === "nn-trained") return "trained";
+  return "";
 }
 
 /** Decode the engine's opaque payload into a [row][col] grid (row 0 = bottom). */
@@ -150,6 +158,7 @@ export function Connect4Board({
     const seat = seatToMove(state);
     if (seat === "human") return;
     const player = seatToPlayer(seat);
+    const model = seatToModel(seat);
 
     const tag = `${handle.handleId}:${state.ply}`;
     if (engineTurnRef.current === tag) return;
@@ -173,7 +182,7 @@ export function Connect4Board({
             // Timeout guards against a browser gRPC-Web stream that hangs
             // waiting for a dropped trailer (the solver itself is ~instant).
             for await (const prog of client.requestMove(
-              create(RequestMoveRequestSchema, { handle, player }),
+              create(RequestMoveRequestSchema, { handle, player, model }),
               { signal: AbortSignal.timeout(8000) },
             )) {
               if (prog.kind.case === "stats") setLastStats(prog.kind.value);

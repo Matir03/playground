@@ -69,12 +69,20 @@ Python **model server** running:
 cd python
 python -m venv .venv && . .venv/bin/activate
 pip install -e '.[model]'
-playground-model-server --game connect4 --port 7200   # random weights
 
-# engine must point at it (this is the default --model-uri):
-cargo run --release -p connect4-engine -- serve \
-    --addr 127.0.0.1:7100 --model-uri http://127.0.0.1:7200
+# One model server per net (random weights here; a trained one alongside).
+playground-model-server --game connect4 --port 7200 \
+    --checkpoint data/models/connect4/random/checkpoint.safetensors &
+playground-model-server --game connect4 --port 7201 \
+    --checkpoint data/models/connect4/bc-perfect/checkpoint.safetensors &
+
+# One engine, wired to both under names the UI selects ("random" / "trained").
+cargo run --release -p connect4-engine -- serve --addr 127.0.0.1:7100 \
+    --model random=http://127.0.0.1:7200 --model trained=http://127.0.0.1:7201
 ```
+
+In the UI each seat can be `NN — random` or `NN — trained`; the engine routes
+the move to the matching model server.
 
 The net is **untrained** (random init), so it plays weakly — the point is to
 exercise the full search ↔ model-server path; the UI shows per-move visit and
@@ -175,30 +183,31 @@ playground-orchestrator start-run --game connect4 --config configs/connect4-m2.y
 
 The full self-play → encoder/reifier/eval/policy stage schedule (see
 [docs/algorithm.md](docs/algorithm.md)) is still M4. What works today is a
-**behavioral-cloning** pipeline for Connect 4: clone the perfect solver from
-games it plays against the random net, using only the solver's own moves as
-targets (policy = the column it played, value = the game result).
+**behavioral-cloning** pipeline for Connect 4: the random net plays itself, and
+every position is annotated by the perfect solver — its best move (policy
+target) and its **evaluation** of the position (value target). We train on the
+solver's annotation, not the realized game scores, so the value target is a
+graded assessment rather than "who won this random game".
 
 ```bash
-# 0. Save the random-init net (a baseline checkpoint to keep / warm-start from).
+# 0. Save the random-init net (kept as a baseline / opponent).
 playground-train save-random          # -> data/models/connect4/random/checkpoint.safetensors
 
-# 1. Generate data. Needs a running engine + model server (the random net).
-#    Plays perfect-vs-random games and records ONLY the perfect bot's moves.
-playground-train gen-data --games 600 # -> data/datasets/connect4_perfect.npz
+# 1. Generate data. Needs a running engine + the random model server.
+#    Random-net self-play, annotated by the perfect bot's policy + value.
+playground-train gen-data --games 300 # -> data/datasets/connect4_annotated.npz
 
-# 2. Train (encoder + eval + policy heads) and save into the model registry.
-playground-train train --epochs 40    # -> data/models/connect4/bc-perfect/checkpoint.safetensors
-
-# 3. Serve the trained net instead of the random one.
-playground-model-server --game connect4 --port 7200 \
-    --checkpoint data/models/connect4/bc-perfect/checkpoint.safetensors
+# 2. Train (encoder + eval + policy heads) into the model registry.
+playground-train train --data data/datasets/connect4_annotated.npz \
+    --epochs 40                       # -> data/models/connect4/bc-perfect/checkpoint.safetensors
 ```
 
 `train` prints the held-out move-match rate against the perfect bot. The model
 server's `--checkpoint` (and the `ReloadWeights` RPC) load any `.safetensors`
 checkpoint; reify is a structural column decode for Connect 4, so the trained
-policy+value heads are what drive the NN's MCTS.
+policy+value heads are what drive the NN's MCTS. Serve the random and trained
+nets side by side (see "the neural-net engine" above) to pick between them in
+the UI.
 
 ### Python — eval
 

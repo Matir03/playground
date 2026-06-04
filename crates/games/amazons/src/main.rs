@@ -41,7 +41,8 @@ async fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Serve { addr, model_uri } | Cmd::SelfPlay { addr, model_uri, .. } => {
             let model = RemoteModelClient::<Amazons>::connect(&model_uri).await?;
-            playground_engine_server::run::<Amazons, _>(addr, model).await?;
+            let models = std::collections::HashMap::from([("nn".to_string(), model)]);
+            playground_engine_server::run::<Amazons, _>(addr, models).await?;
         }
         Cmd::Match { .. } => anyhow::bail!("match: implement in M2"),
         Cmd::Stdio => anyhow::bail!("stdio: implement when needed"),

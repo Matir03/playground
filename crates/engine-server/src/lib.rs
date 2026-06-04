@@ -66,7 +66,9 @@ where
     G: Game,
     M: ModelClient<G> + 'static,
 {
-    model: Arc<M>,
+    /// NN models by name (e.g. "random", "trained"). The NN player picks one
+    /// per RequestMove; empty name = the first inserted.
+    models: HashMap<String, Arc<M>>,
     games:  Registry,
     _game:  PhantomData<G>,
 }
@@ -76,12 +78,29 @@ where
     G: Game,
     M: ModelClient<G> + 'static,
 {
-    pub fn new(model: M) -> Self {
+    pub fn new(models: HashMap<String, M>) -> Self {
         Self {
-            model: Arc::new(model),
+            models: models.into_iter().map(|(k, v)| (k, Arc::new(v))).collect(),
             games:  Arc::new(RwLock::new(HashMap::new())),
             _game:  PhantomData,
         }
+    }
+
+    /// Resolve a model by name; empty name falls back to any configured model.
+    fn model_for(&self, name: &str) -> Result<&Arc<M>, Status> {
+        let chosen = if name.is_empty() {
+            self.models.values().next()
+        } else {
+            self.models.get(name)
+        };
+        chosen.ok_or_else(|| {
+            let mut names: Vec<&str> = self.models.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            Status::failed_precondition(format!(
+                "no NN model {:?} configured (available: {:?})",
+                name, names
+            ))
+        })
     }
 }
 
@@ -218,9 +237,12 @@ where
         }
 
         let chosen_move = match player {
-            EnginePlayer::Nn => nn_choose_move::<G, M>(&self.model, &state, inner.budget.as_ref())
-                .await
-                .map_err(|e| Status::internal(format!("nn move failed: {e}")))?,
+            EnginePlayer::Nn => {
+                let model = self.model_for(&inner.model)?.clone();
+                nn_choose_move::<G, M>(&model, &state, inner.budget.as_ref())
+                    .await
+                    .map_err(|e| Status::internal(format!("nn move failed: {e}")))?
+            }
             // Default / Solver: the built-in perfect solver. The solve can be
             // CPU-heavy, so keep it off the async runtime's worker threads.
             _ => tokio::task::spawn_blocking(move || {
@@ -293,14 +315,15 @@ where
 
 /// Serve `EngineService` on `addr` with gRPC-Web + permissive CORS so the
 /// browser can call it directly.
-pub async fn run<G, M>(addr: SocketAddr, model: M) -> anyhow::Result<()>
+pub async fn run<G, M>(addr: SocketAddr, models: HashMap<String, M>) -> anyhow::Result<()>
 where
     G: Solver,
     M: ModelClient<G> + 'static,
 {
-    let svc = EngineServiceServer::new(EngineServer::<G, M>::new(model));
+    let model_names: Vec<String> = models.keys().cloned().collect();
+    let svc = EngineServiceServer::new(EngineServer::<G, M>::new(models));
 
-    tracing::info!(%addr, game_id = G::id(), "engine server listening");
+    tracing::info!(%addr, game_id = G::id(), models = ?model_names, "engine server listening");
 
     tonic::transport::Server::builder()
         .accept_http1(true)

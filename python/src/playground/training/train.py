@@ -1,8 +1,9 @@
 """Behavioral cloning: train a Connect 4 net to imitate the perfect solver.
 
-Targets come from generate.py (perfect-bot positions only):
+Targets come from generate.py (the perfect bot's annotation of each position):
   - policy: cross-entropy on the column the solver played
-  - value:  MSE on the eventual game result for the side to move
+  - value:  MSE on the solver's *evaluation* of the position (its graded value
+            for the side to move), not the realized game score
 
 Trains the encoder + eval + policy-prior heads (the play-relevant ones; the
 reifier is structural for Connect 4 — see net.py). Saves a checkpoint into the

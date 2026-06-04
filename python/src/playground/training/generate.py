@@ -1,12 +1,14 @@
-"""Generate behavioral-cloning data from perfect-bot vs random-net games.
+"""Generate behavioral-cloning data by annotating random-net self-play.
 
-Drives a running Connect 4 engine (and the model server it points at) over
-gRPC. Each game: the perfect solver plays one side, the random NN the other,
-from a randomized opening for diversity. We record **only the perfect bot's**
-moves — (board, chosen column, eventual game result) — as the training targets.
+Games are played by the **random net against itself** (with randomized openings
+for diversity). Every position is then annotated by the **perfect bot** — its
+best move (policy target) and its evaluation of the position (value target).
+We train on the perfect bot's annotation, never on the realized game scores, so
+the value target is the solver's graded assessment rather than "who happened to
+win this random game".
 
-Requires the engine (default :7100) and a model server (its --model-uri) to be
-running.
+Requires a running engine (default :7100) that has the random NN model plus the
+solver, and the model server(s) it points at.
 """
 
 from __future__ import annotations
@@ -24,13 +26,33 @@ from playground.model_server.net import connect4_legal_columns
 CONNECT4 = g.GAME_ID_CONNECT4
 
 
-def _chosen_col(stub, req) -> int:
+def _solver_eval(stub, handle) -> tuple[int, float]:
+    """Perfect bot's (best move, evaluation for the side to move)."""
+    col, val = None, 0.0
+    for prog in stub.RequestMove(e.RequestMoveRequest(handle=handle, player=e.ENGINE_PLAYER_SOLVER)):
+        if prog.HasField("stats"):
+            val = prog.stats.best_value
+        elif prog.HasField("chosen"):
+            col = prog.chosen.payload[0]
+    if col is None:
+        raise RuntimeError("solver returned no move")
+    return int(col), float(val)
+
+
+def _nn_move(stub, handle, model: str, visits: int) -> int:
     col = None
-    for prog in stub.RequestMove(req):
+    for prog in stub.RequestMove(
+        e.RequestMoveRequest(
+            handle=handle,
+            player=e.ENGINE_PLAYER_NN,
+            model=model,
+            budget=e.SearchBudget(max_visits=visits),
+        )
+    ):
         if prog.HasField("chosen"):
             col = prog.chosen.payload[0]
     if col is None:
-        raise RuntimeError("RequestMove returned no chosen move")
+        raise RuntimeError("NN returned no move")
     return int(col)
 
 
@@ -40,7 +62,7 @@ def _apply(stub, handle, col):
     )
 
 
-def generate(engine_addr: str, games: int, max_opening: int, nn_visits: int, seed: int):
+def generate(engine_addr: str, games: int, max_opening: int, nn_visits: int, nn_model: str, seed: int):
     rng = random.Random(seed)
     stub = eg.EngineServiceStub(grpc.insecure_channel(engine_addr))
 
@@ -52,8 +74,7 @@ def generate(engine_addr: str, games: int, max_opening: int, nn_visits: int, see
         handle = stub.NewGame(e.NewGameRequest(game_id=CONNECT4))
         state = stub.GetState(handle)
 
-        # Randomized opening for position diversity (both engines are otherwise
-        # deterministic, so without this every game would be identical).
+        # Randomized opening so the deterministic self-play games differ.
         for _ in range(rng.randint(0, max_opening)):
             if state.outcome != g.OUTCOME_IN_PROGRESS:
                 break
@@ -62,45 +83,18 @@ def generate(engine_addr: str, games: int, max_opening: int, nn_visits: int, see
                 break
             state = _apply(stub, handle, rng.choice(legal))
 
-        perfect_side = rng.choice([g.PLAYER_FIRST, g.PLAYER_SECOND])
-        game_records: list[tuple[bytes, int]] = []
-
+        # Play out as random-net self-play, annotating each position with the
+        # perfect bot's move + evaluation before the random net moves.
         while state.outcome == g.OUTCOME_IN_PROGRESS:
-            if state.to_move == perfect_side:
-                col = _chosen_col(
-                    stub, e.RequestMoveRequest(handle=handle, player=e.ENGINE_PLAYER_SOLVER)
-                )
-                game_records.append((bytes(state.payload), col))  # perfect-bot data only
-            else:
-                col = _chosen_col(
-                    stub,
-                    e.RequestMoveRequest(
-                        handle=handle,
-                        player=e.ENGINE_PLAYER_NN,
-                        budget=e.SearchBudget(max_visits=nn_visits),
-                    ),
-                )
-            state = _apply(stub, handle, col)
-
-        # Game result, from the perfect bot's perspective (= side to move at
-        # every recorded position).
-        oc = state.outcome
-        if oc == g.OUTCOME_DRAW:
-            v = 0.0
-        elif (oc == g.OUTCOME_FIRST_WINS and perfect_side == g.PLAYER_FIRST) or (
-            oc == g.OUTCOME_SECOND_WINS and perfect_side == g.PLAYER_SECOND
-        ):
-            v = 1.0
-        else:
-            v = -1.0
-
-        for payload, col in game_records:
-            states.append(np.frombuffer(payload, dtype=np.uint8))
-            cols.append(col)
-            values.append(v)
+            sol_col, sol_val = _solver_eval(stub, handle)
+            states.append(np.frombuffer(bytes(state.payload), dtype=np.uint8))
+            cols.append(sol_col)
+            values.append(sol_val)
+            nn_col = _nn_move(stub, handle, nn_model, nn_visits)
+            state = _apply(stub, handle, nn_col)
 
         if (gi + 1) % 25 == 0:
-            print(f"  {gi + 1}/{games} games, {len(cols)} positions")
+            print(f"  {gi + 1}/{games} games, {len(cols)} annotated positions")
 
     if not states:
         return np.zeros((0, 44), np.uint8), np.zeros(0, np.int64), np.zeros(0, np.float32)

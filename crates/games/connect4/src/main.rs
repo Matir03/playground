@@ -6,6 +6,7 @@ mod book;
 mod game;
 mod solver;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use clap::{Parser, Subcommand};
@@ -27,6 +28,11 @@ enum Cmd {
         addr: SocketAddr,
         #[arg(long, default_value = "http://127.0.0.1:7200")]
         model_uri: String,
+        /// Named NN model server(s), as `name=uri`. Repeat for several (e.g.
+        /// `--model random=http://127.0.0.1:7200 --model trained=...:7201`).
+        /// If none given, `model_uri` is registered under the name "nn".
+        #[arg(long = "model", value_name = "NAME=URI")]
+        models: Vec<String>,
         /// Path to the Connect 4 opening book. Defaults to the bundled
         /// `data/7x6.book`; the perfect engine still works without it but is
         /// slow in the opening.
@@ -39,6 +45,8 @@ enum Cmd {
         addr: SocketAddr,
         #[arg(long, default_value = "http://127.0.0.1:7200")]
         model_uri: String,
+        #[arg(long = "model", value_name = "NAME=URI")]
+        models: Vec<String>,
         #[arg(long, default_value_t = 16)]
         workers: u32,
         #[arg(long)]
@@ -65,13 +73,31 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Serve { addr, model_uri, book } | Cmd::SelfPlay { addr, model_uri, book, .. } => {
+        Cmd::Serve { addr, model_uri, models, book }
+        | Cmd::SelfPlay { addr, model_uri, models, book, .. } => {
             if let Some(path) = book {
                 // The solver reads this on first use (see solver::book()).
                 std::env::set_var("CONNECT4_BOOK", path);
             }
-            let model = RemoteModelClient::<Connect4>::connect(&model_uri).await?;
-            playground_engine_server::run::<Connect4, _>(addr, model).await?;
+            // Build the name -> model-client map. `--model name=uri` entries win;
+            // otherwise register `--model-uri` as "nn".
+            let specs: Vec<(String, String)> = if models.is_empty() {
+                vec![("nn".to_string(), model_uri)]
+            } else {
+                models
+                    .iter()
+                    .map(|s| {
+                        s.split_once('=')
+                            .map(|(n, u)| (n.to_string(), u.to_string()))
+                            .ok_or_else(|| anyhow::anyhow!("--model must be NAME=URI, got {s:?}"))
+                    })
+                    .collect::<anyhow::Result<_>>()?
+            };
+            let mut clients = HashMap::new();
+            for (name, uri) in specs {
+                clients.insert(name, RemoteModelClient::<Connect4>::connect(&uri).await?);
+            }
+            playground_engine_server::run::<Connect4, _>(addr, clients).await?;
         }
         Cmd::Match { .. } => {
             anyhow::bail!("match subcommand: implement in M2");
