@@ -16,13 +16,16 @@
 //!      terminal nodes).
 //!   4. **Backup** — negamax the leaf value up the visited path.
 //!
-//! Deviations from the full design (deliberate, see docs/algorithm.md "open
-//! questions"): selection is PUCT rather than KR-UCT, and each edge is reified
-//! once (no noisy reified siblings / progressive widening yet). Those refine
-//! search quality but only matter once the network is trained; the structure
-//! here — GS-space search that reifies through `encode`/`eval`/`policy`/`reify`
-//! — is the planned one. KR-UCT + siblings slot in at the selection/reification
-//! steps.
+//! Selection is **KR-UCT** (kernel-regression UCT, docs/algorithm.md step 5):
+//! value and visit counts are shared across actions via a Gaussian kernel over
+//! their action vectors, so similar actions inform each other. See
+//! `kr_uct_select`. (σ → 0 recovers PUCT.)
+//!
+//! Still deferred (see docs/algorithm.md "open questions"): noisy reified
+//! siblings + progressive widening, which matter for large/continuous action
+//! spaces (Amazons/Arimaa). For Connect 4's 7 discrete columns the kernel over
+//! the column children already gives the KR-UCT smoothing; each edge is reified
+//! once.
 
 use bytes::Bytes;
 
@@ -43,8 +46,11 @@ pub struct SearchConfig {
     pub reification_interval: u32,
     /// Multiplier for exploration noise on reified siblings (not used yet).
     pub sibling_noise_base: f64,
-    /// PUCT exploration constant.
+    /// Exploration constant (PUCT term, now over kernel-weighted counts).
     pub exploration_c: f64,
+    /// KR-UCT kernel bandwidth σ over action vectors: how much value/visits are
+    /// shared between similar actions. σ → 0 recovers plain PUCT.
+    pub kernel_bandwidth: f64,
     /// Optional RNG seed for deterministic tests.
     pub seed: Option<u64>,
 }
@@ -57,6 +63,7 @@ impl Default for SearchConfig {
             reification_interval: 8,
             sibling_noise_base: 0.25,
             exploration_c: 1.4,
+            kernel_bandwidth: 0.75,
             seed: None,
         }
     }
@@ -122,16 +129,24 @@ impl<G: Game> Node<G> {
     }
 }
 
-/// PUCT score for a child edge, from the parent's perspective. `child` value is
-/// stored in the child's own (opponent's) perspective, hence the negation.
-fn puct<G: Game>(parent_visits: u32, edge: &Edge, child: &Node<G>, c: f64) -> f64 {
-    let q = if child.visits > 0 {
-        -(child.value_sum / child.visits as f64)
-    } else {
-        0.0
-    };
-    let u = c * edge.prior * (parent_visits as f64).sqrt() / (1.0 + child.visits as f64);
-    q + u
+/// Decode an opaque action-vector into a point for the KR-UCT kernel. Action
+/// vectors are little-endian f32 (what the model's action head emits).
+fn action_point(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Gaussian kernel exp(-||a-b||² / 2σ²) between two action points.
+fn kernel(a: &[f32], b: &[f32], sigma: f64) -> f64 {
+    let n = a.len().min(b.len());
+    let mut sq = 0.0f64;
+    for i in 0..n {
+        let d = (a[i] - b[i]) as f64;
+        sq += d * d;
+    }
+    (-sq / (2.0 * sigma * sigma)).exp()
 }
 
 // ── Search ──────────────────────────────────────────────────────────────────
@@ -201,7 +216,7 @@ async fn simulate<G: Game, M: ModelClient<G>>(
         if tree[cur].terminal || !tree[cur].expanded {
             break;
         }
-        let Some(edge_idx) = select_best(tree, cur, config.exploration_c) else {
+        let Some(edge_idx) = kr_uct_select(tree, cur, config) else {
             break; // expanded but childless — treat as leaf
         };
         let child = tree[cur].edges[edge_idx].child;
@@ -309,16 +324,55 @@ async fn expand<G: Game, M: ModelClient<G>>(
     Ok(model.eval(&gs).await?)
 }
 
-/// Pick the highest-PUCT edge of `node_idx`. Reads child stats from the arena.
-fn select_best<G: Game>(tree: &[Node<G>], node_idx: usize, c: f64) -> Option<usize> {
+/// KR-UCT child selection: kernel-regression UCT (Yee et al. 2016). Value and
+/// visit counts are shared across actions by a Gaussian kernel over their action
+/// vectors, so similar actions inform each other (and unvisited actions inherit
+/// a value estimate from their neighbours). With σ → 0 the kernel collapses to
+/// the identity and this is exactly PUCT.
+///
+///   q_b      = child b's mean value, from the parent's perspective
+///   W(a)     = Σ_b k(a,b) · n_b                      (kernel-weighted count)
+///   Q_kr(a)  = Σ_b k(a,b) · n_b · q_b / W(a)         (kernel-regressed value)
+///   score(a) = Q_kr(a) + c · prior_a · √N / (1 + W(a))
+fn kr_uct_select<G: Game>(tree: &[Node<G>], node_idx: usize, config: &SearchConfig) -> Option<usize> {
     let node = &tree[node_idx];
+    let m = node.edges.len();
+    if m == 0 {
+        return None;
+    }
+    let pts: Vec<Vec<f32>> = node.edges.iter().map(|e| action_point(&e.action_vector)).collect();
+    let n: Vec<f64> = node.edges.iter().map(|e| tree[e.child].visits as f64).collect();
+    let q: Vec<f64> = node
+        .edges
+        .iter()
+        .map(|e| {
+            let c = &tree[e.child];
+            if c.visits > 0 {
+                -(c.value_sum / c.visits as f64) // child value is opponent-perspective
+            } else {
+                0.0
+            }
+        })
+        .collect();
+
+    let sigma = config.kernel_bandwidth.max(1e-6);
+    let total = node.visits as f64;
     let mut best = None;
     let mut best_score = f64::NEG_INFINITY;
-    for (i, e) in node.edges.iter().enumerate() {
-        let score = puct(node.visits, e, &tree[e.child], c);
+    for a in 0..m {
+        let mut w = 0.0;
+        let mut num = 0.0;
+        for b in 0..m {
+            let k = kernel(&pts[a], &pts[b], sigma);
+            w += k * n[b];
+            num += k * n[b] * q[b];
+        }
+        let q_kr = if w > 0.0 { num / w } else { 0.0 };
+        let u = config.exploration_c * node.edges[a].prior * total.sqrt() / (1.0 + w);
+        let score = q_kr + u;
         if score > best_score {
             best_score = score;
-            best = Some(i);
+            best = Some(a);
         }
     }
     best
@@ -432,7 +486,8 @@ mod tests {
                 .take(top_b as usize)
                 .map(|mv| PolicyCandidate {
                     prior: 1.0 / n,
-                    action_vector: Countdown::encode_move(&mv).into(),
+                    // f32 action point (one dim = the move), for the KR kernel.
+                    action_vector: (mv as f32).to_le_bytes().to_vec().into(),
                     next_gs: gs_of(&Countdown::apply(&state, &mv)),
                 })
                 .collect())
@@ -480,5 +535,27 @@ mod tests {
         let state = Countdown::initial_state();
         let res = search(&MockModel, &state, &cfg).await.unwrap();
         assert!(Countdown::legal_moves(&state).contains(&res.chosen));
+    }
+
+    #[tokio::test]
+    async fn kr_uct_robust_across_bandwidths() {
+        // From near-PUCT (σ→0) to heavy smoothing, search stays well-formed.
+        let state = Countdown::initial_state();
+        for sigma in [0.01, 0.5, 2.0, 50.0] {
+            let cfg = SearchConfig { simulations: 48, kernel_bandwidth: sigma, ..Default::default() };
+            let res = search(&MockModel, &state, &cfg).await.unwrap();
+            assert!(Countdown::legal_moves(&state).contains(&res.chosen), "σ={sigma}");
+            assert_eq!(res.visits, 48);
+        }
+    }
+
+    #[test]
+    fn kernel_is_one_at_zero_and_decays() {
+        let a = [3.0f32];
+        assert!((kernel(&a, &a, 0.75) - 1.0).abs() < 1e-9);
+        let near = kernel(&[3.0], &[4.0], 0.75);
+        let far = kernel(&[3.0], &[6.0], 0.75);
+        assert!(near > far && far >= 0.0, "kernel must decay with distance");
+        assert_eq!(action_point(&1.5f32.to_le_bytes()), vec![1.5f32]);
     }
 }
