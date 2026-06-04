@@ -1,19 +1,24 @@
-"""Random-weight neural network for the Connect 4 ModelService.
+"""Connect 4 network for the ModelService.
 
-This is the reification-based MuZero variant's four heads (see
-docs/algorithm.md) wired up with *random* initial weights — enough to serve
-Encode/Eval/Policy/Reify end-to-end. It is not trained, so its play is weak;
-the point is to exercise the full engine ↔ model-server path.
+The reification-based MuZero variant's heads (see docs/algorithm.md) over a
+`GS_DIM` tanh latent (the GS / LatentGameState):
 
-GS (game-state latent) is a `GS_DIM`-vector of float32, tanh-bounded. The
-encoder reads a game's concrete state; for Connect 4 that is two 6×7 planes
-(side-to-move's stones, opponent's stones).
+  encoder : 2×6×7 planes (side-to-move's stones, opponent's) -> GS
+  eval    : GS -> scalar value in [-1, 1] (outcome for the side to move)
+  policy  : GS -> per-column prior + predicted next-GS
+  reifier : decode a policy edge back to a concrete move
+
+Connect 4's action space is just the 7 columns, so policy candidate *i*
+corresponds to column *i* and reification is a structural decode of the column
+the policy selected (no learned reifier needed for a discrete action space —
+that machinery is for Amazons/Arimaa). The trainable, play-relevant heads are
+therefore `eval` and `pol_prior`; `train.py` fits them by cloning the perfect
+solver.
 """
 
 from __future__ import annotations
 
-import struct
-
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -35,18 +40,12 @@ def connect4_planes(payload: bytes) -> torch.Tensor:
     """
     if len(payload) < C4_CELLS + 2:
         raise ValueError(f"connect4 payload too short: {len(payload)}")
-    ply = struct.unpack_from("<H", payload, C4_CELLS)[0]
+    cells = np.frombuffer(bytes(payload[:C4_CELLS]), dtype=np.uint8).reshape(C4_ROWS, C4_COLS)
+    ply = int(payload[C4_CELLS]) | (int(payload[C4_CELLS + 1]) << 8)
     mover = 1 if ply % 2 == 0 else 2
-    own = torch.zeros(C4_ROWS, C4_COLS)
-    opp = torch.zeros(C4_ROWS, C4_COLS)
-    for r in range(C4_ROWS):
-        for c in range(C4_COLS):
-            v = payload[r * C4_COLS + c]
-            if v == mover:
-                own[r, c] = 1.0
-            elif v != 0:
-                opp[r, c] = 1.0
-    return torch.stack([own, opp], dim=0)  # (2, 6, 7)
+    own = (cells == mover).astype(np.float32)
+    opp = ((cells != 0) & (cells != mover)).astype(np.float32)
+    return torch.from_numpy(np.stack([own, opp], axis=0))  # (2, 6, 7)
 
 
 def connect4_legal_columns(payload: bytes) -> list[int]:
@@ -55,56 +54,84 @@ def connect4_legal_columns(payload: bytes) -> list[int]:
     return [c for c in range(C4_COLS) if payload[top * C4_COLS + c] == 0]
 
 
-class ConnectFourModel(nn.Module):
-    """Encoder + eval + policy + reifier over the GS latent."""
+def action_vector_for_column(col: int) -> torch.Tensor:
+    """Action-head seed that encodes the chosen column (reifier decodes it)."""
+    v = torch.zeros(ACTION_DIM)
+    v[0] = float(col)
+    return v
 
+
+def decode_column(action_seed: bytes) -> int | None:
+    if not action_seed:
+        return None
+    arr = np.frombuffer(bytes(action_seed), dtype="<f4")
+    return int(round(float(arr[0]))) if arr.size else None
+
+
+class ConnectFourModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         # Encoder: 2×6×7 -> GS_DIM
         self.enc_conv1 = nn.Conv2d(2, 32, 3, padding=1)
         self.enc_conv2 = nn.Conv2d(32, 32, 3, padding=1)
         self.enc_fc = nn.Linear(32 * C4_CELLS, GS_DIM)
-
-        # Eval: GS -> scalar in [-1, 1]
+        # Eval: GS -> scalar
         self.val_fc1 = nn.Linear(GS_DIM, 64)
         self.val_fc2 = nn.Linear(64, 1)
-
-        # Policy: GS -> B priors, action vectors, and predicted next-GS.
+        # Policy: per-column prior + predicted next-GS (state head).
         self.pol_prior = nn.Linear(GS_DIM, C4_COLS)
-        self.pol_action = nn.Linear(GS_DIM, C4_COLS * ACTION_DIM)
         self.pol_next = nn.Linear(GS_DIM, C4_COLS * GS_DIM)
 
-        # Reifier: (from_gs, to_gs) -> score per column (masked to legal).
-        self.reify_fc = nn.Linear(2 * GS_DIM, C4_COLS)
-
-    # — heads —
-    def encode(self, planes: torch.Tensor) -> torch.Tensor:
-        x = F.relu(self.enc_conv1(planes.unsqueeze(0)))
+    # — batched (training) —
+    def encode_batch(self, planes: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.enc_conv1(planes))
         x = F.relu(self.enc_conv2(x))
         x = x.flatten(1)
-        return torch.tanh(self.enc_fc(x)).squeeze(0)  # (GS_DIM,)
+        return torch.tanh(self.enc_fc(x))
+
+    def value_batch(self, gs: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.val_fc1(gs))
+        return torch.tanh(self.val_fc2(x)).squeeze(-1)
+
+    def forward(self, planes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(B,2,6,7) -> (value (B,), policy logits (B,7)). Used by training."""
+        gs = self.encode_batch(planes)
+        return self.value_batch(gs), self.pol_prior(gs)
+
+    # — single-example (inference / model server) —
+    def encode(self, planes: torch.Tensor) -> torch.Tensor:
+        return self.encode_batch(planes.unsqueeze(0)).squeeze(0)
 
     def value(self, gs: torch.Tensor) -> float:
-        x = F.relu(self.val_fc1(gs))
-        return float(torch.tanh(self.val_fc2(x)).item())
+        return float(self.value_batch(gs.unsqueeze(0)).item())
 
     def policy(self, gs: torch.Tensor, top_b: int):
         priors = F.softmax(self.pol_prior(gs), dim=-1)
-        actions = self.pol_action(gs).view(C4_COLS, ACTION_DIM)
         nexts = torch.tanh(self.pol_next(gs)).view(C4_COLS, GS_DIM)
         order = torch.argsort(priors, descending=True)
         out = []
         for i in order[: max(0, top_b)]:
-            out.append((float(priors[i]), actions[i], nexts[i]))
+            col = int(i)
+            out.append((float(priors[col]), action_vector_for_column(col), nexts[col]))
         return out
 
-    def reify_column(self, from_gs: torch.Tensor, to_gs: torch.Tensor, legal: list[int]) -> int:
-        scores = self.reify_fc(torch.cat([from_gs, to_gs]))
-        if not legal:
-            return 0
-        # Pick the highest-scoring legal column.
-        best = max(legal, key=lambda c: float(scores[c]))
-        return best
+    def reify_column(self, action_seed: bytes, legal: list[int]) -> int:
+        col = decode_column(action_seed)
+        if col is not None and col in legal:
+            return col
+        return legal[0] if legal else 0
+
+
+def save_checkpoint(model: ConnectFourModel, path: str) -> None:
+    from safetensors.torch import save_file
+
+    save_file(model.state_dict(), path)
+
+
+def load_checkpoint(model: ConnectFourModel, path: str) -> None:
+    from safetensors.torch import load_file
+
+    model.load_state_dict(load_file(path))
 
 
 def gs_to_bytes(gs: torch.Tensor) -> bytes:
@@ -112,7 +139,5 @@ def gs_to_bytes(gs: torch.Tensor) -> bytes:
 
 
 def gs_from_bytes(payload: bytes) -> torch.Tensor:
-    import numpy as np
-
-    arr = np.frombuffer(payload, dtype="<f4").copy()
+    arr = np.frombuffer(bytes(payload), dtype="<f4").copy()
     return torch.from_numpy(arr)

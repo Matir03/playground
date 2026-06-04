@@ -21,6 +21,8 @@ import torch
 from playground.gen.playground.game import game_pb2
 from playground.gen.playground.model import model_pb2, model_pb2_grpc
 
+import os
+
 from .net import (
     GS_DIM,
     ConnectFourModel,
@@ -28,6 +30,7 @@ from .net import (
     connect4_planes,
     gs_from_bytes,
     gs_to_bytes,
+    load_checkpoint,
 )
 
 log = logging.getLogger(__name__)
@@ -37,25 +40,30 @@ C4_DEFAULT_B = 7
 
 
 class ModelServicer(model_pb2_grpc.ModelServiceServicer):
-    def __init__(self, game: str, seed: int = 0) -> None:
+    def __init__(self, game: str, seed: int = 0, checkpoint: str | None = None) -> None:
         if game != "connect4":
             raise SystemExit(f"model server: only 'connect4' is wired today (got {game!r})")
         self.game = game
         self.game_id = game_pb2.GAME_ID_CONNECT4
         self._lock = threading.Lock()
-        self._version = 0
-        self._load(seed)
+        self._reloads = 0
+        self._load(seed, checkpoint)
 
-    def _load(self, seed: int) -> None:
+    def _load(self, seed: int, checkpoint: str | None = None) -> None:
         torch.manual_seed(seed)
         net = ConnectFourModel()
+        if checkpoint:
+            load_checkpoint(net, checkpoint)
         net.eval()
         for p in net.parameters():
             p.requires_grad_(False)
         self.net = net
-        self._version += 1
-        self.model_version = f"connect4-random-v{self._version}"
-        log.info("loaded model %s (random weights, seed=%d)", self.model_version, seed)
+        if checkpoint:
+            self.model_version = f"connect4-{os.path.splitext(os.path.basename(checkpoint))[0]}"
+            log.info("loaded model %s from %s", self.model_version, checkpoint)
+        else:
+            self.model_version = f"connect4-random-seed{seed}"
+            log.info("loaded model %s (random weights)", self.model_version)
 
     def _gs_msg(self, gs_tensor) -> game_pb2.LatentGameState:
         return game_pb2.LatentGameState(
@@ -93,11 +101,9 @@ class ModelServicer(model_pb2_grpc.ModelServiceServicer):
         return resp
 
     def Reify(self, request, context):
-        from_gs = gs_from_bytes(request.from_gs.payload)
-        to_gs = gs_from_bytes(request.to_gs.payload)
+        # Discrete action space: decode the column the policy edge selected.
         legal = connect4_legal_columns(request.from_state.payload)
-        with self._lock:
-            col = self.net.reify_column(from_gs, to_gs, legal)
+        col = self.net.reify_column(request.action_vector, legal)
         move = game_pb2.Move(game_id=self.game_id, payload=bytes([col]))
         return model_pb2.ReifyResponse(move=move, score=0.0)
 
@@ -127,10 +133,15 @@ class ModelServicer(model_pb2_grpc.ModelServiceServicer):
         return resp
 
     def ReloadWeights(self, request, context):
-        # No registry yet: re-seed from the requested source string.
-        seed = abs(hash(request.source)) % (2**31) if request.source else 0
+        # `source` is a checkpoint path (.safetensors) if it exists, else a
+        # string to re-seed random weights from.
+        src = request.source
         with self._lock:
-            self._load(seed)
+            self._reloads += 1
+            if src and src.endswith(".safetensors") and os.path.exists(src):
+                self._load(0, checkpoint=src)
+            else:
+                self._load(abs(hash(src)) % (2**31) if src else 0)
         return model_pb2.ReloadWeightsResponse(loaded_version=self.model_version)
 
     def Health(self, request, context):
@@ -153,7 +164,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     torch.set_num_threads(1)
 
-    servicer = ModelServicer(args.game, seed=args.seed)
+    servicer = ModelServicer(args.game, seed=args.seed, checkpoint=args.checkpoint)
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=args.max_workers))
     model_pb2_grpc.add_ModelServiceServicer_to_server(servicer, server)
     server.add_insecure_port(f"[::]:{args.port}")

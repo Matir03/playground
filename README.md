@@ -173,14 +173,32 @@ playground-orchestrator start-run --game connect4 --config configs/connect4-m2.y
 
 ### Python — training
 
-Trains one head stage at a time (see [docs/algorithm.md](docs/algorithm.md)
-for what each stage targets). Stub until M2.
+The full self-play → encoder/reifier/eval/policy stage schedule (see
+[docs/algorithm.md](docs/algorithm.md)) is still M4. What works today is a
+**behavioral-cloning** pipeline for Connect 4: clone the perfect solver from
+games it plays against the random net, using only the solver's own moves as
+targets (policy = the column it played, value = the game result).
 
 ```bash
-playground-train --game connect4 --stage encoder-reifier \
-    --records-dir data/runs/<run_id>/games \
-    --out data/models/connect4/<new_version>
+# 0. Save the random-init net (a baseline checkpoint to keep / warm-start from).
+playground-train save-random          # -> data/models/connect4/random/checkpoint.safetensors
+
+# 1. Generate data. Needs a running engine + model server (the random net).
+#    Plays perfect-vs-random games and records ONLY the perfect bot's moves.
+playground-train gen-data --games 600 # -> data/datasets/connect4_perfect.npz
+
+# 2. Train (encoder + eval + policy heads) and save into the model registry.
+playground-train train --epochs 40    # -> data/models/connect4/bc-perfect/checkpoint.safetensors
+
+# 3. Serve the trained net instead of the random one.
+playground-model-server --game connect4 --port 7200 \
+    --checkpoint data/models/connect4/bc-perfect/checkpoint.safetensors
 ```
+
+`train` prints the held-out move-match rate against the perfect bot. The model
+server's `--checkpoint` (and the `ReloadWeights` RPC) load any `.safetensors`
+checkpoint; reify is a structural column decode for Connect 4, so the trained
+policy+value heads are what drive the NN's MCTS.
 
 ### Python — eval
 
