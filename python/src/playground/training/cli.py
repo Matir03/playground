@@ -86,6 +86,8 @@ def main() -> None:
     sp.add_argument("--move-ms", type=float, default=0.0,
                     help="time budget per move (ms); 0 = use --sims. Uncapped rollouts when set.")
     sp.add_argument("--init", default=None, help="warm-start from an existing checkpoint")
+    sp.add_argument("--workers", type=int, default=1,
+                    help="parallel self-play worker processes (each pinned to 1 torch thread)")
     sp.add_argument("--seed", type=int, default=0)
 
     tr = sub.add_parser("train", help="behavioral-clone the perfect bot")
@@ -110,7 +112,7 @@ def main() -> None:
             args.out, args.channels, args.blocks, args.generations, args.games_per_gen,
             args.sims, args.epochs, args.batch_size, args.lr, args.buffer_gens,
             args.c_puct, args.dir_alpha, args.dir_eps, args.temp_moves, args.eval_games, args.seed,
-            move_ms=args.move_ms, init=args.init,
+            move_ms=args.move_ms, init=args.init, workers=args.workers,
         )
     elif args.cmd == "train":
         from .train import train

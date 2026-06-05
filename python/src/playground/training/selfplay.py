@@ -128,6 +128,37 @@ def run_mcts(
     return counts
 
 
+# ── Parallel self-play workers ────────────────────────────────────────────────
+# Game generation is embarrassingly parallel, so we fan it out over a process
+# pool. Each worker loads the current net once (via an initializer) and plays
+# whole games. Crucially each worker pins torch to a single thread: the MCTS does
+# batch-1 forwards on a tiny 6×7 board, where torch's intra-op threading is pure
+# overhead (same lesson as the in-process candle engine). N single-threaded
+# workers therefore scale far better than one many-threaded process.
+
+_WORKER = {}
+
+
+def _worker_init(ckpt_path: str, channels: int, blocks: int, params: dict) -> None:
+    torch.set_num_threads(1)
+    net = ConnectFourResNet(channels=channels, blocks=blocks)
+    load_checkpoint(net, ckpt_path)
+    net.eval()
+    for p in net.parameters():
+        p.requires_grad_(False)
+    _WORKER["net"] = net
+    _WORKER["params"] = params
+
+
+def _worker_play(seed: int):
+    p = _WORKER["params"]
+    rng = np.random.default_rng(seed)
+    return self_play_game(
+        _WORKER["net"], p["sims"], p["c_puct"], p["dir_alpha"], p["dir_eps"],
+        p["temp_moves"], rng, p["move_ms"],
+    )
+
+
 def self_play_game(net, sims, c_puct, dir_alpha, dir_eps, temp_moves, rng, move_ms=0.0):
     board = Board()
     examples = []  # (planes, policy(7), to_move)
@@ -204,6 +235,7 @@ def selfplay_train(
     seed: int,
     move_ms: float = 0.0,
     init: str | None = None,
+    workers: int = 1,
 ) -> str:
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
@@ -225,17 +257,39 @@ def selfplay_train(
     os.makedirs(out_dir, exist_ok=True)
     ckpt = os.path.join(out_dir, "checkpoint.safetensors")
 
+    worker_ckpt = os.path.join(out_dir, "_worker.safetensors")
+    play_params = {
+        "sims": sims, "c_puct": c_puct, "dir_alpha": dir_alpha, "dir_eps": dir_eps,
+        "temp_moves": temp_moves, "move_ms": move_ms,
+    }
+
     for gen in range(generations):
         net.eval()
         t0 = time.time()
         gen_examples = []
         sims_acc = 0.0
-        for _ in range(games_per_gen):
-            ex, avg_sims = self_play_game(
-                net, sims, c_puct, dir_alpha, dir_eps, temp_moves, rng, move_ms
-            )
-            gen_examples += ex
-            sims_acc += avg_sims
+        if workers > 1:
+            # Fan game generation out over a process pool reloading the current
+            # weights. New pool per generation so workers pick up the latest net.
+            from concurrent.futures import ProcessPoolExecutor
+
+            save_checkpoint(net, worker_ckpt)
+            seeds = [seed * 1_000_000 + gen * 10_000 + i for i in range(games_per_gen)]
+            with ProcessPoolExecutor(
+                max_workers=workers,
+                initializer=_worker_init,
+                initargs=(worker_ckpt, channels, blocks, play_params),
+            ) as pool:
+                for ex, avg_sims in pool.map(_worker_play, seeds):
+                    gen_examples += ex
+                    sims_acc += avg_sims
+        else:
+            for _ in range(games_per_gen):
+                ex, avg_sims = self_play_game(
+                    net, sims, c_puct, dir_alpha, dir_eps, temp_moves, rng, move_ms
+                )
+                gen_examples += ex
+                sims_acc += avg_sims
         avg_sims = sims_acc / max(1, games_per_gen)
         window.append(gen_examples)
         data = [ex for g in window for ex in g]
