@@ -33,6 +33,9 @@ def _rate(args) -> None:
     from .rating import fit_elo
 
     parts = _participants(args.run, not args.no_baselines)
+    for spec in args.extra or []:
+        name, ckpt = spec.split("=", 1)
+        parts.append((name, ckpt))
     if len(parts) < 2:
         raise SystemExit("need at least two participants (run selfplay first)")
 
@@ -80,6 +83,7 @@ def main() -> None:
     r.add_argument("--games", type=int, default=12, help="games per pair")
     r.add_argument("--sims", type=int, default=24, help="MCTS sims per move")
     r.add_argument("--no-baselines", action="store_true", help="generations only")
+    r.add_argument("--extra", action="append", help="extra participant NAME=checkpoint; repeatable")
     r.add_argument("--solver", action="store_true", help="include the perfect solver (needs engine)")
     r.add_argument("--engine", default="127.0.0.1:7100", help="engine addr for the solver player")
     r.add_argument("--seed", type=int, default=0)
