@@ -80,7 +80,18 @@ def _select(node: _Node, c_puct: float) -> int:
     return best
 
 
-def run_mcts(board: Board, net, sims: int, c_puct: float, dir_alpha: float, dir_eps: float, rng) -> np.ndarray:
+def run_mcts(
+    board: Board,
+    net,
+    sims: int,
+    c_puct: float,
+    dir_alpha: float,
+    dir_eps: float,
+    rng,
+    move_ms: float = 0.0,
+) -> np.ndarray:
+    """PUCT MCTS. Runs a fixed `sims` count, or — if `move_ms > 0` — uncapped
+    rollouts until the per-move time budget (ms) is spent."""
     root = _Node(board)
     _expand(root, net)
     legal = list(root.P)
@@ -89,7 +100,7 @@ def run_mcts(board: Board, net, sims: int, c_puct: float, dir_alpha: float, dir_
         for i, c in enumerate(legal):
             root.P[c] = (1 - dir_eps) * root.P[c] + dir_eps * noise[i]
 
-    for _ in range(sims):
+    def simulate() -> None:
         node, path = root, []
         while node.expanded and not node.terminal:
             c = _select(node, c_puct)
@@ -103,17 +114,27 @@ def run_mcts(board: Board, net, sims: int, c_puct: float, dir_alpha: float, dir_
             n.N[c] += 1
             n.W[c] += v
 
+    if move_ms > 0:
+        deadline = time.perf_counter() + move_ms / 1000.0
+        while time.perf_counter() < deadline:
+            simulate()
+    else:
+        for _ in range(sims):
+            simulate()
+
     counts = np.zeros(COLS, dtype=np.float64)
     for c, n in root.N.items():
         counts[c] = n
     return counts
 
 
-def self_play_game(net, sims, c_puct, dir_alpha, dir_eps, temp_moves, rng):
+def self_play_game(net, sims, c_puct, dir_alpha, dir_eps, temp_moves, rng, move_ms=0.0):
     board = Board()
     examples = []  # (planes, policy(7), to_move)
+    total_sims = 0
     while not board.terminal()[0]:
-        counts = run_mcts(board, net, sims, c_puct, dir_alpha, dir_eps, rng)
+        counts = run_mcts(board, net, sims, c_puct, dir_alpha, dir_eps, rng, move_ms)
+        total_sims += int(counts.sum())
         policy = counts / counts.sum()
         examples.append((board.planes(), policy.astype(np.float32), board.to_move))
         if board.ply < temp_moves:
@@ -127,7 +148,8 @@ def self_play_game(net, sims, c_puct, dir_alpha, dir_eps, temp_moves, rng):
     for planes, policy, to_move in examples:
         z = 0.0 if w == 0 else (1.0 if w == to_move else -1.0)
         out.append((planes, policy, np.float32(z)))
-    return out
+    avg_sims = total_sims / max(1, len(examples))
+    return out, avg_sims
 
 
 def _greedy_policy_move(net, board: Board) -> int:
@@ -180,10 +202,15 @@ def selfplay_train(
     temp_moves: int,
     eval_games: int,
     seed: int,
+    move_ms: float = 0.0,
+    init: str | None = None,
 ) -> str:
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     net = ConnectFourResNet(channels=channels, blocks=blocks)
+    if init:
+        load_checkpoint(net, init)  # warm-start from an existing checkpoint
+        print(f"warm-started from {init}")
     opt = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-4)
 
     # Optional baseline opponent for a progress signal.
@@ -202,8 +229,14 @@ def selfplay_train(
         net.eval()
         t0 = time.time()
         gen_examples = []
+        sims_acc = 0.0
         for _ in range(games_per_gen):
-            gen_examples += self_play_game(net, sims, c_puct, dir_alpha, dir_eps, temp_moves, rng)
+            ex, avg_sims = self_play_game(
+                net, sims, c_puct, dir_alpha, dir_eps, temp_moves, rng, move_ms
+            )
+            gen_examples += ex
+            sims_acc += avg_sims
+        avg_sims = sims_acc / max(1, games_per_gen)
         window.append(gen_examples)
         data = [ex for g in window for ex in g]
 
@@ -241,7 +274,7 @@ def selfplay_train(
             json.dump(gen_cfg, f, indent=2)
         print(
             f"gen {gen + 1}/{generations}  games {games_per_gen}  examples {len(data)}  "
-            f"winrate_vs_random {wr:.2f}  ({time.time() - t0:.0f}s)",
+            f"avg_sims/move {avg_sims:.0f}  winrate_vs_random {wr:.2f}  ({time.time() - t0:.0f}s)",
             flush=True,
         )
 
