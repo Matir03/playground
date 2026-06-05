@@ -312,6 +312,30 @@ mod tests {
         s
     }
 
+    // Raw forward throughput (run with `--ignored -- --nocapture`).
+    #[tokio::test]
+    #[ignore]
+    async fn bench_forward() {
+        for (name, ckpt) in [
+            ("random", "../../../data/models/connect4/random/checkpoint.safetensors"),
+            ("selfplay", "../../../data/models/connect4/selfplay/checkpoint.safetensors"),
+        ] {
+            if !Path::new(ckpt).exists() {
+                continue;
+            }
+            let m = LocalModel::load(ckpt).unwrap();
+            let s = state_after(&[3, 3, 2, 4]);
+            // encode only (the trunk — the expensive head)
+            let n = 5000;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                let _ = m.encode(&s).await.unwrap();
+            }
+            let us = t.elapsed().as_micros() as f64 / n as f64;
+            eprintln!("{name}: encode {us:.1} us/call  ({:.0}/s)", 1e6 / us);
+        }
+    }
+
     // Parity check against the Python net (run with `-- --nocapture`). Gated on
     // the checkpoints existing so CI without the data registry still passes.
     #[tokio::test]
