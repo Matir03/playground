@@ -28,6 +28,7 @@ import {
   NewGameRequestSchema,
   ApplyMoveRequestSchema,
   RequestMoveRequestSchema,
+  SearchBudgetSchema,
   type SearchStats,
 } from "../../gen/playground/engine/engine_pb";
 
@@ -93,6 +94,10 @@ export function Connect4Board({
   const [firstSeat, setFirstSeat] = useState<Seat>("human");
   const [secondSeat, setSecondSeat] = useState<Seat>("solver");
   const [thinking, setThinking] = useState(false);
+  // NN search budget (ignored by the solver). Default: 1 second per move.
+  const [limitMode, setLimitMode] = useState<"seconds" | "visits">("seconds");
+  const [seconds, setSeconds] = useState(1);
+  const [visits, setVisits] = useState(800);
   const [lastStats, setLastStats] = useState<SearchStats | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -184,7 +189,17 @@ export function Connect4Board({
             // Timeout guards against a browser gRPC-Web stream that hangs
             // waiting for a dropped trailer (the solver itself is ~instant).
             for await (const prog of client.requestMove(
-              create(RequestMoveRequestSchema, { handle, player, model }),
+              create(RequestMoveRequestSchema, {
+                handle,
+                player,
+                model,
+                budget: create(
+                  SearchBudgetSchema,
+                  limitMode === "seconds"
+                    ? { maxMillis: Math.max(1, Math.round(seconds * 1000)) }
+                    : { maxVisits: Math.max(1, Math.round(visits)) },
+                ),
+              }),
               { signal: AbortSignal.timeout(8000) },
             )) {
               if (prog.kind.case === "stats") setLastStats(prog.kind.value);
@@ -230,6 +245,30 @@ export function Connect4Board({
       <div style={{ display: "flex", gap: "1.5rem", marginBottom: "0.75rem", flexWrap: "wrap" }}>
         <SeatPicker label="Yellow (first)" seat={firstSeat} onChange={setFirstSeat} />
         <SeatPicker label="Red (second)" seat={secondSeat} onChange={setSecondSeat} />
+        <label style={{ display: "flex", flexDirection: "column", fontSize: "0.85rem", color: "#555" }}>
+          NN search limit
+          <span style={{ display: "flex", gap: 4 }}>
+            <input
+              type="number"
+              min={limitMode === "seconds" ? 0.1 : 1}
+              step={limitMode === "seconds" ? 0.1 : 50}
+              value={limitMode === "seconds" ? seconds : visits}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                if (limitMode === "seconds") setSeconds(v);
+                else setVisits(v);
+              }}
+              style={{ width: 70 }}
+            />
+            <select
+              value={limitMode}
+              onChange={(e) => setLimitMode(e.target.value as "seconds" | "visits")}
+            >
+              <option value="seconds">seconds</option>
+              <option value="visits">visits</option>
+            </select>
+          </span>
+        </label>
         <button onClick={() => void newGame()} disabled={busy}>
           New game
         </button>

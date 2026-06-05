@@ -123,7 +123,10 @@ where
     M: ModelClient<G>,
 {
     let mut config = playground_core::mcts::SearchConfig::default();
-    if let Some(v) = budget.and_then(|b| b.max_visits).filter(|&v| v > 0) {
+    // A time budget takes precedence over a visit budget.
+    if let Some(ms) = budget.and_then(|b| b.max_millis).filter(|&v| v > 0) {
+        config.move_millis = ms as u64;
+    } else if let Some(v) = budget.and_then(|b| b.max_visits).filter(|&v| v > 0) {
         config.simulations = v;
     }
     let result = playground_core::mcts::search::<G, M>(model, state, &config).await?;

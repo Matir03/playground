@@ -91,13 +91,14 @@ model server reads the net's architecture from a sibling `config.json` (the
 larger self-play ResNet vs the small cloned/random nets), so one server binary
 serves any checkpoint.
 
-The net is **untrained** (random init), so it plays weakly — the point is to
-exercise the full search ↔ model-server path; the UI shows per-move visit and
-reification counts. The MCTS itself lives in `crates/core/src/mcts.rs`; budget
-defaults to 160 simulations (override via `RequestMove`'s `max_visits`).
-Selection is currently PUCT and each edge is reified once — KR-UCT and noisy
-reified siblings / progressive widening (see docs/algorithm.md) are the next
-refinements and only matter once the network is trained.
+The UI shows per-move visit and reification counts, and a per-seat **search
+limit** for the NN — either a time budget (default **1 second/move**) or a fixed
+visit count (`RequestMove`'s `max_millis` / `max_visits`; a time budget runs
+uncapped rollouts until it elapses). The MCTS itself lives in
+`crates/core/src/mcts.rs` and uses **KR-UCT** selection (kernel regression over
+action vectors; σ → 0 recovers PUCT). Noisy reified siblings / progressive
+widening (see docs/algorithm.md) are the remaining refinements, relevant for the
+larger games.
 
 ### Prerequisites
 

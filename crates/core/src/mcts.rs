@@ -36,8 +36,11 @@ use crate::model::ModelClient;
 /// Search configuration. Field list will grow as the algorithm solidifies.
 #[derive(Clone, Debug)]
 pub struct SearchConfig {
-    /// Number of simulations (tree traversals) to run.
+    /// Number of simulations (tree traversals) to run, when `move_millis` is 0.
     pub simulations: u32,
+    /// Per-move time budget in milliseconds. If > 0, run uncapped rollouts until
+    /// the budget elapses instead of a fixed `simulations` count.
+    pub move_millis: u64,
     /// B — number of (action, next_gs) candidates produced by the policy head
     /// per expansion.
     pub policy_top_b: u32,
@@ -59,6 +62,7 @@ impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             simulations: 160,
+            move_millis: 0,
             policy_top_b: 8,
             reification_interval: 8,
             sibling_noise_base: 0.25,
@@ -161,8 +165,21 @@ pub async fn search<G: Game, M: ModelClient<G>>(
     let mut tree: Vec<Node<G>> = vec![Node::reified(root_gs, root_state.clone())];
     let mut reifications = 0u32;
 
-    for _ in 0..config.simulations.max(1) {
-        simulate(model, &mut tree, config, &mut reifications).await?;
+    if config.move_millis > 0 {
+        // Uncapped rollouts until the per-move time budget elapses (with a
+        // generous hard cap to bound tree memory).
+        const HARD_CAP: u32 = 2_000_000;
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(config.move_millis);
+        let mut n = 0u32;
+        while n < HARD_CAP && std::time::Instant::now() < deadline {
+            simulate(model, &mut tree, config, &mut reifications).await?;
+            n += 1;
+        }
+    } else {
+        for _ in 0..config.simulations.max(1) {
+            simulate(model, &mut tree, config, &mut reifications).await?;
+        }
     }
 
     // Choose the most-visited reified root edge.
