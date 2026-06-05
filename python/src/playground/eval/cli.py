@@ -29,15 +29,20 @@ def _participants(run_dir: str, baselines: bool) -> list[tuple[str, str]]:
 
 
 def _rate(args) -> None:
-    from .arena import load_net, match
+    from .arena import load_net, match, net_player, solver_player
     from .rating import fit_elo
 
     parts = _participants(args.run, not args.no_baselines)
     if len(parts) < 2:
         raise SystemExit("need at least two participants (run selfplay first)")
+
+    # Build players: each net moves by its MCTS; the solver moves via the engine.
+    players = {n: net_player(load_net(p), args.sims) for n, p in parts}
     names = [n for n, _ in parts]
+    if args.solver:
+        players["solver"] = solver_player(args.engine)
+        names.append("solver")  # perfect-play ceiling reference
     print("participants:", ", ".join(names))
-    nets = {n: load_net(p) for n, p in parts}
 
     rng = np.random.default_rng(args.seed)
     k = len(names)
@@ -45,7 +50,7 @@ def _rate(args) -> None:
     games = np.zeros((k, k))
     for ia, ib in itertools.combinations(range(k), 2):
         a, b = names[ia], names[ib]
-        sa = match(nets[a], nets[b], args.games, args.sims, rng)  # a's avg score
+        sa = match(players[a], players[b], args.games, rng)  # a's avg score
         score[ia][ib] += sa * args.games
         score[ib][ia] += (1 - sa) * args.games
         games[ia][ib] += args.games
@@ -75,6 +80,8 @@ def main() -> None:
     r.add_argument("--games", type=int, default=12, help="games per pair")
     r.add_argument("--sims", type=int, default=24, help="MCTS sims per move")
     r.add_argument("--no-baselines", action="store_true", help="generations only")
+    r.add_argument("--solver", action="store_true", help="include the perfect solver (needs engine)")
+    r.add_argument("--engine", default="127.0.0.1:7100", help="engine addr for the solver player")
     r.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
     if args.cmd == "rate":
