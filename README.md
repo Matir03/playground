@@ -91,6 +91,30 @@ model server reads the net's architecture from a sibling `config.json` (the
 larger self-play ResNet vs the small cloned/random nets), so one server binary
 serves any checkpoint.
 
+#### Embedded (in-process) NN — no Python, no gRPC round-trips
+
+The MCTS above evaluates the net by a gRPC call **per node** to the Python model
+server, so the round-trips cap the search (~310–360 visits/s at a 1 s budget).
+You can instead run the net **inside the engine** with `--model-local
+NAME=CHECKPOINT`: the same `.safetensors` checkpoints are loaded with
+[`candle`](https://github.com/huggingface/candle) and inference is a local
+function call (architecture still read from the sibling `config.json`). No Python
+process is involved.
+
+```bash
+cargo run --release -p connect4-engine -- serve --addr 127.0.0.1:7100 \
+    --model-local random=data/models/connect4/random/checkpoint.safetensors \
+    --model-local trained=data/models/connect4/bc-perfect/checkpoint.safetensors \
+    --model-local selfplay=data/models/connect4/selfplay/checkpoint.safetensors
+```
+
+The UI is unchanged — it just selects a name. Removing the round-trips lets the
+same 1 s budget reach far more visits: ~12,800/s for the small nets (≈41×) and
+~630/s for the larger self-play ResNet (≈1.7×). `--model-local` and `--model`
+(remote) can be mixed in one engine. The net runs single-threaded by default
+(batch-1 inference on the 6×7 board is faster without rayon's threading
+overhead); override with `RAYON_NUM_THREADS`.
+
 The UI shows per-move visit and reification counts, and a per-seat **search
 limit** for the NN — either a time budget (default **1 second/move**) or a fixed
 visit count (`RequestMove`'s `max_millis` / `max_visits`; a time budget runs
