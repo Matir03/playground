@@ -240,9 +240,20 @@ def selfplay_train(
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     net = ConnectFourResNet(channels=channels, blocks=blocks)
+    # Resume support: if the output dir already holds generations, continue
+    # numbering from the latest (and warm-start from it unless --init overrides).
+    # Makes the run idempotent across interruptions (e.g. a host reboot).
+    import glob
+
+    existing = sorted(glob.glob(os.path.join(out_dir, "gen*")))
+    start_gen = int(os.path.basename(existing[-1])[3:]) if existing else 0
     if init:
-        load_checkpoint(net, init)  # warm-start from an existing checkpoint
-        print(f"warm-started from {init}")
+        load_checkpoint(net, init)  # warm-start from an explicit checkpoint
+        print(f"warm-started from {init}", flush=True)
+    elif start_gen > 0:
+        resume = os.path.join(out_dir, f"gen{start_gen:03d}", "checkpoint.safetensors")
+        load_checkpoint(net, resume)
+        print(f"resumed from {resume} (continuing after gen {start_gen})", flush=True)
     opt = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-4)
 
     # Optional baseline opponent for a progress signal.
@@ -317,9 +328,10 @@ def selfplay_train(
 
         # Keep every generation's checkpoint separately (for the rating curve),
         # and mirror the latest into the top-level dir for serving convenience.
-        gen_dir = os.path.join(out_dir, f"gen{gen + 1:03d}")
+        gen_num = start_gen + gen + 1
+        gen_dir = os.path.join(out_dir, f"gen{gen_num:03d}")
         os.makedirs(gen_dir, exist_ok=True)
-        gen_cfg = {"arch": arch_of(net), "generation": gen + 1, "winrate_vs_random": wr}
+        gen_cfg = {"arch": arch_of(net), "generation": gen_num, "winrate_vs_random": wr}
         save_checkpoint(net, os.path.join(gen_dir, "checkpoint.safetensors"))
         with open(os.path.join(gen_dir, "config.json"), "w") as f:
             json.dump(gen_cfg, f, indent=2)
@@ -327,8 +339,9 @@ def selfplay_train(
         with open(os.path.join(out_dir, "config.json"), "w") as f:
             json.dump(gen_cfg, f, indent=2)
         print(
-            f"gen {gen + 1}/{generations}  games {games_per_gen}  examples {len(data)}  "
-            f"avg_sims/move {avg_sims:.0f}  winrate_vs_random {wr:.2f}  ({time.time() - t0:.0f}s)",
+            f"gen {gen_num} (+{gen + 1}/{generations})  games {games_per_gen}  "
+            f"examples {len(data)}  avg_sims/move {avg_sims:.0f}  "
+            f"winrate_vs_random {wr:.2f}  ({time.time() - t0:.0f}s)",
             flush=True,
         )
 
