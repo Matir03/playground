@@ -12,11 +12,9 @@ MCTS (reify is a structural column decode).
 
 from __future__ import annotations
 
-import itertools
 import json
+import multiprocessing
 import os
-import queue
-import threading
 import time
 from collections import deque
 
@@ -32,44 +30,11 @@ from playground.model_server.net import (
     save_checkpoint,
 )
 
+from . import mp_worker
 from .connect4 import COLS, Board
+from .mcts_core import run_mcts, self_play_game  # torch-free search + game loop
 
-
-class _Node:
-    __slots__ = ("board", "P", "N", "W", "children", "expanded", "terminal", "term_v")
-
-    def __init__(self, board: Board) -> None:
-        self.board = board
-        self.P: dict[int, float] = {}
-        self.N: dict[int, int] = {}
-        self.W: dict[int, float] = {}
-        self.children: dict[int, _Node] = {}
-        self.expanded = False
-        self.terminal = False
-        self.term_v = 0.0
-
-
-def _expand(node: _Node, evaluate) -> float:
-    """Expand `node`; return the value for the side to move.
-
-    `evaluate(board) -> (value: float, probs: np.ndarray[COLS])` decouples the
-    MCTS from how inference happens — a direct single forward, or the batched
-    evaluator that coalesces many games' leaves into one device call.
-    """
-    term, tv = node.board.terminal()
-    if term:
-        node.terminal = True
-        node.term_v = tv
-        return tv
-    v, probs = evaluate(node.board)
-    legal = node.board.legal()
-    s = float(sum(probs[c] for c in legal)) or 1.0
-    for c in legal:
-        node.P[c] = float(probs[c]) / s
-        node.N[c] = 0
-        node.W[c] = 0.0
-    node.expanded = True
-    return float(v)
+PLANES = 2 * 6 * 7
 
 
 def _net_evaluate(net):
@@ -85,184 +50,72 @@ def _net_evaluate(net):
     return evaluate
 
 
-def _select(node: _Node, c_puct: float) -> int:
-    total = sum(node.N.values())
-    sqrt_total = (total + 1) ** 0.5
-    best, best_score = -1, -1e30
-    for c in node.P:
-        q = node.W[c] / node.N[c] if node.N[c] > 0 else 0.0
-        u = c_puct * node.P[c] * sqrt_total / (1 + node.N[c])
-        if q + u > best_score:
-            best_score, best = q + u, c
-    return best
+# ── Multiprocessing self-play with a central GPU inference server ─────────────
+# The GIL serialises Python MCTS tree work, capping a threaded batched evaluator.
+# Instead run the games in worker PROCESSES (true-parallel tree work) and keep a
+# single inference server — this (main) process, which owns the GPU net — that
+# batches their leaf evaluations. IPC is shared memory: a request-flag array the
+# server polls (a worker writes its planes, then raises its flag) and a per-slot
+# Event the worker blocks on (the server sets it after the forward). No GIL
+# contention across workers, and no weight syncing (the server holds the live net).
 
 
-def run_mcts(
-    board: Board,
-    evaluate,
-    sims: int,
-    c_puct: float,
-    dir_alpha: float,
-    dir_eps: float,
-    rng,
-    move_ms: float = 0.0,
-):
-    """PUCT MCTS. Runs a fixed `sims` count, or — if `move_ms > 0` — uncapped
-    rollouts until the per-move time budget (ms) is spent. Returns
-    `(visit_counts[COLS], root_value)`, the root value being the search's value
-    estimate for the side to move (visit-weighted mean of the children's Q)."""
-    root = _Node(board)
-    _expand(root, evaluate)
-    legal = list(root.P)
-    if dir_eps > 0 and legal:
-        noise = rng.dirichlet([dir_alpha] * len(legal))
-        for i, c in enumerate(legal):
-            root.P[c] = (1 - dir_eps) * root.P[c] + dir_eps * noise[i]
+def _generate_games_mp(net, device, n_games, params, n_workers, max_batch, base_seed):
+    """Generate `n_games` across `n_workers` processes fed by a batched GPU server."""
+    ctx = multiprocessing.get_context("spawn")
+    req_planes = ctx.RawArray("f", n_workers * PLANES)
+    req_ready = ctx.RawArray("b", n_workers)
+    val_arr = ctx.RawArray("f", n_workers)
+    prob_arr = ctx.RawArray("f", n_workers * COLS)
+    resp_events = [ctx.Event() for _ in range(n_workers)]
+    counter = ctx.Value("i", 0)   # next game index workers atomically claim
+    finished = ctx.Value("i", 0)  # games completed
+    result_q = ctx.Queue()
 
-    def simulate() -> None:
-        node, path = root, []
-        while node.expanded and not node.terminal:
-            c = _select(node, c_puct)
-            path.append((node, c))
-            if c not in node.children:
-                node.children[c] = _Node(node.board.play(c))
-            node = node.children[c]
-        v = node.term_v if node.terminal else _expand(node, evaluate)
-        for n, c in reversed(path):
-            v = -v
-            n.N[c] += 1
-            n.W[c] += v
+    procs = []
+    for slot in range(n_workers):
+        p = ctx.Process(
+            target=mp_worker.worker,
+            args=(slot, n_games, base_seed, counter, finished, req_planes, req_ready,
+                  val_arr, prob_arr, resp_events[slot], result_q, n_workers, params),
+            daemon=True,
+        )
+        p.start()
+        procs.append(p)
 
-    if move_ms > 0:
-        deadline = time.perf_counter() + move_ms / 1000.0
-        while time.perf_counter() < deadline:
-            simulate()
-    else:
-        for _ in range(sims):
-            simulate()
+    ready_np = np.frombuffer(req_ready, dtype=np.int8)
+    req_np = np.frombuffer(req_planes, dtype=np.float32).reshape(n_workers, 2, 6, 7)
+    val_np = np.frombuffer(val_arr, dtype=np.float32)
+    prob_np = np.frombuffer(prob_arr, dtype=np.float32).reshape(n_workers, COLS)
 
-    counts = np.zeros(COLS, dtype=np.float64)
-    for c, n in root.N.items():
-        counts[c] = n
-    total_n = sum(root.N.values())
-    root_value = (sum(root.W.values()) / total_n) if total_n > 0 else 0.0
-    return counts, root_value
+    nbatch = nsamp = 0
+    while finished.value < n_games:
+        # Snapshot the flags (workers set them concurrently); per-byte int8 reads
+        # are atomic, so the copy is consistent and nonzero can't race.
+        slots = np.nonzero(ready_np.copy())[0]
+        if slots.size == 0:
+            time.sleep(0.0002)
+            continue
+        if slots.size > max_batch:
+            slots = slots[:max_batch]
+        ready_np[slots] = 0  # clear before serving so workers can re-request
+        planes = torch.from_numpy(req_np[slots]).to(device)
+        with torch.no_grad():
+            v, probs = net.policy_value(planes)
+        val_np[slots] = v.cpu().numpy()
+        prob_np[slots] = probs.cpu().numpy()
+        nbatch += 1
+        nsamp += int(slots.size)
+        for s in slots:
+            resp_events[int(s)].set()
 
-
-def self_play_game(evaluate, sims, c_puct, dir_alpha, dir_eps, temp_moves, rng, move_ms=0.0):
-    """Play one self-play game; return (examples, avg_sims).
-
-    Each example is (planes, policy_target[COLS], value_target). The policy
-    target is the MCTS visit distribution; the value target is the MCTS root
-    value at that position (the local search estimate for the side to move) —
-    not the final game result.
-    """
-    board = Board()
-    examples = []
-    total_sims = 0
-    while not board.terminal()[0]:
-        counts, root_v = run_mcts(board, evaluate, sims, c_puct, dir_alpha, dir_eps, rng, move_ms)
-        total_sims += int(counts.sum())
-        policy = counts / counts.sum()
-        examples.append((board.planes(), policy.astype(np.float32), np.float32(root_v)))
-        if board.ply < temp_moves:
-            col = int(rng.choice(COLS, p=policy))
-        else:
-            col = int(counts.argmax())
-        board = board.play(col)
-
-    avg_sims = total_sims / max(1, len(examples))
-    return examples, avg_sims
-
-
-# ── Batched, concurrent self-play (central GPU evaluator) ─────────────────────
-# Many games run as threads in one process; instead of each calling the net with
-# a batch-1 forward, every MCTS leaf is submitted to a central evaluator that
-# coalesces the in-flight leaves across games into one batched forward (on the
-# GPU when available). While that forward runs the GIL is released, so the other
-# game threads make progress — keeping the device fed with large batches.
-
-
-class BatchedEvaluator:
-    def __init__(self, net, device, max_batch: int = 256, wait_ms: float = 1.0) -> None:
-        self.net = net
-        self.device = device
-        self.max_batch = max_batch
-        self.wait = wait_ms / 1000.0
-        self.q: queue.Queue = queue.Queue()
-        self._stop = False
-        self.nbatches = 0
-        self.nsamples = 0
-        self.thread = threading.Thread(target=self._loop, daemon=True)
-        self.thread.start()
-
-    def evaluate(self, board):
-        ev = threading.Event()
-        box: list = []
-        self.q.put((board.planes(), ev, box))
-        ev.wait()
-        return box[0]
-
-    def _loop(self) -> None:
-        while True:
-            try:
-                first = self.q.get(timeout=0.1)
-            except queue.Empty:
-                if self._stop:
-                    return
-                continue
-            batch = [first]
-            deadline = time.perf_counter() + self.wait
-            while len(batch) < self.max_batch:
-                remaining = deadline - time.perf_counter()
-                if remaining <= 0:
-                    break
-                try:
-                    batch.append(self.q.get(timeout=remaining))
-                except queue.Empty:
-                    break
-            planes = torch.from_numpy(np.stack([b[0] for b in batch])).to(self.device)
-            with torch.no_grad():
-                v, probs = self.net.policy_value(planes)
-            v = v.cpu().numpy()
-            probs = probs.cpu().numpy()
-            self.nbatches += 1
-            self.nsamples += len(batch)
-            for i, (_, ev, box) in enumerate(batch):
-                box.append((float(v[i]), probs[i]))
-                ev.set()
-
-    def close(self) -> None:
-        self._stop = True
-        self.thread.join()
-
-
-def _generate_games_concurrent(net, device, n_games, params, concurrent, max_batch, base_seed):
-    """Generate `n_games` via `concurrent` game threads sharing a BatchedEvaluator."""
-    ev = BatchedEvaluator(net, device, max_batch=max_batch)
+    # Drain results before joining (a Queue with unread data deadlocks join).
     results: list = []
-    rlock = threading.Lock()
-    counter = itertools.count()
-
-    def worker() -> None:
-        while True:
-            i = next(counter)
-            if i >= n_games:
-                return
-            rng = np.random.default_rng(base_seed + i)
-            out = self_play_game(
-                ev.evaluate, params["sims"], params["c_puct"], params["dir_alpha"],
-                params["dir_eps"], params["temp_moves"], rng, params["move_ms"],
-            )
-            with rlock:
-                results.append(out)
-
-    threads = [threading.Thread(target=worker) for _ in range(concurrent)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    ev.close()
+    for _ in range(n_workers):
+        results.extend(result_q.get())
+    for p in procs:
+        p.join()
+    return results, nsamp / max(1, nbatch)
     avg_batch = ev.nsamples / max(1, ev.nbatches)
     return results, avg_batch
 
@@ -399,9 +252,9 @@ def selfplay_train(
         sims_acc = 0.0
         avg_batch = 0.0
         if concurrent > 1:
-            # Central batched evaluator: `concurrent` game threads share one
-            # GPU-batched net (the chosen design). Largest throughput on the GPU.
-            results, avg_batch = _generate_games_concurrent(
+            # Worker PROCESSES (true-parallel tree work) fed by the central GPU
+            # inference server — avoids the GIL cap of the threaded approach.
+            results, avg_batch = _generate_games_mp(
                 net, device, games_per_gen, play_params, concurrent, max_batch,
                 seed * 1_000_000 + gen * 10_000,
             )

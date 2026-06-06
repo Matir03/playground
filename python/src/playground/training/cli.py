@@ -91,7 +91,7 @@ def main() -> None:
     sp.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"],
                     help="device for the net (auto = cuda if available)")
     sp.add_argument("--concurrent-games", type=int, default=1,
-                    help="concurrent game threads sharing one batched evaluator (GPU path); >1 enables batched eval")
+                    help="worker processes feeding the central GPU inference server (>1 enables batched eval, no GIL cap)")
     sp.add_argument("--max-batch", type=int, default=256,
                     help="max leaves coalesced into one batched forward")
     sp.add_argument("--seed", type=int, default=0)
