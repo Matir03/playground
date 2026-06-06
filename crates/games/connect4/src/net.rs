@@ -156,6 +156,10 @@ enum Arch {
 fn read_arch(checkpoint: &Path) -> Arch {
     let cfg = checkpoint.with_file_name("config.json");
     if let Ok(text) = std::fs::read_to_string(&cfg) {
+        // Python's json writes bare NaN/Infinity (e.g. an unset winrate), which
+        // is invalid JSON; serde rejects it. Sanitize so we can still read the
+        // arch rather than silently falling back to the wrong architecture.
+        let text = text.replace("NaN", "null").replace("Infinity", "null");
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
             let arch = &v["arch"];
             if arch["kind"] == "resnet" {
