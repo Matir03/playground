@@ -17,7 +17,7 @@ import numpy as np
 
 from playground.model_server.net import build_model, load_checkpoint
 from playground.training.connect4 import Board
-from playground.training.selfplay import run_mcts
+from playground.training.selfplay import _net_evaluate, run_mcts
 
 
 def load_net(checkpoint: str):
@@ -34,8 +34,10 @@ def load_net(checkpoint: str):
 
 
 def net_player(net, sims: int):
+    evaluate = _net_evaluate(net)
+
     def move(board: Board, rng) -> int:
-        counts = run_mcts(board, net, sims, 1.4, 0.0, 0.0, rng)
+        counts, _ = run_mcts(board, evaluate, sims, 1.4, 0.0, 0.0, rng)
         return int(counts.argmax())
 
     return move

@@ -87,7 +87,13 @@ def main() -> None:
                     help="time budget per move (ms); 0 = use --sims. Uncapped rollouts when set.")
     sp.add_argument("--init", default=None, help="warm-start from an existing checkpoint")
     sp.add_argument("--workers", type=int, default=1,
-                    help="parallel self-play worker processes (each pinned to 1 torch thread)")
+                    help="CPU fallback: parallel self-play worker processes (each pinned to 1 torch thread)")
+    sp.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"],
+                    help="device for the net (auto = cuda if available)")
+    sp.add_argument("--concurrent-games", type=int, default=1,
+                    help="concurrent game threads sharing one batched evaluator (GPU path); >1 enables batched eval")
+    sp.add_argument("--max-batch", type=int, default=256,
+                    help="max leaves coalesced into one batched forward")
     sp.add_argument("--seed", type=int, default=0)
 
     tr = sub.add_parser("train", help="behavioral-clone the perfect bot")
@@ -113,6 +119,7 @@ def main() -> None:
             args.sims, args.epochs, args.batch_size, args.lr, args.buffer_gens,
             args.c_puct, args.dir_alpha, args.dir_eps, args.temp_moves, args.eval_games, args.seed,
             move_ms=args.move_ms, init=args.init, workers=args.workers,
+            device=args.device, concurrent=args.concurrent_games, max_batch=args.max_batch,
         )
     elif args.cmd == "train":
         from .train import train
