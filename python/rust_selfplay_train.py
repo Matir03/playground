@@ -17,6 +17,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import subprocess
 import time
 from collections import deque
@@ -103,6 +104,7 @@ def main() -> None:
     examples_bin = os.path.join(work_dir, "examples.bin")
 
     window: deque = deque(maxlen=args.buffer_gens)
+    history: list = []
     ckpt = os.path.join(args.out, "checkpoint.safetensors")
 
     for gen in range(args.generations):
@@ -115,7 +117,8 @@ def main() -> None:
         save_checkpoint(net, work_ckpt)
         net.to(device)
 
-        # 2) generate one generation of self-play in Rust.
+        # 2) generate one generation of self-play in Rust (capture stderr to
+        #    pull out nodes/move, which the Rust generator reports).
         cmd = [
             args.rust_bin, "selfplay-gen",
             "--model", work_ckpt, "--out", examples_bin,
@@ -125,10 +128,15 @@ def main() -> None:
             "--c-puct", str(args.c_puct), "--temp-moves", str(args.temp_moves),
             "--seed", str(args.seed * 1_000_000 + gen_num),
         ]
-        subprocess.run(cmd, check=True)
+        proc = subprocess.run(cmd, check=True, stderr=subprocess.PIPE, text=True)
+        print(proc.stderr.rstrip(), flush=True)
+        m = re.search(r"([\d.]+) nodes/move", proc.stderr)
+        nodes_per_move = float(m.group(1)) if m else float("nan")
         planes_np, policy_np, value_np = read_examples(examples_bin)
 
-        # 3) train on a replay window of the last buffer-gens generations.
+        # 3) train on a replay window of the last buffer-gens generations. The
+        #    deque(maxlen) drops games older than that automatically — stale,
+        #    off-policy games stop being trained on once they age out.
         window.append((planes_np, policy_np, value_np))
         planes = torch.from_numpy(np.concatenate([w[0] for w in window])).to(device)
         target_pi = torch.from_numpy(np.concatenate([w[1] for w in window])).to(device)
@@ -137,8 +145,11 @@ def main() -> None:
         net.train()
         rng = np.random.default_rng(args.seed + gen_num)
         idx = np.arange(planes.shape[0])
-        for _ in range(args.epochs):
+        # Track the final epoch's mean losses as the converged-fit signal.
+        ep_v = ep_p = ep_n = 0.0
+        for epoch in range(args.epochs):
             rng.shuffle(idx)
+            ep_v = ep_p = ep_n = 0.0
             for i in range(0, len(idx), args.batch_size):
                 b = torch.from_numpy(idx[i : i + args.batch_size]).to(device)
                 v_pred, logits = net(planes[b])
@@ -148,6 +159,10 @@ def main() -> None:
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
+                ep_v += float(loss_v) * b.shape[0]
+                ep_p += float(loss_p) * b.shape[0]
+                ep_n += b.shape[0]
+        value_loss, policy_loss = ep_v / ep_n, ep_p / ep_n
 
         # 4) checkpoint this generation (+ mirror to the top level for serving).
         net.eval()
@@ -162,8 +177,24 @@ def main() -> None:
             with open(path, "w") as f:
                 json.dump(cfg, f, indent=2)
 
+        buf_examples = int(planes.shape[0])
+        history.append({
+            "gen": gen_num,
+            "examples_this_gen": int(planes_np.shape[0]),
+            "buffer_gens": len(window),
+            "buffer_examples": buf_examples,
+            "nodes_per_move": nodes_per_move,
+            "value_loss": value_loss,
+            "policy_loss": policy_loss,
+            "total_loss": value_loss + policy_loss,
+        })
+        with open(os.path.join(args.out, "train_history.json"), "w") as f:
+            json.dump(history, f, indent=2)
+
         print(f"gen {gen_num} (+{gen + 1}/{args.generations})  "
-              f"examples {planes.shape[0]} (this gen {planes_np.shape[0]})  "
+              f"this_gen {planes_np.shape[0]}  buffer {len(window)}gens/{buf_examples}ex  "
+              f"nodes/move {nodes_per_move:.0f}  "
+              f"loss v {value_loss:.4f} p {policy_loss:.4f} tot {value_loss + policy_loss:.4f}  "
               f"({time.time() - t0:.0f}s)", flush=True)
 
     print(f"saved {ckpt}")

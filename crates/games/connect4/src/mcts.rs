@@ -139,13 +139,16 @@ fn select(node: &Node, c_puct: f32) -> usize {
     best
 }
 
-/// Run PUCT MCTS from `root_state`. Returns `(visit_counts, root_value)`.
+/// Run PUCT MCTS from `root_state`. Returns `(visit_counts, root_value, nodes)`,
+/// where `nodes` is the number of distinct positions in the search tree — the
+/// honest measure of search effort (unlike the raw simulation count, which
+/// saturated Connect 4 subtrees inflate as sims revisit existing nodes).
 pub fn run_mcts(
     eval: &impl Evaluator,
     root_state: &Connect4State,
     p: &Params,
     rng: &mut impl Rng,
-) -> anyhow::Result<([u32; C4_COLS], f32)> {
+) -> anyhow::Result<([u32; C4_COLS], f32, u32)> {
     let mut arena: Vec<Node> = Vec::with_capacity(p.sims as usize + 1);
     arena.push(Node::new(root_state.clone()));
     expand(&mut arena, 0, eval)?;
@@ -209,6 +212,7 @@ pub fn run_mcts(
         }
     }
 
+    let nodes = arena.len() as u32;
     let root = &arena[0];
     let total_n: u32 = root.n.iter().sum();
     let root_value = if total_n > 0 {
@@ -216,7 +220,7 @@ pub fn run_mcts(
     } else {
         0.0
     };
-    Ok((root.n, root_value))
+    Ok((root.n, root_value, nodes))
 }
 
 /// One self-play training example: planes (2×6×7), MCTS policy target, and the
@@ -230,19 +234,21 @@ pub struct Example {
     pub value: f32,
 }
 
-/// Play one self-play game. Returns `(examples, total_sims)`.
+/// Play one self-play game. Returns `(examples, total_sims, total_nodes)`.
 pub fn self_play_game(
     eval: &impl Evaluator,
     p: &Params,
     rng: &mut impl Rng,
-) -> anyhow::Result<(Vec<Example>, u64)> {
+) -> anyhow::Result<(Vec<Example>, u64, u64)> {
     let mut state = Connect4::initial_state();
     let mut examples = Vec::new();
     let mut total_sims: u64 = 0;
+    let mut total_nodes: u64 = 0;
     while terminal_value(&state).is_none() {
-        let (counts, root_v) = run_mcts(eval, &state, p, rng)?;
+        let (counts, root_v, nodes) = run_mcts(eval, &state, p, rng)?;
         let sum: u32 = counts.iter().sum();
         total_sims += sum as u64;
+        total_nodes += nodes as u64;
         let mut policy = [0f32; C4_COLS];
         for c in 0..C4_COLS {
             policy[c] = counts[c] as f32 / sum as f32;
@@ -256,7 +262,7 @@ pub fn self_play_game(
         };
         state = Connect4::apply(&state, &Connect4Move { col: col as u8 });
     }
-    Ok((examples, total_sims))
+    Ok((examples, total_sims, total_nodes))
 }
 
 /// 2×6×7 side-to-move planes (own stones, then opponent's), matching

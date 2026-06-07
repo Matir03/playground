@@ -109,7 +109,8 @@ fn server_loop(rx: Receiver<Req>, model: &LocalModel, max_batch: usize, counters
 
 struct Counters {
     next: AtomicUsize,    // next game index to claim
-    sims: AtomicU64,      // total simulations run
+    sims: AtomicU64,      // total simulations run (root-to-leaf traversals)
+    nodes: AtomicU64,     // total tree nodes built (distinct positions searched)
     examples: AtomicU64,  // total training examples produced
     batches: AtomicU64,   // batched forwards executed (batched mode)
     batch_samples: AtomicU64, // leaves summed over those forwards
@@ -132,9 +133,10 @@ fn worker_loop(
             break;
         }
         let mut rng = ChaCha8Rng::seed_from_u64(base_seed.wrapping_add(idx as u64));
-        let (examples, sims) =
+        let (examples, sims, nodes) =
             self_play_game(eval, params, &mut rng).expect("self-play game failed");
         counters.sims.fetch_add(sims, Ordering::Relaxed);
+        counters.nodes.fetch_add(nodes, Ordering::Relaxed);
         counters.examples.fetch_add(examples.len() as u64, Ordering::Relaxed);
         if let Some(sink) = sink {
             sink.lock().unwrap().extend(examples);
@@ -145,6 +147,7 @@ fn worker_loop(
 /// Aggregate stats from a generation run.
 pub struct GenStats {
     pub sims: u64,
+    pub nodes: u64,
     pub examples: u64,
     pub elapsed: f64,
     pub avg_batch: f64,
@@ -167,6 +170,7 @@ pub fn generate(
     let counters = Counters {
         next: AtomicUsize::new(0),
         sims: AtomicU64::new(0),
+        nodes: AtomicU64::new(0),
         examples: AtomicU64::new(0),
         batches: AtomicU64::new(0),
         batch_samples: AtomicU64::new(0),
@@ -209,6 +213,7 @@ pub fn generate(
     };
     let stats = GenStats {
         sims: counters.sims.load(Ordering::Relaxed),
+        nodes: counters.nodes.load(Ordering::Relaxed),
         examples: counters.examples.load(Ordering::Relaxed),
         elapsed,
         avg_batch,
@@ -295,10 +300,12 @@ pub fn run_generate(
     f.write_all(&buf)?;
     f.flush()?;
 
-    let avg_sims = s.sims as f64 / s.examples.max(1) as f64;
+    let moves = s.examples.max(1) as f64;
     eprintln!(
-        "  wrote {} examples ({} games, {:.0} avg_sims/move, avg_batch {:.0}) in {:.1}s",
-        examples.len(), n_games, avg_sims, s.avg_batch, s.elapsed,
+        "  wrote {} examples ({} games, {:.0} nodes/move, {:.0} sims/move, \
+         avg_batch {:.0}) in {:.1}s",
+        examples.len(), n_games, s.nodes as f64 / moves, s.sims as f64 / moves,
+        s.avg_batch, s.elapsed,
     );
     Ok(())
 }
