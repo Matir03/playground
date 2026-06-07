@@ -23,7 +23,16 @@ tracing-subscriber.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 serde_json.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+# Gamma sampling for the MCTS root Dirichlet noise (self-play).
+rand_distr = "0.4"
 
 # In-process NN inference (embedded engine, no gRPC round-trips).
 candle-core = "0.10"
 candle-nn = "0.10"
+
+[features]
+# Build candle with CUDA kernels so the self-play benchmark can run inference on
+# the GPU (a central batched inference server). Needs nvcc on PATH at build time.
+cuda = ["candle-core/cuda", "candle-nn/cuda"]

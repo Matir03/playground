@@ -139,6 +139,33 @@ impl Net {
         v.flatten_all()?.to_vec1::<f32>().map(|v| v[0])
     }
 
+    /// GS (1,64) -> (value, full column priors over 7). The self-play forward:
+    /// matches Python's `policy_value` (softmax over all columns, renormalised
+    /// over legal moves by the caller). Skips the `pol_next` matmul, which only
+    /// the reification policy head needs.
+    fn value_policy(&self, gs: &Tensor) -> candle_core::Result<(f32, Vec<f32>)> {
+        let x = self.val_fc1.forward(gs)?.relu()?;
+        let v = self.val_fc2.forward(&x)?.tanh()?.flatten_all()?.to_vec1::<f32>()?[0];
+        let pri = candle_nn::ops::softmax(&self.pol_prior.forward(gs)?, 1)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        Ok((v, pri))
+    }
+
+    /// Batched self-play forward: planes (B,2,6,7) -> (values[B], probs[B*7]),
+    /// the latter row-major softmax over the 7 columns. This is what the GPU
+    /// inference server calls — coalescing many search threads' leaves into one
+    /// forward is the whole point of the batched path.
+    fn value_policy_batch(&self, planes: &Tensor) -> candle_core::Result<(Vec<f32>, Vec<f32>)> {
+        let gs = self.encode(planes)?; // (B,64)
+        let x = self.val_fc1.forward(&gs)?.relu()?;
+        let v = self.val_fc2.forward(&x)?.tanh()?; // (B,1)
+        let vals = v.flatten_all()?.to_vec1::<f32>()?;
+        let pri = candle_nn::ops::softmax(&self.pol_prior.forward(&gs)?, 1)?; // (B,7)
+        let probs = pri.flatten_all()?.to_vec1::<f32>()?;
+        Ok((vals, probs))
+    }
+
     /// GS (1,64) -> (column priors over 7, predicted next-GS per column (7,64)).
     fn policy_heads(&self, gs: &Tensor) -> candle_core::Result<(Vec<f32>, Tensor)> {
         let priors = candle_nn::ops::softmax(&self.pol_prior.forward(gs)?, 1)?;
@@ -180,12 +207,32 @@ pub struct LocalModel {
     model_version: String,
 }
 
+/// A compute device for the in-process net. `cuda` is only available when the
+/// crate is built with the `cuda` feature (it pulls candle's CUDA kernels).
+pub fn pick_device(cuda: bool) -> anyhow::Result<Device> {
+    if cuda {
+        #[cfg(feature = "cuda")]
+        {
+            return Ok(Device::new_cuda(0)?);
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            anyhow::bail!("cuda requested but this binary was built without the `cuda` feature");
+        }
+    }
+    Ok(Device::Cpu)
+}
+
 impl LocalModel {
-    /// Load a `.safetensors` checkpoint (architecture from its `config.json`).
+    /// Load a `.safetensors` checkpoint on CPU (architecture from config.json).
     pub fn load(checkpoint: &str) -> anyhow::Result<Self> {
+        Self::load_on(checkpoint, Device::Cpu)
+    }
+
+    /// Load a checkpoint onto a chosen device (see `pick_device`).
+    pub fn load_on(checkpoint: &str, device: Device) -> anyhow::Result<Self> {
         let path = Path::new(checkpoint);
         let arch = read_arch(path);
-        let device = Device::Cpu;
         // SAFETY: the mmap lives for the VarBuilder's load; tensors are copied.
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[checkpoint], DType::F32, &device)?
@@ -193,6 +240,46 @@ impl LocalModel {
         let net = Net::load(&arch, vb)?;
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("local");
         Ok(Self { net, device, model_version: format!("connect4-{stem}") })
+    }
+
+    /// Fill `out` (length `b*2*CELLS`) with the side-to-move planes of `states`.
+    fn fill_planes(states: &[&Connect4State], out: &mut [f32]) {
+        for (i, state) in states.iter().enumerate() {
+            let mover = if state.ply % 2 == 0 { 1u8 } else { 2u8 };
+            let base = i * 2 * CELLS;
+            for r in 0..C4_ROWS {
+                for c in 0..C4_COLS {
+                    let cell = state.cells[r][c];
+                    let idx = r * C4_COLS + c;
+                    if cell == mover {
+                        out[base + idx] = 1.0;
+                    } else if cell != 0 {
+                        out[base + CELLS + idx] = 1.0;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Batched self-play forward over concrete states -> per-state
+    /// `(value, softmax priors over 7 columns)`. The GPU inference server's hot
+    /// path: one host→device copy, one forward, one device→host copy per batch.
+    pub fn policy_value_batch(
+        &self,
+        states: &[&Connect4State],
+    ) -> anyhow::Result<Vec<(f32, [f32; C4_COLS])>> {
+        let b = states.len();
+        let mut data = vec![0f32; b * 2 * CELLS];
+        Self::fill_planes(states, &mut data);
+        let planes = Tensor::from_vec(data, (b, 2, C4_ROWS, C4_COLS), &self.device)?;
+        let (vals, probs) = self.net.value_policy_batch(&planes)?;
+        let mut out = Vec::with_capacity(b);
+        for i in 0..b {
+            let mut arr = [0f32; C4_COLS];
+            arr.copy_from_slice(&probs[i * C4_COLS..(i + 1) * C4_COLS]);
+            out.push((vals[i], arr));
+        }
+        Ok(out)
     }
 
     fn planes(&self, state: &Connect4State) -> candle_core::Result<Tensor> {
@@ -219,6 +306,20 @@ impl LocalModel {
 
     fn gs_state(&self, payload: Vec<f32>) -> LatentGameState {
         LatentGameState::new(f32_to_bytes(&payload), vec![GS_DIM as i32], self.model_version.clone())
+    }
+
+    /// AlphaZero-style self-play forward: a concrete state -> (value for the
+    /// side to move, full softmax priors over the 7 columns). Synchronous and
+    /// `&self`-only so the self-play MCTS can call it from many native threads
+    /// (`LocalModel` is `Send + Sync`); candle tensors are `Arc`-backed and
+    /// inference allocates fresh outputs, so concurrent forwards are safe.
+    pub fn policy_value(&self, state: &Connect4State) -> anyhow::Result<(f32, [f32; C4_COLS])> {
+        let planes = self.planes(state)?;
+        let gs = self.net.encode(&planes)?;
+        let (v, pri) = self.net.value_policy(&gs)?;
+        let mut arr = [0f32; C4_COLS];
+        arr.copy_from_slice(&pri[..C4_COLS]);
+        Ok((v, arr))
     }
 }
 

@@ -4,7 +4,9 @@
 
 mod book;
 mod game;
+mod mcts;
 mod net;
+mod selfplay;
 mod solver;
 
 use std::collections::HashMap;
@@ -127,6 +129,46 @@ enum Cmd {
     },
     /// Newline-delimited stdio protocol for debugging / tools.
     Stdio,
+    /// Self-play generation throughput benchmark (the Rust port of the Python
+    /// multiprocessing self-play). Generates games on native threads sharing the
+    /// in-process net and reports sims/sec — for comparing against Python.
+    SelfplayBench {
+        /// Checkpoint to play with (architecture from its sibling config.json).
+        #[arg(long)]
+        model: String,
+        /// Run inference on the GPU (requires a `cuda`-feature build).
+        #[arg(long)]
+        cuda: bool,
+        /// Coalesce leaf evals from all threads into batched forwards via a
+        /// central inference server. Required for a sane GPU run; on CPU the
+        /// default batch-1-per-thread path is usually faster.
+        #[arg(long)]
+        batched: bool,
+        /// Max leaves coalesced into one batched forward (with --batched).
+        #[arg(long, default_value_t = 256)]
+        max_batch: usize,
+        #[arg(long, default_value_t = 64)]
+        games: usize,
+        /// Worker threads (true-parallel tree work; defaults to all cores). With
+        /// --batched, oversubscribing cores helps fill batches (threads waiting
+        /// on the server don't burn a core).
+        #[arg(long)]
+        threads: Option<usize>,
+        /// Fixed simulations per move (the throughput unit; avoids the
+        /// time-budget confound a comparison would otherwise have).
+        #[arg(long, default_value_t = 200)]
+        sims: u32,
+        #[arg(long, default_value_t = 1.5)]
+        c_puct: f32,
+        #[arg(long, default_value_t = 1.0)]
+        dir_alpha: f32,
+        #[arg(long, default_value_t = 0.25)]
+        dir_eps: f32,
+        #[arg(long, default_value_t = 10)]
+        temp_moves: u32,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
 }
 
 #[tokio::main]
@@ -183,6 +225,22 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Stdio => {
             anyhow::bail!("stdio subcommand: implement when a second tool needs it");
+        }
+        Cmd::SelfplayBench {
+            model, cuda, batched, max_batch, games, threads,
+            sims, c_puct, dir_alpha, dir_eps, temp_moves, seed,
+        } => {
+            let threads = threads.unwrap_or_else(|| {
+                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+            });
+            let params = mcts::Params { sims, c_puct, dir_alpha, dir_eps, temp_moves };
+            // Run off the async runtime: this is CPU-bound, synchronous work.
+            tokio::task::spawn_blocking(move || {
+                selfplay::run_benchmark(
+                    &model, cuda, games, threads, params, batched, max_batch, seed,
+                )
+            })
+            .await??;
         }
     }
     Ok(())
