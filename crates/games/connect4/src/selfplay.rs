@@ -16,16 +16,17 @@
 //! Either way it's a throughput benchmark: generate games at a fixed simulation
 //! count and report sims/sec.
 
+use std::io::Write;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
 use crate::game::{Connect4State, C4_COLS};
-use crate::mcts::{self_play_game, Evaluator, Params};
+use crate::mcts::{self_play_game, Evaluator, Example, Params};
 use crate::net::LocalModel;
 
 type EvalOut = (f32, [f32; C4_COLS]);
@@ -114,13 +115,16 @@ struct Counters {
     batch_samples: AtomicU64, // leaves summed over those forwards
 }
 
-/// Play games claimed from the shared counter until they run out.
+/// Play games claimed from the shared counter until they run out. When `sink` is
+/// given, each finished game's training examples are appended to it (one lock
+/// per game — negligible against a game's cost); otherwise they're just counted.
 fn worker_loop(
     eval: &impl Evaluator,
     counters: &Counters,
     n_games: usize,
     base_seed: u64,
     params: &Params,
+    sink: Option<&Mutex<Vec<Example>>>,
 ) {
     loop {
         let idx = counters.next.fetch_add(1, Ordering::Relaxed);
@@ -132,13 +136,24 @@ fn worker_loop(
             self_play_game(eval, params, &mut rng).expect("self-play game failed");
         counters.sims.fetch_add(sims, Ordering::Relaxed);
         counters.examples.fetch_add(examples.len() as u64, Ordering::Relaxed);
+        if let Some(sink) = sink {
+            sink.lock().unwrap().extend(examples);
+        }
     }
+}
+
+/// Aggregate stats from a generation run.
+pub struct GenStats {
+    pub sims: u64,
+    pub examples: u64,
+    pub elapsed: f64,
+    pub avg_batch: f64,
 }
 
 /// Generate `n_games` across `threads` native threads. With `batched`, a central
 /// inference server coalesces leaf evals (the GPU path); otherwise each thread
-/// runs its own batch-1 forward. Returns `(total_sims, total_examples, secs,
-/// avg_batch)`.
+/// runs its own batch-1 forward. When `collect`, the produced training examples
+/// are returned (else an empty Vec — the benchmark path).
 pub fn generate(
     model: Arc<LocalModel>,
     n_games: usize,
@@ -147,7 +162,8 @@ pub fn generate(
     base_seed: u64,
     batched: bool,
     max_batch: usize,
-) -> (u64, u64, f64, f64) {
+    collect: bool,
+) -> (GenStats, Vec<Example>) {
     let counters = Counters {
         next: AtomicUsize::new(0),
         sims: AtomicU64::new(0),
@@ -155,6 +171,7 @@ pub fn generate(
         batches: AtomicU64::new(0),
         batch_samples: AtomicU64::new(0),
     };
+    let sink: Option<Mutex<Vec<Example>>> = collect.then(|| Mutex::new(Vec::new()));
 
     let t0 = Instant::now();
     if batched {
@@ -167,7 +184,8 @@ pub fn generate(
                 let eval = BatchedEval { req_tx: req_tx.clone() };
                 let counters = &counters;
                 let params = &params;
-                scope.spawn(move || worker_loop(&eval, counters, n_games, base_seed, params));
+                let sink = sink.as_ref();
+                scope.spawn(move || worker_loop(&eval, counters, n_games, base_seed, params, sink));
             }
             drop(req_tx); // drop the spare so the server can detect shutdown
         });
@@ -177,7 +195,8 @@ pub fn generate(
                 let eval = DirectEval { model: Arc::clone(&model) };
                 let counters = &counters;
                 let params = &params;
-                scope.spawn(move || worker_loop(&eval, counters, n_games, base_seed, params));
+                let sink = sink.as_ref();
+                scope.spawn(move || worker_loop(&eval, counters, n_games, base_seed, params, sink));
             }
         });
     }
@@ -188,12 +207,14 @@ pub fn generate(
     } else {
         0.0
     };
-    (
-        counters.sims.load(Ordering::Relaxed),
-        counters.examples.load(Ordering::Relaxed),
+    let stats = GenStats {
+        sims: counters.sims.load(Ordering::Relaxed),
+        examples: counters.examples.load(Ordering::Relaxed),
         elapsed,
         avg_batch,
-    )
+    };
+    let examples = sink.map(|m| m.into_inner().unwrap()).unwrap_or_default();
+    (stats, examples)
 }
 
 /// Run a self-play throughput benchmark and print the results.
@@ -217,14 +238,67 @@ pub fn run_benchmark(
         params.sims,
         if cuda { "cuda" } else { "cpu" },
     );
-    let (sims, examples, elapsed, avg_batch) =
-        generate(model, n_games, threads, params, base_seed, batched, max_batch);
-    let sims_per_s = sims as f64 / elapsed;
-    let games_per_s = n_games as f64 / elapsed;
-    let batch_note = if batched { format!("  avg_batch {avg_batch:.0}") } else { String::new() };
+    let (s, _) = generate(model, n_games, threads, params, base_seed, batched, max_batch, false);
+    let sims_per_s = s.sims as f64 / s.elapsed;
+    let games_per_s = n_games as f64 / s.elapsed;
+    let batch_note = if batched { format!("  avg_batch {:.0}", s.avg_batch) } else { String::new() };
     println!(
-        "games {n_games}  examples {examples}  total_sims {sims}  \
-         time {elapsed:.2}s  sims/s {sims_per_s:.0}  games/s {games_per_s:.2}{batch_note}"
+        "games {n_games}  examples {}  total_sims {}  \
+         time {:.2}s  sims/s {sims_per_s:.0}  games/s {games_per_s:.2}{batch_note}",
+        s.examples, s.sims, s.elapsed,
+    );
+    Ok(())
+}
+
+/// Self-play training-data record on disk: a little-endian `u64` example count,
+/// followed by that many records of 84 plane f32 + 7 policy f32 + 1 value f32
+/// (`RECORD_F32` floats each). `python/rust_selfplay_train.py` reads this back.
+const RECORD_F32: usize = 2 * 6 * 7 + C4_COLS + 1;
+
+/// Generate one generation of self-play and write the training examples to
+/// `out_path`. This is the data source for the Rust-self-play training loop.
+#[allow(clippy::too_many_arguments)]
+pub fn run_generate(
+    checkpoint: &str,
+    cuda: bool,
+    out_path: &str,
+    n_games: usize,
+    threads: usize,
+    params: Params,
+    batched: bool,
+    max_batch: usize,
+    base_seed: u64,
+) -> anyhow::Result<()> {
+    let device = crate::net::pick_device(cuda)?;
+    let model = Arc::new(LocalModel::load_on(checkpoint, device)?);
+    let budget = if params.move_ms > 0.0 {
+        format!("{}ms/move", params.move_ms)
+    } else {
+        format!("{} sims/move", params.sims)
+    };
+    eprintln!(
+        "rust self-play gen: {n_games} games, {threads} threads, {budget}, \
+         device {}, model {checkpoint} -> {out_path}",
+        if cuda { "cuda" } else { "cpu" },
+    );
+    let (s, examples) =
+        generate(model, n_games, threads, params, base_seed, batched, max_batch, true);
+
+    let mut buf = Vec::with_capacity(8 + examples.len() * RECORD_F32 * 4);
+    buf.extend_from_slice(&(examples.len() as u64).to_le_bytes());
+    for ex in &examples {
+        for &x in ex.planes.iter().chain(ex.policy.iter()).chain(std::iter::once(&ex.value)) {
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    let mut f = std::io::BufWriter::new(std::fs::File::create(out_path)?);
+    f.write_all(&buf)?;
+    f.flush()?;
+
+    let avg_sims = s.sims as f64 / s.examples.max(1) as f64;
+    eprintln!(
+        "  wrote {} examples ({} games, {:.0} avg_sims/move, avg_batch {:.0}) in {:.1}s",
+        examples.len(), n_games, avg_sims, s.avg_batch, s.elapsed,
     );
     Ok(())
 }

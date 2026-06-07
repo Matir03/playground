@@ -11,6 +11,8 @@
 //! Nodes live in a per-game arena (`Vec<Node>`, child indices) rather than boxed
 //! pointers: the 6×7 board makes nodes tiny and the arena keeps them contiguous.
 
+use std::time::{Duration, Instant};
+
 use rand::Rng;
 use rand_distr::{Distribution, Gamma};
 
@@ -41,7 +43,11 @@ where
 /// Parameters mirroring the Python self-play knobs.
 #[derive(Clone, Copy)]
 pub struct Params {
+    /// Fixed simulations per move, used when `move_ms == 0`.
     pub sims: u32,
+    /// Per-move time budget in ms; when > 0 it overrides `sims` and the search
+    /// runs uncapped rollouts until the budget is spent (mirrors Python).
+    pub move_ms: f64,
     pub c_puct: f32,
     pub dir_alpha: f32,
     pub dir_eps: f32,
@@ -160,8 +166,19 @@ pub fn run_mcts(
         }
     }
 
+    let use_time = p.move_ms > 0.0;
+    let deadline = Instant::now() + Duration::from_secs_f64(p.move_ms / 1000.0);
     let mut path: Vec<(usize, usize)> = Vec::with_capacity(64);
-    for _ in 0..p.sims {
+    let mut sim = 0u32;
+    loop {
+        if use_time {
+            if Instant::now() >= deadline {
+                break;
+            }
+        } else if sim >= p.sims {
+            break;
+        }
+        sim += 1;
         path.clear();
         let mut node = 0usize;
         // Descend to a leaf (unexpanded or terminal).

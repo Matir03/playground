@@ -169,6 +169,47 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
+    /// Generate one generation of self-play games and write the training
+    /// examples to `--out` (consumed by python/rust_selfplay_train.py). Same
+    /// engine as `selfplay-bench` but collects + dumps examples, and supports a
+    /// per-move time budget via `--move-ms`.
+    SelfplayGen {
+        #[arg(long)]
+        model: String,
+        /// Output file for the training examples (binary; see selfplay.rs).
+        #[arg(long)]
+        out: String,
+        #[arg(long)]
+        cuda: bool,
+        #[arg(long)]
+        batched: bool,
+        #[arg(long, default_value_t = 256)]
+        max_batch: usize,
+        #[arg(long, default_value_t = 64)]
+        games: usize,
+        #[arg(long)]
+        threads: Option<usize>,
+        /// Per-move time budget in ms (overrides --sims when > 0).
+        #[arg(long, default_value_t = 0.0)]
+        move_ms: f64,
+        #[arg(long, default_value_t = 200)]
+        sims: u32,
+        #[arg(long, default_value_t = 1.5)]
+        c_puct: f32,
+        #[arg(long, default_value_t = 1.0)]
+        dir_alpha: f32,
+        #[arg(long, default_value_t = 0.25)]
+        dir_eps: f32,
+        #[arg(long, default_value_t = 10)]
+        temp_moves: u32,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+}
+
+/// Default worker-thread count: all available cores.
+fn default_threads() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
 #[tokio::main]
@@ -230,14 +271,29 @@ async fn main() -> anyhow::Result<()> {
             model, cuda, batched, max_batch, games, threads,
             sims, c_puct, dir_alpha, dir_eps, temp_moves, seed,
         } => {
-            let threads = threads.unwrap_or_else(|| {
-                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
-            });
-            let params = mcts::Params { sims, c_puct, dir_alpha, dir_eps, temp_moves };
+            let threads = threads.unwrap_or_else(default_threads);
+            let params = mcts::Params {
+                sims, move_ms: 0.0, c_puct, dir_alpha, dir_eps, temp_moves,
+            };
             // Run off the async runtime: this is CPU-bound, synchronous work.
             tokio::task::spawn_blocking(move || {
                 selfplay::run_benchmark(
                     &model, cuda, games, threads, params, batched, max_batch, seed,
+                )
+            })
+            .await??;
+        }
+        Cmd::SelfplayGen {
+            model, out, cuda, batched, max_batch, games, threads, move_ms,
+            sims, c_puct, dir_alpha, dir_eps, temp_moves, seed,
+        } => {
+            let threads = threads.unwrap_or_else(default_threads);
+            let params = mcts::Params {
+                sims, move_ms, c_puct, dir_alpha, dir_eps, temp_moves,
+            };
+            tokio::task::spawn_blocking(move || {
+                selfplay::run_generate(
+                    &model, cuda, &out, games, threads, params, batched, max_batch, seed,
                 )
             })
             .await??;
