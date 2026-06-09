@@ -41,13 +41,21 @@ where
 }
 
 /// Parameters mirroring the Python self-play knobs.
+///
+/// Search budget precedence: `node_budget` > `move_ms` > `sims`. A node budget
+/// (distinct tree nodes built) gives a consistent search *depth* regardless of
+/// tree saturation, unlike a sim count or time budget — saturated Connect 4
+/// subtrees burn those on redundant re-traversals.
 #[derive(Clone, Copy)]
 pub struct Params {
-    /// Fixed simulations per move, used when `move_ms == 0`.
+    /// Fixed simulations per move, used when `move_ms == 0` and `node_budget == 0`.
     pub sims: u32,
-    /// Per-move time budget in ms; when > 0 it overrides `sims` and the search
+    /// Per-move time budget in ms; when > 0 (and `node_budget == 0`) the search
     /// runs uncapped rollouts until the budget is spent (mirrors Python).
     pub move_ms: f64,
+    /// Per-move node budget; when > 0 it overrides the others and the search runs
+    /// until the tree holds this many distinct nodes (or saturates).
+    pub node_budget: u32,
     pub c_puct: f32,
     pub dir_alpha: f32,
     pub dir_eps: f32,
@@ -149,7 +157,8 @@ pub fn run_mcts(
     p: &Params,
     rng: &mut impl Rng,
 ) -> anyhow::Result<([u32; C4_COLS], f32, u32)> {
-    let mut arena: Vec<Node> = Vec::with_capacity(p.sims as usize + 1);
+    let cap = p.node_budget.max(p.sims) as usize + 1;
+    let mut arena: Vec<Node> = Vec::with_capacity(cap);
     arena.push(Node::new(root_state.clone()));
     expand(&mut arena, 0, eval)?;
 
@@ -169,12 +178,22 @@ pub fn run_mcts(
         }
     }
 
-    let use_time = p.move_ms > 0.0;
+    // Budget mode (precedence: node_budget > move_ms > sims).
+    let use_nodes = p.node_budget > 0;
+    let use_time = !use_nodes && p.move_ms > 0.0;
     let deadline = Instant::now() + Duration::from_secs_f64(p.move_ms / 1000.0);
+    // Stop a node-budget search early once the tree saturates (no new node in
+    // this many consecutive sims = every leaf reachable is terminal).
+    const SATURATION_PATIENCE: u32 = 512;
     let mut path: Vec<(usize, usize)> = Vec::with_capacity(64);
     let mut sim = 0u32;
+    let mut no_growth = 0u32;
     loop {
-        if use_time {
+        if use_nodes {
+            if arena.len() as u32 >= p.node_budget || no_growth >= SATURATION_PATIENCE {
+                break;
+            }
+        } else if use_time {
             if Instant::now() >= deadline {
                 break;
             }
@@ -182,6 +201,7 @@ pub fn run_mcts(
             break;
         }
         sim += 1;
+        let nodes_before = arena.len();
         path.clear();
         let mut node = 0usize;
         // Descend to a leaf (unexpanded or terminal).
@@ -209,6 +229,13 @@ pub fn run_mcts(
             v = -v;
             arena[n].n[c] += 1;
             arena[n].w[c] += v;
+        }
+        // A sim grows the tree iff it reached a non-terminal leaf; track runs of
+        // no-growth sims to detect saturation under a node budget.
+        if arena.len() == nodes_before {
+            no_growth += 1;
+        } else {
+            no_growth = 0;
         }
     }
 

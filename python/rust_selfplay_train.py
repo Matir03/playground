@@ -58,6 +58,8 @@ def main() -> None:
     ap.add_argument("--generations", type=int, default=8)
     ap.add_argument("--games-per-gen", type=int, default=96)
     ap.add_argument("--move-ms", type=float, default=1000.0)
+    ap.add_argument("--node-budget", type=int, default=0,
+                    help="per-move node budget; overrides --move-ms when > 0")
     ap.add_argument("--threads", type=int, default=96)
     ap.add_argument("--max-batch", type=int, default=128)
     ap.add_argument("--epochs", type=int, default=4)
@@ -91,7 +93,9 @@ def main() -> None:
         print(f"resumed from {resume} (after gen {start_gen})", flush=True)
     net.to(device)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr, weight_decay=1e-4)
-    print(f"device {device}  games/gen {args.games_per_gen}  move-ms {args.move_ms:.0f}  "
+    budget = (f"node-budget {args.node_budget}" if args.node_budget > 0
+              else f"move-ms {args.move_ms:.0f}")
+    print(f"device {device}  games/gen {args.games_per_gen}  {budget}  "
           f"threads {args.threads}", flush=True)
 
     # The worker checkpoint the Rust generator loads each gen; it reads the arch
@@ -124,10 +128,13 @@ def main() -> None:
             "--model", work_ckpt, "--out", examples_bin,
             "--cuda", "--batched", "--max-batch", str(args.max_batch),
             "--games", str(args.games_per_gen), "--threads", str(args.threads),
-            "--move-ms", str(args.move_ms),
             "--c-puct", str(args.c_puct), "--temp-moves", str(args.temp_moves),
             "--seed", str(args.seed * 1_000_000 + gen_num),
         ]
+        if args.node_budget > 0:
+            cmd += ["--node-budget", str(args.node_budget)]
+        else:
+            cmd += ["--move-ms", str(args.move_ms)]
         proc = subprocess.run(cmd, check=True, stderr=subprocess.PIPE, text=True)
         print(proc.stderr.rstrip(), flush=True)
         m = re.search(r"([\d.]+) nodes/move", proc.stderr)

@@ -276,7 +276,9 @@ pub fn run_generate(
 ) -> anyhow::Result<()> {
     let device = crate::net::pick_device(cuda)?;
     let model = Arc::new(LocalModel::load_on(checkpoint, device)?);
-    let budget = if params.move_ms > 0.0 {
+    let budget = if params.node_budget > 0 {
+        format!("{} nodes/move", params.node_budget)
+    } else if params.move_ms > 0.0 {
         format!("{}ms/move", params.move_ms)
     } else {
         format!("{} sims/move", params.sims)

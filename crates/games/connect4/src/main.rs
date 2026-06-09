@@ -189,6 +189,11 @@ enum Cmd {
         games: usize,
         #[arg(long)]
         threads: Option<usize>,
+        /// Per-move node budget: search until the tree holds this many distinct
+        /// nodes (overrides --move-ms and --sims when > 0). Consistent depth
+        /// regardless of saturation.
+        #[arg(long, default_value_t = 0)]
+        node_budget: u32,
         /// Per-move time budget in ms (overrides --sims when > 0).
         #[arg(long, default_value_t = 0.0)]
         move_ms: f64,
@@ -273,7 +278,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let threads = threads.unwrap_or_else(default_threads);
             let params = mcts::Params {
-                sims, move_ms: 0.0, c_puct, dir_alpha, dir_eps, temp_moves,
+                sims, move_ms: 0.0, node_budget: 0, c_puct, dir_alpha, dir_eps, temp_moves,
             };
             // Run off the async runtime: this is CPU-bound, synchronous work.
             tokio::task::spawn_blocking(move || {
@@ -284,12 +289,12 @@ async fn main() -> anyhow::Result<()> {
             .await??;
         }
         Cmd::SelfplayGen {
-            model, out, cuda, batched, max_batch, games, threads, move_ms,
+            model, out, cuda, batched, max_batch, games, threads, node_budget, move_ms,
             sims, c_puct, dir_alpha, dir_eps, temp_moves, seed,
         } => {
             let threads = threads.unwrap_or_else(default_threads);
             let params = mcts::Params {
-                sims, move_ms, c_puct, dir_alpha, dir_eps, temp_moves,
+                sims, move_ms, node_budget, c_puct, dir_alpha, dir_eps, temp_moves,
             };
             tokio::task::spawn_blocking(move || {
                 selfplay::run_generate(
