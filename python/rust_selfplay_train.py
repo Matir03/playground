@@ -27,6 +27,7 @@ import torch
 import torch.nn.functional as F
 
 from playground.model_server.net import (
+    GS_DIM,
     ConnectFourResNet,
     arch_of,
     load_checkpoint,
@@ -48,6 +49,31 @@ def read_examples(path: str):
     return planes, policy, value
 
 
+def child_planes_and_mask(planes: np.ndarray):
+    """For each state's side-to-move planes, the planes of each of the 7 children
+    plus a legality mask — derived purely in the own/opponent frame (no board).
+
+    planes[:,0]=own (side to move), planes[:,1]=opponent, row 0 = bottom. Playing
+    column c drops an own stone in the lowest empty row, then it's the opponent's
+    turn, so the child's side-to-move planes swap: own_child = opponent,
+    opp_child = own + the new stone. Returns (child[N,7,2,6,7], mask[N,7]).
+    """
+    n = planes.shape[0]
+    own, opp = planes[:, 0], planes[:, 1]          # [N,6,7]
+    occupied = own + opp
+    height = occupied.sum(axis=1)                   # [N,7] filled cells per column
+    child = np.zeros((n, 7, 2, 6, 7), dtype=np.float32)
+    mask = (height < 6).astype(np.float32)          # [N,7] legal = not full
+    rows = np.arange(n)
+    for c in range(7):
+        h = np.clip(height[:, c].astype(int), 0, 5)  # drop row (clamped for full)
+        own_next = own.copy()
+        own_next[rows, h, c] = 1.0                    # place the mover's stone
+        child[:, c, 0] = opp                          # perspective flip
+        child[:, c, 1] = own_next
+    return child, mask
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="data/models/connect4/selfplay-rust")
@@ -60,6 +86,10 @@ def main() -> None:
     ap.add_argument("--move-ms", type=float, default=1000.0)
     ap.add_argument("--node-budget", type=int, default=0,
                     help="per-move node budget; overrides --move-ms when > 0")
+    ap.add_argument("--reif-weight", type=float, default=0.0,
+                    help="weight of the reifier-consistency aux loss (0 = off). "
+                         "Trains pol_next(gs)[c] to match encode(child_c) "
+                         "(stop-grad target), MuZero-style latent dynamics.")
     ap.add_argument("--threads", type=int, default=96)
     ap.add_argument("--max-batch", type=int, default=128)
     ap.add_argument("--epochs", type=int, default=4)
@@ -145,31 +175,54 @@ def main() -> None:
         #    deque(maxlen) drops games older than that automatically — stale,
         #    off-policy games stop being trained on once they age out.
         window.append((planes_np, policy_np, value_np))
-        planes = torch.from_numpy(np.concatenate([w[0] for w in window])).to(device)
+        planes_all = np.concatenate([w[0] for w in window])
+        planes = torch.from_numpy(planes_all).to(device)
         target_pi = torch.from_numpy(np.concatenate([w[1] for w in window])).to(device)
         target_z = torch.from_numpy(np.concatenate([w[2] for w in window])).to(device)
+
+        reif_w = args.reif_weight
+        if reif_w > 0:
+            # Per-state child planes + legality mask for the reifier target.
+            child_np, mask_np = child_planes_and_mask(planes_all)
+            child_t = torch.from_numpy(child_np).to(device)   # [N,7,2,6,7]
+            mask_t = torch.from_numpy(mask_np).to(device)     # [N,7]
 
         net.train()
         rng = np.random.default_rng(args.seed + gen_num)
         idx = np.arange(planes.shape[0])
         # Track the final epoch's mean losses as the converged-fit signal.
-        ep_v = ep_p = ep_n = 0.0
+        ep_v = ep_p = ep_r = ep_n = 0.0
         for epoch in range(args.epochs):
             rng.shuffle(idx)
-            ep_v = ep_p = ep_n = 0.0
+            ep_v = ep_p = ep_r = ep_n = 0.0
             for i in range(0, len(idx), args.batch_size):
                 b = torch.from_numpy(idx[i : i + args.batch_size]).to(device)
-                v_pred, logits = net(planes[b])
+                gs = net.encode_batch(planes[b])
+                v_pred = net.value_batch(gs)
+                logits = net.pol_prior(gs)
                 loss_v = F.mse_loss(v_pred, target_z[b])
                 loss_p = -(target_pi[b] * F.log_softmax(logits, dim=1)).sum(1).mean()
                 loss = loss_v + loss_p
+                loss_r = torch.zeros((), device=device)
+                if reif_w > 0:
+                    # Predicted next-GS per column vs the encoder's own embedding
+                    # of the actual child (stop-grad target), masked to legal moves.
+                    pred_next = torch.tanh(net.pol_next(gs)).view(-1, 7, GS_DIM)
+                    with torch.no_grad():
+                        ch = child_t[b].view(-1, 2, 6, 7)
+                        tgt_next = net.encode_batch(ch).view(-1, 7, GS_DIM)
+                    msk = mask_t[b]
+                    per = ((pred_next - tgt_next) ** 2).mean(-1) * msk   # [B,7]
+                    loss_r = per.sum() / msk.sum().clamp(min=1.0)
+                    loss = loss + reif_w * loss_r
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
                 ep_v += float(loss_v) * b.shape[0]
                 ep_p += float(loss_p) * b.shape[0]
+                ep_r += float(loss_r) * b.shape[0]
                 ep_n += b.shape[0]
-        value_loss, policy_loss = ep_v / ep_n, ep_p / ep_n
+        value_loss, policy_loss, reif_loss = ep_v / ep_n, ep_p / ep_n, ep_r / ep_n
 
         # 4) checkpoint this generation (+ mirror to the top level for serving).
         net.eval()
@@ -193,15 +246,18 @@ def main() -> None:
             "nodes_per_move": nodes_per_move,
             "value_loss": value_loss,
             "policy_loss": policy_loss,
+            "reif_loss": reif_loss,
             "total_loss": value_loss + policy_loss,
         })
         with open(os.path.join(args.out, "train_history.json"), "w") as f:
             json.dump(history, f, indent=2)
 
+        reif_note = f" r {reif_loss:.4f}" if reif_w > 0 else ""
         print(f"gen {gen_num} (+{gen + 1}/{args.generations})  "
               f"this_gen {planes_np.shape[0]}  buffer {len(window)}gens/{buf_examples}ex  "
               f"nodes/move {nodes_per_move:.0f}  "
-              f"loss v {value_loss:.4f} p {policy_loss:.4f} tot {value_loss + policy_loss:.4f}  "
+              f"loss v {value_loss:.4f} p {policy_loss:.4f}{reif_note} "
+              f"tot {value_loss + policy_loss:.4f}  "
               f"({time.time() - t0:.0f}s)", flush=True)
 
     print(f"saved {ckpt}")
