@@ -66,13 +66,7 @@ impl Game for Go9 {
         if state.consecutive_passes < 2 {
             return Outcome::InProgress;
         }
-        let (black, white_raw) = score_area(&state.board);
-        let white = white_raw as f64 + KOMI;
-        match (black as f64).partial_cmp(&white) {
-            Some(std::cmp::Ordering::Greater) => Outcome::FirstWins,
-            Some(std::cmp::Ordering::Less) => Outcome::SecondWins,
-            _ => Outcome::Draw,
-        }
+        area_outcome(state)
     }
 
     fn legal_moves(state: &Self::State) -> Vec<Self::Move> {
@@ -225,6 +219,19 @@ impl Game for Go9 {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Area-score outcome (Chinese rules + komi) for a position, ignoring the pass
+/// count. `outcome` uses this once two passes end the game; self-play also calls
+/// it to adjudicate a game stopped at a move cap. White gets the komi.
+pub fn area_outcome(state: &Go9State) -> Outcome {
+    let (black, white_raw) = score_area(&state.board);
+    let white = white_raw as f64 + KOMI;
+    match (black as f64).partial_cmp(&white) {
+        Some(std::cmp::Ordering::Greater) => Outcome::FirstWins,
+        Some(std::cmp::Ordering::Less) => Outcome::SecondWins,
+        _ => Outcome::Draw,
+    }
+}
 
 fn neighbors(r: usize, c: usize) -> impl Iterator<Item = (usize, usize)> {
     let mut v: [Option<(usize, usize)>; 4] = [None; 4];

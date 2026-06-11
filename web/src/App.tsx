@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
 import { engineClientFor } from "./lib/client";
 import { Connect4Board } from "./games/connect4/Board";
+import { Go9Board } from "./games/go9/Board";
 
 const GAMES = [
   { id: "connect4", label: "Connect 4", engineUrl: "http://127.0.0.1:7100", playable: true },
-  { id: "go9",      label: "Go 9×9",     engineUrl: "http://127.0.0.1:7101", playable: false },
+  { id: "go9",      label: "Go 9×9",     engineUrl: "http://127.0.0.1:7101", playable: true },
   { id: "amazons",  label: "Amazons",    engineUrl: "http://127.0.0.1:7102", playable: false },
   { id: "arimaa",   label: "Arimaa",     engineUrl: "http://127.0.0.1:7103", playable: false },
 ] as const;
@@ -16,6 +17,8 @@ type EngineHealth =
 
 const connect4 = GAMES[0];
 const connect4Client = engineClientFor(connect4.engineUrl);
+const go9 = GAMES[1];
+const go9Client = engineClientFor(go9.engineUrl);
 
 export function App() {
   const [healths, setHealths] = useState<Record<string, EngineHealth>>(
@@ -59,6 +62,21 @@ export function App() {
         </p>
       ) : (
         <Connect4Board client={connect4Client} />
+      )}
+
+      <h2 style={{ marginTop: "2rem", marginBottom: "0.5rem" }}>Go 9×9</h2>
+      <p style={{ marginTop: 0, color: "#555" }}>
+        Set each seat to a human or the self-play net. The Rust engine enforces
+        the rules (ko, suicide, area scoring); the NN seat plays via the
+        reification MCTS over the embedded net. <Health h={healths.go9} />
+      </p>
+      {healths.go9.status === "error" ? (
+        <p style={{ color: "crimson" }}>
+          Engine not reachable at {go9.engineUrl}. Start it with{" "}
+          <code>go9-engine serve --model-local nn=&lt;checkpoint&gt;</code>.
+        </p>
+      ) : (
+        <Go9Board client={go9Client} />
       )}
 
       <h2 style={{ marginTop: "2rem" }}>Engines</h2>
