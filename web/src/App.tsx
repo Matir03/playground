@@ -4,100 +4,150 @@ import { Connect4Board } from "./games/connect4/Board";
 import { Go9Board } from "./games/go9/Board";
 
 // Engines are reached under same-origin proxy paths (see vite.config.ts), so the
-// whole app works behind one origin / one public tunnel without CORS.
+// whole app works behind one origin without CORS.
 const GAMES = [
-  { id: "connect4", label: "Connect 4", engineUrl: "/c4",  playable: true },
-  { id: "go9",      label: "Go 9×9",     engineUrl: "/go9", playable: true },
-  { id: "amazons",  label: "Amazons",    engineUrl: "/a",   playable: false },
-  { id: "arimaa",   label: "Arimaa",     engineUrl: "/ar",  playable: false },
+  {
+    id: "connect4", label: "Connect 4", engineUrl: "/c4", playable: true,
+    blurb: "Play a human or the built-in perfect solver. The Rust engine enforces the rules and plays optimally for engine seats.",
+    start: "cargo run --bin connect4-engine -- serve",
+  },
+  {
+    id: "go9", label: "Go 9×9", engineUrl: "/go9", playable: true,
+    blurb: "Play a human or the self-play net. The engine enforces ko / suicide / area scoring; the NN seat plays via the reification MCTS over the embedded net.",
+    start: "go9-engine serve --model-local nn=<checkpoint>",
+  },
+  { id: "amazons", label: "Amazons", engineUrl: "/a", playable: false, blurb: "", start: "" },
+  { id: "arimaa", label: "Arimaa", engineUrl: "/ar", playable: false, blurb: "", start: "" },
 ] as const;
+
+type GameId = (typeof GAMES)[number]["id"];
 
 type EngineHealth =
   | { status: "unknown" }
   | { status: "ok"; version: string }
   | { status: "error"; message: string };
 
-const connect4 = GAMES[0];
-const connect4Client = engineClientFor(connect4.engineUrl);
-const go9 = GAMES[1];
-const go9Client = engineClientFor(go9.engineUrl);
+// One client per playable engine, created once.
+const clients: Partial<Record<GameId, ReturnType<typeof engineClientFor>>> = {
+  connect4: engineClientFor("/c4"),
+  go9: engineClientFor("/go9"),
+};
 
 export function App() {
+  const [selected, setSelected] = useState<GameId | null>(null);
   const [healths, setHealths] = useState<Record<string, EngineHealth>>(
-    Object.fromEntries(GAMES.map((g) => [g.id, { status: "unknown" }]))
+    Object.fromEntries(GAMES.map((g) => [g.id, { status: "unknown" }])),
   );
 
   useEffect(() => {
     for (const g of GAMES) {
       (async () => {
         try {
-          const client = engineClientFor(g.engineUrl);
-          const resp = await client.health({});
-          setHealths((prev) => ({
-            ...prev,
-            [g.id]: { status: "ok", version: resp.version },
-          }));
+          const resp = await engineClientFor(g.engineUrl).health({});
+          setHealths((prev) => ({ ...prev, [g.id]: { status: "ok", version: resp.version } }));
         } catch (e) {
-          setHealths((prev) => ({
-            ...prev,
-            [g.id]: { status: "error", message: (e as Error).message },
-          }));
+          setHealths((prev) => ({ ...prev, [g.id]: { status: "error", message: (e as Error).message } }));
         }
       })();
     }
   }, []);
 
+  const game = GAMES.find((g) => g.id === selected) ?? null;
+
   return (
     <main style={{ fontFamily: "system-ui, sans-serif", padding: "2rem", maxWidth: 720 }}>
-      <h1>playground</h1>
-
-      <h2 style={{ marginBottom: "0.5rem" }}>Connect 4</h2>
-      <p style={{ marginTop: 0, color: "#555" }}>
-        Set each seat to a human or the built-in perfect solver. The Rust engine
-        enforces the rules and, for engine seats, plays optimally.{" "}
-        <Health h={healths.connect4} />
-      </p>
-      {healths.connect4.status === "error" ? (
-        <p style={{ color: "crimson" }}>
-          Engine not reachable at {connect4.engineUrl}. Start it with{" "}
-          <code>cargo run --bin connect4-engine -- serve</code>.
-        </p>
+      {game == null ? (
+        <Menu healths={healths} onPick={setSelected} />
       ) : (
-        <Connect4Board client={connect4Client} />
+        <GameView game={game} health={healths[game.id]} onBack={() => setSelected(null)} />
       )}
-
-      <h2 style={{ marginTop: "2rem", marginBottom: "0.5rem" }}>Go 9×9</h2>
-      <p style={{ marginTop: 0, color: "#555" }}>
-        Set each seat to a human or the self-play net. The Rust engine enforces
-        the rules (ko, suicide, area scoring); the NN seat plays via the
-        reification MCTS over the embedded net. <Health h={healths.go9} />
-      </p>
-      {healths.go9.status === "error" ? (
-        <p style={{ color: "crimson" }}>
-          Engine not reachable at {go9.engineUrl}. Start it with{" "}
-          <code>go9-engine serve --model-local nn=&lt;checkpoint&gt;</code>.
-        </p>
-      ) : (
-        <Go9Board client={go9Client} />
-      )}
-
-      <h2 style={{ marginTop: "2rem" }}>Engines</h2>
-      <ul>
-        {GAMES.map((g) => (
-          <li key={g.id}>
-            <strong>{g.label}</strong> @ {g.engineUrl} — <Health h={healths[g.id]} />
-            {!g.playable && <span style={{ color: "#888" }}> (UI pending)</span>}
-          </li>
-        ))}
-      </ul>
     </main>
+  );
+}
+
+function Menu({
+  healths,
+  onPick,
+}: {
+  healths: Record<string, EngineHealth>;
+  onPick: (id: GameId) => void;
+}) {
+  return (
+    <>
+      <h1 style={{ marginBottom: "0.25rem" }}>playground</h1>
+      <p style={{ marginTop: 0, color: "#555" }}>Pick a game to play.</p>
+      <div style={{ display: "grid", gap: "0.75rem", marginTop: "1.5rem" }}>
+        {GAMES.map((g) => {
+          const h = healths[g.id];
+          const disabled = !g.playable;
+          return (
+            <button
+              key={g.id}
+              onClick={() => g.playable && onPick(g.id)}
+              disabled={disabled}
+              style={{
+                textAlign: "left",
+                padding: "1rem 1.25rem",
+                borderRadius: 10,
+                border: "1px solid #ddd",
+                background: disabled ? "#f5f5f5" : "#fff",
+                cursor: disabled ? "default" : "pointer",
+                color: disabled ? "#999" : "inherit",
+                font: "inherit",
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                <strong style={{ fontSize: "1.1rem" }}>{g.label}</strong>
+                {g.playable ? <Health h={h} /> : <span style={{ color: "#888" }}>UI pending</span>}
+              </div>
+              {g.blurb && <div style={{ color: "#666", fontSize: "0.9rem", marginTop: 4 }}>{g.blurb}</div>}
+            </button>
+          );
+        })}
+      </div>
+    </>
+  );
+}
+
+function GameView({
+  game,
+  health,
+  onBack,
+}: {
+  game: (typeof GAMES)[number];
+  health: EngineHealth;
+  onBack: () => void;
+}) {
+  const client = clients[game.id];
+  return (
+    <>
+      <button
+        onClick={onBack}
+        style={{ marginBottom: "1rem", background: "none", border: "none", color: "#1d4ed8", cursor: "pointer", font: "inherit", padding: 0 }}
+      >
+        ← Menu
+      </button>
+      <h1 style={{ marginTop: 0, marginBottom: "0.5rem" }}>{game.label}</h1>
+      <p style={{ marginTop: 0, color: "#555" }}>
+        {game.blurb} <Health h={health} />
+      </p>
+      {health.status === "error" || !client ? (
+        <p style={{ color: "crimson" }}>
+          Engine not reachable at {game.engineUrl}. Start it with <code>{game.start}</code>.
+        </p>
+      ) : game.id === "connect4" ? (
+        <Connect4Board client={client} />
+      ) : (
+        <Go9Board client={client} />
+      )}
+    </>
   );
 }
 
 function Health({ h }: { h: EngineHealth }) {
   switch (h.status) {
-    case "unknown": return <span>checking…</span>;
-    case "ok":      return <span style={{ color: "green" }}>ok (v{h.version})</span>;
-    case "error":   return <span style={{ color: "crimson" }}>down ({h.message})</span>;
+    case "unknown": return <span style={{ color: "#888" }}>checking…</span>;
+    case "ok": return <span style={{ color: "green" }}>ok (v{h.version})</span>;
+    case "error": return <span style={{ color: "crimson" }}>down</span>;
   }
 }
