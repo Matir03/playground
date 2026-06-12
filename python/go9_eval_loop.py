@@ -62,9 +62,19 @@ def main() -> None:
     else:
         state = {"anchor_gen": anchor_gen, "best_gen": anchor_gen, "best_elo": 0.0,
                  "elo": {str(anchor_gen): 0.0}, "history": []}
-    seen = {int(h["gen"]) for h in state["history"]}
+
+    # `processed_through` is the highest snapshot gen finished (or skipped). On a
+    # (re)start, skip any stale backlog already on disk and only rate snapshots
+    # produced from now on — the learner's eval-lead gate reads this watermark.
+    existing = [int(os.path.basename(d)[3:]) for d in glob.glob(os.path.join(snaps, "gen*"))
+                if os.path.basename(d)[3:].isdigit()]
+    pt = max([anchor_gen, int(state.get("processed_through", anchor_gen))] + existing)
+    state["processed_through"] = pt
+    with open(elo_path, "w") as f:
+        json.dump(state, f, indent=2)
     print(f"evaluator: anchor gen {state['anchor_gen']} = ELO 0  best gen {state['best_gen']}  "
-          f"games {args.games}  node-budget {args.node_budget}", flush=True)
+          f"processed_through gen {pt} (backlog skipped)  games {args.games}  "
+          f"node-budget {args.node_budget}", flush=True)
 
     while True:
         gens = []
@@ -73,7 +83,7 @@ def main() -> None:
             if os.path.exists(ck):
                 gens.append((int(os.path.basename(d)[3:]), ck))
         for gen, ck in sorted(gens):
-            if gen in seen:
+            if gen <= state["processed_through"]:
                 continue
             try:
                 s = run_match(args.rust_bin, ck, best_ckpt, args.games, args.node_budget,
@@ -92,9 +102,9 @@ def main() -> None:
             state["elo"][str(gen)] = elo
             state["history"].append({"gen": gen, "vs_best": state["best_gen"],
                                      "score": s, "elo": elo, "promoted": promoted})
+            state["processed_through"] = gen  # advance the watermark (the gate)
             with open(elo_path, "w") as f:
                 json.dump(state, f, indent=2)
-            seen.add(gen)
             tag = "PROMOTED" if promoted else f"kept best gen{state['best_gen']}"
             print(f"gen{gen} vs best: score {s:.3f}  ELO {elo:+.0f}  [{tag}]", flush=True)
         time.sleep(args.interval)

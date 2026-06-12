@@ -51,8 +51,11 @@ def main() -> None:
     ap.add_argument("--blocks", type=int, default=10)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--batch-size", type=int, default=256)
-    ap.add_argument("--steps-per-round", type=int, default=200)
-    ap.add_argument("--snapshot-every", type=int, default=5, help="rounds per snapshot")
+    ap.add_argument("--steps-per-snapshot", type=int, default=300)
+    ap.add_argument("--max-reuse", type=float, default=4.0,
+                    help="cap samples trained <= max_reuse * samples the actor produced")
+    ap.add_argument("--eval-lead", type=int, default=3,
+                    help="stay at most this many snapshots ahead of the evaluator")
     ap.add_argument("--min-samples", type=int, default=4000)
     ap.add_argument("--reif-weight", type=float, default=1.0)
     ap.add_argument("--device", default="cuda")
@@ -78,44 +81,46 @@ def main() -> None:
     opt = torch.optim.Adam(net.parameters(), lr=args.lr, weight_decay=1e-4)
 
     cfg = json.load(open(os.path.join(live, "config.json")))
-    snap_gen = int(cfg.get("generation", 0))
-    print(f"learner: device {device}  batch {args.batch_size}  steps/round {args.steps_per_round}"
-          f"  start gen {snap_gen}", flush=True)
+    anchor_gen = int(cfg.get("generation", 0))
+    elo_path = os.path.join(live, "elo.json")
+    reif_w = args.reif_weight
 
     cache: dict[str, tuple] = {}  # chunk path -> arrays
     big: tuple | None = None      # concatenated arrays for sampling
-    round_i = 0
-    reif_w = args.reif_weight
+    produced = 0  # cumulative samples the actor has produced (4x-throttle base)
+    consumed = 0  # cumulative samples trained on
 
     def refresh() -> bool:
+        nonlocal produced
         files = set(glob.glob(os.path.join(buffer_dir, "chunk_*.bin")))
         changed = False
         for f in files - cache.keys():
             try:
-                cache[f] = read_examples(f)
-                changed = True
+                ex = read_examples(f)
             except Exception:
-                pass  # mid-rename or short read; pick it up next refresh
+                continue  # mid-rename / short read; pick it up next refresh
+            cache[f] = ex
+            produced += ex[0].shape[0]
+            changed = True
         for f in list(cache.keys() - files):
             del cache[f]
             changed = True
         return changed
 
-    while True:
-        if refresh() or big is None:
-            if cache:
-                cols = list(zip(*cache.values()))
-                big = tuple(np.concatenate(c) for c in cols)
-        n = big[0].shape[0] if big else 0
-        if n < args.min_samples:
-            time.sleep(2.0)
-            continue
+    def processed_through() -> int:
+        """Highest snapshot gen the evaluator has finished (or skipped)."""
+        try:
+            return int(json.load(open(elo_path)).get("processed_through", anchor_gen))
+        except Exception:
+            return anchor_gen
 
+    def train_block(big, k: int):
+        nonlocal consumed
         planes, policy, value, played, has_next, next_planes = big
+        n = planes.shape[0]
         net.train()
-        t0 = time.time()
-        ev = ep = er = 0.0
-        for _ in range(args.steps_per_round):
+        acc = [0.0, 0.0, 0.0]
+        for _ in range(k):
             b = rng.integers(0, n, size=args.batch_size)
             pl = torch.from_numpy(planes[b]).to(device)
             tgt_pi = torch.from_numpy(policy[b]).to(device)
@@ -141,14 +146,57 @@ def main() -> None:
             opt.zero_grad()
             loss.backward()
             opt.step()
-            ev += float(loss_v); ep += float(loss_p); er += float(loss_r)
+            consumed += args.batch_size
+            acc[0] += float(loss_v); acc[1] += float(loss_p); acc[2] += float(loss_r)
+        return acc
 
-        spr = args.steps_per_round
+    # Snapshot numbering continues from the highest existing snapshot.
+    existing = [int(os.path.basename(d)[3:]) for d in glob.glob(os.path.join(snaps, "gen*"))
+                if os.path.basename(d)[3:].isdigit()]
+    snap_gen = max(existing + [anchor_gen])
+    refresh()  # seed `produced` with the current buffer
+    print(f"learner: device {device}  batch {args.batch_size}  "
+          f"throttle {args.max_reuse}x actor  eval-lead {args.eval_lead}  "
+          f"snapshot/{args.steps_per_snapshot} steps  continuing after gen {snap_gen}", flush=True)
+
+    BLOCK = 50
+    steps_into_snap = 0
+    losses = [0.0, 0.0, 0.0]
+    nblk = 0
+    while True:
+        if refresh() or big is None:
+            if cache:
+                cols = list(zip(*cache.values()))
+                big = tuple(np.concatenate(c) for c in cols)
+        n = big[0].shape[0] if big else 0
+        if n < args.min_samples:
+            time.sleep(2.0)
+            continue
+
+        # Eval-lead gate: don't begin the next snapshot (snap_gen+1) until the
+        # evaluator has finished (snap_gen+1) - eval_lead.
+        if steps_into_snap == 0:
+            need = (snap_gen + 1) - args.eval_lead
+            if need > anchor_gen and processed_through() < need:
+                time.sleep(2.0)
+                continue
+
+        # 4x throttle: never train on more than max_reuse * produced samples.
+        budget = int(args.max_reuse * produced) - consumed
+        if budget < args.batch_size:
+            time.sleep(2.0)
+            continue
+
+        block = min(BLOCK, args.steps_per_snapshot - steps_into_snap, budget // args.batch_size)
+        acc = train_block(big, block)
+        for i in range(3):
+            losses[i] += acc[i]
+        nblk += block
+        steps_into_snap += block
         net.eval()
         save_atomic(net, latest)  # publish for actor hot-swap
-        round_i += 1
-        snap = ""
-        if round_i % args.snapshot_every == 0:
+
+        if steps_into_snap >= args.steps_per_snapshot:
             snap_gen += 1
             d = os.path.join(snaps, f"gen{snap_gen:03d}")
             os.makedirs(d, exist_ok=True)
@@ -156,12 +204,13 @@ def main() -> None:
             net.to(device)
             with open(os.path.join(d, "config.json"), "w") as f:
                 json.dump({"arch": arch_of(net), "generation": snap_gen}, f)
-            snap = f"  -> snapshot gen{snap_gen}"
-
-        steps_s = spr / (time.time() - t0)
-        print(f"round {round_i}  samples {n}  chunks {len(cache)}  "
-              f"loss v {ev/spr:.4f} p {ep/spr:.4f} r {er/spr:.4f}  "
-              f"{steps_s:.0f} steps/s{snap}", flush=True)
+            print(f"snapshot gen{snap_gen}  samples {n}  chunks {len(cache)}  "
+                  f"produced {produced}  consumed {consumed} ({consumed/max(1,produced):.1f}x)  "
+                  f"loss v {losses[0]/max(1,nblk):.4f} p {losses[1]/max(1,nblk):.4f} "
+                  f"r {losses[2]/max(1,nblk):.4f}", flush=True)
+            steps_into_snap = 0
+            losses = [0.0, 0.0, 0.0]
+            nblk = 0
 
 
 if __name__ == "__main__":
