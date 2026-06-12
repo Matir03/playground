@@ -78,6 +78,8 @@ def main() -> None:
     ap.add_argument("--buffer-gens", type=int, default=3)
     ap.add_argument("--c-puct", type=float, default=1.5)
     ap.add_argument("--temp-moves", type=int, default=16)
+    ap.add_argument("--max-ply", type=int, default=80,
+                    help="end a self-play game at this ply, adjudicate by area score")
     ap.add_argument("--reif-weight", type=float, default=1.0)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=0)
@@ -135,6 +137,7 @@ def main() -> None:
             "--cuda", "--batched", "--max-batch", str(args.max_batch),
             "--games", str(args.games_per_gen), "--threads", str(args.threads),
             "--c-puct", str(args.c_puct), "--temp-moves", str(args.temp_moves),
+            "--max-ply", str(args.max_ply),
             "--seed", str(args.seed * 1_000_000 + gen_num),
         ]
         if args.node_budget > 0:

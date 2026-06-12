@@ -121,6 +121,8 @@ enum Cmd {
         dir_eps: f32,
         #[arg(long, default_value_t = 16)]
         temp_moves: u32,
+        #[arg(long, default_value_t = 80)]
+        max_ply: u32,
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
@@ -155,6 +157,9 @@ enum Cmd {
         dir_eps: f32,
         #[arg(long, default_value_t = 16)]
         temp_moves: u32,
+        /// End a self-play game at this ply and adjudicate by area score.
+        #[arg(long, default_value_t = 80)]
+        max_ply: u32,
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
@@ -214,11 +219,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::SelfplayBench {
             model, cuda, batched, max_batch, games, threads,
-            sims, c_puct, dir_alpha, dir_eps, temp_moves, seed,
+            sims, c_puct, dir_alpha, dir_eps, temp_moves, max_ply, seed,
         } => {
             let threads = threads.unwrap_or_else(default_threads);
             let params = mcts::Params {
-                sims, move_ms: 0.0, node_budget: 0, c_puct, dir_alpha, dir_eps, temp_moves,
+                sims, move_ms: 0.0, node_budget: 0, c_puct, dir_alpha, dir_eps, temp_moves, max_ply,
             };
             tokio::task::spawn_blocking(move || {
                 selfplay::run_benchmark(&model, cuda, games, threads, params, batched, max_batch, seed)
@@ -227,11 +232,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::SelfplayGen {
             model, out, cuda, batched, max_batch, games, threads, node_budget, move_ms,
-            sims, c_puct, dir_alpha, dir_eps, temp_moves, seed,
+            sims, c_puct, dir_alpha, dir_eps, temp_moves, max_ply, seed,
         } => {
             let threads = threads.unwrap_or_else(default_threads);
             let params = mcts::Params {
-                sims, move_ms, node_budget, c_puct, dir_alpha, dir_eps, temp_moves,
+                sims, move_ms, node_budget, c_puct, dir_alpha, dir_eps, temp_moves, max_ply,
             };
             tokio::task::spawn_blocking(move || {
                 selfplay::run_generate(

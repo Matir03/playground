@@ -21,8 +21,6 @@ use crate::net::{action_to_move, move_to_action, ACTIONS};
 
 const CELLS: usize = N * N; // 81
 pub const PLANES: usize = 3 * CELLS; // 243
-/// Hard ply cap; a game still running here is adjudicated by area score.
-const MAX_PLY: usize = 2 * CELLS; // 162
 
 /// A leaf evaluator: a Go state -> (value for the side to move, softmax priors
 /// over the 82 actions). Lets the same search drive a direct batch-1 forward or
@@ -50,6 +48,10 @@ pub struct Params {
     pub dir_alpha: f32,
     pub dir_eps: f32,
     pub temp_moves: u32,
+    /// Hard ply cap for a self-play game: at this many moves the game is ended
+    /// and adjudicated by area score even if neither side has passed. Keeps weak
+    /// nets from dragging games out with noisy filler moves.
+    pub max_ply: u32,
 }
 
 struct Node {
@@ -278,7 +280,7 @@ pub fn self_play_game(
 
     loop {
         let cur = states.last().unwrap();
-        if terminal_value(cur).is_some() || states.len() - 1 >= MAX_PLY {
+        if terminal_value(cur).is_some() || states.len() - 1 >= p.max_ply as usize {
             break;
         }
         let (counts, _root_v, nodes) = run_mcts(eval, cur, p, rng)?;
