@@ -1,5 +1,6 @@
 //! 9×9 Go engine binary. See connect4-engine for subcommand semantics.
 
+mod eval;
 mod game;
 mod mcts;
 mod net;
@@ -163,6 +164,60 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
+    /// Continuous self-play actor: forever load live/latest.safetensors (hot-swap),
+    /// generate a chunk of games, append to live/buffer, prune to --max-chunks.
+    SelfplayLoop {
+        /// The live workspace dir (holds latest.safetensors, config.json, buffer/).
+        #[arg(long, default_value = "data/models/go9/live")]
+        live: String,
+        #[arg(long)]
+        cuda: bool,
+        #[arg(long, default_value_t = 256)]
+        max_batch: usize,
+        #[arg(long, default_value_t = 32)]
+        games_per_chunk: usize,
+        #[arg(long, default_value_t = 60)]
+        max_chunks: usize,
+        #[arg(long)]
+        threads: Option<usize>,
+        #[arg(long, default_value_t = 256)]
+        node_budget: u32,
+        #[arg(long, default_value_t = 1.5)]
+        c_puct: f32,
+        #[arg(long, default_value_t = 0.5)]
+        dir_alpha: f32,
+        #[arg(long, default_value_t = 0.25)]
+        dir_eps: f32,
+        #[arg(long, default_value_t = 16)]
+        temp_moves: u32,
+        #[arg(long, default_value_t = 80)]
+        max_ply: u32,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Play a head-to-head match between two checkpoints; print A's score (ELO).
+    EvalMatch {
+        #[arg(long)]
+        model_a: String,
+        #[arg(long)]
+        model_b: String,
+        #[arg(long)]
+        cuda: bool,
+        #[arg(long, default_value_t = 16)]
+        games: usize,
+        #[arg(long)]
+        threads: Option<usize>,
+        #[arg(long, default_value_t = 256)]
+        max_batch: usize,
+        #[arg(long, default_value_t = 128)]
+        node_budget: u32,
+        #[arg(long, default_value_t = 1.5)]
+        c_puct: f32,
+        #[arg(long, default_value_t = 80)]
+        max_ply: u32,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
     Match {
         #[arg(long)]
         first_player_uri: String,
@@ -242,6 +297,35 @@ async fn main() -> anyhow::Result<()> {
                 selfplay::run_generate(
                     &model, cuda, &out, games, threads, params, batched, max_batch, seed,
                 )
+            })
+            .await??;
+        }
+        Cmd::SelfplayLoop {
+            live, cuda, max_batch, games_per_chunk, max_chunks, threads,
+            node_budget, c_puct, dir_alpha, dir_eps, temp_moves, max_ply, seed,
+        } => {
+            let threads = threads.unwrap_or_else(default_threads);
+            let params = mcts::Params {
+                sims: 0, move_ms: 0.0, node_budget, c_puct, dir_alpha, dir_eps, temp_moves, max_ply,
+            };
+            tokio::task::spawn_blocking(move || {
+                selfplay::run_loop(&live, cuda, params, games_per_chunk, max_chunks, threads, max_batch, seed)
+            })
+            .await??;
+        }
+        Cmd::EvalMatch {
+            model_a, model_b, cuda, games, threads, max_batch, node_budget, c_puct, max_ply, seed,
+        } => {
+            let threads = threads.unwrap_or_else(default_threads);
+            // Match play: net's best move (argmax), but sample the first few
+            // moves for game diversity (temp_moves), and no root noise.
+            let params = mcts::Params {
+                sims: 0, move_ms: 0.0, node_budget, c_puct,
+                dir_alpha: 0.5, dir_eps: 0.0, temp_moves: 8, max_ply,
+            };
+            tokio::task::spawn_blocking(move || {
+                eval::run_match(&model_a, &model_b, cuda, games, params, threads, max_batch, seed)
+                    .map(|_| ())
             })
             .await??;
         }

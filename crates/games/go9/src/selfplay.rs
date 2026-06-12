@@ -263,10 +263,24 @@ pub fn run_generate(
     );
     let (s, examples) =
         generate(model, n_games, threads, params, base_seed, batched, max_batch, true);
+    write_dump(out_path, &examples)?;
 
+    let moves = s.examples.max(1) as f64;
+    eprintln!(
+        "  wrote {} examples ({} games, {:.0} nodes/move, {:.0} sims/move, avg_batch {:.0}) \
+         in {:.1}s",
+        examples.len(), n_games, s.nodes as f64 / moves, s.sims as f64 / moves,
+        s.avg_batch, s.elapsed,
+    );
+    Ok(())
+}
+
+/// Write a replay dump: u64 example count, then `count` records of `RECORD_F32`
+/// little-endian f32 (planes, policy, value z, played_action, has_next, next_planes).
+pub fn write_dump(out_path: &str, examples: &[Example]) -> anyhow::Result<()> {
     let mut buf = Vec::with_capacity(8 + examples.len() * RECORD_F32 * 4);
     buf.extend_from_slice(&(examples.len() as u64).to_le_bytes());
-    for ex in &examples {
+    for ex in examples {
         for &x in &ex.planes {
             buf.extend_from_slice(&x.to_le_bytes());
         }
@@ -283,13 +297,78 @@ pub fn run_generate(
     let mut f = std::io::BufWriter::new(std::fs::File::create(out_path)?);
     f.write_all(&buf)?;
     f.flush()?;
-
-    let moves = s.examples.max(1) as f64;
-    eprintln!(
-        "  wrote {} examples ({} games, {:.0} nodes/move, {:.0} sims/move, avg_batch {:.0}) \
-         in {:.1}s",
-        examples.len(), n_games, s.nodes as f64 / moves, s.sims as f64 / moves,
-        s.avg_batch, s.elapsed,
-    );
     Ok(())
+}
+
+/// Highest existing `chunk_NNNNNN.bin` index in `dir`, or None.
+fn max_chunk_seq(dir: &std::path::Path) -> Option<u64> {
+    std::fs::read_dir(dir).ok()?.filter_map(|e| {
+        let name = e.ok()?.file_name().into_string().ok()?;
+        name.strip_prefix("chunk_")?.strip_suffix(".bin")?.parse::<u64>().ok()
+    }).max()
+}
+
+/// Delete oldest `chunk_*.bin` so at most `keep` remain (FIFO replay window).
+fn prune_buffer(dir: &std::path::Path, keep: usize) {
+    let mut chunks: Vec<(u64, std::path::PathBuf)> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd.filter_map(|e| {
+            let e = e.ok()?;
+            let n = e.file_name().into_string().ok()?;
+            let seq = n.strip_prefix("chunk_")?.strip_suffix(".bin")?.parse::<u64>().ok()?;
+            Some((seq, e.path()))
+        }).collect(),
+        Err(_) => return,
+    };
+    if chunks.len() <= keep {
+        return;
+    }
+    chunks.sort_by_key(|(seq, _)| *seq);
+    for (_, path) in &chunks[..chunks.len() - keep] {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Actor loop: forever load the latest checkpoint (hot-swap), generate a chunk of
+/// `games_per_chunk` games, append it to the buffer, and prune to `max_chunks`.
+/// Reloading the checkpoint each chunk is the hot-swap mechanism — the learner
+/// publishes `latest.safetensors` atomically and actors pick it up next chunk.
+#[allow(clippy::too_many_arguments)]
+pub fn run_loop(
+    live_dir: &str,
+    cuda: bool,
+    params: Params,
+    games_per_chunk: usize,
+    max_chunks: usize,
+    threads: usize,
+    max_batch: usize,
+    base_seed: u64,
+) -> anyhow::Result<()> {
+    let latest = format!("{live_dir}/latest.safetensors");
+    let buffer = std::path::Path::new(live_dir).join("buffer");
+    std::fs::create_dir_all(&buffer)?;
+    let device = crate::net::pick_device(cuda)?;
+    let mut seq = max_chunk_seq(&buffer).map(|s| s + 1).unwrap_or(0);
+    eprintln!(
+        "go9 actor loop: {games_per_chunk} games/chunk, {threads} threads, device {}, \
+         buffer {} (keep {max_chunks}), model {latest}",
+        if cuda { "cuda" } else { "cpu" }, buffer.display(),
+    );
+    loop {
+        let t0 = Instant::now();
+        let model = Arc::new(LocalModel::load_on(&latest, device.clone())?);
+        let chunk_seed = base_seed.wrapping_add(seq.wrapping_mul(games_per_chunk as u64));
+        let (s, examples) =
+            generate(model, games_per_chunk, threads, params, chunk_seed, cuda, max_batch, true);
+        let path = buffer.join(format!("chunk_{seq:06}.bin"));
+        let tmp = buffer.join(format!("chunk_{seq:06}.bin.tmp"));
+        write_dump(tmp.to_str().unwrap(), &examples)?;
+        std::fs::rename(&tmp, &path)?;
+        prune_buffer(&buffer, max_chunks);
+        let moves = s.examples.max(1) as f64;
+        eprintln!(
+            "  chunk {seq}: {} ex  {:.0} nodes/move  avg_batch {:.0}  {:.1}s",
+            examples.len(), s.nodes as f64 / moves, s.avg_batch, t0.elapsed().as_secs_f64(),
+        );
+        seq += 1;
+    }
 }
