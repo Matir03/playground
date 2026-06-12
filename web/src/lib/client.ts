@@ -14,7 +14,14 @@ import { EngineService } from "../gen/playground/engine/engine_pb";
 import { OrchestratorService } from "../gen/playground/orchestrator/orchestrator_pb";
 
 export function engineClientFor(baseUrl: string) {
-  const transport = createGrpcWebTransport({ baseUrl });
+  // Same-origin proxy paths ("/go9") are resolved against the page origin so the
+  // app works behind any host (localhost or a public tunnel); absolute URLs pass
+  // through unchanged.
+  const abs =
+    baseUrl.startsWith("/") && typeof window !== "undefined"
+      ? window.location.origin + baseUrl
+      : baseUrl;
+  const transport = createGrpcWebTransport({ baseUrl: abs });
   return createClient(EngineService, transport);
 }
 

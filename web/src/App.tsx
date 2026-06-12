@@ -3,11 +3,13 @@ import { engineClientFor } from "./lib/client";
 import { Connect4Board } from "./games/connect4/Board";
 import { Go9Board } from "./games/go9/Board";
 
+// Engines are reached under same-origin proxy paths (see vite.config.ts), so the
+// whole app works behind one origin / one public tunnel without CORS.
 const GAMES = [
-  { id: "connect4", label: "Connect 4", engineUrl: "http://127.0.0.1:7100", playable: true },
-  { id: "go9",      label: "Go 9×9",     engineUrl: "http://127.0.0.1:7101", playable: true },
-  { id: "amazons",  label: "Amazons",    engineUrl: "http://127.0.0.1:7102", playable: false },
-  { id: "arimaa",   label: "Arimaa",     engineUrl: "http://127.0.0.1:7103", playable: false },
+  { id: "connect4", label: "Connect 4", engineUrl: "/c4",  playable: true },
+  { id: "go9",      label: "Go 9×9",     engineUrl: "/go9", playable: true },
+  { id: "amazons",  label: "Amazons",    engineUrl: "/a",   playable: false },
+  { id: "arimaa",   label: "Arimaa",     engineUrl: "/ar",  playable: false },
 ] as const;
 
 type EngineHealth =
