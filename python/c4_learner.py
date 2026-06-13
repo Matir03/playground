@@ -74,7 +74,25 @@ def main() -> None:
     latest = os.path.join(live, "latest.safetensors")
     snaps = os.path.join(live, "snapshots")
     scores_path = os.path.join(live, "scores.json")
+    pause_flag = os.path.join(live, "PAUSE")
+    pause_marker = os.path.join(live, "learner.paused")
     os.makedirs(snaps, exist_ok=True)
+
+    def pause_gate() -> None:
+        # While the evaluator holds PAUSE, park so it gets the whole GPU; advertise
+        # learner.paused so it knows training has actually stopped. Checked between
+        # training blocks, so we yield within a few seconds.
+        if not os.path.exists(pause_flag):
+            return
+        open(pause_marker, "w").close()
+        print("paused for evaluation", flush=True)
+        while os.path.exists(pause_flag):
+            time.sleep(1.0)
+        try:
+            os.remove(pause_marker)
+        except OSError:
+            pass
+        print("resumed", flush=True)
 
     net = ConnectFourResNet(channels=args.channels, blocks=args.blocks)
     if os.path.exists(latest):
@@ -126,6 +144,7 @@ def main() -> None:
     lv = lp = 0.0
     nb = 0
     while True:
+        pause_gate()
         if refresh() or big is None:
             if cache:
                 cols = list(zip(*cache.values()))

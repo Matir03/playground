@@ -269,6 +269,12 @@ enum Cmd {
         /// Random opening plies for variety (each game).
         #[arg(long, default_value_t = 4)]
         opening: u32,
+        /// Worker threads playing games in parallel (leaf evals batched).
+        #[arg(long)]
+        threads: Option<usize>,
+        /// Max leaves coalesced into one batched forward.
+        #[arg(long, default_value_t = 256)]
+        max_batch: usize,
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
@@ -378,14 +384,16 @@ async fn main() -> anyhow::Result<()> {
             })
             .await??;
         }
-        Cmd::EvalSolver { model, cuda, games, node_budget, c_puct, opening, seed } => {
+        Cmd::EvalSolver { model, cuda, games, node_budget, c_puct, opening, threads, max_batch, seed } => {
             // Deterministic-ish net play (argmax, no root noise) vs the solver.
+            let threads = threads.unwrap_or_else(default_threads);
             let params = mcts::Params {
                 sims: 0, move_ms: 0.0, node_budget, c_puct,
                 dir_alpha: 1.0, dir_eps: 0.0, temp_moves: 0, explore_eps: 0.0,
             };
             tokio::task::spawn_blocking(move || {
-                eval::run_eval_vs_solver(&model, cuda, games, params, opening, seed).map(|_| ())
+                eval::run_eval_vs_solver(&model, cuda, games, params, opening, seed, threads, max_batch)
+                    .map(|_| ())
             })
             .await??;
         }

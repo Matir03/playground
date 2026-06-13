@@ -49,7 +49,7 @@ impl Evaluator for DirectEval {
 
 /// One leaf-evaluation request: the state to evaluate and where to send the
 /// result back. `resp` is the requesting thread's reusable response channel.
-struct Req {
+pub(crate) struct Req {
     state: Connect4State,
     resp: SyncSender<EvalOut>,
 }
@@ -62,8 +62,8 @@ thread_local! {
 
 /// Evaluator that hands its leaf to the central inference server and blocks for
 /// the batched result. Each thread holds its own `Sender` clone.
-struct BatchedEval {
-    req_tx: Sender<Req>,
+pub(crate) struct BatchedEval {
+    pub(crate) req_tx: Sender<Req>,
 }
 
 impl Evaluator for BatchedEval {
@@ -80,7 +80,9 @@ impl Evaluator for BatchedEval {
 /// The inference server: block for a request, drain whatever else is already
 /// queued (up to `max_batch`), run one batched forward, scatter the results.
 /// Returns when every `Sender` has been dropped (all search threads finished).
-fn server_loop(rx: Receiver<Req>, model: &LocalModel, max_batch: usize, counters: &Counters) {
+/// `counters` is optional so the same server backs both self-play (which wants
+/// the avg-batch stats) and the evaluator (which does not).
+fn server_loop(rx: Receiver<Req>, model: &LocalModel, max_batch: usize, counters: Option<&Counters>) {
     loop {
         let first = match rx.recv() {
             Ok(r) => r,
@@ -93,8 +95,10 @@ fn server_loop(rx: Receiver<Req>, model: &LocalModel, max_batch: usize, counters
                 Err(_) => break,
             }
         }
-        counters.batches.fetch_add(1, Ordering::Relaxed);
-        counters.batch_samples.fetch_add(batch.len() as u64, Ordering::Relaxed);
+        if let Some(c) = counters {
+            c.batches.fetch_add(1, Ordering::Relaxed);
+            c.batch_samples.fetch_add(batch.len() as u64, Ordering::Relaxed);
+        }
         let states: Vec<&Connect4State> = batch.iter().map(|r| &r.state).collect();
         let out = model
             .policy_value_batch(&states)
@@ -103,6 +107,12 @@ fn server_loop(rx: Receiver<Req>, model: &LocalModel, max_batch: usize, counters
             let _ = req.resp.send(res); // requester may have gone away; ignore
         }
     }
+}
+
+/// Counters-free batched inference server, for callers (the evaluator) that want
+/// the GPU coalescing of `server_loop` but not the self-play batch stats.
+pub(crate) fn run_inference_server(rx: Receiver<Req>, model: &LocalModel, max_batch: usize) {
+    server_loop(rx, model, max_batch, None)
 }
 
 // ── Driver ───────────────────────────────────────────────────────────────────
@@ -183,7 +193,7 @@ pub fn generate(
         std::thread::scope(|scope| {
             let model_ref = &model;
             let counters_ref = &counters;
-            scope.spawn(move || server_loop(req_rx, model_ref, max_batch, counters_ref));
+            scope.spawn(move || server_loop(req_rx, model_ref, max_batch, Some(counters_ref)));
             for _ in 0..threads {
                 let eval = BatchedEval { req_tx: req_tx.clone() };
                 let counters = &counters;
@@ -346,6 +356,25 @@ fn prune_buffer(dir: &std::path::Path, keep: usize) {
     }
 }
 
+/// Cooperative pause: while the evaluator holds `live/PAUSE` (so it can run its
+/// match with the full GPU), park here and advertise `live/actor.paused` so the
+/// evaluator knows self-play has actually stopped. Checked between chunks, so the
+/// actor yields the GPU at chunk granularity (the evaluator runs infrequently).
+fn pause_gate(live_dir: &str) {
+    let pause = std::path::Path::new(live_dir).join("PAUSE");
+    if !pause.exists() {
+        return;
+    }
+    let marker = std::path::Path::new(live_dir).join("actor.paused");
+    let _ = std::fs::File::create(&marker);
+    eprintln!("  [actor] paused for evaluation");
+    while pause.exists() {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    let _ = std::fs::remove_file(&marker);
+    eprintln!("  [actor] resumed");
+}
+
 /// Actor loop: forever load the latest checkpoint (hot-swap), generate a chunk of
 /// `games_per_chunk` games, append it to the buffer, and prune to `max_chunks`.
 #[allow(clippy::too_many_arguments)]
@@ -370,6 +399,7 @@ pub fn run_loop(
         if cuda { "cuda" } else { "cpu" }, buffer.display(), params.explore_eps,
     );
     loop {
+        pause_gate(live_dir);
         let t0 = Instant::now();
         let model = Arc::new(LocalModel::load_on(&latest, device.clone())?);
         let chunk_seed = base_seed.wrapping_add(seq.wrapping_mul(games_per_chunk as u64));
