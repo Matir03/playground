@@ -72,13 +72,18 @@ class GTP:
         self.p.terminate()
 
 
-def net_move(stub, handle, seconds: float):
-    """Ask the engine's NN for a move; returns the Move proto."""
+def net_move(stub, handle, visits: int, seconds: float):
+    """Ask the engine's NN for a move; returns the Move proto. Prefers a FIXED
+    visit budget (load-independent — important under GPU contention with training);
+    falls back to a time budget when visits<=0."""
+    budget = (
+        e.SearchBudget(max_visits=visits) if visits > 0
+        else e.SearchBudget(max_millis=int(seconds * 1000))
+    )
     chosen = None
     for prog in stub.RequestMove(
         e.RequestMoveRequest(
-            handle=handle, player=e.ENGINE_PLAYER_NN, model="nn",
-            budget=e.SearchBudget(max_millis=int(seconds * 1000)),
+            handle=handle, player=e.ENGINE_PLAYER_NN, model="nn", budget=budget,
         )
     ):
         if prog.HasField("chosen"):
@@ -101,7 +106,7 @@ def vertex_to_move(v: str):
     return g.Move(game_id=g.GAME_ID_GO9, payload=bytes([1, r, c]))
 
 
-def play_game(stub, gnugo: GTP, net_is_black: bool, seconds: float, cap: int = 200) -> str:
+def play_game(stub, gnugo: GTP, net_is_black: bool, visits: int, seconds: float, cap: int = 200) -> str:
     """Play one game. Returns 'net' or 'gnugo' (winner)."""
     handle = stub.NewGame(e.NewGameRequest(game_id=g.GAME_ID_GO9))
     gnugo.send("clear_board")
@@ -118,7 +123,7 @@ def play_game(stub, gnugo: GTP, net_is_black: bool, seconds: float, cap: int = 2
         net_turn = black_to_move == net_is_black
 
         if net_turn:
-            mv = net_move(stub, handle, seconds)
+            mv = net_move(stub, handle, visits, seconds)
             stub.ApplyMove(e.ApplyMoveRequest(handle=handle, move=mv))
             gnugo.send(f"play {color} {move_to_vertex(mv.payload)}")
         else:
@@ -148,19 +153,22 @@ def main() -> None:
     ap.add_argument("--gnugo", default="gnugo")
     ap.add_argument("--games", type=int, default=6)
     ap.add_argument("--level", type=int, default=1, help="GNU Go strength 1..10")
-    ap.add_argument("--seconds", type=float, default=1.0, help="net seconds/move")
+    ap.add_argument("--seconds", type=float, default=1.0, help="net seconds/move (if --visits<=0)")
+    ap.add_argument("--visits", type=int, default=0,
+                    help="fixed visit/node budget per move (load-independent; preferred under contention)")
     args = ap.parse_args()
 
     stub = eg.EngineServiceStub(grpc.insecure_channel(args.engine))
+    budget_desc = f"{args.visits} visits/move" if args.visits > 0 else f"{args.seconds}s/move"
     print("engine:", stub.Health(e.HealthRequest()).version,
-          "| gnugo level", args.level, "| net", args.seconds, "s/move", flush=True)
+          "| gnugo level", args.level, "| net", budget_desc, flush=True)
 
     net_wins = 0
     for gm in range(args.games):
         gnugo = GTP([args.gnugo, "--mode", "gtp", "--chinese-rules", "--level", str(args.level)])
         net_black = gm % 2 == 0
         t0 = time.time()
-        winner, score = play_game(stub, gnugo, net_black, args.seconds)
+        winner, score = play_game(stub, gnugo, net_black, args.visits, args.seconds)
         gnugo.close()
         net_wins += winner == "net"
         print(f"  game {gm + 1}: net={'B' if net_black else 'W'}  "
