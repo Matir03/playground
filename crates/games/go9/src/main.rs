@@ -86,6 +86,10 @@ enum Cmd {
         /// Named in-process NN(s), as `name=checkpoint.safetensors` (candle).
         #[arg(long = "model-local", value_name = "NAME=CHECKPOINT")]
         models_local: Vec<String>,
+        /// Run in-process NN inference on the GPU (needs a `cuda`-feature build).
+        /// Much faster per move for the larger Go net — use it for play.
+        #[arg(long)]
+        cuda: bool,
     },
     /// As Serve, but also accepts StartSelfPlay requests.
     SelfPlay {
@@ -97,6 +101,8 @@ enum Cmd {
         models: Vec<String>,
         #[arg(long = "model-local", value_name = "NAME=CHECKPOINT")]
         models_local: Vec<String>,
+        #[arg(long)]
+        cuda: bool,
     },
     /// Self-play generation throughput benchmark.
     SelfplayBench {
@@ -122,6 +128,10 @@ enum Cmd {
         dir_eps: f32,
         #[arg(long, default_value_t = 16)]
         temp_moves: u32,
+        /// Per-node uniform exploration floor mixed into priors (0 = off). Keeps
+        /// self-play from collapsing into a narrow action subspace.
+        #[arg(long, default_value_t = 0.25)]
+        explore_eps: f32,
         #[arg(long, default_value_t = 80)]
         max_ply: u32,
         #[arg(long, default_value_t = 0)]
@@ -158,6 +168,9 @@ enum Cmd {
         dir_eps: f32,
         #[arg(long, default_value_t = 16)]
         temp_moves: u32,
+        /// Per-node uniform exploration floor mixed into priors (0 = off).
+        #[arg(long, default_value_t = 0.25)]
+        explore_eps: f32,
         /// End a self-play game at this ply and adjudicate by area score.
         #[arg(long, default_value_t = 80)]
         max_ply: u32,
@@ -190,6 +203,10 @@ enum Cmd {
         dir_eps: f32,
         #[arg(long, default_value_t = 16)]
         temp_moves: u32,
+        /// Per-node uniform exploration floor mixed into priors (0 = off). Keeps
+        /// self-play from collapsing into a narrow action subspace.
+        #[arg(long, default_value_t = 0.25)]
+        explore_eps: f32,
         #[arg(long, default_value_t = 80)]
         max_ply: u32,
         #[arg(long, default_value_t = 0)]
@@ -246,14 +263,15 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Serve { addr, model_uri, models, models_local }
-        | Cmd::SelfPlay { addr, model_uri, models, models_local } => {
+        Cmd::Serve { addr, model_uri, models, models_local, cuda }
+        | Cmd::SelfPlay { addr, model_uri, models, models_local, cuda } => {
+            let device = net::pick_device(cuda)?;
             let mut clients: HashMap<String, Go9Model> = HashMap::new();
             for spec in &models_local {
                 let (name, ckpt) = spec
                     .split_once('=')
                     .ok_or_else(|| anyhow::anyhow!("--model-local must be NAME=CHECKPOINT, got {spec:?}"))?;
-                clients.insert(name.to_string(), Go9Model::Local(LocalModel::load(ckpt)?));
+                clients.insert(name.to_string(), Go9Model::Local(LocalModel::load_on(ckpt, device.clone())?));
             }
             let remote_specs: Vec<(String, String)> = if models.is_empty() && clients.is_empty() {
                 vec![("nn".to_string(), model_uri)]
@@ -274,11 +292,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::SelfplayBench {
             model, cuda, batched, max_batch, games, threads,
-            sims, c_puct, dir_alpha, dir_eps, temp_moves, max_ply, seed,
+            sims, c_puct, dir_alpha, dir_eps, temp_moves, explore_eps, max_ply, seed,
         } => {
             let threads = threads.unwrap_or_else(default_threads);
             let params = mcts::Params {
-                sims, move_ms: 0.0, node_budget: 0, c_puct, dir_alpha, dir_eps, temp_moves, max_ply,
+                sims, move_ms: 0.0, node_budget: 0, c_puct, dir_alpha, dir_eps, temp_moves,
+                explore_eps, max_ply,
             };
             tokio::task::spawn_blocking(move || {
                 selfplay::run_benchmark(&model, cuda, games, threads, params, batched, max_batch, seed)
@@ -287,11 +306,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::SelfplayGen {
             model, out, cuda, batched, max_batch, games, threads, node_budget, move_ms,
-            sims, c_puct, dir_alpha, dir_eps, temp_moves, max_ply, seed,
+            sims, c_puct, dir_alpha, dir_eps, temp_moves, explore_eps, max_ply, seed,
         } => {
             let threads = threads.unwrap_or_else(default_threads);
             let params = mcts::Params {
-                sims, move_ms, node_budget, c_puct, dir_alpha, dir_eps, temp_moves, max_ply,
+                sims, move_ms, node_budget, c_puct, dir_alpha, dir_eps, temp_moves,
+                explore_eps, max_ply,
             };
             tokio::task::spawn_blocking(move || {
                 selfplay::run_generate(
@@ -302,11 +322,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::SelfplayLoop {
             live, cuda, max_batch, games_per_chunk, max_chunks, threads,
-            node_budget, c_puct, dir_alpha, dir_eps, temp_moves, max_ply, seed,
+            node_budget, c_puct, dir_alpha, dir_eps, temp_moves, explore_eps, max_ply, seed,
         } => {
             let threads = threads.unwrap_or_else(default_threads);
             let params = mcts::Params {
-                sims: 0, move_ms: 0.0, node_budget, c_puct, dir_alpha, dir_eps, temp_moves, max_ply,
+                sims: 0, move_ms: 0.0, node_budget, c_puct, dir_alpha, dir_eps, temp_moves,
+                explore_eps, max_ply,
             };
             tokio::task::spawn_blocking(move || {
                 selfplay::run_loop(&live, cuda, params, games_per_chunk, max_chunks, threads, max_batch, seed)
@@ -321,7 +342,7 @@ async fn main() -> anyhow::Result<()> {
             // moves for game diversity (temp_moves), and no root noise.
             let params = mcts::Params {
                 sims: 0, move_ms: 0.0, node_budget, c_puct,
-                dir_alpha: 0.5, dir_eps: 0.0, temp_moves: 8, max_ply,
+                dir_alpha: 0.5, dir_eps: 0.0, temp_moves: 8, explore_eps: 0.0, max_ply,
             };
             tokio::task::spawn_blocking(move || {
                 eval::run_match(&model_a, &model_b, cuda, games, params, threads, max_batch, seed)

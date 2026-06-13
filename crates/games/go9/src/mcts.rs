@@ -48,6 +48,12 @@ pub struct Params {
     pub dir_alpha: f32,
     pub dir_eps: f32,
     pub temp_moves: u32,
+    /// Per-node uniform exploration floor: at EVERY expanded node, mix this much
+    /// uniform mass into the priors over legal moves, so the search reliably
+    /// tries off-policy / random moves throughout the tree (not just the policy's
+    /// favorites). Generalizes the root-only Dirichlet noise to the whole tree to
+    /// keep self-play from collapsing into a narrow action subspace. 0 = off.
+    pub explore_eps: f32,
     /// Hard ply cap for a self-play game: at this many moves the game is ended
     /// and adjudicated by area score even if neither side has passed. Keeps weak
     /// nets from dragging games out with noisy filler moves.
@@ -119,6 +125,12 @@ fn expand(arena: &mut Vec<Node>, idx: usize, eval: &impl Evaluator) -> anyhow::R
     }
     node.expanded = true;
     Ok(v)
+}
+
+/// Uniformly pick one legal action of a node (for ε-greedy forced exploration).
+fn random_legal(node: &Node, rng: &mut impl Rng) -> usize {
+    let legal: Vec<usize> = (0..ACTIONS).filter(|&a| node.legal[a]).collect();
+    legal[rng.gen_range(0..legal.len())]
 }
 
 /// PUCT action selection over the legal actions of `node`.
@@ -194,7 +206,15 @@ pub fn run_mcts(
         path.clear();
         let mut node = 0usize;
         while arena[node].expanded && !arena[node].terminal {
-            let a = select(&arena[node], p.c_puct);
+            // ε-greedy forced exploration: with prob explore_eps descend to a
+            // uniformly-random legal child instead of the PUCT pick, so the
+            // search reliably samples the full action space and self-play doesn't
+            // collapse into a narrow subspace.
+            let a = if p.explore_eps > 0.0 && rng.gen::<f32>() < p.explore_eps {
+                random_legal(&arena[node], rng)
+            } else {
+                select(&arena[node], p.c_puct)
+            };
             path.push((node, a));
             let child = arena[node].children[a];
             node = if child >= 0 {
