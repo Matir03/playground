@@ -3,6 +3,7 @@
 //! See docs/protocols.md for subcommand semantics.
 
 mod book;
+mod eval;
 mod game;
 mod mcts;
 mod net;
@@ -166,6 +167,10 @@ enum Cmd {
         dir_eps: f32,
         #[arg(long, default_value_t = 10)]
         temp_moves: u32,
+        /// Per-node ε-greedy forced exploration (random visits excluded from the
+        /// policy target). 0 = off.
+        #[arg(long, default_value_t = 0.25)]
+        explore_eps: f32,
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
@@ -207,6 +212,63 @@ enum Cmd {
         dir_eps: f32,
         #[arg(long, default_value_t = 10)]
         temp_moves: u32,
+        /// Per-node ε-greedy forced exploration (random visits excluded from the
+        /// policy target). 0 = off.
+        #[arg(long, default_value_t = 0.25)]
+        explore_eps: f32,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Continuous self-play actor: forever load live/latest.safetensors (hot-swap),
+    /// generate a chunk of games, append to live/buffer, prune to --max-chunks.
+    SelfplayLoop {
+        #[arg(long, default_value = "data/models/connect4/live")]
+        live: String,
+        #[arg(long)]
+        cuda: bool,
+        #[arg(long, default_value_t = 256)]
+        max_batch: usize,
+        #[arg(long, default_value_t = 64)]
+        games_per_chunk: usize,
+        #[arg(long, default_value_t = 60)]
+        max_chunks: usize,
+        #[arg(long)]
+        threads: Option<usize>,
+        #[arg(long, default_value_t = 0)]
+        node_budget: u32,
+        #[arg(long, default_value_t = 0.0)]
+        move_ms: f64,
+        #[arg(long, default_value_t = 200)]
+        sims: u32,
+        #[arg(long, default_value_t = 1.5)]
+        c_puct: f32,
+        #[arg(long, default_value_t = 1.0)]
+        dir_alpha: f32,
+        #[arg(long, default_value_t = 0.25)]
+        dir_eps: f32,
+        #[arg(long, default_value_t = 10)]
+        temp_moves: u32,
+        #[arg(long, default_value_t = 0.25)]
+        explore_eps: f32,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Absolute-strength eval: play a checkpoint's MCTS vs the perfect solver and
+    /// print the net's score (the distance-to-perfect signal).
+    EvalSolver {
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        cuda: bool,
+        #[arg(long, default_value_t = 40)]
+        games: u32,
+        #[arg(long, default_value_t = 200)]
+        node_budget: u32,
+        #[arg(long, default_value_t = 1.5)]
+        c_puct: f32,
+        /// Random opening plies for variety (each game).
+        #[arg(long, default_value_t = 4)]
+        opening: u32,
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
@@ -274,11 +336,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::SelfplayBench {
             model, cuda, batched, max_batch, games, threads,
-            sims, c_puct, dir_alpha, dir_eps, temp_moves, seed,
+            sims, c_puct, dir_alpha, dir_eps, temp_moves, explore_eps, seed,
         } => {
             let threads = threads.unwrap_or_else(default_threads);
             let params = mcts::Params {
-                sims, move_ms: 0.0, node_budget: 0, c_puct, dir_alpha, dir_eps, temp_moves,
+                sims, move_ms: 0.0, node_budget: 0, c_puct, dir_alpha, dir_eps, temp_moves, explore_eps,
             };
             // Run off the async runtime: this is CPU-bound, synchronous work.
             tokio::task::spawn_blocking(move || {
@@ -290,16 +352,40 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::SelfplayGen {
             model, out, cuda, batched, max_batch, games, threads, node_budget, move_ms,
-            sims, c_puct, dir_alpha, dir_eps, temp_moves, seed,
+            sims, c_puct, dir_alpha, dir_eps, temp_moves, explore_eps, seed,
         } => {
             let threads = threads.unwrap_or_else(default_threads);
             let params = mcts::Params {
-                sims, move_ms, node_budget, c_puct, dir_alpha, dir_eps, temp_moves,
+                sims, move_ms, node_budget, c_puct, dir_alpha, dir_eps, temp_moves, explore_eps,
             };
             tokio::task::spawn_blocking(move || {
                 selfplay::run_generate(
                     &model, cuda, &out, games, threads, params, batched, max_batch, seed,
                 )
+            })
+            .await??;
+        }
+        Cmd::SelfplayLoop {
+            live, cuda, max_batch, games_per_chunk, max_chunks, threads, node_budget, move_ms,
+            sims, c_puct, dir_alpha, dir_eps, temp_moves, explore_eps, seed,
+        } => {
+            let threads = threads.unwrap_or_else(default_threads);
+            let params = mcts::Params {
+                sims, move_ms, node_budget, c_puct, dir_alpha, dir_eps, temp_moves, explore_eps,
+            };
+            tokio::task::spawn_blocking(move || {
+                selfplay::run_loop(&live, cuda, params, games_per_chunk, max_chunks, threads, max_batch, seed)
+            })
+            .await??;
+        }
+        Cmd::EvalSolver { model, cuda, games, node_budget, c_puct, opening, seed } => {
+            // Deterministic-ish net play (argmax, no root noise) vs the solver.
+            let params = mcts::Params {
+                sims: 0, move_ms: 0.0, node_budget, c_puct,
+                dir_alpha: 1.0, dir_eps: 0.0, temp_moves: 0, explore_eps: 0.0,
+            };
+            tokio::task::spawn_blocking(move || {
+                eval::run_eval_vs_solver(&model, cuda, games, params, opening, seed).map(|_| ())
             })
             .await??;
         }

@@ -60,12 +60,19 @@ pub struct Params {
     pub dir_alpha: f32,
     pub dir_eps: f32,
     pub temp_moves: u32,
+    /// Per-node ε-greedy forced exploration: at every node, with this probability
+    /// the simulation descends to a uniformly-random legal child instead of the
+    /// PUCT pick, so the search samples the full action space (not just the
+    /// policy's favorites). These random visits are excluded from the policy
+    /// target (see `rnd`). 0 = off.
+    pub explore_eps: f32,
 }
 
 struct Node {
     state: Connect4State,
     p: [f32; C4_COLS],   // priors, 0 for illegal columns
-    n: [u32; C4_COLS],   // visit counts per child
+    n: [u32; C4_COLS],   // visit counts per child (incl. forced-random)
+    rnd: [u32; C4_COLS], // subset of n taken via ε-greedy forced-random selection
     w: [f32; C4_COLS],   // total value per child (from the parent's perspective)
     children: [i32; C4_COLS], // arena index of each child, -1 = not created
     legal: [bool; C4_COLS],
@@ -80,6 +87,7 @@ impl Node {
             state,
             p: [0.0; C4_COLS],
             n: [0; C4_COLS],
+            rnd: [0; C4_COLS],
             w: [0.0; C4_COLS],
             children: [-1; C4_COLS],
             legal: [false; C4_COLS],
@@ -147,6 +155,12 @@ fn select(node: &Node, c_puct: f32) -> usize {
     best
 }
 
+/// Uniformly pick one legal column of a node (for ε-greedy forced exploration).
+fn random_legal(node: &Node, rng: &mut impl Rng) -> usize {
+    let legal: Vec<usize> = (0..C4_COLS).filter(|&c| node.legal[c]).collect();
+    legal[rng.gen_range(0..legal.len())]
+}
+
 /// Run PUCT MCTS from `root_state`. Returns `(visit_counts, root_value, nodes)`,
 /// where `nodes` is the number of distinct positions in the search tree — the
 /// honest measure of search effort (unlike the raw simulation count, which
@@ -156,7 +170,7 @@ pub fn run_mcts(
     root_state: &Connect4State,
     p: &Params,
     rng: &mut impl Rng,
-) -> anyhow::Result<([u32; C4_COLS], f32, u32)> {
+) -> anyhow::Result<([u32; C4_COLS], f32, u32, u32)> {
     let cap = p.node_budget.max(p.sims) as usize + 1;
     let mut arena: Vec<Node> = Vec::with_capacity(cap);
     arena.push(Node::new(root_state.clone()));
@@ -185,7 +199,7 @@ pub fn run_mcts(
     // Stop a node-budget search early once the tree saturates (no new node in
     // this many consecutive sims = every leaf reachable is terminal).
     const SATURATION_PATIENCE: u32 = 512;
-    let mut path: Vec<(usize, usize)> = Vec::with_capacity(64);
+    let mut path: Vec<(usize, usize, bool)> = Vec::with_capacity(64); // (node, col, was_random)
     let mut sim = 0u32;
     let mut no_growth = 0u32;
     loop {
@@ -206,8 +220,13 @@ pub fn run_mcts(
         let mut node = 0usize;
         // Descend to a leaf (unexpanded or terminal).
         while arena[node].expanded && !arena[node].terminal {
-            let c = select(&arena[node], p.c_puct);
-            path.push((node, c));
+            let was_random = p.explore_eps > 0.0 && rng.gen::<f32>() < p.explore_eps;
+            let c = if was_random {
+                random_legal(&arena[node], rng)
+            } else {
+                select(&arena[node], p.c_puct)
+            };
+            path.push((node, c, was_random));
             let child = arena[node].children[c];
             node = if child >= 0 {
                 child as usize
@@ -225,10 +244,13 @@ pub fn run_mcts(
             expand(&mut arena, node, eval)?
         };
         // Backprop, flipping sign at each level (value is for the side to move).
-        for &(n, c) in path.iter().rev() {
+        for &(n, c, was_random) in path.iter().rev() {
             v = -v;
             arena[n].n[c] += 1;
             arena[n].w[c] += v;
+            if was_random {
+                arena[n].rnd[c] += 1;
+            }
         }
         // A sim grows the tree iff it reached a non-terminal leaf; track runs of
         // no-growth sims to detect saturation under a node budget.
@@ -247,13 +269,19 @@ pub fn run_mcts(
     } else {
         0.0
     };
-    Ok((root.n, root_value, nodes))
+    // Policy counts exclude ε-greedy forced-random visits, so the target/move
+    // reflect only what the search (PUCT) genuinely preferred.
+    let mut policy_counts = [0u32; C4_COLS];
+    for c in 0..C4_COLS {
+        policy_counts[c] = root.n[c].saturating_sub(root.rnd[c]);
+    }
+    Ok((policy_counts, root_value, nodes, sim))
 }
 
-/// One self-play training example: planes (2×6×7), MCTS policy target, and the
-/// MCTS root value target (the local search estimate for the side to move).
-/// The benchmark only counts these, but they're the exact targets a Rust
-/// trainer would consume — mirroring the tuples Python's `self_play_game` emits.
+/// One self-play training example: planes (2×6×7), MCTS policy target (PUCT-only
+/// visit distribution), and the value target = the final game outcome z from this
+/// position's side-to-move POV (not the local root value — outcome z is the
+/// grounded AlphaZero target).
 #[allow(dead_code)] // fields are the training targets; the bench only counts them
 pub struct Example {
     pub planes: [f32; PLANES],
@@ -267,27 +295,59 @@ pub fn self_play_game(
     p: &Params,
     rng: &mut impl Rng,
 ) -> anyhow::Result<(Vec<Example>, u64, u64)> {
-    let mut state = Connect4::initial_state();
-    let mut examples = Vec::new();
+    let mut states = vec![Connect4::initial_state()];
+    let mut moves: Vec<([f32; C4_COLS], u8)> = Vec::new(); // (policy, side-to-move 1/2)
     let mut total_sims: u64 = 0;
     let mut total_nodes: u64 = 0;
-    while terminal_value(&state).is_none() {
-        let (counts, root_v, nodes) = run_mcts(eval, &state, p, rng)?;
-        let sum: u32 = counts.iter().sum();
-        total_sims += sum as u64;
-        total_nodes += nodes as u64;
-        let mut policy = [0f32; C4_COLS];
-        for c in 0..C4_COLS {
-            policy[c] = counts[c] as f32 / sum as f32;
-        }
-        examples.push(Example { planes: planes_of(&state), policy, value: root_v });
 
-        let col = if (state.ply as u32) < p.temp_moves {
-            sample_categorical(&policy, rng)
+    loop {
+        let cur = states.last().unwrap();
+        if terminal_value(cur).is_some() {
+            break;
+        }
+        let (counts, _root_v, nodes, sims) = run_mcts(eval, cur, p, rng)?;
+        total_sims += sims as u64;
+        total_nodes += nodes as u64;
+        let sum: u32 = counts.iter().sum();
+        let mut policy = [0f32; C4_COLS];
+        let col;
+        if sum > 0 {
+            for c in 0..C4_COLS {
+                policy[c] = counts[c] as f32 / sum as f32;
+            }
+            col = if (cur.ply as u32) < p.temp_moves {
+                sample_categorical(&policy, rng)
+            } else {
+                argmax(&counts)
+            };
         } else {
-            argmax(&counts)
+            // Degenerate (all root visits forced-random): uniform over legal.
+            let legal: Vec<usize> = Connect4::legal_moves(cur).iter().map(|m| m.col as usize).collect();
+            let u = 1.0 / legal.len().max(1) as f32;
+            for &lc in &legal {
+                policy[lc] = u;
+            }
+            col = legal.first().copied().unwrap_or(0);
+        }
+        let to_move = if cur.ply % 2 == 0 { 1u8 } else { 2u8 };
+        moves.push((policy, to_move));
+        let next = Connect4::apply(cur, &Connect4Move { col: col as u8 });
+        states.push(next);
+    }
+
+    // Backfill value = final outcome z from each position's side-to-move POV.
+    let winner: Option<u8> = match Connect4::outcome(states.last().unwrap()) {
+        Outcome::FirstWins => Some(1),
+        Outcome::SecondWins => Some(2),
+        _ => None,
+    };
+    let mut examples = Vec::with_capacity(moves.len());
+    for (i, (policy, to_move)) in moves.into_iter().enumerate() {
+        let z = match winner {
+            Some(w) => if w == to_move { 1.0 } else { -1.0 },
+            None => 0.0,
         };
-        state = Connect4::apply(&state, &Connect4Move { col: col as u8 });
+        examples.push(Example { planes: planes_of(&states[i]), policy, value: z });
     }
     Ok((examples, total_sims, total_nodes))
 }
