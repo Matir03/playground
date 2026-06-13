@@ -64,6 +64,11 @@ struct Node {
     state: Go9State,
     p: [f32; ACTIONS],
     n: [u32; ACTIONS],
+    /// Visits where this edge was taken via ε-greedy FORCED-RANDOM selection
+    /// (subset of `n`). The policy target uses `n - rnd` so forced exploration
+    /// doesn't pollute it — a move only counts toward the policy if the search
+    /// (PUCT) genuinely preferred it. `n` (incl. random) still drives Q/PUCT.
+    rnd: [u32; ACTIONS],
     w: [f32; ACTIONS],
     children: [i32; ACTIONS],
     legal: [bool; ACTIONS],
@@ -78,6 +83,7 @@ impl Node {
             state,
             p: [0.0; ACTIONS],
             n: [0; ACTIONS],
+            rnd: [0; ACTIONS],
             w: [0.0; ACTIONS],
             children: [-1; ACTIONS],
             legal: [false; ACTIONS],
@@ -154,13 +160,16 @@ fn select(node: &Node, c_puct: f32) -> usize {
     best
 }
 
-/// Run PUCT MCTS from `root_state`. Returns `(visit_counts[82], root_value, nodes)`.
+/// Run PUCT MCTS from `root_state`. Returns `(policy_counts[82], root_value,
+/// nodes, sims)` where `policy_counts` are PUCT-only visits (total minus
+/// ε-greedy forced-random visits) — the genuine search preference used for the
+/// policy target and move selection; `sims` is the true simulation count.
 pub fn run_mcts(
     eval: &impl Evaluator,
     root_state: &Go9State,
     p: &Params,
     rng: &mut impl Rng,
-) -> anyhow::Result<([u32; ACTIONS], f32, u32)> {
+) -> anyhow::Result<([u32; ACTIONS], f32, u32, u32)> {
     let cap = p.node_budget.max(p.sims) as usize + 1;
     let mut arena: Vec<Node> = Vec::with_capacity(cap.min(4096));
     arena.push(Node::new(root_state.clone()));
@@ -186,7 +195,7 @@ pub fn run_mcts(
     let use_time = !use_nodes && p.move_ms > 0.0;
     let deadline = Instant::now() + Duration::from_secs_f64(p.move_ms / 1000.0);
     const SATURATION_PATIENCE: u32 = 512;
-    let mut path: Vec<(usize, usize)> = Vec::with_capacity(64);
+    let mut path: Vec<(usize, usize, bool)> = Vec::with_capacity(64); // (node, action, was_random)
     let mut sim = 0u32;
     let mut no_growth = 0u32;
     loop {
@@ -210,12 +219,13 @@ pub fn run_mcts(
             // uniformly-random legal child instead of the PUCT pick, so the
             // search reliably samples the full action space and self-play doesn't
             // collapse into a narrow subspace.
-            let a = if p.explore_eps > 0.0 && rng.gen::<f32>() < p.explore_eps {
+            let was_random = p.explore_eps > 0.0 && rng.gen::<f32>() < p.explore_eps;
+            let a = if was_random {
                 random_legal(&arena[node], rng)
             } else {
                 select(&arena[node], p.c_puct)
             };
-            path.push((node, a));
+            path.push((node, a, was_random));
             let child = arena[node].children[a];
             node = if child >= 0 {
                 child as usize
@@ -232,10 +242,13 @@ pub fn run_mcts(
         } else {
             expand(&mut arena, node, eval)?
         };
-        for &(n, a) in path.iter().rev() {
+        for &(n, a, was_random) in path.iter().rev() {
             v = -v;
             arena[n].n[a] += 1;
             arena[n].w[a] += v;
+            if was_random {
+                arena[n].rnd[a] += 1;
+            }
         }
         if arena.len() == nodes_before {
             no_growth += 1;
@@ -249,7 +262,13 @@ pub fn run_mcts(
     let total_n: u32 = root.n.iter().sum();
     let root_value =
         if total_n > 0 { root.w.iter().sum::<f32>() / total_n as f32 } else { 0.0 };
-    Ok((root.n, root_value, nodes))
+    // Policy counts exclude ε-greedy forced-random visits, so the target/move
+    // reflect only what the search (PUCT) genuinely preferred.
+    let mut policy_counts = [0u32; ACTIONS];
+    for a in 0..ACTIONS {
+        policy_counts[a] = root.n[a].saturating_sub(root.rnd[a]);
+    }
+    Ok((policy_counts, root_value, nodes, sim))
 }
 
 /// One self-play training example. `planes` is the position; `policy` the MCTS
@@ -303,21 +322,34 @@ pub fn self_play_game(
         if terminal_value(cur).is_some() || states.len() - 1 >= p.max_ply as usize {
             break;
         }
-        let (counts, _root_v, nodes) = run_mcts(eval, cur, p, rng)?;
-        total_sims += counts.iter().map(|&n| n as u64).sum::<u64>();
+        // `counts` are PUCT-only (ε-greedy random visits excluded), so the policy
+        // target + played move reflect the search's genuine preference, not forced
+        // exploration. `sims` is the true simulation count (for stats).
+        let (counts, _root_v, nodes, sims) = run_mcts(eval, cur, p, rng)?;
+        total_sims += sims as u64;
         total_nodes += nodes as u64;
         let sum: u32 = counts.iter().sum();
         let mut policy = [0f32; ACTIONS];
+        let a;
         if sum > 0 {
-            for a in 0..ACTIONS {
-                policy[a] = counts[a] as f32 / sum as f32;
+            for i in 0..ACTIONS {
+                policy[i] = counts[i] as f32 / sum as f32;
             }
-        }
-        let a = if (states.len() as u32 - 1) < p.temp_moves {
-            sample_categorical(&policy, rng)
+            a = if (states.len() as u32 - 1) < p.temp_moves {
+                sample_categorical(&policy, rng)
+            } else {
+                argmax(&counts)
+            };
         } else {
-            argmax(&counts)
-        };
+            // Degenerate (e.g. every root visit was forced-random): fall back to a
+            // uniform target over legal moves so we never emit an all-zero policy.
+            let legal: Vec<usize> = Go9::legal_moves(cur).iter().map(move_to_action).collect();
+            let u = 1.0 / legal.len().max(1) as f32;
+            for &la in &legal {
+                policy[la] = u;
+            }
+            a = legal.first().copied().unwrap_or(ACTIONS - 1);
+        }
         let to_move = cur.to_move;
         moves.push((policy, a, to_move));
         let next = Go9::apply(cur, &action_to_move(a));

@@ -121,7 +121,7 @@ fn play_one(req_tx: &Sender<Req>, a_is_black: bool, p: &Params, seed: u64) -> f3
         let black_to_move = state.to_move == 1;
         let is_a = black_to_move == a_is_black;
         let eval = MatchEval { req_tx, is_a };
-        let (counts, _v, _n) = run_mcts(&eval, &state, p, &mut rng).expect("mcts");
+        let (counts, _v, _n, _s) = run_mcts(&eval, &state, p, &mut rng).expect("mcts");
         // Sample the opening for game diversity, then play the net's best move.
         let a = if ply < p.temp_moves { sample(&counts, &mut rng) } else { argmax(&counts) };
         let mv = action_to_move(a);
