@@ -336,8 +336,13 @@ impl<G: BatchGame> GameSearch<G> {
             let nodes_before = self.arena.len();
             let mut node = 0usize;
             'descend: while self.arena[node].expanded && !self.arena[node].terminal {
-                let was_random =
-                    self.params.explore_eps > 0.0 && rng.gen::<f32>() < self.params.explore_eps;
+                // Root-only ε-greedy: forced-random exploration is injected only at
+                // the root (node 0), so the deep tree stays pure PUCT (its Q values
+                // aren't polluted by random rollouts). The root random visits are
+                // excluded from the policy target via `rnd`, so the target stays clean.
+                let was_random = node == 0
+                    && self.params.explore_eps > 0.0
+                    && rng.gen::<f32>() < self.params.explore_eps;
                 let a = if was_random { self.random_legal(node, rng) } else { self.select(node) };
                 if a == usize::MAX {
                     break; // no legal action left (shouldn't happen: pass is always legal)

@@ -60,7 +60,7 @@ pub struct Params {
     pub dir_alpha: f32,
     pub dir_eps: f32,
     pub temp_moves: u32,
-    /// Per-node ε-greedy forced exploration: at every node, with this probability
+    /// Root-only ε-greedy forced exploration: at the root, with this probability
     /// the simulation descends to a uniformly-random legal child instead of the
     /// PUCT pick, so the search samples the full action space (not just the
     /// policy's favorites). These random visits are excluded from the policy
@@ -220,7 +220,8 @@ pub fn run_mcts(
         let mut node = 0usize;
         // Descend to a leaf (unexpanded or terminal).
         while arena[node].expanded && !arena[node].terminal {
-            let was_random = p.explore_eps > 0.0 && rng.gen::<f32>() < p.explore_eps;
+            // Root-only ε-greedy (node 0): keeps the deep tree pure PUCT.
+            let was_random = node == 0 && p.explore_eps > 0.0 && rng.gen::<f32>() < p.explore_eps;
             let c = if was_random {
                 random_legal(&arena[node], rng)
             } else {

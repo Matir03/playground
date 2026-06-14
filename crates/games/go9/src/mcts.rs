@@ -48,11 +48,11 @@ pub struct Params {
     pub dir_alpha: f32,
     pub dir_eps: f32,
     pub temp_moves: u32,
-    /// Per-node uniform exploration floor: at EVERY expanded node, mix this much
-    /// uniform mass into the priors over legal moves, so the search reliably
-    /// tries off-policy / random moves throughout the tree (not just the policy's
-    /// favorites). Generalizes the root-only Dirichlet noise to the whole tree to
-    /// keep self-play from collapsing into a narrow action subspace. 0 = off.
+    /// Root-only ε-greedy forced exploration: at the root, with this probability a
+    /// simulation descends to a uniformly-random legal child instead of the PUCT
+    /// pick, so self-play samples root alternatives (and doesn't collapse into a
+    /// narrow subspace) without polluting the deep tree. These root random visits
+    /// are excluded from the policy target (see `rnd`). 0 = off.
     pub explore_eps: f32,
     /// Hard ply cap for a self-play game: at this many moves the game is ended
     /// and adjudicated by area score even if neither side has passed. Keeps weak
@@ -215,11 +215,10 @@ pub fn run_mcts(
         path.clear();
         let mut node = 0usize;
         while arena[node].expanded && !arena[node].terminal {
-            // ε-greedy forced exploration: with prob explore_eps descend to a
-            // uniformly-random legal child instead of the PUCT pick, so the
-            // search reliably samples the full action space and self-play doesn't
-            // collapse into a narrow subspace.
-            let was_random = p.explore_eps > 0.0 && rng.gen::<f32>() < p.explore_eps;
+            // Root-only ε-greedy forced exploration (node 0): with prob explore_eps
+            // descend to a uniformly-random legal child instead of the PUCT pick, so
+            // self-play samples root alternatives without polluting the deep tree.
+            let was_random = node == 0 && p.explore_eps > 0.0 && rng.gen::<f32>() < p.explore_eps;
             let a = if was_random {
                 random_legal(&arena[node], rng)
             } else {
