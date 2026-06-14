@@ -271,6 +271,61 @@ pub fn run_mcts(
     Ok((policy_counts, root_value, nodes, sim))
 }
 
+/// Adapter so the generic batched self-play engine
+/// ([`playground_core::batch_search`]) can drive Go 9×9: fixed 82-action space,
+/// 243-plane encoding, and a ko-aware position key for the eval cache.
+impl playground_core::batch_search::BatchGame for Go9 {
+    type State = Go9State;
+    const ACTIONS: usize = ACTIONS;
+    const PLANES: usize = PLANES;
+
+    fn initial_state() -> Go9State {
+        <Go9 as Game>::initial_state()
+    }
+    fn to_move(state: &Go9State) -> u8 {
+        state.to_move
+    }
+    /// Cheap candidate mask: every empty point plus pass. Suicide/ko are filtered
+    /// lazily by `apply_action`, so we never run full legality over all 81 points.
+    fn candidate_actions(state: &Go9State) -> Vec<usize> {
+        let mut v = Vec::with_capacity(ACTIONS);
+        let mut empty = !(state.black | state.white) & crate::game::BOARD_MASK;
+        while empty != 0 {
+            v.push(empty.trailing_zeros() as usize);
+            empty &= empty - 1;
+        }
+        v.push(ACTIONS - 1); // pass
+        v
+    }
+    fn apply_action(state: &Go9State, action: usize) -> Option<Go9State> {
+        match action_to_move(action) {
+            crate::game::Go9Move::Pass => Some(Go9::apply(state, &crate::game::Go9Move::Pass)),
+            crate::game::Go9Move::Play { r, c } => {
+                crate::game::apply_play_checked(state, r as usize, c as usize)
+            }
+        }
+    }
+    fn terminal_value(state: &Go9State) -> Option<f32> {
+        terminal_value(state)
+    }
+    fn encode_planes(state: &Go9State, out: &mut [f32]) {
+        out.copy_from_slice(&planes_of(state));
+    }
+    /// The bitboards already identify the position — so the key is just a cheap mix
+    /// of (black, white, side-to-move, ko boards), no per-cell loop. Excludes
+    /// ply/pass count so a position transposed across games/moves is a cache hit;
+    /// includes the ko board since it changes the legal set (cached with the eval).
+    fn hash_key(state: &Go9State) -> u128 {
+        let mut h = state.black.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(31)
+            ^ state.white.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+        h ^= state.to_move as u128;
+        if let Some((pb, pw)) = state.prev {
+            h ^= pb.rotate_left(17) ^ pw.rotate_left(43).wrapping_mul(0x1656_67B1_9E37_79F9);
+        }
+        h
+    }
+}
+
 /// One self-play training example. `planes` is the position; `policy` the MCTS
 /// visit distribution; `value` the game-outcome z (side-to-move POV); and
 /// `played_action`/`next_planes` the 1-step transition for the reifier loss.
@@ -285,23 +340,11 @@ pub struct Example {
 }
 
 /// 3×9×9 side-to-move planes (own stones, opponent stones, side-to-move
-/// constant), matching `net.rs` `fill_planes` and `Go9::to_features`.
+/// constant). Delegates to the bitboard filler so the encoding has one source of
+/// truth shared with `net.rs` and `Go9::to_features`.
 pub fn planes_of(state: &Go9State) -> [f32; PLANES] {
-    let own = state.to_move;
-    let side: f32 = if state.to_move == 1 { 1.0 } else { 0.0 };
     let mut data = [0f32; PLANES];
-    for r in 0..N {
-        for c in 0..N {
-            let cell = state.board[r][c];
-            let idx = r * N + c;
-            if cell == own {
-                data[idx] = 1.0;
-            } else if cell != 0 {
-                data[CELLS + idx] = 1.0;
-            }
-            data[2 * CELLS + idx] = side;
-        }
-    }
+    crate::game::fill_planes_into(state, &mut data);
     data
 }
 

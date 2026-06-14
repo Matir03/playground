@@ -25,8 +25,11 @@ use std::time::Instant;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
-use crate::game::{Connect4State, C4_COLS};
-use crate::mcts::{self_play_game, Evaluator, Example, Params};
+use playground_core::batch_search::{self, SearchParams};
+use playground_core::{Game, Outcome};
+
+use crate::game::{Connect4, Connect4State, C4_COLS};
+use crate::mcts::{self_play_game, planes_of, Evaluator, Example, Params};
 use crate::net::LocalModel;
 
 type EvalOut = (f32, [f32; C4_COLS]);
@@ -161,6 +164,46 @@ pub struct GenStats {
     pub examples: u64,
     pub elapsed: f64,
     pub avg_batch: f64,
+    /// Network forwards actually run (nodes minus eval-cache hits). Engine path only.
+    pub evals: u64,
+    pub cache_hits: u64,
+}
+
+/// Convert per-game search knobs into the engine's `SearchParams`.
+fn to_search_params(p: &Params) -> SearchParams {
+    SearchParams {
+        sims: p.sims,
+        node_budget: p.node_budget,
+        c_puct: p.c_puct,
+        dir_alpha: p.dir_alpha,
+        dir_eps: p.dir_eps,
+        temp_moves: p.temp_moves,
+        explore_eps: p.explore_eps,
+        max_ply: 0, // Connect 4 always plays to a natural terminal
+    }
+}
+
+/// Turn the engine's game records into training examples: value = final outcome z
+/// from each position's side-to-move POV.
+fn examples_from_records(records: Vec<batch_search::GameRecord<Connect4>>) -> Vec<Example> {
+    let mut out = Vec::new();
+    for rec in records {
+        let winner: Option<u8> = match Connect4::outcome(rec.states.last().unwrap()) {
+            Outcome::FirstWins => Some(1),
+            Outcome::SecondWins => Some(2),
+            _ => None,
+        };
+        for (i, mv) in rec.moves.iter().enumerate() {
+            let z = match winner {
+                Some(w) => if w == mv.to_move { 1.0 } else { -1.0 },
+                None => 0.0,
+            };
+            let mut policy = [0f32; C4_COLS];
+            policy.copy_from_slice(&mv.policy);
+            out.push(Example { planes: planes_of(&rec.states[i]), policy, value: z });
+        }
+    }
+    out
 }
 
 /// Generate `n_games` across `threads` native threads. With `batched`, a central
@@ -177,6 +220,32 @@ pub fn generate(
     max_batch: usize,
     collect: bool,
 ) -> (GenStats, Vec<Example>) {
+    // GPU path: the generic batched engine (cross-game lockstep batching, leaf-side
+    // encoding, eval cache). The direct/CPU path keeps the simple per-thread search.
+    if batched {
+        let (records, cs) = batch_search::run_chunk::<Connect4>(
+            model.as_ref(),
+            n_games,
+            to_search_params(&params),
+            threads,
+            max_batch,
+            base_seed,
+            true, // Connect 4 transposes heavily: ~91% eval-cache hit rate
+        );
+        let examples_count: u64 = records.iter().map(|r| r.moves.len() as u64).sum();
+        let stats = GenStats {
+            sims: cs.nodes + cs.terminal_sims,
+            nodes: cs.nodes,
+            examples: examples_count,
+            elapsed: cs.elapsed,
+            avg_batch: cs.avg_batch(),
+            evals: cs.evals,
+            cache_hits: cs.cache_hits,
+        };
+        let examples = if collect { examples_from_records(records) } else { Vec::new() };
+        return (stats, examples);
+    }
+
     let counters = Counters {
         next: AtomicUsize::new(0),
         sims: AtomicU64::new(0),
@@ -227,6 +296,8 @@ pub fn generate(
         examples: counters.examples.load(Ordering::Relaxed),
         elapsed,
         avg_batch,
+        evals: 0,
+        cache_hits: 0,
     };
     let examples = sink.map(|m| m.into_inner().unwrap()).unwrap_or_default();
     (stats, examples)
@@ -254,13 +325,20 @@ pub fn run_benchmark(
         if cuda { "cuda" } else { "cpu" },
     );
     let (s, _) = generate(model, n_games, threads, params, base_seed, batched, max_batch, false);
-    let sims_per_s = s.sims as f64 / s.elapsed;
+    let nodes_per_s = s.nodes as f64 / s.elapsed;
+    let evals_per_s = s.evals as f64 / s.elapsed;
     let games_per_s = n_games as f64 / s.elapsed;
-    let batch_note = if batched { format!("  avg_batch {:.0}", s.avg_batch) } else { String::new() };
+    let hit_rate = if s.nodes > 0 { s.cache_hits as f64 / s.nodes as f64 } else { 0.0 };
+    let batch_note = if batched {
+        format!("  avg_batch {:.0}  evals/s {evals_per_s:.0}  cache_hit {:.1}%",
+                s.avg_batch, 100.0 * hit_rate)
+    } else {
+        String::new()
+    };
     println!(
-        "games {n_games}  examples {}  total_sims {}  \
-         time {:.2}s  sims/s {sims_per_s:.0}  games/s {games_per_s:.2}{batch_note}",
-        s.examples, s.sims, s.elapsed,
+        "games {n_games}  examples {}  total_sims {}  nodes {}  \
+         time {:.2}s  nodes/s {nodes_per_s:.0}  games/s {games_per_s:.2}{batch_note}",
+        s.examples, s.sims, s.nodes, s.elapsed,
     );
     Ok(())
 }

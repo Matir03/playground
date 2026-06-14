@@ -1,21 +1,39 @@
 //! 9×9 Go. Chinese rules, komi 7.5, positional ko (one-step lookback).
 //!
-//! Outcome is determined only on two consecutive passes; territory scoring
-//! uses flood-fill area counting (stones + empty points surrounded by one
-//! colour).
+//! The board is two **bitboards** (`black`, `white`) over the 81 points, bit
+//! `i = r*9 + c`. This makes the rules hot path cheap: group flood-fill, liberty
+//! and capture checks are `u128` shift/mask ops (no per-cell array scans or heap
+//! allocation), and a position's identity (for the eval cache) is just the pair
+//! of bitboards rather than a 162-cell hash. Outcome is decided on two passes;
+//! scoring is Chinese area scoring (stones + surrounded empty points).
 
 use playground_core::{Game, Outcome, Player, SearchOutcome, Solver};
 
 pub const N: usize = 9;
 pub const KOMI: f64 = 7.5;
+const NN: usize = N * N; // 81 points
+/// Low 81 bits set — the valid board area within a u128.
+pub const BOARD_MASK: u128 = (1u128 << NN) - 1;
 
-type Board = [[u8; N]; N]; // 0 empty, 1 black (first), 2 white (second)
+const fn col_mask(c: usize) -> u128 {
+    let mut m = 0u128;
+    let mut r = 0;
+    while r < N {
+        m |= 1u128 << (r * N + c);
+        r += 1;
+    }
+    m
+}
+const COL0: u128 = col_mask(0); // leftmost column (c == 0)
+const COL8: u128 = col_mask(N - 1); // rightmost column (c == 8)
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Go9State {
-    pub board: Board,
-    /// The board position immediately before the last move, for ko detection.
-    pub prev_board: Option<Board>,
+    /// Bit `r*9+c` set = a black stone there.
+    pub black: u128,
+    pub white: u128,
+    /// The (black, white) bitboards before the last move, for positional ko.
+    pub prev: Option<(u128, u128)>,
     /// 1 = black's turn, 2 = white's turn.
     pub to_move: u8,
     pub consecutive_passes: u8,
@@ -24,13 +42,26 @@ pub struct Go9State {
 
 impl Default for Go9State {
     fn default() -> Self {
-        Self {
-            board: [[0; N]; N],
-            prev_board: None,
-            to_move: 1,
-            consecutive_passes: 0,
-            ply: 0,
+        Self { black: 0, white: 0, prev: None, to_move: 1, consecutive_passes: 0, ply: 0 }
+    }
+}
+
+impl Go9State {
+    /// Stone at point `i` (0..81): 0 empty, 1 black, 2 white.
+    #[inline]
+    pub fn cell_at(&self, i: usize) -> u8 {
+        if (self.black >> i) & 1 == 1 {
+            1
+        } else if (self.white >> i) & 1 == 1 {
+            2
+        } else {
+            0
         }
+    }
+    /// Stones of the side to move / the opponent, as bitboards.
+    #[inline]
+    pub fn own_opp(&self) -> (u128, u128) {
+        if self.to_move == 1 { (self.black, self.white) } else { (self.white, self.black) }
     }
 }
 
@@ -41,6 +72,55 @@ pub enum Go9Move {
 }
 
 pub struct Go9;
+
+// ── Bitboard rules primitives ────────────────────────────────────────────────
+
+/// All orthogonal neighbours of the set `x` (column masks stop left/right wrap).
+#[inline]
+fn expand(x: u128) -> u128 {
+    ((x >> N) | (x << N) | ((x & !COL0) >> 1) | ((x & !COL8) << 1)) & BOARD_MASK
+}
+
+/// The maximal connected group of `color` stones reachable from `seed` (a single
+/// stone bit), by flood-fill to a fixpoint.
+#[inline]
+fn group_of(color: u128, seed: u128) -> u128 {
+    let mut g = seed & color;
+    loop {
+        let next = (g | (expand(g) & color)) & BOARD_MASK;
+        if next == g {
+            return g;
+        }
+        g = next;
+    }
+}
+
+/// Does `group` touch at least one empty point?
+#[inline]
+fn has_lib(group: u128, empty: u128) -> bool {
+    expand(group) & empty != 0
+}
+
+/// Place a stone (bit `b`) of the mover (`mine`) and resolve opponent captures.
+/// Returns the post-capture (mine, opp) bitboards. Does *not* check suicide/ko.
+#[inline]
+fn place_with_captures(mine: u128, opp: u128, b: u128) -> (u128, u128) {
+    let mine2 = mine | b;
+    let mut opp2 = opp;
+    let mut adj = expand(b) & opp2; // opponent stones touching the new stone
+    while adj != 0 {
+        let seed = adj & adj.wrapping_neg(); // lowest set bit
+        let g = group_of(opp2, seed);
+        let empty = !(mine2 | opp2) & BOARD_MASK;
+        if !has_lib(g, empty) {
+            opp2 &= !g; // capture: group has no liberties
+        }
+        adj &= !g; // done with this group (captured or not)
+    }
+    (mine2, opp2)
+}
+
+// ── Game trait ───────────────────────────────────────────────────────────────
 
 impl Game for Go9 {
     type State = Go9State;
@@ -55,11 +135,7 @@ impl Game for Go9 {
     }
 
     fn to_move(state: &Self::State) -> Player {
-        if state.to_move == 1 {
-            Player::First
-        } else {
-            Player::Second
-        }
+        if state.to_move == 1 { Player::First } else { Player::Second }
     }
 
     fn outcome(state: &Self::State) -> Outcome {
@@ -74,43 +150,45 @@ impl Game for Go9 {
             return vec![];
         }
         let mut moves = vec![Go9Move::Pass];
-        for r in 0..N as u8 {
-            for c in 0..N as u8 {
-                if is_legal_play(state, r, c) {
-                    moves.push(Go9Move::Play { r, c });
-                }
+        let mut empty = !(state.black | state.white) & BOARD_MASK;
+        while empty != 0 {
+            let i = empty.trailing_zeros() as usize;
+            empty &= empty - 1;
+            if apply_play_checked(state, i / N, i % N).is_some() {
+                moves.push(Go9Move::Play { r: (i / N) as u8, c: (i % N) as u8 });
             }
         }
         moves
     }
 
     fn apply(state: &Self::State, mv: &Self::Move) -> Self::State {
-        let mut next = state.clone();
-        let prev_board = state.board;
+        let mut next = *state;
+        let prev = (state.black, state.white);
         match mv {
             Go9Move::Pass => {
                 next.consecutive_passes += 1;
-                next.prev_board = Some(prev_board);
             }
             Go9Move::Play { r, c } => {
-                let (r, c) = (*r as usize, *c as usize);
-                let color = next.to_move;
-                next.board[r][c] = color;
-                // Capture any opponent groups that now have no liberties.
-                let opp = 3 - color;
-                for (nr, nc) in neighbors(r, c) {
-                    if next.board[nr][nc] == opp && !has_liberty(&next.board, nr, nc) {
-                        remove_group(&mut next.board, nr, nc);
-                    }
+                let b = 1u128 << (*r as usize * N + *c as usize);
+                let (mine, opp) = state.own_opp();
+                let (mut mine2, opp2) = place_with_captures(mine, opp, b);
+                // Suicide is excluded by legality, but guard anyway (matches the
+                // old array implementation): drop the placed group if libertyless.
+                let empty = !(mine2 | opp2) & BOARD_MASK;
+                if !has_lib(group_of(mine2, b), empty) {
+                    mine2 &= !group_of(mine2, b);
                 }
-                // Suicide is excluded by is_legal_play; this is a safety guard.
-                if !has_liberty(&next.board, r, c) {
-                    remove_group(&mut next.board, r, c);
+                if state.to_move == 1 {
+                    next.black = mine2;
+                    next.white = opp2;
+                } else {
+                    next.white = mine2;
+                    next.black = opp2;
                 }
                 next.consecutive_passes = 0;
-                next.prev_board = Some(prev_board);
             }
         }
+        next.prev = Some(prev);
         next.to_move = 3 - state.to_move;
         next.ply += 1;
         next
@@ -121,38 +199,30 @@ impl Game for Go9 {
     }
 
     fn to_features(state: &Self::State) -> Vec<u8> {
-        // Planes: [own stones, opp stones, to-move constant]
-        let own = state.to_move;
-        let opp = 3 - own;
-        let mut out = Vec::with_capacity(3 * N * N);
-        for &color in &[own, opp] {
-            for r in 0..N {
-                for c in 0..N {
-                    out.push(if state.board[r][c] == color { 1 } else { 0 });
-                }
+        // Planes: [own stones, opp stones, to-move constant].
+        let (own, opp) = state.own_opp();
+        let mut out = Vec::with_capacity(3 * NN);
+        for &bb in &[own, opp] {
+            for i in 0..NN {
+                out.push(((bb >> i) & 1) as u8);
             }
         }
         let side_plane: u8 = if state.to_move == 1 { 1 } else { 0 };
-        for _ in 0..N * N {
-            out.push(side_plane);
-        }
+        out.resize(3 * NN, side_plane);
         out
     }
 
     fn encode_state(state: &Self::State) -> Vec<u8> {
-        let board_bytes = N * N;
-        let mut out = Vec::with_capacity(2 * board_bytes + 5);
-        for r in 0..N {
-            for c in 0..N {
-                out.push(state.board[r][c]);
-            }
+        // Wire format preserved: 81 cell bytes, optional prev (81 bytes), to_move,
+        // passes, ply — so existing decoders keep working.
+        let mut out = Vec::with_capacity(2 * NN + 5);
+        for i in 0..NN {
+            out.push(state.cell_at(i));
         }
-        if let Some(prev) = state.prev_board {
+        if let Some((pb, pw)) = state.prev {
             out.push(1);
-            for r in 0..N {
-                for c in 0..N {
-                    out.push(prev[r][c]);
-                }
+            for i in 0..NN {
+                out.push(if (pb >> i) & 1 == 1 { 1 } else if (pw >> i) & 1 == 1 { 2 } else { 0 });
             }
         } else {
             out.push(0);
@@ -164,41 +234,42 @@ impl Game for Go9 {
     }
 
     fn decode_state(bytes: &[u8]) -> anyhow::Result<Self::State> {
-        let board_bytes = N * N;
-        if bytes.len() < board_bytes + 4 {
+        if bytes.len() < NN + 4 {
             anyhow::bail!("go9 state: too short ({} bytes)", bytes.len());
         }
         let mut state = Go9State::default();
         let mut i = 0;
-        for r in 0..N {
-            for c in 0..N {
-                state.board[r][c] = bytes[i];
-                i += 1;
+        for p in 0..NN {
+            match bytes[i] {
+                1 => state.black |= 1u128 << p,
+                2 => state.white |= 1u128 << p,
+                _ => {}
             }
+            i += 1;
         }
         let has_prev = bytes[i];
         i += 1;
         if has_prev == 1 {
-            if bytes.len() < i + board_bytes + 4 {
+            if bytes.len() < i + NN + 4 {
                 anyhow::bail!("go9 state: too short for prev board");
             }
-            let mut prev = [[0u8; N]; N];
-            for r in 0..N {
-                for c in 0..N {
-                    prev[r][c] = bytes[i];
-                    i += 1;
+            let (mut pb, mut pw) = (0u128, 0u128);
+            for p in 0..NN {
+                match bytes[i] {
+                    1 => pb |= 1u128 << p,
+                    2 => pw |= 1u128 << p,
+                    _ => {}
                 }
+                i += 1;
             }
-            state.prev_board = Some(prev);
+            state.prev = Some((pb, pw));
         }
         if bytes.len() < i + 4 {
             anyhow::bail!("go9 state: missing tail");
         }
         state.to_move = bytes[i];
-        i += 1;
-        state.consecutive_passes = bytes[i];
-        i += 1;
-        state.ply = u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+        state.consecutive_passes = bytes[i + 1];
+        state.ply = u16::from_le_bytes([bytes[i + 2], bytes[i + 3]]);
         Ok(state)
     }
 
@@ -220,11 +291,55 @@ impl Game for Go9 {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+/// Apply a stone play with full legality (the lazy check the batched search uses):
+/// place the stone + resolve captures, returning `None` if the move is suicide or
+/// repeats the previous board (positional ko). `r,c` must be an empty point.
+pub fn apply_play_checked(state: &Go9State, r: usize, c: usize) -> Option<Go9State> {
+    let i = r * N + c;
+    if ((state.black | state.white) >> i) & 1 == 1 {
+        return None; // occupied
+    }
+    let b = 1u128 << i;
+    let (mine, opp) = state.own_opp();
+    let (mine2, opp2) = place_with_captures(mine, opp, b);
+    let empty = !(mine2 | opp2) & BOARD_MASK;
+    if !has_lib(group_of(mine2, b), empty) {
+        return None; // suicide
+    }
+    let (nb, nw) = if state.to_move == 1 { (mine2, opp2) } else { (opp2, mine2) };
+    if let Some((pb, pw)) = state.prev {
+        if nb == pb && nw == pw {
+            return None; // positional ko
+        }
+    }
+    Some(Go9State {
+        black: nb,
+        white: nw,
+        prev: Some((state.black, state.white)),
+        to_move: 3 - state.to_move,
+        consecutive_passes: 0,
+        ply: state.ply + 1,
+    })
+}
+
+/// Write the 3×9×9 self-play planes (own, opp, side-to-move) into `out` (len 243).
+/// Single source of truth for both the in-process net and the search.
+pub fn fill_planes_into(state: &Go9State, out: &mut [f32]) {
+    debug_assert_eq!(out.len(), 3 * NN);
+    let (own, opp) = state.own_opp();
+    let side: f32 = if state.to_move == 1 { 1.0 } else { 0.0 };
+    for i in 0..NN {
+        out[i] = ((own >> i) & 1) as f32;
+        out[NN + i] = ((opp >> i) & 1) as f32;
+        out[2 * NN + i] = side;
+    }
+}
+
 /// Area-score outcome (Chinese rules + komi) for a position, ignoring the pass
-/// count. `outcome` uses this once two passes end the game; self-play also calls
-/// it to adjudicate a game stopped at a move cap. White gets the komi.
+/// count. White gets the komi. Used to end a game on two passes and to adjudicate
+/// a game stopped at a move cap.
 pub fn area_outcome(state: &Go9State) -> Outcome {
-    let (black, white_raw) = score_area(&state.board);
+    let (black, white_raw) = score_area(state.black, state.white);
     let white = white_raw as f64 + KOMI;
     match (black as f64).partial_cmp(&white) {
         Some(std::cmp::Ordering::Greater) => Outcome::FirstWins,
@@ -233,145 +348,31 @@ pub fn area_outcome(state: &Go9State) -> Outcome {
     }
 }
 
-fn neighbors(r: usize, c: usize) -> impl Iterator<Item = (usize, usize)> {
-    let mut v: [Option<(usize, usize)>; 4] = [None; 4];
-    let mut idx = 0;
-    if r > 0 {
-        v[idx] = Some((r - 1, c));
-        idx += 1;
+/// Chinese area score `(black, white)`: stones plus empty regions bordered by a
+/// single colour. Bitboard flood-fill of the empty regions.
+fn score_area(black: u128, white: u128) -> (u32, u32) {
+    let mut b = black.count_ones();
+    let mut w = white.count_ones();
+    let occupied = black | white;
+    let mut remaining = !occupied & BOARD_MASK;
+    while remaining != 0 {
+        let seed = remaining & remaining.wrapping_neg();
+        let region = group_of(!occupied & BOARD_MASK, seed);
+        remaining &= !region;
+        let border = expand(region) & occupied;
+        let touches_black = border & black != 0;
+        let touches_white = border & white != 0;
+        if touches_black && !touches_white {
+            b += region.count_ones();
+        } else if touches_white && !touches_black {
+            w += region.count_ones();
+        } // else dame — counts for neither
     }
-    if r + 1 < N {
-        v[idx] = Some((r + 1, c));
-        idx += 1;
-    }
-    if c > 0 {
-        v[idx] = Some((r, c - 1));
-        idx += 1;
-    }
-    if c + 1 < N {
-        v[idx] = Some((r, c + 1));
-        let _ = idx;
-    }
-    v.into_iter().flatten()
+    (b, w)
 }
 
-/// Returns (stones, liberties) for the connected group containing (r, c).
-fn group_info(board: &Board, r: usize, c: usize) -> (Vec<(usize, usize)>, bool) {
-    let color = board[r][c];
-    let mut seen = [[false; N]; N];
-    let mut stack = vec![(r, c)];
-    let mut stones = vec![];
-    let mut has_lib = false;
-    while let Some((rr, cc)) = stack.pop() {
-        if seen[rr][cc] {
-            continue;
-        }
-        seen[rr][cc] = true;
-        stones.push((rr, cc));
-        for (nr, nc) in neighbors(rr, cc) {
-            match board[nr][nc] {
-                0 => has_lib = true,
-                c if c == color && !seen[nr][nc] => stack.push((nr, nc)),
-                _ => {}
-            }
-        }
-    }
-    (stones, has_lib)
-}
-
-fn has_liberty(board: &Board, r: usize, c: usize) -> bool {
-    group_info(board, r, c).1
-}
-
-fn remove_group(board: &mut Board, r: usize, c: usize) {
-    let (stones, _) = group_info(board, r, c);
-    for (sr, sc) in stones {
-        board[sr][sc] = 0;
-    }
-}
-
-fn is_legal_play(state: &Go9State, r: u8, c: u8) -> bool {
-    let (r, c) = (r as usize, c as usize);
-    if state.board[r][c] != 0 {
-        return false;
-    }
-    let color = state.to_move;
-    let opp = 3 - color;
-
-    // Simulate the placement.
-    let mut b = state.board;
-    b[r][c] = color;
-    for (nr, nc) in neighbors(r, c) {
-        if b[nr][nc] == opp && !has_liberty(&b, nr, nc) {
-            remove_group(&mut b, nr, nc);
-        }
-    }
-    // Suicide is illegal.
-    if !has_liberty(&b, r, c) {
-        return false;
-    }
-    // Positional ko: no immediate repetition of the previous board.
-    if let Some(prev) = state.prev_board {
-        if b == prev {
-            return false;
-        }
-    }
-    true
-}
-
-fn score_area(board: &Board) -> (u32, u32) {
-    let mut black = 0u32;
-    let mut white = 0u32;
-    let mut visited = [[false; N]; N];
-
-    // Count stones.
-    for r in 0..N {
-        for c in 0..N {
-            match board[r][c] {
-                1 => black += 1,
-                2 => white += 1,
-                _ => {}
-            }
-        }
-    }
-
-    // Flood-fill empty regions and assign territory.
-    for start_r in 0..N {
-        for start_c in 0..N {
-            if board[start_r][start_c] != 0 || visited[start_r][start_c] {
-                continue;
-            }
-            let mut stack = vec![(start_r, start_c)];
-            let mut region = vec![];
-            let mut touches = [false, false]; // [black, white]
-            while let Some((rr, cc)) = stack.pop() {
-                if visited[rr][cc] {
-                    continue;
-                }
-                visited[rr][cc] = true;
-                region.push((rr, cc));
-                for (nr, nc) in neighbors(rr, cc) {
-                    match board[nr][nc] {
-                        0 if !visited[nr][nc] => stack.push((nr, nc)),
-                        1 => touches[0] = true,
-                        2 => touches[1] = true,
-                        _ => {}
-                    }
-                }
-            }
-            let count = region.len() as u32;
-            match touches {
-                [true, false] => black += count,
-                [false, true] => white += count,
-                _ => {} // dame (contested) — counts for neither
-            }
-        }
-    }
-    (black, white)
-}
-
-// Placeholder built-in engine: plays the first legal move. No strong solver
-// for Go yet — this only exists so the engine can answer RequestMove.
+// Placeholder built-in engine: plays the first legal move. No strong Go solver
+// yet — this only exists so the engine can answer RequestMove.
 impl Solver for Go9 {
     fn choose_move(state: &Self::State) -> SearchOutcome<Self::Move> {
         let best_move = Self::legal_moves(state)
@@ -389,8 +390,7 @@ mod tests {
     #[test]
     fn empty_board_has_82_moves() {
         let s = Go9::initial_state();
-        // 81 play moves + 1 pass
-        assert_eq!(Go9::legal_moves(&s).len(), 82);
+        assert_eq!(Go9::legal_moves(&s).len(), 82); // 81 plays + pass
     }
 
     #[test]
@@ -409,7 +409,17 @@ mod tests {
         s = Go9::apply(&s, &Go9Move::Play { r: 0, c: 1 }); // white
         s = Go9::apply(&s, &Go9Move::Pass); // black passes
         s = Go9::apply(&s, &Go9Move::Play { r: 1, c: 0 }); // white captures
-        assert_eq!(s.board[0][0], 0, "captured stone should be empty");
+        assert_eq!(s.cell_at(0), 0, "captured stone should be empty");
+    }
+
+    #[test]
+    fn suicide_is_illegal() {
+        // White surrounds the single empty point (0,0); black playing there is
+        // suicide (no capture, no liberty) → illegal.
+        let mut s = Go9::initial_state();
+        s.white = (1u128 << 1) | (1u128 << N); // (0,1) and (1,0)
+        s.to_move = 1;
+        assert!(apply_play_checked(&s, 0, 0).is_none());
     }
 
     #[test]
@@ -418,5 +428,17 @@ mod tests {
             let bytes = Go9::encode_move(&mv);
             assert_eq!(Go9::decode_move(&bytes).unwrap(), mv);
         }
+    }
+
+    #[test]
+    fn state_roundtrip() {
+        let mut s = Go9::initial_state();
+        s = Go9::apply(&s, &Go9Move::Play { r: 2, c: 3 });
+        s = Go9::apply(&s, &Go9Move::Play { r: 4, c: 4 });
+        let bytes = Go9::encode_state(&s);
+        let back = Go9::decode_state(&bytes).unwrap();
+        assert_eq!(back.black, s.black);
+        assert_eq!(back.white, s.white);
+        assert_eq!(back.to_move, s.to_move);
     }
 }

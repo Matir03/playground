@@ -3,6 +3,7 @@
 //! The engine-server and model-client crates wrap this with transport.
 //! See `docs/architecture.md` for the boundary rationale.
 
+pub mod batch_search;
 pub mod game;
 pub mod latent_state;
 pub mod model;

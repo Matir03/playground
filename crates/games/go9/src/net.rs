@@ -196,24 +196,12 @@ impl LocalModel {
         Ok(Self { net, device, model_version: format!("go9-{stem}") })
     }
 
-    /// Fill `out` (length `b*3*CELLS`) with the 3 side-to-move planes of `states`.
+    /// Fill `out` (length `b*3*CELLS`) with the 3 side-to-move planes of `states`,
+    /// via the shared bitboard plane filler (one source of truth).
     fn fill_planes(states: &[&Go9State], out: &mut [f32]) {
+        let stride = IN_PLANES * CELLS;
         for (i, s) in states.iter().enumerate() {
-            let own = s.to_move;
-            let base = i * IN_PLANES * CELLS;
-            let side: f32 = if s.to_move == 1 { 1.0 } else { 0.0 };
-            for r in 0..N {
-                for c in 0..N {
-                    let cell = s.board[r][c];
-                    let idx = r * N + c;
-                    if cell == own {
-                        out[base + idx] = 1.0;
-                    } else if cell != 0 {
-                        out[base + CELLS + idx] = 1.0;
-                    }
-                    out[base + 2 * CELLS + idx] = side;
-                }
-            }
+            crate::game::fill_planes_into(s, &mut out[i * stride..(i + 1) * stride]);
         }
     }
 
@@ -258,6 +246,15 @@ impl LocalModel {
             out.push((vals[i], arr));
         }
         Ok(out)
+    }
+}
+
+/// The batched-self-play engine sees the net as a pure forward over pre-encoded
+/// planes (workers do the encoding — `fill_planes` is off the GPU thread's path).
+impl playground_core::batch_search::BatchModel for LocalModel {
+    fn forward(&self, planes: &[f32], b: usize) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
+        let t = Tensor::from_vec(planes.to_vec(), (b, IN_PLANES, N, N), &self.device)?;
+        Ok(self.net.value_policy_batch(&t)?)
     }
 }
 

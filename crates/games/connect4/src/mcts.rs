@@ -20,7 +20,7 @@ use playground_core::{Game, Outcome};
 
 use crate::game::{Connect4, Connect4Move, Connect4State, C4_COLS};
 
-const PLANES: usize = 2 * 6 * 7;
+pub const PLANES: usize = 2 * 6 * 7;
 
 /// A leaf evaluator: a concrete state -> (value for the side to move, full
 /// softmax priors over the 7 columns). Decoupling the search from inference this
@@ -278,6 +278,48 @@ pub fn run_mcts(
     Ok((policy_counts, root_value, nodes, sim))
 }
 
+/// Adapter so the generic batched self-play engine
+/// ([`playground_core::batch_search`]) can drive Connect 4: 7-action space,
+/// 84-plane encoding, and a board key for the eval cache.
+impl playground_core::batch_search::BatchGame for Connect4 {
+    type State = Connect4State;
+    const ACTIONS: usize = C4_COLS;
+    const PLANES: usize = PLANES;
+
+    fn initial_state() -> Connect4State {
+        <Connect4 as Game>::initial_state()
+    }
+    fn to_move(state: &Connect4State) -> u8 {
+        if state.ply % 2 == 0 { 1 } else { 2 }
+    }
+    fn candidate_actions(state: &Connect4State) -> Vec<usize> {
+        Connect4::legal_moves(state).iter().map(|m| m.col as usize).collect()
+    }
+    fn apply_action(state: &Connect4State, action: usize) -> Option<Connect4State> {
+        // Every legal column is a candidate, so a candidate is always legal.
+        Some(Connect4::apply(state, &Connect4Move { col: action as u8 }))
+    }
+    fn terminal_value(state: &Connect4State) -> Option<f32> {
+        terminal_value(state)
+    }
+    fn encode_planes(state: &Connect4State, out: &mut [f32]) {
+        out.copy_from_slice(&planes_of(state));
+    }
+    /// FNV-1a over the 6×7 cells — which fully determine the position and side to
+    /// move (stone count parity), so transpositions across games/moves hit.
+    fn hash_key(state: &Connect4State) -> u128 {
+        const PRIME: u128 = 0x0000_0000_0100_0000_01b3;
+        let mut h: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+        for row in &state.cells {
+            for &cell in row {
+                h ^= cell as u128;
+                h = h.wrapping_mul(PRIME);
+            }
+        }
+        h
+    }
+}
+
 /// One self-play training example: planes (2×6×7), MCTS policy target (PUCT-only
 /// visit distribution), and the value target = the final game outcome z from this
 /// position's side-to-move POV (not the local root value — outcome z is the
@@ -354,7 +396,7 @@ pub fn self_play_game(
 
 /// 2×6×7 side-to-move planes (own stones, then opponent's), matching
 /// `connect4.py` `Board.planes` and the net's `planes`.
-fn planes_of(state: &Connect4State) -> [f32; PLANES] {
+pub fn planes_of(state: &Connect4State) -> [f32; PLANES] {
     let mover = if state.ply % 2 == 0 { 1u8 } else { 2u8 };
     let cells = 6 * 7;
     let mut data = [0f32; PLANES];

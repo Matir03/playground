@@ -14,8 +14,11 @@ use std::time::Instant;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
-use crate::game::Go9State;
-use crate::mcts::{self_play_game, Evaluator, Example, Params, PLANES};
+use playground_core::batch_search::{self, SearchParams};
+use playground_core::{Game, Outcome};
+
+use crate::game::{area_outcome, Go9, Go9State};
+use crate::mcts::{self_play_game, planes_of, Evaluator, Example, Params, PLANES};
 use crate::net::{LocalModel, ACTIONS};
 
 type EvalOut = (f32, [f32; ACTIONS]);
@@ -126,6 +129,59 @@ pub struct GenStats {
     pub examples: u64,
     pub elapsed: f64,
     pub avg_batch: f64,
+    /// Network forwards actually run (nodes minus eval-cache hits). Engine path only.
+    pub evals: u64,
+    pub cache_hits: u64,
+}
+
+/// Convert per-game search knobs into the engine's `SearchParams`.
+fn to_search_params(p: &Params) -> SearchParams {
+    SearchParams {
+        sims: p.sims,
+        node_budget: p.node_budget,
+        c_puct: p.c_puct,
+        dir_alpha: p.dir_alpha,
+        dir_eps: p.dir_eps,
+        temp_moves: p.temp_moves,
+        explore_eps: p.explore_eps,
+        max_ply: p.max_ply,
+    }
+}
+
+/// Turn the engine's game records into training examples: value = final outcome z
+/// (area-adjudicated if the game hit the ply cap), plus the played action and the
+/// next position's planes for the reifier consistency loss.
+fn examples_from_records(records: Vec<batch_search::GameRecord<Go9>>) -> Vec<Example> {
+    let mut out = Vec::new();
+    for rec in records {
+        let final_state = rec.states.last().unwrap();
+        let outcome = match Go9::outcome(final_state) {
+            Outcome::InProgress => area_outcome(final_state),
+            o => o,
+        };
+        let winner: Option<u8> = match outcome {
+            Outcome::FirstWins => Some(1),
+            Outcome::SecondWins => Some(2),
+            _ => None,
+        };
+        for (i, mv) in rec.moves.iter().enumerate() {
+            let z = match winner {
+                Some(w) => if w == mv.to_move { 1.0 } else { -1.0 },
+                None => 0.0,
+            };
+            let mut policy = [0f32; ACTIONS];
+            policy.copy_from_slice(&mv.policy);
+            out.push(Example {
+                planes: planes_of(&rec.states[i]),
+                policy,
+                value: z,
+                played_action: mv.action as u8,
+                has_next: true,
+                next_planes: planes_of(&rec.states[i + 1]),
+            });
+        }
+    }
+    out
 }
 
 /// Generate `n_games` across `threads` native threads. With `batched`, a central
@@ -141,6 +197,34 @@ pub fn generate(
     max_batch: usize,
     collect: bool,
 ) -> (GenStats, Vec<Example>) {
+    // GPU path: the generic batched engine (cross-game lockstep batching, leaf-side
+    // encoding, eval cache). The direct/CPU path keeps the simple per-thread search.
+    // `GO9_OLD=1` routes the batched path through the original independent-thread
+    // server instead, for A/B comparing the two architectures.
+    if batched && std::env::var_os("GO9_OLD").is_none() {
+        let (records, cs) = batch_search::run_chunk::<Go9>(
+            model.as_ref(),
+            n_games,
+            to_search_params(&params),
+            threads,
+            max_batch,
+            base_seed,
+            false, // Go transposes little (~20% hits); the cache's per-leaf cost isn't worth it
+        );
+        let examples_count: u64 = records.iter().map(|r| r.moves.len() as u64).sum();
+        let stats = GenStats {
+            sims: cs.nodes + cs.terminal_sims,
+            nodes: cs.nodes,
+            examples: examples_count,
+            elapsed: cs.elapsed,
+            avg_batch: cs.avg_batch(),
+            evals: cs.evals,
+            cache_hits: cs.cache_hits,
+        };
+        let examples = if collect { examples_from_records(records) } else { Vec::new() };
+        return (stats, examples);
+    }
+
     let counters = Counters {
         next: AtomicUsize::new(0),
         sims: AtomicU64::new(0),
@@ -191,6 +275,8 @@ pub fn generate(
         examples: counters.examples.load(Ordering::Relaxed),
         elapsed,
         avg_batch,
+        evals: 0,
+        cache_hits: 0,
     };
     let examples = sink.map(|m| m.into_inner().unwrap()).unwrap_or_default();
     (stats, examples)
@@ -217,12 +303,19 @@ pub fn run_benchmark(
         if cuda { "cuda" } else { "cpu" },
     );
     let (s, _) = generate(model, n_games, threads, params, base_seed, batched, max_batch, false);
-    let sims_per_s = s.sims as f64 / s.elapsed;
+    let nodes_per_s = s.nodes as f64 / s.elapsed;
+    let evals_per_s = s.evals as f64 / s.elapsed;
     let games_per_s = n_games as f64 / s.elapsed;
-    let batch_note = if batched { format!("  avg_batch {:.0}", s.avg_batch) } else { String::new() };
+    let hit_rate = if s.nodes > 0 { s.cache_hits as f64 / s.nodes as f64 } else { 0.0 };
+    let batch_note = if batched {
+        format!("  avg_batch {:.0}  evals/s {evals_per_s:.0}  cache_hit {:.1}%",
+                s.avg_batch, 100.0 * hit_rate)
+    } else {
+        String::new()
+    };
     println!(
         "games {n_games}  examples {}  nodes {}  total_sims {}  time {:.2}s  \
-         sims/s {sims_per_s:.0}  games/s {games_per_s:.2}{batch_note}",
+         nodes/s {nodes_per_s:.0}  games/s {games_per_s:.2}{batch_note}",
         s.examples, s.nodes, s.sims, s.elapsed,
     );
     Ok(())

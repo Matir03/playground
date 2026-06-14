@@ -323,6 +323,15 @@ impl LocalModel {
     }
 }
 
+/// The batched-self-play engine sees the net as a pure forward over pre-encoded
+/// planes (workers encode — `fill_planes` is off the GPU thread's path).
+impl playground_core::batch_search::BatchModel for LocalModel {
+    fn forward(&self, planes: &[f32], b: usize) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
+        let t = Tensor::from_vec(planes.to_vec(), (b, 2, C4_ROWS, C4_COLS), &self.device)?;
+        Ok(self.net.value_policy_batch(&t)?)
+    }
+}
+
 #[async_trait]
 impl ModelClient<Connect4> for LocalModel {
     async fn encode(&self, state: &Connect4State) -> anyhow::Result<LatentGameState> {
