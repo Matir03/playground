@@ -84,11 +84,62 @@ class Go9ResNet(nn.Module):
         return self.value_batch(gs), F.softmax(self.pol_prior(gs), dim=-1)
 
 
-def arch_of(model: Go9ResNet) -> dict:
+class Go9AZNet(nn.Module):
+    """Traditional AlphaZero net (benchmark baseline): a ResNet trunk with standard
+    conv policy + value heads that read the **spatial** trunk directly — no latent
+    (GS) bottleneck and no reifier. Policy is a direct softmax over the 82 actions.
+    Contrast with `Go9ResNet`, which funnels the trunk through a GS_DIM latent (for
+    the reification MCTS) before its heads. Same input planes + checkpoint format;
+    parameter names must stay in sync with `crates/games/go9/src/net.rs` AzNet.
+    """
+
+    def __init__(self, channels: int = 96, blocks: int = 10) -> None:
+        super().__init__()
+        self.channels = channels
+        self.blocks_n = blocks
+        self.stem = nn.Conv2d(3, channels, 3, padding=1)
+        self.stem_bn = nn.BatchNorm2d(channels)
+        self.blocks = nn.ModuleList(_ResBlock(channels) for _ in range(blocks))
+        # Policy head: 1×1 conv -> 2 planes -> FC to 82 logits (AlphaZero-standard).
+        self.pol_conv = nn.Conv2d(channels, 2, 1)
+        self.pol_bn = nn.BatchNorm2d(2)
+        self.pol_fc = nn.Linear(2 * CELLS, ACTIONS)
+        # Value head: 1×1 conv -> 1 plane -> FC -> FC -> tanh.
+        self.val_conv = nn.Conv2d(channels, 1, 1)
+        self.val_bn = nn.BatchNorm2d(1)
+        self.val_fc1 = nn.Linear(CELLS, 64)
+        self.val_fc2 = nn.Linear(64, 1)
+
+    def _trunk(self, planes: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.stem_bn(self.stem(planes)))
+        for blk in self.blocks:
+            x = blk(x)
+        return x  # (B, channels, 9, 9) — spatial structure preserved for the heads
+
+    def forward(self, planes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(B,3,9,9) -> (value (B,), policy logits (B,82))."""
+        x = self._trunk(planes)
+        p = F.relu(self.pol_bn(self.pol_conv(x))).flatten(1)
+        logits = self.pol_fc(p)
+        v = F.relu(self.val_bn(self.val_conv(x))).flatten(1)
+        v = F.relu(self.val_fc1(v))
+        v = torch.tanh(self.val_fc2(v)).squeeze(-1)
+        return v, logits
+
+    def policy_value(self, planes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        v, logits = self.forward(planes)
+        return v, F.softmax(logits, dim=-1)
+
+
+def arch_of(model: nn.Module) -> dict:
+    if isinstance(model, Go9AZNet):
+        return {"kind": "go9-az", "channels": model.channels, "blocks": model.blocks_n}
     return {"kind": "go9-resnet", "channels": model.channels, "blocks": model.blocks_n}
 
 
-def build_model(arch: dict | None) -> Go9ResNet:
+def build_model(arch: dict | None) -> nn.Module:
+    if arch and arch.get("kind") == "go9-az":
+        return Go9AZNet(channels=int(arch.get("channels", 96)), blocks=int(arch.get("blocks", 10)))
     if arch and arch.get("kind") == "go9-resnet":
         return Go9ResNet(channels=int(arch.get("channels", 96)), blocks=int(arch.get("blocks", 10)))
     return Go9ResNet()
@@ -106,10 +157,13 @@ def load_checkpoint(model: Go9ResNet, path: str) -> None:
     model.load_state_dict(load_file(path))
 
 
-def save_random(out_dir: str, channels: int, blocks: int, seed: int = 0) -> str:
-    """Write a random-init checkpoint + sibling config.json (arch descriptor)."""
+def save_random(out_dir: str, channels: int, blocks: int, seed: int = 0,
+                kind: str = "go9-resnet") -> str:
+    """Write a random-init checkpoint + sibling config.json (arch descriptor).
+    `kind` selects go9-resnet (reification) or go9-az (vanilla AlphaZero)."""
     torch.manual_seed(seed)
-    model = Go9ResNet(channels=channels, blocks=blocks)
+    model = Go9AZNet(channels=channels, blocks=blocks) if kind == "go9-az" \
+        else Go9ResNet(channels=channels, blocks=blocks)
     os.makedirs(out_dir, exist_ok=True)
     ckpt = os.path.join(out_dir, "checkpoint.safetensors")
     save_checkpoint(model, ckpt)

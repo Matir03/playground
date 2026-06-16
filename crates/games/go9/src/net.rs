@@ -109,17 +109,6 @@ impl Net {
         Ok(v.flatten_all()?.to_vec1::<f32>()?[0])
     }
 
-    /// GS (1,GS_DIM) -> (value, full softmax priors over the 82 actions). The
-    /// self-play forward; skips the pol_next matmul.
-    fn value_policy(&self, gs: &Tensor) -> candle_core::Result<(f32, Vec<f32>)> {
-        let x = self.val_fc1.forward(gs)?.relu()?;
-        let v = self.val_fc2.forward(&x)?.tanh()?.flatten_all()?.to_vec1::<f32>()?[0];
-        let pri = candle_nn::ops::softmax(&self.pol_prior.forward(gs)?, 1)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        Ok((v, pri))
-    }
-
     /// Batched self-play forward: planes (B,3,9,9) -> (values[B], probs[B*82]).
     fn value_policy_batch(&self, planes: &Tensor) -> candle_core::Result<(Vec<f32>, Vec<f32>)> {
         let gs = self.encode(planes)?;
@@ -139,22 +128,107 @@ impl Net {
     }
 }
 
-fn read_arch(checkpoint: &Path) -> (usize, usize) {
+/// Traditional AlphaZero net (benchmark baseline): ResNet trunk + standard conv
+/// policy & value heads reading the spatial trunk directly — no GS latent, no
+/// reifier. Mirrors `go9_net.py` Go9AZNet (parameter names must stay in sync).
+struct AzNet {
+    stem: Conv2d,
+    stem_bn: BatchNorm,
+    blocks: Vec<ResBlock>,
+    pol_conv: Conv2d,
+    pol_bn: BatchNorm,
+    pol_fc: Linear,
+    val_conv: Conv2d,
+    val_bn: BatchNorm,
+    val_fc1: Linear,
+    val_fc2: Linear,
+}
+
+impl AzNet {
+    fn load(channels: usize, blocks_n: usize, vb: VarBuilder) -> candle_core::Result<Self> {
+        let cfg = Conv2dConfig { padding: 1, ..Default::default() };
+        let cfg1 = Conv2dConfig::default(); // 1×1 conv (no padding)
+        let mut blocks = Vec::with_capacity(blocks_n);
+        let blocks_vb = vb.pp("blocks");
+        for i in 0..blocks_n {
+            blocks.push(ResBlock::load(channels, blocks_vb.pp(i.to_string()))?);
+        }
+        Ok(Self {
+            stem: conv2d(IN_PLANES, channels, 3, cfg, vb.pp("stem"))?,
+            stem_bn: batch_norm(channels, BatchNormConfig::default(), vb.pp("stem_bn"))?,
+            blocks,
+            pol_conv: conv2d(channels, 2, 1, cfg1, vb.pp("pol_conv"))?,
+            pol_bn: batch_norm(2, BatchNormConfig::default(), vb.pp("pol_bn"))?,
+            pol_fc: linear(2 * CELLS, ACTIONS, vb.pp("pol_fc"))?,
+            val_conv: conv2d(channels, 1, 1, cfg1, vb.pp("val_conv"))?,
+            val_bn: batch_norm(1, BatchNormConfig::default(), vb.pp("val_bn"))?,
+            val_fc1: linear(CELLS, 64, vb.pp("val_fc1"))?,
+            val_fc2: linear(64, 1, vb.pp("val_fc2"))?,
+        })
+    }
+
+    fn trunk(&self, planes: &Tensor) -> candle_core::Result<Tensor> {
+        let mut x = self.stem_bn.forward_t(&self.stem.forward(planes)?, false)?.relu()?;
+        for blk in &self.blocks {
+            x = blk.forward(&x)?;
+        }
+        Ok(x)
+    }
+
+    /// Batched self-play forward: planes (B,3,9,9) -> (values[B], probs[B*82]).
+    fn value_policy_batch(&self, planes: &Tensor) -> candle_core::Result<(Vec<f32>, Vec<f32>)> {
+        let x = self.trunk(planes)?;
+        let p = self.pol_bn.forward_t(&self.pol_conv.forward(&x)?, false)?.relu()?.flatten_from(1)?;
+        let probs = candle_nn::ops::softmax(&self.pol_fc.forward(&p)?, 1)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let v = self.val_bn.forward_t(&self.val_conv.forward(&x)?, false)?.relu()?.flatten_from(1)?;
+        let v = self.val_fc1.forward(&v)?.relu()?;
+        let vals = self.val_fc2.forward(&v)?.tanh()?.flatten_all()?.to_vec1::<f32>()?;
+        Ok((vals, probs))
+    }
+}
+
+/// Either backbone, chosen by the checkpoint's `arch.kind`. Self-play + eval-match
+/// only need `value_policy_batch`; the latent reification path (ModelClient
+/// encode/eval/policy) is supported by the reification net only.
+enum Backbone {
+    Reif(Net),
+    Az(AzNet),
+}
+
+impl Backbone {
+    fn value_policy_batch(&self, planes: &Tensor) -> candle_core::Result<(Vec<f32>, Vec<f32>)> {
+        match self {
+            Backbone::Reif(n) => n.value_policy_batch(planes),
+            Backbone::Az(n) => n.value_policy_batch(planes),
+        }
+    }
+}
+
+enum Arch {
+    Reif { channels: usize, blocks: usize },
+    Az { channels: usize, blocks: usize },
+}
+
+fn read_arch(checkpoint: &Path) -> Arch {
     let cfg = checkpoint.with_file_name("config.json");
     if let Ok(text) = std::fs::read_to_string(&cfg) {
         // Python's json writes bare NaN/Infinity (invalid JSON); sanitize first.
         let text = text.replace("NaN", "null").replace("Infinity", "null");
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
             let arch = &v["arch"];
+            let channels = arch["channels"].as_u64().unwrap_or(96) as usize;
+            let blocks = arch["blocks"].as_u64().unwrap_or(10) as usize;
+            if arch["kind"] == "go9-az" {
+                return Arch::Az { channels, blocks };
+            }
             if arch["kind"] == "go9-resnet" {
-                return (
-                    arch["channels"].as_u64().unwrap_or(96) as usize,
-                    arch["blocks"].as_u64().unwrap_or(10) as usize,
-                );
+                return Arch::Reif { channels, blocks };
             }
         }
     }
-    (96, 10)
+    Arch::Reif { channels: 96, blocks: 10 }
 }
 
 /// A compute device for the in-process net. `cuda` needs the `cuda` feature.
@@ -174,7 +248,7 @@ pub fn pick_device(cuda: bool) -> anyhow::Result<Device> {
 
 /// A `ModelClient` that runs the Go 9×9 net in-process via candle.
 pub struct LocalModel {
-    net: Net,
+    net: Backbone,
     device: Device,
     model_version: String,
 }
@@ -188,10 +262,12 @@ impl LocalModel {
     /// Load a checkpoint onto a chosen device (see `pick_device`).
     pub fn load_on(checkpoint: &str, device: Device) -> anyhow::Result<Self> {
         let path = Path::new(checkpoint);
-        let (channels, blocks) = read_arch(path);
         // SAFETY: the mmap lives for the VarBuilder's load; tensors are copied.
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[checkpoint], DType::F32, &device)? };
-        let net = Net::load(channels, blocks, vb)?;
+        let net = match read_arch(path) {
+            Arch::Reif { channels, blocks } => Backbone::Reif(Net::load(channels, blocks, vb)?),
+            Arch::Az { channels, blocks } => Backbone::Az(AzNet::load(channels, blocks, vb)?),
+        };
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("local");
         Ok(Self { net, device, model_version: format!("go9-{stem}") })
     }
@@ -222,11 +298,10 @@ impl LocalModel {
     /// AlphaZero-style self-play forward: state -> (value, softmax over 82).
     /// `&self`-only so the self-play MCTS can call it from many native threads.
     pub fn policy_value(&self, state: &Go9State) -> anyhow::Result<(f32, [f32; ACTIONS])> {
-        let gs = self.net.encode(&self.planes(state)?)?;
-        let (v, pri) = self.net.value_policy(&gs)?;
+        let (vals, probs) = self.net.value_policy_batch(&self.planes(state)?)?;
         let mut arr = [0f32; ACTIONS];
-        arr.copy_from_slice(&pri[..ACTIONS]);
-        Ok((v, arr))
+        arr.copy_from_slice(&probs[..ACTIONS]);
+        Ok((vals[0], arr))
     }
 
     /// Batched self-play forward over concrete states.
@@ -261,17 +336,26 @@ impl playground_core::batch_search::BatchModel for LocalModel {
 #[async_trait]
 impl ModelClient<Go9> for LocalModel {
     async fn encode(&self, state: &Go9State) -> anyhow::Result<LatentGameState> {
-        let gs = self.net.encode(&self.planes(state)?)?.flatten_all()?.to_vec1::<f32>()?;
+        let Backbone::Reif(net) = &self.net else {
+            anyhow::bail!("go9-az net has no latent encoder; reification MCTS unsupported");
+        };
+        let gs = net.encode(&self.planes(state)?)?.flatten_all()?.to_vec1::<f32>()?;
         Ok(self.gs_state(gs))
     }
 
     async fn eval(&self, gs: &LatentGameState) -> anyhow::Result<f64> {
-        Ok(self.net.value(&self.gs_tensor(gs)?)? as f64)
+        let Backbone::Reif(net) = &self.net else {
+            anyhow::bail!("go9-az net: latent eval unsupported");
+        };
+        Ok(net.value(&self.gs_tensor(gs)?)? as f64)
     }
 
     async fn policy(&self, gs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>> {
+        let Backbone::Reif(net) = &self.net else {
+            anyhow::bail!("go9-az net: latent policy unsupported");
+        };
         let t = self.gs_tensor(gs)?;
-        let (priors, nexts) = self.net.policy_heads(&t)?;
+        let (priors, nexts) = net.policy_heads(&t)?;
         let mut order: Vec<usize> = (0..ACTIONS).collect();
         order.sort_by(|&a, &b| priors[b].total_cmp(&priors[a]));
         let mut out = Vec::with_capacity(top_b as usize);
