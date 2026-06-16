@@ -30,6 +30,7 @@ rand_distr = "0.4"
 # In-process NN inference (embedded engine, no gRPC round-trips).
 candle-core = "0.10"
 candle-nn = "0.10"
+ort = { version = "=2.0.0-rc.12", features = ["load-dynamic", "cuda", "tensorrt"] }
 
 [features]
 # Build candle with CUDA kernels for GPU self-play (needs nvcc at build time).

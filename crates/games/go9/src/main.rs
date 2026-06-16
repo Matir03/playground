@@ -4,6 +4,7 @@ mod eval;
 mod game;
 mod mcts;
 mod net;
+mod ort_net;
 mod selfplay;
 
 use std::collections::HashMap;
@@ -136,6 +137,18 @@ enum Cmd {
         max_ply: u32,
         #[arg(long, default_value_t = 0)]
         seed: u64,
+        /// Inference backend: "candle" (default) or "ort" (ONNX Runtime).
+        #[arg(long, default_value = "candle")]
+        backend: String,
+        /// ONNX model path (required for --backend ort).
+        #[arg(long, default_value = "")]
+        onnx: String,
+        /// ORT execution provider: "cuda" or "trt" (TensorRT).
+        #[arg(long, default_value = "trt")]
+        ep: String,
+        /// Use fp16 (TensorRT EP). fp32 if false. Takes a value: --fp16 true|false.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        fp16: bool,
     },
     /// Generate one generation of self-play games to `--out` (training data).
     SelfplayGen {
@@ -293,6 +306,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::SelfplayBench {
             model, cuda, batched, max_batch, games, threads,
             sims, c_puct, dir_alpha, dir_eps, temp_moves, explore_eps, max_ply, seed,
+            backend, onnx, ep, fp16,
         } => {
             let threads = threads.unwrap_or_else(default_threads);
             let params = mcts::Params {
@@ -300,7 +314,8 @@ async fn main() -> anyhow::Result<()> {
                 explore_eps, max_ply,
             };
             tokio::task::spawn_blocking(move || {
-                selfplay::run_benchmark(&model, cuda, games, threads, params, batched, max_batch, seed)
+                selfplay::run_benchmark(&model, cuda, games, threads, params, batched, max_batch,
+                    seed, &backend, &onnx, &ep, fp16)
             })
             .await??;
         }

@@ -297,6 +297,7 @@ pub fn generate(
 
 /// Throughput benchmark (no example collection).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn run_benchmark(
     checkpoint: &str,
     cuda: bool,
@@ -306,7 +307,40 @@ pub fn run_benchmark(
     batched: bool,
     max_batch: usize,
     base_seed: u64,
+    backend: &str,
+    onnx: &str,
+    ep: &str,
+    fp16: bool,
 ) -> anyhow::Result<()> {
+    // ORT/TensorRT backend: drive the same batched engine via an ONNX Runtime
+    // session instead of candle, to compare inference throughput.
+    if backend == "ort" {
+        let model = crate::ort_net::OrtModel::new(onnx, ep, fp16, "/tmp/go9_trt_cache")?;
+        eprintln!(
+            "go9 self-play: {n_games} games, {threads} threads, {} nodes/move, \
+             backend ort/{ep} fp16={fp16}, onnx {onnx}",
+            params.node_budget,
+        );
+        let (_records, cs) = batch_search::run_chunk::<Go9>(
+            &model, n_games, to_search_params(&params), threads, max_batch, base_seed, false,
+        );
+        let nps = cs.nodes as f64 / cs.elapsed;
+        let gps = n_games as f64 / cs.elapsed;
+        println!(
+            "games {n_games}  nodes {}  total_sims {}  time {:.2}s  nodes/s {nps:.0}  \
+             games/s {gps:.2}  avg_batch {:.0}  evals/s {:.0}",
+            cs.nodes, cs.nodes + cs.terminal_sims, cs.elapsed, cs.avg_batch(),
+            cs.evals as f64 / cs.elapsed,
+        );
+        let cpu = (cs.gather_secs + cs.wait_secs + cs.apply_secs).max(1e-9);
+        println!(
+            "  profile: gpu_duty {:.0}%  | gather {:.0}% wait {:.0}% apply {:.0}%",
+            100.0 * cs.gpu_duty(),
+            100.0 * cs.gather_secs / cpu, 100.0 * cs.wait_secs / cpu, 100.0 * cs.apply_secs / cpu,
+        );
+        return Ok(());
+    }
+
     let device = crate::net::pick_device(cuda)?;
     let model = Arc::new(LocalModel::load_on(checkpoint, device)?);
     let mode = if batched { format!("batched (max_batch {max_batch})") } else { "direct".into() };
