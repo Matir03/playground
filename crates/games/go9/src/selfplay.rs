@@ -132,6 +132,11 @@ pub struct GenStats {
     /// Network forwards actually run (nodes minus eval-cache hits). Engine path only.
     pub evals: u64,
     pub cache_hits: u64,
+    /// GPU-forward duty cycle [0,1] (≈1 = GPU-bound) and the CPU phase split.
+    pub gpu_duty: f64,
+    pub gather_secs: f64,
+    pub wait_secs: f64,
+    pub apply_secs: f64,
 }
 
 /// Convert per-game search knobs into the engine's `SearchParams`.
@@ -220,6 +225,10 @@ pub fn generate(
             avg_batch: cs.avg_batch(),
             evals: cs.evals,
             cache_hits: cs.cache_hits,
+            gpu_duty: cs.gpu_duty(),
+            gather_secs: cs.gather_secs,
+            wait_secs: cs.wait_secs,
+            apply_secs: cs.apply_secs,
         };
         let examples = if collect { examples_from_records(records) } else { Vec::new() };
         return (stats, examples);
@@ -277,6 +286,10 @@ pub fn generate(
         avg_batch,
         evals: 0,
         cache_hits: 0,
+        gpu_duty: 0.0,
+        gather_secs: 0.0,
+        wait_secs: 0.0,
+        apply_secs: 0.0,
     };
     let examples = sink.map(|m| m.into_inner().unwrap()).unwrap_or_default();
     (stats, examples)
@@ -318,6 +331,20 @@ pub fn run_benchmark(
          nodes/s {nodes_per_s:.0}  games/s {games_per_s:.2}{batch_note}",
         s.examples, s.nodes, s.sims, s.elapsed,
     );
+    if batched {
+        // CPU-vs-GPU profile: gpu_duty ≈1 means GPU-bound; the worker phase split
+        // (summed over threads) shows where the CPU time goes.
+        let cpu = s.gather_secs + s.wait_secs + s.apply_secs;
+        println!(
+            "  profile: gpu_duty {:.0}%  | worker gather {:.0}% wait {:.0}% apply {:.0}%  \
+             (gather={:.1}s wait={:.1}s apply={:.1}s)",
+            100.0 * s.gpu_duty,
+            100.0 * s.gather_secs / cpu.max(1e-9),
+            100.0 * s.wait_secs / cpu.max(1e-9),
+            100.0 * s.apply_secs / cpu.max(1e-9),
+            s.gather_secs, s.wait_secs, s.apply_secs,
+        );
+    }
     Ok(())
 }
 

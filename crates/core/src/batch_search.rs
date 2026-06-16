@@ -108,6 +108,14 @@ pub struct ChunkStats {
     pub batches: u64,
     pub batch_samples: u64,
     pub elapsed: f64,
+    /// Wall-clock seconds the inference server spent inside `model.forward` (the
+    /// GPU compute). `gpu_secs / elapsed` is the GPU duty cycle: ≪1 = CPU-bound.
+    pub gpu_secs: f64,
+    /// Summed worker time (over all workers, so > elapsed) in each phase — the
+    /// gather:wait:apply ratio shows where the CPU side spends its time.
+    pub gather_secs: f64,
+    pub wait_secs: f64,
+    pub apply_secs: f64,
 }
 
 impl ChunkStats {
@@ -117,6 +125,10 @@ impl ChunkStats {
     pub fn cache_hit_rate(&self) -> f64 {
         let total = self.evals + self.cache_hits;
         if total > 0 { self.cache_hits as f64 / total as f64 } else { 0.0 }
+    }
+    /// Fraction of wall time the GPU was computing (≈1 = GPU-bound).
+    pub fn gpu_duty(&self) -> f64 {
+        if self.elapsed > 0.0 { self.gpu_secs / self.elapsed } else { 0.0 }
     }
 }
 
@@ -172,6 +184,7 @@ fn inference_server<G: BatchGame>(
 ) {
     let mut local_batches = 0u64;
     let mut local_samples = 0u64;
+    let mut local_gpu = 0.0f64;
     loop {
         let first = match rx.recv() {
             Ok(r) => r,
@@ -192,7 +205,9 @@ fn inference_server<G: BatchGame>(
         for w in &waves {
             planes.extend_from_slice(&w.planes);
         }
+        let t_gpu = Instant::now();
         let (vals, priors) = model.forward(&planes, total).expect("batched forward failed");
+        local_gpu += t_gpu.elapsed().as_secs_f64();
         let mut off = 0usize;
         for w in waves {
             let mut out = Vec::with_capacity(w.count);
@@ -209,6 +224,7 @@ fn inference_server<G: BatchGame>(
     let mut s = stats.lock().unwrap();
     s.batches += local_batches;
     s.batch_samples += local_samples;
+    s.gpu_secs += local_gpu;
 }
 
 // ── Per-game search ──────────────────────────────────────────────────────────
@@ -590,6 +606,9 @@ pub fn run_chunk<G: BatchGame>(
             g.evals += s.evals;
             g.cache_hits += s.cache_hits;
             g.terminal_sims += s.terminal_sims;
+            g.gather_secs += s.gather_secs;
+            g.wait_secs += s.wait_secs;
+            g.apply_secs += s.apply_secs;
         }
     });
 
@@ -605,6 +624,9 @@ struct WorkerStats {
     evals: u64,
     cache_hits: u64,
     terminal_sims: u64,
+    gather_secs: f64,
+    wait_secs: f64,
+    apply_secs: f64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -626,6 +648,7 @@ fn worker<G: BatchGame>(
     loop {
         // Gather one pending leaf from every active game (resolving cache hits and
         // terminal/short searches inline) into a single wave.
+        let t_gather = Instant::now();
         let mut wave_planes: Vec<f32> = Vec::new();
         let mut wave_meta: Vec<(usize, u128, G::State)> = Vec::new();
         let mut any_active = false;
@@ -663,6 +686,7 @@ fn worker<G: BatchGame>(
             }
         }
 
+        ws.gather_secs += t_gather.elapsed().as_secs_f64();
         if !any_active {
             break;
         }
@@ -670,11 +694,14 @@ fn worker<G: BatchGame>(
             continue; // every active game resolved via cache this round
         }
 
+        let t_wait = Instant::now();
         req_tx
             .send(Req { planes: wave_planes, count: wave_meta.len(), resp: resp_tx.clone() })
             .expect("inference server gone");
         let results = resp_rx.recv().expect("inference response dropped");
+        ws.wait_secs += t_wait.elapsed().as_secs_f64();
 
+        let t_apply = Instant::now();
         for ((ri, key, state), (value, priors)) in wave_meta.into_iter().zip(results) {
             let legal = G::candidate_actions(&state);
             let s: f32 = legal.iter().map(|&a| priors[a]).sum::<f32>().max(1e-12);
@@ -691,6 +718,7 @@ fn worker<G: BatchGame>(
             ws.evals += 1;
             ws.nodes += 1;
         }
+        ws.apply_secs += t_apply.elapsed().as_secs_f64();
     }
 
     // Roll per-search terminal-sim counts into worker stats.
