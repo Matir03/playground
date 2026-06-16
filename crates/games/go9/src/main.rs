@@ -224,6 +224,15 @@ enum Cmd {
         max_ply: u32,
         #[arg(long, default_value_t = 0)]
         seed: u64,
+        /// Inference backend: "candle" (default) or "ort" (ONNX Runtime; reads
+        /// <live>/model.onnx, which the learner exports each snapshot).
+        #[arg(long, default_value = "candle")]
+        backend: String,
+        /// ORT execution provider: "cuda" (recommended for hot-swap) or "trt".
+        #[arg(long, default_value = "cuda")]
+        ep: String,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        fp16: bool,
     },
     /// Play a head-to-head match between two checkpoints; print A's score (ELO).
     EvalMatch {
@@ -338,6 +347,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::SelfplayLoop {
             live, cuda, max_batch, games_per_chunk, max_chunks, threads,
             node_budget, c_puct, dir_alpha, dir_eps, temp_moves, explore_eps, max_ply, seed,
+            backend, ep, fp16,
         } => {
             let threads = threads.unwrap_or_else(default_threads);
             let params = mcts::Params {
@@ -345,7 +355,8 @@ async fn main() -> anyhow::Result<()> {
                 explore_eps, max_ply,
             };
             tokio::task::spawn_blocking(move || {
-                selfplay::run_loop(&live, cuda, params, games_per_chunk, max_chunks, threads, max_batch, seed)
+                selfplay::run_loop(&live, cuda, params, games_per_chunk, max_chunks, threads,
+                    max_batch, seed, &backend, &ep, fp16)
             })
             .await??;
         }

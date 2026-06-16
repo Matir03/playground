@@ -13,6 +13,7 @@
 
 use std::sync::Mutex;
 
+use ort::ep::cuda::ConvAlgorithmSearch;
 use ort::execution_providers::{CUDA, TensorRT};
 use ort::session::Session;
 use ort::value::Tensor;
@@ -38,6 +39,11 @@ impl OrtModel {
     /// `ep` = "cuda" (fp32) or "trt" (TensorRT, fp16 when `fp16`). `cache_dir` is
     /// where TensorRT caches its built engines.
     pub fn new(onnx_path: &str, ep: &str, fp16: bool, cache_dir: &str) -> anyhow::Result<Self> {
+        // Heuristic conv-algorithm selection: the default (Exhaustive) re-autotunes
+        // cuDNN for every new batch shape, which is pathological for self-play's
+        // varying batch sizes (a 16-game chunk took 75s; GPU 23%).
+        let cuda = || CUDA::default().with_device_id(0)
+            .with_conv_algorithm_search(ConvAlgorithmSearch::Heuristic);
         let providers = match ep {
             "trt" => {
                 std::fs::create_dir_all(cache_dir).ok();
@@ -48,11 +54,10 @@ impl OrtModel {
                         .with_engine_cache(true)
                         .with_engine_cache_path(cache_dir.to_string())
                         .build(),
-                    // Fall back to CUDA EP for any subgraph TRT can't take.
-                    CUDA::default().with_device_id(0).build(),
+                    cuda().build(), // fallback for any subgraph TRT can't take
                 ]
             }
-            "cuda" => vec![CUDA::default().with_device_id(0).build()],
+            "cuda" => vec![cuda().build()],
             other => anyhow::bail!("unknown --ep {other:?} (use cuda|trt)"),
         };
         let session = Session::builder()

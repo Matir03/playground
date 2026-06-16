@@ -496,32 +496,54 @@ pub fn run_loop(
     threads: usize,
     max_batch: usize,
     base_seed: u64,
+    backend: &str,
+    ep: &str,
+    fp16: bool,
 ) -> anyhow::Result<()> {
     let latest = format!("{live_dir}/latest.safetensors");
+    let onnx = format!("{live_dir}/model.onnx");
+    let trt_cache = format!("{live_dir}/trt_cache");
     let buffer = std::path::Path::new(live_dir).join("buffer");
     std::fs::create_dir_all(&buffer)?;
-    let device = crate::net::pick_device(cuda)?;
+    let ort = backend == "ort";
+    // candle needs a device; ORT loads weights from model.onnx (hot-swapped by the
+    // learner). For ORT use the CUDA EP — it reloads the ONNX cheaply each chunk,
+    // unlike TensorRT which would rebuild its engine on every weight change.
+    let device = if ort { None } else { Some(crate::net::pick_device(cuda)?) };
     let mut seq = max_chunk_seq(&buffer).map(|s| s + 1).unwrap_or(0);
     eprintln!(
-        "go9 actor loop: {games_per_chunk} games/chunk, {threads} threads, device {}, \
-         buffer {} (keep {max_chunks}), model {latest}",
-        if cuda { "cuda" } else { "cpu" }, buffer.display(),
+        "go9 actor loop: backend {backend}{}, {games_per_chunk} games/chunk, {threads} threads, \
+         buffer {} (keep {max_chunks})",
+        if ort { format!("/{ep} fp16={fp16}") } else { String::new() },
+        buffer.display(),
     );
+    let sp = to_search_params(&params);
     loop {
         let t0 = Instant::now();
-        let model = Arc::new(LocalModel::load_on(&latest, device.clone())?);
         let chunk_seed = base_seed.wrapping_add(seq.wrapping_mul(games_per_chunk as u64));
-        let (s, examples) =
-            generate(model, games_per_chunk, threads, params, chunk_seed, cuda, max_batch, true);
+        let (examples, nodes, avg_batch) = if ort {
+            while !std::path::Path::new(&onnx).exists() {
+                std::thread::sleep(std::time::Duration::from_secs(1)); // wait for learner's first export
+            }
+            let model = crate::ort_net::OrtModel::new(&onnx, ep, fp16, &trt_cache)?;
+            let (records, cs) =
+                batch_search::run_chunk::<Go9>(&model, games_per_chunk, sp, threads, max_batch, chunk_seed, false);
+            (examples_from_records(records), cs.nodes, cs.avg_batch())
+        } else {
+            let model = Arc::new(LocalModel::load_on(&latest, device.clone().unwrap())?);
+            let (s, ex) =
+                generate(model, games_per_chunk, threads, params, chunk_seed, cuda, max_batch, true);
+            (ex, s.nodes, s.avg_batch)
+        };
         let path = buffer.join(format!("chunk_{seq:06}.bin"));
         let tmp = buffer.join(format!("chunk_{seq:06}.bin.tmp"));
         write_dump(tmp.to_str().unwrap(), &examples)?;
         std::fs::rename(&tmp, &path)?;
         prune_buffer(&buffer, max_chunks);
-        let moves = s.examples.max(1) as f64;
+        let moves = examples.len().max(1) as f64;
         eprintln!(
-            "  chunk {seq}: {} ex  {:.0} nodes/move  avg_batch {:.0}  {:.1}s",
-            examples.len(), s.nodes as f64 / moves, s.avg_batch, t0.elapsed().as_secs_f64(),
+            "  chunk {seq}: {} ex  {:.0} nodes/move  avg_batch {avg_batch:.0}  {:.1}s",
+            examples.len(), nodes as f64 / moves, t0.elapsed().as_secs_f64(),
         );
         seq += 1;
     }

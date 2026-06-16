@@ -44,6 +44,24 @@ def save_atomic(net: Go9ResNet, path: str) -> None:
     os.replace(tmp, path)
 
 
+def export_onnx_atomic(net: Go9ResNet, path: str) -> None:
+    """Export the value+policy path to ONNX (dynamic batch) for the ORT actor to
+    hot-swap to. Written atomically so the actor never reads a half-written file."""
+    was_training = net.training
+    net.eval()
+    dev = next(net.parameters()).device
+    tmp = path + ".tmp"
+    torch.onnx.export(
+        net, torch.zeros(1, 3, 9, 9, device=dev), tmp,
+        input_names=["planes"], output_names=["value", "policy"],
+        dynamic_axes={"planes": {0: "b"}, "value": {0: "b"}, "policy": {0: "b"}},
+        opset_version=17, dynamo=False,
+    )
+    os.replace(tmp, path)
+    if was_training:
+        net.train()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", default="data/models/go9/live")
@@ -79,6 +97,9 @@ def main() -> None:
         print(f"seeded from {latest}", flush=True)
     net.to(device)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr, weight_decay=1e-4)
+    # Publish an initial ONNX so an ORT-backed actor has weights to start from.
+    onnx_path = os.path.join(live, "model.onnx")
+    export_onnx_atomic(net, onnx_path)
 
     cfg = json.load(open(os.path.join(live, "config.json")))
     anchor_gen = int(cfg.get("generation", 0))
@@ -204,6 +225,7 @@ def main() -> None:
             net.to(device)
             with open(os.path.join(d, "config.json"), "w") as f:
                 json.dump({"arch": arch_of(net), "generation": snap_gen}, f)
+            export_onnx_atomic(net, onnx_path)  # refresh for the ORT actor's hot-swap
             print(f"snapshot gen{snap_gen}  samples {n}  chunks {len(cache)}  "
                   f"produced {produced}  consumed {consumed} ({consumed/max(1,produced):.1f}x)  "
                   f"loss v {losses[0]/max(1,nblk):.4f} p {losses[1]/max(1,nblk):.4f} "
