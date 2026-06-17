@@ -67,6 +67,8 @@ pub struct Params {
     /// of its own moves in a row (`resign_consecutive == 0` disables it).
     pub resign_threshold: f32,
     pub resign_consecutive: u32,
+    /// Fraction of games that never resign (play to the end) for resign calibration.
+    pub resign_playout_frac: f32,
 }
 
 struct Node {

@@ -153,6 +153,7 @@ fn to_search_params(p: &Params) -> SearchParams {
         settle_plies: p.settle_plies,
         resign_threshold: p.resign_threshold,
         resign_consecutive: p.resign_consecutive,
+        resign_playout_frac: p.resign_playout_frac,
     }
 }
 

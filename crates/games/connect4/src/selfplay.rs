@@ -184,6 +184,7 @@ fn to_search_params(p: &Params) -> SearchParams {
         settle_plies: 0,
         resign_threshold: 0.0,
         resign_consecutive: 0,
+        resign_playout_frac: 0.0,
     }
 }
 

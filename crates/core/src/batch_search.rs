@@ -98,6 +98,11 @@ pub struct SearchParams {
     /// (`resign_consecutive == 0` disables resignation).
     pub resign_threshold: f32,
     pub resign_consecutive: u32,
+    /// Fraction of games that *never* resign (play to a real terminal/settle/cap),
+    /// even when resignation is enabled — the AlphaZero resign-calibration
+    /// safeguard, so a too-aggressive threshold can't silently corrupt training
+    /// with false resignations. 0 = every game may resign.
+    pub resign_playout_frac: f32,
 }
 
 /// One move's training-relevant record (policy target + the move actually played).
@@ -529,6 +534,9 @@ struct Runner<G: BatchGame> {
     rng: ChaCha8Rng,
     finished: bool,
     resigned_by: Option<u8>,
+    /// Whether this game is allowed to resign (false in the resign-calibration
+    /// fraction that always plays to the end).
+    resign_enabled: bool,
     /// Score-stability: last seen `score_signature` and how many consecutive plies
     /// it has been unchanged.
     last_sig: Option<i64>,
@@ -541,13 +549,18 @@ struct Runner<G: BatchGame> {
 impl<G: BatchGame> Runner<G> {
     fn new(seed: u64, params: SearchParams) -> Self {
         let s0 = G::initial_state();
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        // Decide up front (deterministically per game) whether this game may resign;
+        // a `resign_playout_frac` slice always plays to the end for calibration.
+        let resign_enabled = rng.gen::<f32>() >= params.resign_playout_frac;
         Self {
             search: GameSearch::new(s0.clone(), params),
             states: vec![s0],
             moves: Vec::new(),
-            rng: ChaCha8Rng::seed_from_u64(seed),
+            rng,
             finished: false,
             resigned_by: None,
+            resign_enabled,
             last_sig: None,
             stable_plies: 0,
             resign_run: [0, 0],
@@ -588,7 +601,7 @@ impl<G: BatchGame> Runner<G> {
         // is hopeless for enough of its own moves in a row, it resigns instead of
         // playing on (e.g. nonsense invasions of the opponent's settled territory,
         // which is exactly the time-wasting we want to cut).
-        if params.resign_consecutive > 0 && self.resigned_by.is_none() {
+        if params.resign_consecutive > 0 && self.resign_enabled && self.resigned_by.is_none() {
             let si = (to_move - 1) as usize;
             if root_value <= params.resign_threshold {
                 self.resign_run[si] += 1;

@@ -238,6 +238,11 @@ enum Cmd {
         /// (0 = resignation off).
         #[arg(long, default_value_t = 4)]
         resign_consecutive: u32,
+        /// Fraction of games that never resign and play to the end — the resign
+        /// calibration safeguard, so a too-aggressive threshold can't corrupt
+        /// training with false resignations. 0 = every game may resign.
+        #[arg(long, default_value_t = 0.25)]
+        resign_playout_frac: f32,
         #[arg(long, default_value_t = 0)]
         seed: u64,
         /// Inference backend: "candle" (default) or "ort" (ONNX Runtime; reads
@@ -358,7 +363,7 @@ async fn main() -> anyhow::Result<()> {
             let params = mcts::Params {
                 sims, move_ms: 0.0, node_budget: 0, c_puct, dir_alpha, dir_eps, temp_moves,
                 explore_eps, max_ply,
-                settle_plies: 0, resign_threshold: 0.0, resign_consecutive: 0,
+                settle_plies: 0, resign_threshold: 0.0, resign_consecutive: 0, resign_playout_frac: 0.0,
             };
             tokio::task::spawn_blocking(move || {
                 selfplay::run_benchmark(&model, cuda, games, threads, params, batched, max_batch,
@@ -374,7 +379,7 @@ async fn main() -> anyhow::Result<()> {
             let params = mcts::Params {
                 sims, move_ms, node_budget, c_puct, dir_alpha, dir_eps, temp_moves,
                 explore_eps, max_ply,
-                settle_plies: 0, resign_threshold: 0.0, resign_consecutive: 0,
+                settle_plies: 0, resign_threshold: 0.0, resign_consecutive: 0, resign_playout_frac: 0.0,
             };
             tokio::task::spawn_blocking(move || {
                 selfplay::run_generate(
@@ -386,14 +391,14 @@ async fn main() -> anyhow::Result<()> {
         Cmd::SelfplayLoop {
             live, cuda, max_batch, games_per_chunk, max_chunks, threads,
             node_budget, c_puct, dir_alpha, dir_eps, temp_moves, explore_eps, max_ply, seed,
-            settle_plies, resign_threshold, resign_consecutive,
+            settle_plies, resign_threshold, resign_consecutive, resign_playout_frac,
             backend, ep, fp16,
         } => {
             let threads = threads.unwrap_or_else(default_threads);
             let params = mcts::Params {
                 sims: 0, move_ms: 0.0, node_budget, c_puct, dir_alpha, dir_eps, temp_moves,
                 explore_eps, max_ply,
-                settle_plies, resign_threshold, resign_consecutive,
+                settle_plies, resign_threshold, resign_consecutive, resign_playout_frac,
             };
             tokio::task::spawn_blocking(move || {
                 selfplay::run_loop(&live, cuda, params, games_per_chunk, max_chunks, threads,
@@ -410,7 +415,7 @@ async fn main() -> anyhow::Result<()> {
             let params = mcts::Params {
                 sims: 0, move_ms: 0.0, node_budget, c_puct,
                 dir_alpha: 0.5, dir_eps: 0.0, temp_moves: 8, explore_eps: 0.0, max_ply,
-                settle_plies: 0, resign_threshold: 0.0, resign_consecutive: 0,
+                settle_plies: 0, resign_threshold: 0.0, resign_consecutive: 0, resign_playout_frac: 0.0,
             };
             tokio::task::spawn_blocking(move || {
                 eval::run_match(&model_a, &model_b, cuda, games, params, threads, max_batch, seed)

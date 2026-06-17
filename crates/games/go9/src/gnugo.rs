@@ -111,7 +111,7 @@ pub fn run_gnugo_match(
     let params = Params {
         sims: 0, move_ms: 0.0, node_budget, c_puct,
         dir_alpha: 1.0, dir_eps: 0.0, temp_moves: 0, explore_eps: 0.0, max_ply,
-        settle_plies: 0, resign_threshold: 0.0, resign_consecutive: 0,
+        settle_plies: 0, resign_threshold: 0.0, resign_consecutive: 0, resign_playout_frac: 0.0,
     };
     eprintln!(
         "go9 vs GNU Go L{level}: {games} games, {node_budget} visits/move (concrete value+policy), \
