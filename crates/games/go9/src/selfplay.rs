@@ -150,6 +150,9 @@ fn to_search_params(p: &Params) -> SearchParams {
         temp_moves: p.temp_moves,
         explore_eps: p.explore_eps,
         max_ply: p.max_ply,
+        settle_plies: p.settle_plies,
+        resign_threshold: p.resign_threshold,
+        resign_consecutive: p.resign_consecutive,
     }
 }
 
@@ -160,14 +163,21 @@ fn examples_from_records(records: Vec<batch_search::GameRecord<Go9>>) -> Vec<Exa
     let mut out = Vec::new();
     for rec in records {
         let final_state = rec.states.last().unwrap();
-        let outcome = match Go9::outcome(final_state) {
-            Outcome::InProgress => area_outcome(final_state),
-            o => o,
-        };
-        let winner: Option<u8> = match outcome {
-            Outcome::FirstWins => Some(1),
-            Outcome::SecondWins => Some(2),
-            _ => None,
+        // A resigning side loses outright (its search was confident enough that the
+        // unsettled final board shouldn't be area-scored); otherwise adjudicate the
+        // final position (terminal outcome, or area score if stopped early/capped).
+        let winner: Option<u8> = if let Some(loser) = rec.resigned_by {
+            Some(if loser == 1 { 2 } else { 1 })
+        } else {
+            let outcome = match Go9::outcome(final_state) {
+                Outcome::InProgress => area_outcome(final_state),
+                o => o,
+            };
+            match outcome {
+                Outcome::FirstWins => Some(1),
+                Outcome::SecondWins => Some(2),
+                _ => None,
+            }
         };
         for (i, mv) in rec.moves.iter().enumerate() {
             let z = match winner {
@@ -521,19 +531,20 @@ pub fn run_loop(
     loop {
         let t0 = Instant::now();
         let chunk_seed = base_seed.wrapping_add(seq.wrapping_mul(games_per_chunk as u64));
-        let (examples, nodes, avg_batch) = if ort {
+        let (examples, nodes, avg_batch, n_resigned) = if ort {
             while !std::path::Path::new(&onnx).exists() {
                 std::thread::sleep(std::time::Duration::from_secs(1)); // wait for learner's first export
             }
             let model = crate::ort_net::OrtModel::new(&onnx, ep, fp16, &trt_cache)?;
             let (records, cs) =
                 batch_search::run_chunk::<Go9>(&model, games_per_chunk, sp, threads, max_batch, chunk_seed, false);
-            (examples_from_records(records), cs.nodes, cs.avg_batch())
+            let resigned = records.iter().filter(|r| r.resigned_by.is_some()).count();
+            (examples_from_records(records), cs.nodes, cs.avg_batch(), Some(resigned))
         } else {
             let model = Arc::new(LocalModel::load_on(&latest, device.clone().unwrap())?);
             let (s, ex) =
                 generate(model, games_per_chunk, threads, params, chunk_seed, cuda, max_batch, true);
-            (ex, s.nodes, s.avg_batch)
+            (ex, s.nodes, s.avg_batch, None)
         };
         let path = buffer.join(format!("chunk_{seq:06}.bin"));
         let tmp = buffer.join(format!("chunk_{seq:06}.bin.tmp"));
@@ -541,9 +552,17 @@ pub fn run_loop(
         std::fs::rename(&tmp, &path)?;
         prune_buffer(&buffer, max_chunks);
         let moves = examples.len().max(1) as f64;
+        let games = games_per_chunk.max(1) as f64;
+        // plies/game shows score-stability + resignation cutting game length as the
+        // net learns to settle (vs grinding filler moves out to the ply cap).
+        let resign_note = match n_resigned {
+            Some(r) => format!("  {:.0}% resigned", 100.0 * r as f64 / games),
+            None => String::new(),
+        };
         eprintln!(
-            "  chunk {seq}: {} ex  {:.0} nodes/move  avg_batch {avg_batch:.0}  {:.1}s",
-            examples.len(), nodes as f64 / moves, t0.elapsed().as_secs_f64(),
+            "  chunk {seq}: {} ex  {:.0} plies/game  {:.0} nodes/move  avg_batch {avg_batch:.0}{resign_note}  {:.1}s",
+            examples.len(), examples.len() as f64 / games, nodes as f64 / moves,
+            t0.elapsed().as_secs_f64(),
         );
         seq += 1;
     }

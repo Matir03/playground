@@ -57,6 +57,14 @@ pub trait BatchGame: Send + Sync + 'static {
     fn encode_planes(state: &Self::State, out: &mut [f32]);
     /// A collision-resistant key for the eval cache (position identity).
     fn hash_key(state: &Self::State) -> u128;
+    /// A cheap signature of the position's *settled area score* (e.g. Go: packed
+    /// black/white area). Used for score-stability early termination: when this is
+    /// unchanged for `settle_plies` consecutive plies the borders are settled, so
+    /// the game is stopped and adjudicated. `None` (the default) disables
+    /// score-stability for the game.
+    fn score_signature(_state: &Self::State) -> Option<i64> {
+        None
+    }
 }
 
 /// The network, as the engine sees it: a pure batched forward over planes.
@@ -77,8 +85,19 @@ pub struct SearchParams {
     pub dir_eps: f32,
     pub temp_moves: u32,
     pub explore_eps: f32,
-    /// Hard ply cap for a self-play game (0 = no cap).
+    /// Hard ply cap for a self-play game (0 = no cap). With score-stability +
+    /// resignation enabled this is just a safety backstop against non-terminating
+    /// games (e.g. repetition cycles), not the primary terminator.
     pub max_ply: u32,
+    /// Score-stability early stop: end the game once `score_signature` is unchanged
+    /// for this many consecutive plies (0 = disabled). The final position is then
+    /// adjudicated by the caller (area scoring).
+    pub settle_plies: u32,
+    /// Resignation: a side resigns (and loses) if its root win-estimate stays at or
+    /// below `resign_threshold` for `resign_consecutive` of its own moves in a row
+    /// (`resign_consecutive == 0` disables resignation).
+    pub resign_threshold: f32,
+    pub resign_consecutive: u32,
 }
 
 /// One move's training-relevant record (policy target + the move actually played).
@@ -94,6 +113,10 @@ pub struct MoveRecord {
 pub struct GameRecord<G: BatchGame> {
     pub states: Vec<G::State>,
     pub moves: Vec<MoveRecord>,
+    /// If `Some(side)`, that side resigned → it loses. The caller should derive the
+    /// value target from this (a resignation loss) instead of scoring the final
+    /// position, which may not be fully settled when a side resigns.
+    pub resigned_by: Option<u8>,
 }
 
 /// Throughput counters. `nodes` = distinct tree nodes built (the honest search-
@@ -480,6 +503,19 @@ impl<G: BatchGame> GameSearch<G> {
         let root = &self.arena[0];
         (0..G::ACTIONS).map(|a| root.n[a].saturating_sub(root.rnd[a])).collect()
     }
+
+    /// Mean action-value at the root from the side-to-move's perspective, in
+    /// [-1, 1] — the search's win estimate, used for the resignation check. 0 when
+    /// the root has no visits yet.
+    fn root_value(&self) -> f32 {
+        let root = &self.arena[0];
+        let n: u32 = root.n.iter().sum();
+        if n == 0 {
+            return 0.0;
+        }
+        let w: f32 = root.w.iter().sum();
+        w / n as f32
+    }
 }
 
 // ── Driver ───────────────────────────────────────────────────────────────────
@@ -492,6 +528,14 @@ struct Runner<G: BatchGame> {
     moves: Vec<MoveRecord>,
     rng: ChaCha8Rng,
     finished: bool,
+    resigned_by: Option<u8>,
+    /// Score-stability: last seen `score_signature` and how many consecutive plies
+    /// it has been unchanged.
+    last_sig: Option<i64>,
+    stable_plies: u32,
+    /// Per-side (index = to_move-1) run of consecutive own-moves at/under the
+    /// resignation threshold.
+    resign_run: [u32; 2],
 }
 
 impl<G: BatchGame> Runner<G> {
@@ -503,6 +547,10 @@ impl<G: BatchGame> Runner<G> {
             moves: Vec::new(),
             rng: ChaCha8Rng::seed_from_u64(seed),
             finished: false,
+            resigned_by: None,
+            last_sig: None,
+            stable_plies: 0,
+            resign_run: [0, 0],
         }
     }
 
@@ -510,6 +558,8 @@ impl<G: BatchGame> Runner<G> {
     /// the game, and either start the next move's search or finish the game.
     fn complete_move(&mut self, params: &SearchParams) {
         let counts = self.search.policy_counts();
+        // The search's win-estimate for the side about to move (used to resign).
+        let root_value = self.search.root_value();
         let sum: u32 = counts.iter().sum();
         let cur = self.states.last().unwrap();
         let mut policy = vec![0f32; G::ACTIONS];
@@ -534,6 +584,22 @@ impl<G: BatchGame> Runner<G> {
             action = legal.first().copied().unwrap_or(0);
         }
         let to_move = G::to_move(cur);
+        // Resignation (KataGo/AZ-style): if the side to move's search win-estimate
+        // is hopeless for enough of its own moves in a row, it resigns instead of
+        // playing on (e.g. nonsense invasions of the opponent's settled territory,
+        // which is exactly the time-wasting we want to cut).
+        if params.resign_consecutive > 0 && self.resigned_by.is_none() {
+            let si = (to_move - 1) as usize;
+            if root_value <= params.resign_threshold {
+                self.resign_run[si] += 1;
+                self.resign_run[1 - si] = 0;
+                if self.resign_run[si] >= params.resign_consecutive {
+                    self.resigned_by = Some(to_move);
+                }
+            } else {
+                self.resign_run[si] = 0;
+            }
+        }
         self.moves.push(MoveRecord { policy, action, to_move });
         // The chosen action came from visited (hence legal) children, so this is
         // legal; fall back to the first candidate if the degenerate branch hit.
@@ -542,8 +608,25 @@ impl<G: BatchGame> Runner<G> {
             .expect("no legal move from a non-terminal state");
         self.states.push(next.clone());
 
+        // Score-stability: once the area-score signature stops changing for
+        // `settle_plies` plies in a row, the borders are settled (dame filled,
+        // invasions refuted) — stop and let the caller adjudicate by area score
+        // rather than grinding score-neutral filler moves out to the ply cap.
+        if params.settle_plies > 0 {
+            let sig = G::score_signature(&next);
+            if sig.is_some() && sig == self.last_sig {
+                self.stable_plies += 1;
+            } else {
+                self.stable_plies = 0;
+                self.last_sig = sig;
+            }
+        }
+        let settled = params.settle_plies > 0 && self.stable_plies >= params.settle_plies;
+        let capped = params.max_ply > 0 && self.states.len() as u32 - 1 >= params.max_ply;
         let over = G::terminal_value(&next).is_some()
-            || (params.max_ply > 0 && self.states.len() as u32 - 1 >= params.max_ply);
+            || self.resigned_by.is_some()
+            || settled
+            || capped;
         if over {
             self.finished = true;
         } else {
@@ -727,7 +810,7 @@ fn worker<G: BatchGame>(
     }
     let recs = runners
         .into_iter()
-        .map(|r| GameRecord { states: r.states, moves: r.moves })
+        .map(|r| GameRecord { states: r.states, moves: r.moves, resigned_by: r.resigned_by })
         .collect();
     (recs, ws)
 }

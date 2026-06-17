@@ -350,7 +350,7 @@ pub fn area_outcome(state: &Go9State) -> Outcome {
 
 /// Chinese area score `(black, white)`: stones plus empty regions bordered by a
 /// single colour. Bitboard flood-fill of the empty regions.
-fn score_area(black: u128, white: u128) -> (u32, u32) {
+pub(crate) fn score_area(black: u128, white: u128) -> (u32, u32) {
     let mut b = black.count_ones();
     let mut w = white.count_ones();
     let occupied = black | white;

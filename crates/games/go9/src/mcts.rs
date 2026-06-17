@@ -55,9 +55,18 @@ pub struct Params {
     /// are excluded from the policy target (see `rnd`). 0 = off.
     pub explore_eps: f32,
     /// Hard ply cap for a self-play game: at this many moves the game is ended
-    /// and adjudicated by area score even if neither side has passed. Keeps weak
-    /// nets from dragging games out with noisy filler moves.
+    /// and adjudicated by area score even if neither side has passed. With
+    /// score-stability + resignation on, this is just a safety backstop against
+    /// non-terminating games (repetition cycles), not the main terminator.
     pub max_ply: u32,
+    /// Score-stability early stop (batched self-play only): end the game once the
+    /// area-score signature is unchanged for this many consecutive plies (0 = off).
+    pub settle_plies: u32,
+    /// Resignation (batched self-play only): a side resigns/loses if its root
+    /// win-estimate stays at or below `resign_threshold` for `resign_consecutive`
+    /// of its own moves in a row (`resign_consecutive == 0` disables it).
+    pub resign_threshold: f32,
+    pub resign_consecutive: u32,
 }
 
 struct Node {
@@ -322,6 +331,14 @@ impl playground_core::batch_search::BatchGame for Go9 {
             h ^= pb.rotate_left(17) ^ pw.rotate_left(43).wrapping_mul(0x1656_67B1_9E37_79F9);
         }
         h
+    }
+    /// Packed Chinese area score (black, white) — a cheap "is the score settled?"
+    /// signature. Filling dame or an invasion/capture changes it; filling one's own
+    /// territory or passing leaves it fixed, so a run of unchanged signatures means
+    /// the borders are done.
+    fn score_signature(state: &Go9State) -> Option<i64> {
+        let (b, w) = crate::game::score_area(state.black, state.white);
+        Some(((b as i64) << 20) | w as i64)
     }
 }
 

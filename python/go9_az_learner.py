@@ -45,6 +45,25 @@ def save_atomic(net: Go9AZNet, path: str) -> None:
     os.replace(tmp, path)
 
 
+def export_onnx_atomic(net: Go9AZNet, path: str) -> None:
+    """Export value+policy to ONNX (dynamic batch) for the ORT actor to hot-swap to."""
+    import torch
+
+    was_training = net.training
+    net.eval()
+    dev = next(net.parameters()).device
+    tmp = path + ".tmp"
+    torch.onnx.export(
+        net, torch.zeros(1, 3, 9, 9, device=dev), tmp,
+        input_names=["planes"], output_names=["value", "policy"],
+        dynamic_axes={"planes": {0: "b"}, "value": {0: "b"}, "policy": {0: "b"}},
+        opset_version=17, dynamo=False,
+    )
+    os.replace(tmp, path)
+    if was_training:
+        net.train()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", default="data/models/go9_az/live")
@@ -86,6 +105,9 @@ def main() -> None:
         print(f"from scratch: wrote random gen-0 {latest}", flush=True)
     net.to(device)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr, weight_decay=1e-4)
+    # Publish ONNX so an ORT-backed actor has weights to start from.
+    onnx_path = os.path.join(live, "model.onnx")
+    export_onnx_atomic(net, onnx_path)
 
     anchor_gen = int(json.load(open(cfg_path)).get("generation", 0))
     elo_path = os.path.join(live, "elo.json")

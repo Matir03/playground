@@ -2,6 +2,7 @@
 
 mod eval;
 mod game;
+mod gnugo;
 mod mcts;
 mod net;
 mod ort_net;
@@ -220,8 +221,23 @@ enum Cmd {
         /// self-play from collapsing into a narrow action subspace.
         #[arg(long, default_value_t = 0.25)]
         explore_eps: f32,
-        #[arg(long, default_value_t = 80)]
+        /// Safety backstop ply cap (not the primary terminator — score-stability +
+        /// resignation end most games first; this only bounds chaotic early/random
+        /// nets that never settle, and prevents non-terminating repetition cycles).
+        #[arg(long, default_value_t = 120)]
         max_ply: u32,
+        /// Score-stability early stop: end a game once the area score is unchanged
+        /// for this many consecutive plies (the borders are settled). 0 = off.
+        #[arg(long, default_value_t = 6)]
+        settle_plies: u32,
+        /// Resignation: a side resigns/loses when its root win-estimate stays at or
+        /// below this for `resign-consecutive` of its own moves in a row.
+        #[arg(long, default_value_t = -0.95)]
+        resign_threshold: f32,
+        /// Consecutive own-moves at/under `resign-threshold` before a side resigns
+        /// (0 = resignation off).
+        #[arg(long, default_value_t = 4)]
+        resign_consecutive: u32,
         #[arg(long, default_value_t = 0)]
         seed: u64,
         /// Inference backend: "candle" (default) or "ort" (ONNX Runtime; reads
@@ -254,6 +270,27 @@ enum Cmd {
         c_puct: f32,
         #[arg(long, default_value_t = 80)]
         max_ply: u32,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Absolute-strength eval: the net (concrete value+policy MCTS) vs GNU Go (GTP).
+    GnugoMatch {
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        cuda: bool,
+        #[arg(long, default_value_t = 10)]
+        games: u32,
+        #[arg(long, default_value_t = 1, help = "GNU Go strength 1..10")]
+        level: u32,
+        #[arg(long, default_value_t = 800, help = "net node budget per move")]
+        visits: u32,
+        #[arg(long, default_value_t = 1.5)]
+        c_puct: f32,
+        #[arg(long, default_value_t = 200)]
+        max_ply: u32,
+        #[arg(long, default_value = "gnugo")]
+        gnugo: String,
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
@@ -321,6 +358,7 @@ async fn main() -> anyhow::Result<()> {
             let params = mcts::Params {
                 sims, move_ms: 0.0, node_budget: 0, c_puct, dir_alpha, dir_eps, temp_moves,
                 explore_eps, max_ply,
+                settle_plies: 0, resign_threshold: 0.0, resign_consecutive: 0,
             };
             tokio::task::spawn_blocking(move || {
                 selfplay::run_benchmark(&model, cuda, games, threads, params, batched, max_batch,
@@ -336,6 +374,7 @@ async fn main() -> anyhow::Result<()> {
             let params = mcts::Params {
                 sims, move_ms, node_budget, c_puct, dir_alpha, dir_eps, temp_moves,
                 explore_eps, max_ply,
+                settle_plies: 0, resign_threshold: 0.0, resign_consecutive: 0,
             };
             tokio::task::spawn_blocking(move || {
                 selfplay::run_generate(
@@ -347,12 +386,14 @@ async fn main() -> anyhow::Result<()> {
         Cmd::SelfplayLoop {
             live, cuda, max_batch, games_per_chunk, max_chunks, threads,
             node_budget, c_puct, dir_alpha, dir_eps, temp_moves, explore_eps, max_ply, seed,
+            settle_plies, resign_threshold, resign_consecutive,
             backend, ep, fp16,
         } => {
             let threads = threads.unwrap_or_else(default_threads);
             let params = mcts::Params {
                 sims: 0, move_ms: 0.0, node_budget, c_puct, dir_alpha, dir_eps, temp_moves,
                 explore_eps, max_ply,
+                settle_plies, resign_threshold, resign_consecutive,
             };
             tokio::task::spawn_blocking(move || {
                 selfplay::run_loop(&live, cuda, params, games_per_chunk, max_chunks, threads,
@@ -369,9 +410,17 @@ async fn main() -> anyhow::Result<()> {
             let params = mcts::Params {
                 sims: 0, move_ms: 0.0, node_budget, c_puct,
                 dir_alpha: 0.5, dir_eps: 0.0, temp_moves: 8, explore_eps: 0.0, max_ply,
+                settle_plies: 0, resign_threshold: 0.0, resign_consecutive: 0,
             };
             tokio::task::spawn_blocking(move || {
                 eval::run_match(&model_a, &model_b, cuda, games, params, threads, max_batch, seed)
+                    .map(|_| ())
+            })
+            .await??;
+        }
+        Cmd::GnugoMatch { model, cuda, games, level, visits, c_puct, max_ply, gnugo, seed } => {
+            tokio::task::spawn_blocking(move || {
+                gnugo::run_gnugo_match(&model, cuda, &gnugo, level, games, visits, c_puct, max_ply, seed)
                     .map(|_| ())
             })
             .await??;

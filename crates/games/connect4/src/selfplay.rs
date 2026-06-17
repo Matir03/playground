@@ -180,6 +180,10 @@ fn to_search_params(p: &Params) -> SearchParams {
         temp_moves: p.temp_moves,
         explore_eps: p.explore_eps,
         max_ply: 0, // Connect 4 always plays to a natural terminal
+        // Connect 4 has no area-score / resignation concept; play to the end.
+        settle_plies: 0,
+        resign_threshold: 0.0,
+        resign_consecutive: 0,
     }
 }
 
