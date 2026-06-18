@@ -207,19 +207,22 @@ enum Cmd {
         max_chunks: usize,
         #[arg(long)]
         threads: Option<usize>,
-        #[arg(long, default_value_t = 256)]
+        #[arg(long, default_value_t = 800)]
         node_budget: u32,
         #[arg(long, default_value_t = 1.5)]
         c_puct: f32,
         #[arg(long, default_value_t = 0.5)]
         dir_alpha: f32,
-        #[arg(long, default_value_t = 0.25)]
+        /// Root Dirichlet exploration weight. This noise is baked into the visit
+        /// counts and can't be subtracted from the policy target, so keep it low.
+        #[arg(long, default_value_t = 0.1)]
         dir_eps: f32,
         #[arg(long, default_value_t = 16)]
         temp_moves: u32,
-        /// Per-node uniform exploration floor mixed into priors (0 = off). Keeps
-        /// self-play from collapsing into a narrow action subspace.
-        #[arg(long, default_value_t = 0.25)]
+        /// Root-only ε-greedy forced exploration (excluded from the policy target).
+        /// Default off: rely on Dirichlet so we don't burn search budget on random
+        /// root visits that make the (already budget-limited) targets flatter.
+        #[arg(long, default_value_t = 0.0)]
         explore_eps: f32,
         /// Safety backstop ply cap (not the primary terminator — score-stability +
         /// resignation end most games first; this only bounds chaotic early/random
@@ -228,7 +231,9 @@ enum Cmd {
         max_ply: u32,
         /// Score-stability early stop: end a game once the area score is unchanged
         /// for this many consecutive plies (the borders are settled). 0 = off.
-        #[arg(long, default_value_t = 6)]
+        /// Off by default: a weak net can hit "stable" with dead stones still on the
+        /// board, so area scoring would mislabel the outcome — play games out for now.
+        #[arg(long, default_value_t = 0)]
         settle_plies: u32,
         /// Resignation: a side resigns/loses when its root win-estimate stays at or
         /// below this for `resign-consecutive` of its own moves in a row.
