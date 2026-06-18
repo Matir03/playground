@@ -180,6 +180,97 @@ pub fn legal_moves(state: &AmazonsState) -> Vec<AmazonsMove> {
     out
 }
 
+/// Fused legal-move generation **and** prior computation in one bitboard pass.
+/// `policy` is the net's raw two-head logits (queen ‖ arrow, `POLICY_DIM`). For each
+/// legal move we know its ray direction+distance as we generate it, so the head
+/// index is computed directly (no coordinate→index recompute) and the combined logit
+/// `q + a` accumulated inline; a final softmax-over-legal yields the priors. Returns
+/// (moves, priors) parallel vectors. This is the hot self-play path — it replaces
+/// the old `legal_moves` + `move_priors` (ray_reach → Vec → re-index → exp).
+pub fn expand(state: &AmazonsState, policy: &[f32]) -> (Vec<AmazonsMove>, Vec<f32>) {
+    let mut moves = Vec::new();
+    let mut priors = Vec::new();
+    expand_into(state, policy, &mut moves, &mut priors);
+    (moves, priors)
+}
+
+/// As [`expand`], but writes into caller-provided buffers (cleared first) to avoid
+/// per-call allocation — the hot self-play path reuses one pair of buffers.
+pub fn expand_into(
+    state: &AmazonsState,
+    policy: &[f32],
+    moves: &mut Vec<AmazonsMove>,
+    logits: &mut Vec<f32>,
+) {
+    use crate::moves::{DISTS, MOVE_TYPES, PER_HEAD};
+    moves.clear();
+    logits.clear();
+    let occ = state.occupied();
+    let mut maxl = f32::NEG_INFINITY;
+    let mut q = state.mine();
+    while q != 0 {
+        let from = q.trailing_zeros() as usize;
+        q &= q - 1;
+        let from_r = (from / N) as u8;
+        let from_c = (from % N) as u8;
+        let from_bit = 1u128 << from;
+        let occ_wo_from = occ & !from_bit;
+        let qbase = from * MOVE_TYPES; // queen-head row for this from-square
+        for d in 0..8usize {
+            let mut bit = from_bit;
+            let mut dist = 0usize;
+            loop {
+                bit = shift(bit, d);
+                if bit == 0 || (bit & occ) != 0 {
+                    break;
+                }
+                dist += 1;
+                let to = bit.trailing_zeros() as usize;
+                let to_r = (to / N) as u8;
+                let to_c = (to % N) as u8;
+                let ql = policy[qbase + d * DISTS + (dist - 1)]; // queen logit (dir d, this dist)
+                let occ2 = occ_wo_from | bit; // queen now stands on `to`
+                let abase = PER_HEAD + to * MOVE_TYPES; // arrow-head row for `to`
+                for d2 in 0..8usize {
+                    let mut abit = bit;
+                    let mut adist = 0usize;
+                    loop {
+                        abit = shift(abit, d2);
+                        if abit == 0 || (abit & occ2) != 0 {
+                            break;
+                        }
+                        adist += 1;
+                        let ar = abit.trailing_zeros() as usize;
+                        let logit = ql + policy[abase + d2 * DISTS + (adist - 1)];
+                        if logit > maxl {
+                            maxl = logit;
+                        }
+                        moves.push(AmazonsMove {
+                            from_r,
+                            from_c,
+                            to_r,
+                            to_c,
+                            arrow_r: (ar / N) as u8,
+                            arrow_c: (ar % N) as u8,
+                        });
+                        logits.push(logit);
+                    }
+                }
+            }
+        }
+    }
+    // Softmax over the legal moves (numerically stable).
+    let mut sum = 0.0f32;
+    for l in logits.iter_mut() {
+        *l = (*l - maxl).exp();
+        sum += *l;
+    }
+    let inv = 1.0 / sum.max(1e-12);
+    for l in logits.iter_mut() {
+        *l *= inv;
+    }
+}
+
 /// Apply a (legal) move: move the queen, drop the arrow, flip side. Pure bit ops.
 pub fn apply(state: &AmazonsState, mv: &AmazonsMove) -> AmazonsState {
     let from = 1u128 << idx(mv.from_r as usize, mv.from_c as usize);
@@ -368,6 +459,26 @@ mod tests {
         // end-to-end check on the bitboard ray generation.
         let s = Amazons::initial_state();
         assert_eq!(legal_moves(&s).len(), 2176);
+    }
+
+    #[test]
+    fn expand_matches_legal_moves() {
+        // Fused expand must enumerate the same move set as legal_moves, and priors
+        // must be a valid distribution.
+        let s = Amazons::initial_state();
+        let policy = vec![0.0f32; crate::moves::POLICY_DIM];
+        let (moves, priors) = expand(&s, &policy);
+        assert_eq!(moves.len(), 2176);
+        assert_eq!(priors.len(), moves.len());
+        let sum: f32 = priors.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-3, "priors sum {sum}");
+        // Same set of moves as legal_moves (order may differ).
+        let mut a = legal_moves(&s);
+        let mut b = moves;
+        let key = |m: &AmazonsMove| (m.from_r, m.from_c, m.to_r, m.to_c, m.arrow_r, m.arrow_c);
+        a.sort_by_key(key);
+        b.sort_by_key(key);
+        assert_eq!(a, b);
     }
 
     #[test]

@@ -144,6 +144,11 @@ pub struct ChunkStats {
     pub gather_secs: f64,
     pub wait_secs: f64,
     pub apply_secs: f64,
+    /// GPU-thread non-forward time: `gpu_block_secs` waiting for leaves (eval queue
+    /// empty → starved), `gpu_dispatch_secs` collecting the batch + scattering
+    /// results. (forward time is `gpu_secs`.)
+    pub gpu_block_secs: f64,
+    pub gpu_dispatch_secs: f64,
 }
 
 impl ChunkStats {
@@ -874,17 +879,23 @@ pub trait MoveGame: Send + Sync + 'static {
     fn initial_state() -> Self::State;
     /// 1 or 2 — side to move (tags training examples).
     fn to_move(state: &Self::State) -> u8;
-    /// All legal moves in `state` (empty iff terminal).
-    fn legal_moves(state: &Self::State) -> Vec<Self::Move>;
     /// Apply a (legal) move.
     fn apply(state: &Self::State, mv: &Self::Move) -> Self::State;
     /// Terminal value for the side to move (`None` = in progress).
     fn terminal_value(state: &Self::State) -> Option<f32>;
     /// Write the `PLANES` network-input floats for `state` into `out`.
     fn encode_planes(state: &Self::State, out: &mut [f32]);
-    /// Map the model's raw `POLICY_DIM` policy to a prior per legal move (the game
-    /// does the gather + combine, e.g. softmax-over-legal of summed head logits).
-    fn move_priors(state: &Self::State, moves: &[Self::Move], policy: &[f32]) -> Vec<f32>;
+    /// Generate the legal moves AND their priors in one pass, writing into the caller's
+    /// reused `moves`/`priors` buffers (cleared first) to avoid per-call allocation.
+    /// Priors are the game's combine (e.g. softmax-over-legal of summed two-head
+    /// logits); fusing generation with prior computation lets the game compute head
+    /// indices during move generation instead of recomputing them — the hot path.
+    fn expand(
+        state: &Self::State,
+        policy: &[f32],
+        moves: &mut Vec<Self::Move>,
+        priors: &mut Vec<f32>,
+    );
 }
 
 /// One move's training-relevant record: the legal moves searched, their PUCT visit
@@ -904,20 +915,21 @@ pub struct MvGameRecord<M: MoveGame> {
     pub resigned_by: Option<u8>,
 }
 
-/// Expansion result for a leaf: value + the legal moves + their priors.
-struct MvExpand<M: MoveGame> {
-    value: f32,
-    moves: Vec<M::Move>,
-    p: Vec<f32>,
+/// One child edge: the move, its prior, visit count, value sum, and child node
+/// index (-1 = unexpanded). Storing all per-move data in ONE contiguous array (vs 5
+/// separate Vecs) cuts a node's allocations 5×→1× and makes `select` cache-friendly.
+struct MoveEntry<M: MoveGame> {
+    mv: M::Move,
+    p: f32,
+    n: u32,
+    w: f32,
+    child: i32,
 }
 
 struct MvNode<M: MoveGame> {
     state: M::State,
-    moves: Vec<M::Move>,
-    p: Vec<f32>,
-    n: Vec<u32>,
-    w: Vec<f32>,
-    children: Vec<i32>,
+    entries: Vec<MoveEntry<M>>,
+    total_n: u32, // cached Σ n over entries, so `select` needn't re-sum each call
     expanded: bool,
     terminal: bool,
     term_v: f32,
@@ -927,11 +939,8 @@ impl<M: MoveGame> MvNode<M> {
     fn new(state: M::State) -> Self {
         Self {
             state,
-            moves: Vec::new(),
-            p: Vec::new(),
-            n: Vec::new(),
-            w: Vec::new(),
-            children: Vec::new(),
+            entries: Vec::new(),
+            total_n: 0,
             expanded: false,
             terminal: false,
             term_v: 0.0,
@@ -982,14 +991,13 @@ impl<M: MoveGame> MvSearch<M> {
 
     fn select(&self, node: usize) -> usize {
         let nd = &self.arena[node];
-        let total: u32 = nd.n.iter().sum();
-        let sqrt_total = ((total + 1) as f32).sqrt();
+        let sqrt_total = ((nd.total_n + 1) as f32).sqrt();
         let c_puct = self.params.c_puct;
         let mut best = 0;
         let mut best_score = f32::NEG_INFINITY;
-        for a in 0..nd.moves.len() {
-            let q = if nd.n[a] > 0 { nd.w[a] / nd.n[a] as f32 } else { 0.0 };
-            let u = c_puct * nd.p[a] * sqrt_total / (1 + nd.n[a]) as f32;
+        for (a, e) in nd.entries.iter().enumerate() {
+            let q = if e.n > 0 { e.w / e.n as f32 } else { 0.0 };
+            let u = c_puct * e.p * sqrt_total / (1 + e.n) as f32;
             let score = q + u;
             if score > best_score {
                 best_score = score;
@@ -1009,14 +1017,14 @@ impl<M: MoveGame> MvSearch<M> {
             let mut node = 0usize;
             while self.arena[node].expanded && !self.arena[node].terminal {
                 let a = self.select(node);
-                let child = self.arena[node].children[a];
+                let child = self.arena[node].entries[a].child;
                 let next = if child >= 0 {
                     child as usize
                 } else {
-                    let ns = M::apply(&self.arena[node].state, &self.arena[node].moves[a]);
+                    let ns = M::apply(&self.arena[node].state, &self.arena[node].entries[a].mv);
                     let idx = self.arena.len();
                     self.arena.push(MvNode::new(ns));
-                    self.arena[node].children[a] = idx as i32;
+                    self.arena[node].entries[a].child = idx as i32;
                     idx
                 };
                 self.pending_path.push((node, a));
@@ -1052,30 +1060,32 @@ impl<M: MoveGame> MvSearch<M> {
         }
     }
 
-    fn apply(&mut self, out: MvExpand<M>, rng: &mut impl Rng) {
+    /// Expand the pending leaf from the freshly-generated `moves`+`priors` (passed by
+    /// reference from reused worker scratch — one allocation here for the entries).
+    fn apply(&mut self, value: f32, moves: &[M::Move], priors: &[f32], rng: &mut impl Rng) {
         let node = self.pending_leaf.take().expect("apply with no pending leaf");
-        let m = out.moves.len();
         {
             let nd = &mut self.arena[node];
-            nd.moves = out.moves;
-            nd.p = out.p;
-            nd.n = vec![0; m];
-            nd.w = vec![0.0; m];
-            nd.children = vec![-1; m];
+            nd.entries.clear();
+            nd.entries.reserve(moves.len());
+            for (mv, &p) in moves.iter().zip(priors) {
+                nd.entries.push(MoveEntry { mv: *mv, p, n: 0, w: 0.0, child: -1 });
+            }
+            nd.total_n = 0;
             nd.expanded = true;
         }
         if node == 0 && self.params.dir_eps > 0.0 && !self.dirichlet_done {
             self.apply_dirichlet(rng);
             self.dirichlet_done = true;
         }
-        self.backup(out.value);
+        self.backup(value);
         if self.arena.len() != self.pending_nodes_before {
             self.no_growth = 0;
         }
     }
 
     fn apply_dirichlet(&mut self, rng: &mut impl Rng) {
-        let m = self.arena[0].moves.len();
+        let m = self.arena[0].entries.len();
         if m == 0 {
             return;
         }
@@ -1086,8 +1096,8 @@ impl<M: MoveGame> MvSearch<M> {
             *x /= gsum;
         }
         let eps = self.params.dir_eps;
-        for a in 0..m {
-            self.arena[0].p[a] = (1.0 - eps) * self.arena[0].p[a] + eps * g[a];
+        for (e, &gi) in self.arena[0].entries.iter_mut().zip(g.iter()) {
+            e.p = (1.0 - eps) * e.p + eps * gi;
         }
     }
 
@@ -1095,18 +1105,19 @@ impl<M: MoveGame> MvSearch<M> {
         for &(n, a) in self.pending_path.iter().rev() {
             v = -v;
             let nd = &mut self.arena[n];
-            nd.n[a] += 1;
-            nd.w[a] += v;
+            nd.entries[a].n += 1;
+            nd.entries[a].w += v;
+            nd.total_n += 1;
         }
     }
 
-    /// Visit counts at the root (the policy target, parallel to root moves).
+    /// Visit counts at the root (the policy target, parallel to `root_moves`).
     fn policy_counts(&self) -> Vec<u32> {
-        self.arena[0].n.clone()
+        self.arena[0].entries.iter().map(|e| e.n).collect()
     }
 
-    fn root_moves(&self) -> &[M::Move] {
-        &self.arena[0].moves
+    fn root_moves(&self) -> Vec<M::Move> {
+        self.arena[0].entries.iter().map(|e| e.mv).collect()
     }
 
     /// State of the leaf awaiting evaluation (set by `next`, consumed by `apply`).
@@ -1117,12 +1128,11 @@ impl<M: MoveGame> MvSearch<M> {
     /// Mean action-value at the root from the side-to-move's view, for resignation.
     fn root_value(&self) -> f32 {
         let root = &self.arena[0];
-        let n: u32 = root.n.iter().sum();
-        if n == 0 {
+        if root.total_n == 0 {
             return 0.0;
         }
-        let w: f32 = root.w.iter().sum();
-        w / n as f32
+        let w: f32 = root.entries.iter().map(|e| e.w).sum();
+        w / root.total_n as f32
     }
 }
 
@@ -1160,7 +1170,7 @@ impl<M: MoveGame> MvRunner<M> {
         let sum: u32 = counts.iter().sum();
         let cur = self.states.last().unwrap();
         let to_move = M::to_move(cur);
-        let moves: Vec<M::Move> = self.search.root_moves().to_vec();
+        let moves: Vec<M::Move> = self.search.root_moves();
 
         let played = if moves.is_empty() {
             0 // terminal (no legal move) — shouldn't reach here, guarded below
@@ -1231,6 +1241,7 @@ enum MvTask<M: MoveGame> {
 /// on this thread — steady-state refill, so `concurrency` games stay in flight and no
 /// worker ever idles. Shutdown is driven by the workers'/GPU's `recv_deadline`, not
 /// by game exhaustion, so there's no tail.
+#[allow(clippy::too_many_arguments)]
 fn mv_advance<M: MoveGame>(
     mut r: MvRunner<M>,
     pending: Option<(f32, &[f32])>,
@@ -1239,18 +1250,17 @@ fn mv_advance<M: MoveGame>(
     seed_ctr: &std::sync::atomic::AtomicU64,
     eval_tx: &crossbeam_channel::Sender<(MvRunner<M>, Vec<f32>)>,
     finished: &Mutex<Vec<MvGameRecord<M>>>,
+    moves_buf: &mut Vec<M::Move>,
+    prior_buf: &mut Vec<f32>,
     ws: &mut WorkerStats,
 ) {
     use std::sync::atomic::Ordering;
     if let Some((value, policy)) = pending {
         let t = Instant::now();
         let state = r.search.pending_state().clone();
-        let moves = M::legal_moves(&state);
-        ws.wait_secs += t.elapsed().as_secs_f64(); // (reused) legal-move generation
-        let t2 = Instant::now();
-        let p = M::move_priors(&state, &moves, policy);
-        r.search.apply(MvExpand { value, moves, p }, &mut r.rng);
-        ws.apply_secs += t2.elapsed().as_secs_f64(); // prior-combine + backup
+        M::expand(&state, policy, moves_buf, prior_buf); // fused move-gen + priors (reused bufs)
+        r.search.apply(value, moves_buf, prior_buf, &mut r.rng);
+        ws.apply_secs += t.elapsed().as_secs_f64(); // expand (move-gen + priors) + backup
         ws.nodes += 1;
         ws.evals += 1;
     }
@@ -1302,13 +1312,15 @@ fn mv_gpu_loop<M: MoveGame>(
     let mut win_samples = 0u64;
     let mut win_t = Instant::now();
     loop {
+        if Instant::now() >= deadline {
+            break; // explicit stop: recv_deadline won't fire while the queue is never empty
+        }
         let mut runners = Vec::with_capacity(batch_size);
         let mut planes = Vec::with_capacity(batch_size * M::PLANES);
-        // Block for the first leaf (waking at the deadline), then grab whatever else
-        // is already queued (non-blocking) up to batch_size. We deliberately do NOT
-        // wait for a full 256: blocking for the last few leaves micro-idles the GPU,
-        // which down-clocks it and *lowers* throughput. With enough overcommit the
-        // queue holds ~batch_size already, so batches are near-full anyway.
+        // Block for the first leaf, then take whatever else is queued (forward-what's-
+        // ready, no waiting → GPU never idles for the last leaf). With fast-enough
+        // workers the queue holds ~batch_size already, so batches stay near-full.
+        let t_block = Instant::now();
         match eval_rx.recv_deadline(deadline) {
             Ok((r, pl)) => {
                 planes.extend_from_slice(&pl);
@@ -1325,6 +1337,7 @@ fn mv_gpu_loop<M: MoveGame>(
                 Err(_) => break,
             }
         }
+        local.gpu_block_secs += t_block.elapsed().as_secs_f64();
         let useful = runners.len();
         planes.resize(batch_size * M::PLANES, 0.0); // pad a partial batch to fixed shape
         let t_gpu = Instant::now();
@@ -1334,10 +1347,12 @@ fn mv_gpu_loop<M: MoveGame>(
         local.batch_samples += useful as u64;
         win_batches += 1;
         win_samples += useful as u64;
+        let t_disp = Instant::now();
         let priors = Arc::new(priors);
         for (i, r) in runners.into_iter().enumerate() {
             let _ = work_tx.send(MvTask::Apply(r, vals[i], Arc::clone(&priors), i));
         }
+        local.gpu_dispatch_secs += t_disp.elapsed().as_secs_f64();
         if report_secs > 0.0 {
             let dt = win_t.elapsed().as_secs_f64();
             if dt >= report_secs {
@@ -1354,6 +1369,8 @@ fn mv_gpu_loop<M: MoveGame>(
     }
     let mut s = stats.lock().unwrap();
     s.gpu_secs += local.gpu_secs;
+    s.gpu_block_secs += local.gpu_block_secs;
+    s.gpu_dispatch_secs += local.gpu_dispatch_secs;
     s.batches += local.batches;
     s.batch_samples += local.batch_samples;
 }
@@ -1404,16 +1421,25 @@ pub fn run_selfplay_moves<M: MoveGame>(
             let (finished, seed_ctr, stats) = (&finished, &seed_ctr, &stats);
             handles.push(scope.spawn(move || {
                 let mut ws = WorkerStats::default();
+                let mut moves_buf: Vec<M::Move> = Vec::new();
+                let mut prior_buf: Vec<f32> = Vec::new();
                 loop {
-                    // recv_deadline wakes every worker exactly at the deadline — clean
-                    // fixed-time stop, no polling latency, no broadcast needed.
+                    // Explicit deadline check: recv_deadline alone won't fire while the
+                    // work queue is never empty (continuous refill), so check directly.
+                    if Instant::now() >= deadline {
+                        break;
+                    }
                     match work_rx.recv_deadline(deadline) {
-                        Ok(MvTask::Seed(r)) => {
-                            mv_advance(r, None, &params, base_seed, seed_ctr, &eval_tx, finished, &mut ws)
-                        }
+                        Ok(MvTask::Seed(r)) => mv_advance(
+                            r, None, &params, base_seed, seed_ctr, &eval_tx, finished,
+                            &mut moves_buf, &mut prior_buf, &mut ws,
+                        ),
                         Ok(MvTask::Apply(r, v, pr, off)) => {
                             let slice = &pr[off * pd..(off + 1) * pd];
-                            mv_advance(r, Some((v, slice)), &params, base_seed, seed_ctr, &eval_tx, finished, &mut ws)
+                            mv_advance(
+                                r, Some((v, slice)), &params, base_seed, seed_ctr, &eval_tx, finished,
+                                &mut moves_buf, &mut prior_buf, &mut ws,
+                            )
                         }
                         Err(_) => break,
                     }
@@ -1537,14 +1563,20 @@ pub fn run_actor_continuous<M, F>(
             let (finished, seed_ctr) = (&finished, &seed_ctr);
             scope.spawn(move || {
                 let mut ws = WorkerStats::default();
+                let mut moves_buf: Vec<M::Move> = Vec::new();
+                let mut prior_buf: Vec<f32> = Vec::new();
                 loop {
                     match work_rx.recv() {
-                        Ok(MvTask::Seed(r)) => {
-                            mv_advance(r, None, &params, base_seed, seed_ctr, &eval_tx, finished, &mut ws)
-                        }
+                        Ok(MvTask::Seed(r)) => mv_advance(
+                            r, None, &params, base_seed, seed_ctr, &eval_tx, finished,
+                            &mut moves_buf, &mut prior_buf, &mut ws,
+                        ),
                         Ok(MvTask::Apply(r, v, pr, off)) => {
                             let slice = &pr[off * pd..(off + 1) * pd];
-                            mv_advance(r, Some((v, slice)), &params, base_seed, seed_ctr, &eval_tx, finished, &mut ws)
+                            mv_advance(
+                                r, Some((v, slice)), &params, base_seed, seed_ctr, &eval_tx, finished,
+                                &mut moves_buf, &mut prior_buf, &mut ws,
+                            )
                         }
                         Err(_) => break,
                     }

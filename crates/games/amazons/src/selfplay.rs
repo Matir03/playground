@@ -259,9 +259,17 @@ pub fn run_benchmark(
     // (legal_moves bitboard enumeration) + priors (combine + backup).
     let cpu = cs.gather_secs + cs.wait_secs + cs.apply_secs;
     println!(
-        "  cpu: descent {:.0}%  legal-gen {:.0}%  priors {:.0}%  [{:.1} core-s / {} workers, {:.1} wall]  gpu {:.1}s",
+        "  cpu: descent {:.0}%  legal-gen {:.0}%  priors {:.0}%  [{:.1} core-s / {} workers, {:.1} wall]",
         100.0 * cs.gather_secs / cpu, 100.0 * cs.wait_secs / cpu, 100.0 * cs.apply_secs / cpu,
-        cpu, threads, cs.elapsed, cs.gpu_secs,
+        cpu, threads, cs.elapsed,
+    );
+    // GPU-thread time split: forward (useful) vs block (starved, waiting for leaves)
+    // vs dispatch (collect batch + scatter). High block% = the workers can't feed it.
+    let gt = cs.gpu_secs + cs.gpu_block_secs + cs.gpu_dispatch_secs;
+    println!(
+        "  gpu thread: forward {:.0}%  block/starve {:.0}%  dispatch {:.0}%  [{:.1}s forward, {:.1}s wall]",
+        100.0 * cs.gpu_secs / gt, 100.0 * cs.gpu_block_secs / gt, 100.0 * cs.gpu_dispatch_secs / gt,
+        cs.gpu_secs, cs.elapsed,
     );
     let _ = PLANE_COUNT;
     Ok(())

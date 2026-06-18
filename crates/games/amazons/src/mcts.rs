@@ -8,35 +8,10 @@ use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, Gamma};
 
 use crate::game::{self, AmazonsMove, AmazonsState, CELLS, PLANES as PLANE_COUNT};
-use crate::moves::{move_to_indices, PER_HEAD, POLICY_DIM};
+use crate::moves::POLICY_DIM;
 
 /// Floats per encoded position (4 planes × 100 cells).
 pub const PLANES: usize = PLANE_COUNT * CELLS;
-
-/// Combine the net's raw two-head logits into a prior per legal move:
-/// softmax over legal of `queen_logit[from,qmt] + arrow_logit[to,amt]`.
-pub fn combine_priors(moves: &[AmazonsMove], policy: &[f32]) -> Vec<f32> {
-    let mut logits = Vec::with_capacity(moves.len());
-    let mut maxl = f32::NEG_INFINITY;
-    for m in moves {
-        let (qi, ai) = move_to_indices(m);
-        let l = policy[qi] + policy[PER_HEAD + ai];
-        if l > maxl {
-            maxl = l;
-        }
-        logits.push(l);
-    }
-    let mut sum = 0.0f32;
-    for l in &mut logits {
-        *l = (*l - maxl).exp();
-        sum += *l;
-    }
-    let inv = 1.0 / sum.max(1e-12);
-    for l in &mut logits {
-        *l *= inv;
-    }
-    logits
-}
 
 impl MoveGame for crate::game::Amazons {
     type State = AmazonsState;
@@ -49,9 +24,6 @@ impl MoveGame for crate::game::Amazons {
     }
     fn to_move(state: &AmazonsState) -> u8 {
         state.to_move
-    }
-    fn legal_moves(state: &AmazonsState) -> Vec<AmazonsMove> {
-        game::legal_moves(state)
     }
     fn apply(state: &AmazonsState, mv: &AmazonsMove) -> AmazonsState {
         game::apply(state, mv)
@@ -67,8 +39,8 @@ impl MoveGame for crate::game::Amazons {
     fn encode_planes(state: &AmazonsState, out: &mut [f32]) {
         game::fill_planes_into(state, out);
     }
-    fn move_priors(_state: &AmazonsState, moves: &[AmazonsMove], policy: &[f32]) -> Vec<f32> {
-        combine_priors(moves, policy)
+    fn expand(state: &AmazonsState, policy: &[f32], moves: &mut Vec<AmazonsMove>, priors: &mut Vec<f32>) {
+        game::expand_into(state, policy, moves, priors);
     }
 }
 
@@ -174,8 +146,7 @@ pub fn run_mcts(
             -1.0
         } else {
             let (v, policy) = eval.eval(&arena[node].state)?;
-            let moves = game::legal_moves(&arena[node].state);
-            let mut pr = combine_priors(&moves, &policy);
+            let (moves, mut pr) = game::expand(&arena[node].state, &policy);
             let m = moves.len();
             if node == 0 && p.dir_eps > 0.0 && !dirichlet_done {
                 let gamma = Gamma::new(p.dir_alpha as f64, 1.0).unwrap();
