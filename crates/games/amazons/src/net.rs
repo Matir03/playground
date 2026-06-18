@@ -156,6 +156,7 @@ impl LocalModel {
         Ok(Self { net, device })
     }
 
+    #[allow(dead_code)]
     fn fill_planes(states: &[&AmazonsState], out: &mut [f32]) {
         let stride = IN_PLANES * CELLS;
         for (i, s) in states.iter().enumerate() {
@@ -164,6 +165,7 @@ impl LocalModel {
     }
 
     /// Batched forward over concrete states: (value, raw policy logits[POLICY_DIM]).
+    #[allow(dead_code)]
     pub fn value_policy_batch(
         &self,
         states: &[&AmazonsState],

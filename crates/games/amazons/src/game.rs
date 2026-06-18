@@ -187,6 +187,7 @@ pub fn legal_moves(state: &AmazonsState) -> Vec<AmazonsMove> {
 /// `q + a` accumulated inline; a final softmax-over-legal yields the priors. Returns
 /// (moves, priors) parallel vectors. This is the hot self-play path — it replaces
 /// the old `legal_moves` + `move_priors` (ray_reach → Vec → re-index → exp).
+#[allow(dead_code)] // tuple wrapper kept for tests/eval convenience
 pub fn expand(state: &AmazonsState, policy: &[f32]) -> (Vec<AmazonsMove>, Vec<f32>) {
     let mut moves = Vec::new();
     let mut priors = Vec::new();

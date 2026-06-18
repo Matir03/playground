@@ -1145,6 +1145,9 @@ struct MvRunner<M: MoveGame> {
     resigned_by: Option<u8>,
     resign_enabled: bool,
     resign_run: [u32; 2],
+    /// Eval only: the side (1/2) that model A plays in this game (0 = self-play, one
+    /// model). The leaf's model is A if `state.to_move == eval_a_side` else B.
+    eval_a_side: u8,
 }
 
 impl<M: MoveGame> MvRunner<M> {
@@ -1160,6 +1163,7 @@ impl<M: MoveGame> MvRunner<M> {
             finished: false,
             resigned_by: None,
             resign_enabled,
+            eval_a_side: 0,
             resign_run: [0, 0],
         }
     }
@@ -1595,4 +1599,197 @@ pub fn run_actor_continuous<M, F>(
             on_flush(games);
         }
     });
+}
+
+// ── Two-model evaluation (same pipeline as self-play, A vs B) ──────────────────
+//
+// A head-to-head match A-vs-B reusing the exact async leaf-batching engine — self-
+// play is the special case A == B. `n_games` games run to terminal (no resign);
+// game i has model A playing side `1 + i%2` (alternate colours). Each leaf is routed
+// to the model controlling its side-to-move; the GPU thread partitions the batch by
+// model and runs one forward per model, then scatters. Returns A's score in [0,1].
+
+/// Advance one eval runner: apply the pending eval, descend to the next leaf and send
+/// it tagged with the model that controls its side-to-move; when the game ends, score
+/// it for A (no refill). Sets `done` when the last game finishes.
+#[allow(clippy::too_many_arguments)]
+fn eval_advance<M: MoveGame>(
+    mut r: MvRunner<M>,
+    pending: Option<(f32, &[f32])>,
+    params: &SearchParams,
+    eval_tx: &crossbeam_channel::Sender<(MvRunner<M>, Vec<f32>, usize)>,
+    score_x2: &std::sync::atomic::AtomicU64, // Σ 2×(A's game score), so win=2 draw=1 loss=0
+    remaining: &std::sync::atomic::AtomicUsize,
+    done: &std::sync::atomic::AtomicBool,
+    moves_buf: &mut Vec<M::Move>,
+    prior_buf: &mut Vec<f32>,
+) {
+    use std::sync::atomic::Ordering;
+    if let Some((value, policy)) = pending {
+        let state = r.search.pending_state().clone();
+        M::expand(&state, policy, moves_buf, prior_buf);
+        r.search.apply(value, moves_buf, prior_buf, &mut r.rng);
+    }
+    loop {
+        match r.search.next() {
+            MvStep::Done => {
+                r.complete_move(params);
+                if r.finished {
+                    // Score for A: a finished game's last state is terminal (side to
+                    // move lost); A won iff that loser isn't A's side. Ply-cap = draw.
+                    let final_state = r.states.last().unwrap();
+                    let s2: u64 = match M::terminal_value(final_state) {
+                        Some(_) => {
+                            let loser = M::to_move(final_state);
+                            if loser != r.eval_a_side { 2 } else { 0 }
+                        }
+                        None => 1, // hit max_ply: draw
+                    };
+                    score_x2.fetch_add(s2, Ordering::AcqRel);
+                    if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        done.store(true, Ordering::Release);
+                    }
+                    return;
+                }
+            }
+            MvStep::NeedEval(state) => {
+                let model_id = if M::to_move(&state) == r.eval_a_side { 0 } else { 1 };
+                let mut planes = vec![0f32; M::PLANES];
+                M::encode_planes(&state, &mut planes);
+                let _ = eval_tx.send((r, planes, model_id));
+                return;
+            }
+        }
+    }
+}
+
+/// GPU thread for eval: collect leaves, **partition by model id**, run one forward
+/// per model on its sub-batch, and scatter each result as an `Apply`. (For 1 model
+/// this is just self-play.) Exits when `done` and the queue has drained.
+fn eval_gpu_loop<M: MoveGame>(
+    eval_rx: crossbeam_channel::Receiver<(MvRunner<M>, Vec<f32>, usize)>,
+    work_tx: crossbeam_channel::Sender<MvTask<M>>,
+    models: &[&dyn BatchModel],
+    batch_size: usize,
+    done: &std::sync::atomic::AtomicBool,
+) {
+    use std::sync::atomic::Ordering;
+    let timeout = std::time::Duration::from_millis(20);
+    loop {
+        // Gather up to batch_size leaves (block for the first, then drain).
+        let mut leaves: Vec<(MvRunner<M>, Vec<f32>, usize)> = Vec::with_capacity(batch_size);
+        match eval_rx.recv_timeout(timeout) {
+            Ok(x) => leaves.push(x),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                if done.load(Ordering::Acquire) {
+                    break;
+                }
+                continue;
+            }
+            Err(_) => break,
+        }
+        while leaves.len() < batch_size {
+            match eval_rx.try_recv() {
+                Ok(x) => leaves.push(x),
+                Err(_) => break,
+            }
+        }
+        // Partition leaf indices by model, forward each model on its sub-batch.
+        let mut results: Vec<Option<(f32, std::sync::Arc<Vec<f32>>, usize)>> =
+            (0..leaves.len()).map(|_| None).collect();
+        for (m, model) in models.iter().enumerate() {
+            let idxs: Vec<usize> = (0..leaves.len()).filter(|&i| leaves[i].2 == m).collect();
+            if idxs.is_empty() {
+                continue;
+            }
+            let mut planes = Vec::with_capacity(idxs.len() * M::PLANES);
+            for &i in &idxs {
+                planes.extend_from_slice(&leaves[i].1);
+            }
+            let (vals, priors) = model.forward(&planes, idxs.len()).expect("eval forward failed");
+            let priors = std::sync::Arc::new(priors);
+            for (slot, &i) in idxs.iter().enumerate() {
+                results[i] = Some((vals[slot], std::sync::Arc::clone(&priors), slot));
+            }
+        }
+        for ((r, _planes, _mid), res) in leaves.into_iter().zip(results) {
+            let (value, priors, off) = res.unwrap();
+            let _ = work_tx.send(MvTask::Apply(r, value, priors, off));
+        }
+    }
+}
+
+/// Run an `n_games` A-vs-B match on the async pipeline; return A's score in [0,1].
+/// `model_a`/`model_b` may be the same model (self-play). Plays to terminal (no
+/// resignation) with `params` (use a small `temp_moves` for opening diversity).
+pub fn run_eval_moves<M: MoveGame>(
+    model_a: &dyn BatchModel,
+    model_b: &dyn BatchModel,
+    n_games: usize,
+    params: SearchParams,
+    threads: usize,
+    batch_size: usize,
+    base_seed: u64,
+) -> f64 {
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    let score_x2 = AtomicU64::new(0);
+    let remaining = AtomicUsize::new(n_games);
+    let done = AtomicBool::new(false);
+    let n_workers = threads.max(1);
+    let pd = M::POLICY_DIM;
+    let models: [&dyn BatchModel; 2] = [model_a, model_b];
+
+    let (work_tx, work_rx) = crossbeam_channel::unbounded::<MvTask<M>>();
+    let (eval_tx, eval_rx) = crossbeam_channel::unbounded::<(MvRunner<M>, Vec<f32>, usize)>();
+    for i in 0..n_games {
+        let mut r = MvRunner::new(base_seed.wrapping_add(i as u64), params);
+        r.eval_a_side = 1 + (i % 2) as u8; // alternate which colour A plays
+        work_tx.send(MvTask::Seed(r)).unwrap();
+    }
+
+    std::thread::scope(|scope| {
+        {
+            let eval_rx = eval_rx.clone();
+            let work_tx = work_tx.clone();
+            let (models, done) = (&models, &done);
+            scope.spawn(move || eval_gpu_loop::<M>(eval_rx, work_tx, models, batch_size, done));
+        }
+        for _ in 0..n_workers {
+            let work_rx = work_rx.clone();
+            let eval_tx = eval_tx.clone();
+            let (score_x2, remaining, done) = (&score_x2, &remaining, &done);
+            scope.spawn(move || {
+                let mut moves_buf: Vec<M::Move> = Vec::new();
+                let mut prior_buf: Vec<f32> = Vec::new();
+                let timeout = std::time::Duration::from_millis(20);
+                loop {
+                    match work_rx.recv_timeout(timeout) {
+                        Ok(MvTask::Seed(r)) => eval_advance(
+                            r, None, &params, &eval_tx, score_x2, remaining, done,
+                            &mut moves_buf, &mut prior_buf,
+                        ),
+                        Ok(MvTask::Apply(r, v, pr, off)) => {
+                            let slice = &pr[off * pd..(off + 1) * pd];
+                            eval_advance(
+                                r, Some((v, slice)), &params, &eval_tx, score_x2, remaining, done,
+                                &mut moves_buf, &mut prior_buf,
+                            )
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                            if done.load(Ordering::Acquire) {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+        drop(work_tx);
+        drop(work_rx);
+        drop(eval_tx);
+        drop(eval_rx);
+    });
+
+    score_x2.load(Ordering::Acquire) as f64 / (2.0 * n_games as f64)
 }

@@ -16,8 +16,29 @@ import os
 import random
 import re
 import shutil
+import signal
 import subprocess
 import time
+
+# eval-match uses candle (the snapshots are .safetensors, not ONNX); to keep it from
+# contending with the TRT actor for the GPU, we SIGSTOP the actor + learner while a
+# generation's matches run, then SIGCONT. Patterns identify their argv.
+_PAUSE_PATS = ["amazons-engine selfplay-loop", "amazons_az_learner.py"]
+
+
+def _pids(pat: str) -> list[int]:
+    out = subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True)
+    return [int(x) for x in out.stdout.split()]
+
+
+def set_paused(paused: bool) -> None:
+    sig = signal.SIGSTOP if paused else signal.SIGCONT
+    for pat in _PAUSE_PATS:
+        for pid in _pids(pat):
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
 
 
 def run_match(rust_bin, ckpt_a, ckpt_b, games, node_budget, threads, max_batch, seed) -> float:
@@ -26,7 +47,9 @@ def run_match(rust_bin, ckpt_a, ckpt_b, games, node_budget, threads, max_batch, 
         "--cuda", "--games", str(games), "--node-budget", str(node_budget),
         "--threads", str(threads), "--max-batch", str(max_batch), "--seed", str(seed),
     ]
-    out = subprocess.run(cmd, check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    # Timeout so a stuck match can't leave the actor/learner paused forever.
+    out = subprocess.run(cmd, check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE,
+                         text=True, timeout=900)
     m = re.search(r"A_score\s+([\d.]+)", out.stdout)
     if not m:
         raise RuntimeError(f"no A_score in eval-match output:\n{out.stdout}\n{out.stderr}")
@@ -106,11 +129,16 @@ def main() -> None:
             ck = os.path.join(d, "checkpoint.safetensors")
             if os.path.exists(ck):
                 gens.append((int(os.path.basename(d)[3:]), ck))
-        for gen, ck in sorted(gens):
+        # Rate only the LATEST snapshot each pass (skip intermediates) so eval — which
+        # pauses the actor — runs sparsely and can't starve training when it lags.
+        for gen, ck in sorted(gens, reverse=True):
             if gen <= state["processed_through"]:
                 continue
             pool = select_pool(gen, snaps, state["elo"], state["best_gen"],
                                state.get("prev_best_gen"))
+            # Pause the actor + learner for this generation's matches (less GPU
+            # contention); always resume, even on failure/timeout.
+            set_paused(True)
             try:
                 results = []
                 for i, (label, og, oe, ock) in enumerate(pool):
@@ -121,6 +149,8 @@ def main() -> None:
                 print(f"gen{gen}: eval failed: {e}", flush=True)
                 time.sleep(args.interval)
                 continue
+            finally:
+                set_paused(False)
             if not results:
                 elo = 0.0
             else:
@@ -144,6 +174,7 @@ def main() -> None:
             tag = "PROMOTED" if promoted else f"kept best gen{state['best_gen']}"
             vb = f"{vs_best:.2f}" if vs_best is not None else "n/a"
             print(f"gen{gen}: pooled ELO {elo:+.0f}  vs_best {vb}  [{pool_str}]  [{tag}]", flush=True)
+            break  # rated the latest; resume training, recheck after the interval
         time.sleep(args.interval)
 
 
