@@ -1439,3 +1439,128 @@ pub fn run_selfplay_moves<M: MoveGame>(
     s.elapsed = t0.elapsed().as_secs_f64();
     (finished.into_inner().unwrap(), s)
 }
+
+/// Continuous self-play actor: keeps `concurrency` games in flight **forever** (refill
+/// on completion), and every `flush_secs` calls `on_flush(completed_games)` with the
+/// games that finished since the last flush — in-flight games keep running across
+/// flushes (no tail, no discarded work). The GPU thread reads the model from `model`
+/// each batch, so the caller can hot-swap weights on a learner snapshot by replacing
+/// the `Arc` (e.g. inside `on_flush`). Never returns; the process is killed to stop.
+/// `report_secs` > 0 logs throughput periodically (0 = quiet).
+pub fn run_actor_continuous<M, F>(
+    model: &Mutex<Arc<dyn BatchModel>>,
+    concurrency: usize,
+    params: SearchParams,
+    threads: usize,
+    batch_size: usize,
+    base_seed: u64,
+    flush_secs: f64,
+    report_secs: f64,
+    mut on_flush: F,
+) where
+    M: MoveGame,
+    F: FnMut(Vec<MvGameRecord<M>>),
+{
+    use std::sync::atomic::AtomicU64;
+    let finished: Mutex<Vec<MvGameRecord<M>>> = Mutex::new(Vec::new());
+    let seed_ctr = AtomicU64::new(concurrency as u64);
+    let n_workers = threads.max(1);
+    let pd = M::POLICY_DIM;
+
+    let (work_tx, work_rx) = crossbeam_channel::unbounded::<MvTask<M>>();
+    let (eval_tx, eval_rx) = crossbeam_channel::unbounded::<(MvRunner<M>, Vec<f32>)>();
+    for i in 0..concurrency {
+        work_tx
+            .send(MvTask::Seed(MvRunner::new(base_seed.wrapping_add(i as u64), params)))
+            .unwrap();
+    }
+
+    std::thread::scope(|scope| {
+        // GPU thread: reads the *current* model each batch (hot-swappable).
+        {
+            let eval_rx = eval_rx.clone();
+            let work_tx = work_tx.clone();
+            scope.spawn(move || {
+                let mut win_b = 0u64;
+                let mut win_s = 0u64;
+                let mut win_t = Instant::now();
+                loop {
+                    let mut runners = Vec::with_capacity(batch_size);
+                    let mut planes = Vec::with_capacity(batch_size * M::PLANES);
+                    match eval_rx.recv() {
+                        Ok((r, pl)) => {
+                            planes.extend_from_slice(&pl);
+                            runners.push(r);
+                        }
+                        Err(_) => break,
+                    }
+                    while runners.len() < batch_size {
+                        match eval_rx.try_recv() {
+                            Ok((r, pl)) => {
+                                planes.extend_from_slice(&pl);
+                                runners.push(r);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let useful = runners.len();
+                    planes.resize(batch_size * M::PLANES, 0.0);
+                    let m = model.lock().unwrap().clone(); // current weights (cheap Arc clone)
+                    let (vals, priors) = m.forward(&planes, batch_size).expect("batched forward failed");
+                    drop(m);
+                    let priors = Arc::new(priors);
+                    for (i, r) in runners.into_iter().enumerate() {
+                        let _ = work_tx.send(MvTask::Apply(r, vals[i], Arc::clone(&priors), i));
+                    }
+                    win_b += 1;
+                    win_s += useful as u64;
+                    if report_secs > 0.0 {
+                        let dt = win_t.elapsed().as_secs_f64();
+                        if dt >= report_secs {
+                            eprintln!(
+                                "    [actor gpu] avg_batch {:.0}  {:.0} nodes/s",
+                                win_s as f64 / win_b as f64,
+                                win_s as f64 / dt,
+                            );
+                            win_b = 0;
+                            win_s = 0;
+                            win_t = Instant::now();
+                        }
+                    }
+                }
+            });
+        }
+        // Worker pool: advance games forever (blocking recv; refill on completion).
+        for _ in 0..n_workers {
+            let work_rx = work_rx.clone();
+            let eval_tx = eval_tx.clone();
+            let (finished, seed_ctr) = (&finished, &seed_ctr);
+            scope.spawn(move || {
+                let mut ws = WorkerStats::default();
+                loop {
+                    match work_rx.recv() {
+                        Ok(MvTask::Seed(r)) => {
+                            mv_advance(r, None, &params, base_seed, seed_ctr, &eval_tx, finished, &mut ws)
+                        }
+                        Ok(MvTask::Apply(r, v, pr, off)) => {
+                            let slice = &pr[off * pd..(off + 1) * pd];
+                            mv_advance(r, Some((v, slice)), &params, base_seed, seed_ctr, &eval_tx, finished, &mut ws)
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+        drop(work_tx);
+        drop(work_rx);
+        drop(eval_tx);
+        drop(eval_rx);
+
+        // This (caller) thread: flush completed games every `flush_secs`, forever.
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs_f64(flush_secs));
+            let games = std::mem::take(&mut *finished.lock().unwrap());
+            on_flush(games);
+        }
+    });
+}

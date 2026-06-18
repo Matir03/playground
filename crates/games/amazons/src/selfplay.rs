@@ -11,10 +11,10 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use playground_core::batch_search::{self, MvGameRecord, SearchParams};
+use playground_core::batch_search::{self, BatchModel, MvGameRecord, SearchParams};
 
 use crate::game::{self, Amazons, PLANES as PLANE_COUNT};
 use crate::mcts::PLANES;
@@ -157,42 +157,69 @@ pub fn run_loop(
     std::fs::create_dir_all(&buffer)?;
     let ort = backend == "ort";
     let device = if ort { None } else { Some(crate::net::pick_device(cuda)?) };
+    // The weights file we hot-reload from when the learner snapshots.
+    let weights = if ort { onnx.clone() } else { latest.clone() };
+
+    // Build the current model (ORT/TRT or candle) as a trait object.
+    let make_model = || -> anyhow::Result<Arc<dyn BatchModel>> {
+        if ort {
+            Ok(Arc::new(crate::ort_net::OrtModel::new(&onnx, ep, fp16, &trt_cache)?) as Arc<dyn BatchModel>)
+        } else {
+            Ok(Arc::new(LocalModel::load_on(&latest, device.clone().unwrap())?) as Arc<dyn BatchModel>)
+        }
+    };
+
+    while !Path::new(&weights).exists() {
+        std::thread::sleep(Duration::from_secs(1)); // wait for the learner's first export
+    }
+    let model: Mutex<Arc<dyn BatchModel>> = Mutex::new(make_model()?);
+    let mut last_mtime = std::fs::metadata(&weights).and_then(|m| m.modified()).ok();
     let mut seq = max_chunk_seq(&buffer).map(|s| s + 1).unwrap_or(0);
     eprintln!(
-        "amazons actor loop: backend {backend}{}, concurrency {concurrency}, {chunk_secs:.0}s/chunk, \
-         {threads} threads, buffer {} (keep {max_chunks})",
+        "amazons continuous actor: backend {backend}{}, concurrency {concurrency}, \
+         flush {chunk_secs:.0}s, batch {max_batch}, {threads} threads, buffer {} (keep {max_chunks})",
         if ort { format!("/{ep} fp16={fp16}") } else { String::new() },
         buffer.display(),
     );
-    loop {
-        let t0 = Instant::now();
-        let chunk_seed = base_seed.wrapping_add(seq.wrapping_mul(concurrency as u64).wrapping_mul(64));
-        let (records, cs) = if ort {
-            while !Path::new(&onnx).exists() {
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            }
-            let model = crate::ort_net::OrtModel::new(&onnx, ep, fp16, &trt_cache)?;
-            batch_search::run_selfplay_moves::<Amazons>(&model, concurrency, params, threads, max_batch, chunk_seed, chunk_secs, 0.0)
+
+    // Flush completed games to a buffer chunk every `chunk_secs`; in-flight games keep
+    // running. Hot-reload weights when the learner writes a newer snapshot.
+    let on_flush = |games: Vec<MvGameRecord<Amazons>>| {
+        let n_games = games.len();
+        if n_games == 0 {
+            eprintln!("  flush: 0 games (ramp-up / long games still in flight)");
         } else {
-            let model = Arc::new(LocalModel::load_on(&latest, device.clone().unwrap())?);
-            batch_search::run_selfplay_moves::<Amazons>(&*model, concurrency, params, threads, max_batch, chunk_seed, chunk_secs, 0.0)
-        };
-        let n_games = records.len().max(1);
-        let resigned = records.iter().filter(|r| r.resigned_by.is_some()).count();
-        let examples = examples_from_records(records);
-        let path = buffer.join(format!("chunk_{seq:06}.bin"));
-        let tmp = buffer.join(format!("chunk_{seq:06}.bin.tmp"));
-        write_dump(tmp.to_str().unwrap(), &examples)?;
-        std::fs::rename(&tmp, &path)?;
-        prune_buffer(&buffer, max_chunks);
-        eprintln!(
-            "  chunk {seq}: {} games  {} ex  {:.0} plies/game  avg_batch {:.0}  gpu_duty {:.2}  \
-             {:.0}% resigned  {:.1}s",
-            n_games, examples.len(), examples.len() as f64 / n_games as f64, cs.avg_batch(),
-            cs.gpu_duty(), 100.0 * resigned as f64 / n_games as f64, t0.elapsed().as_secs_f64(),
-        );
-        seq += 1;
-    }
+            let resigned = games.iter().filter(|g| g.resigned_by.is_some()).count();
+            let examples = examples_from_records(games);
+            let tmp = buffer.join(format!("chunk_{seq:06}.bin.tmp"));
+            let path = buffer.join(format!("chunk_{seq:06}.bin"));
+            if write_dump(tmp.to_str().unwrap(), &examples).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+                prune_buffer(&buffer, max_chunks);
+                seq += 1;
+            }
+            eprintln!(
+                "  chunk {}: {n_games} games  {} ex  {:.0} plies/game  {:.0}% resigned",
+                seq.saturating_sub(1), examples.len(),
+                examples.len() as f64 / n_games as f64, 100.0 * resigned as f64 / n_games as f64,
+            );
+        }
+        let mt = std::fs::metadata(&weights).and_then(|m| m.modified()).ok();
+        if mt != last_mtime {
+            match make_model() {
+                Ok(nm) => {
+                    *model.lock().unwrap() = nm;
+                    last_mtime = mt;
+                    eprintln!("  hot-reloaded weights");
+                }
+                Err(e) => eprintln!("  weight reload failed: {e}"),
+            }
+        }
+    };
+
+    batch_search::run_actor_continuous::<Amazons, _>(
+        &model, concurrency, params, threads, max_batch, base_seed, chunk_secs, 60.0, on_flush,
+    );
+    Ok(()) // unreachable (runs until the process is killed)
 }
 
 /// One-chunk throughput benchmark (candle or ort).
