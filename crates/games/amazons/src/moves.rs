@@ -17,6 +17,8 @@ pub const PER_HEAD: usize = N * N * MOVE_TYPES; // 7200
 pub const POLICY_DIM: usize = 2 * PER_HEAD; // 14400 (queen ‖ arrow)
 
 /// (dr, dc) unit step per direction index. Order is shared with `game::shift`.
+/// The source of truth for `DIR_LUT` (verified by a test).
+#[allow(dead_code)]
 const DELTAS: [(i32, i32); DIRS] = [
     (1, 0),   // 0 N
     (-1, 0),  // 1 S
@@ -28,12 +30,12 @@ const DELTAS: [(i32, i32); DIRS] = [
     (-1, -1), // 7 SW
 ];
 
+/// (sdr+1)*3 + (sdc+1) -> direction index, matching `DELTAS` (center unused).
+const DIR_LUT: [usize; 9] = [7, 1, 6, 3, 0, 2, 5, 0, 4];
+
 #[inline]
 fn dir_index(sdr: i32, sdc: i32) -> usize {
-    DELTAS
-        .iter()
-        .position(|&(dr, dc)| dr == sdr && dc == sdc)
-        .expect("non-queen step has no direction")
+    DIR_LUT[((sdr + 1) * 3 + (sdc + 1)) as usize]
 }
 
 /// Move-type index for a queen-slide `(fr,fc) -> (tr,tc)` (must be a straight line).
@@ -77,6 +79,13 @@ mod tests {
         let (q, a) = move_to_indices(&mv);
         assert!(q < PER_HEAD);
         assert!(a < PER_HEAD);
+    }
+
+    #[test]
+    fn dir_lut_matches_deltas() {
+        for (i, &(dr, dc)) in DELTAS.iter().enumerate() {
+            assert_eq!(dir_index(dr, dc), i);
+        }
     }
 
     #[test]

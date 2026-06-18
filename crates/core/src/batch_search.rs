@@ -1109,6 +1109,11 @@ impl<M: MoveGame> MvSearch<M> {
         &self.arena[0].moves
     }
 
+    /// State of the leaf awaiting evaluation (set by `next`, consumed by `apply`).
+    fn pending_state(&self) -> &M::State {
+        &self.arena[self.pending_leaf.expect("pending_state with no pending leaf")].state
+    }
+
     /// Mean action-value at the root from the side-to-move's view, for resignation.
     fn root_value(&self) -> f32 {
         let root = &self.arena[0];
@@ -1199,189 +1204,238 @@ impl<M: MoveGame> MvRunner<M> {
     }
 }
 
-/// Inference server for move-games: coalesce queued waves into batched forwards,
-/// slicing the per-position policy by `POLICY_DIM` (cf. `inference_server`).
-fn mv_inference_server<M: MoveGame>(
-    rx: Receiver<Req>,
+// ── Asynchronous pipelined leaf-batching ──────────────────────────────────────
+//
+// To keep the GPU saturated, games are *overcommitted* (n_games ≫ batch_size) and
+// decoupled from workers via a work-queue. A pool of worker threads continuously
+// descends games to their next leaf and pushes (game, planes) onto `eval`; the GPU
+// thread pulls up to `batch_size` leaves (always a full batch in steady state,
+// padded to a fixed shape so TRT never rebuilds), runs one forward, and pushes each
+// result back as an `Apply` task. Workers pick up `Apply` tasks (expand + backup)
+// and immediately descend the same game to its next leaf. No thread blocks waiting
+// on a specific leaf — while some games' leaves are on the GPU, workers advance
+// others — so the CPU keeps the eval queue full at the rate the GPU drains it.
+// Each game still has exactly one outstanding leaf at a time, so search dynamics
+// are identical to the sequential MCTS.
+
+/// CPU work item: a game to advance. `Apply` carries the value + a shared ref to the
+/// whole batch's policy logits + this game's row offset, so the GPU thread never
+/// copies a per-game 14400-float slice.
+enum MvTask<M: MoveGame> {
+    Seed(MvRunner<M>),
+    Apply(MvRunner<M>, f32, Arc<Vec<f32>>, usize),
+}
+
+/// Advance one runner: apply the pending eval (if any), then descend to its next leaf
+/// (push to `eval`). When a game ends, record it and immediately start a fresh game
+/// on this thread — steady-state refill, so `concurrency` games stay in flight and no
+/// worker ever idles. Shutdown is driven by the workers'/GPU's `recv_deadline`, not
+/// by game exhaustion, so there's no tail.
+fn mv_advance<M: MoveGame>(
+    mut r: MvRunner<M>,
+    pending: Option<(f32, &[f32])>,
+    params: &SearchParams,
+    base_seed: u64,
+    seed_ctr: &std::sync::atomic::AtomicU64,
+    eval_tx: &crossbeam_channel::Sender<(MvRunner<M>, Vec<f32>)>,
+    finished: &Mutex<Vec<MvGameRecord<M>>>,
+    ws: &mut WorkerStats,
+) {
+    use std::sync::atomic::Ordering;
+    if let Some((value, policy)) = pending {
+        let t = Instant::now();
+        let state = r.search.pending_state().clone();
+        let moves = M::legal_moves(&state);
+        ws.wait_secs += t.elapsed().as_secs_f64(); // (reused) legal-move generation
+        let t2 = Instant::now();
+        let p = M::move_priors(&state, &moves, policy);
+        r.search.apply(MvExpand { value, moves, p }, &mut r.rng);
+        ws.apply_secs += t2.elapsed().as_secs_f64(); // prior-combine + backup
+        ws.nodes += 1;
+        ws.evals += 1;
+    }
+    loop {
+        let t = Instant::now();
+        match r.search.next() {
+            MvStep::Done => {
+                r.complete_move(params);
+                if r.finished {
+                    ws.gather_secs += t.elapsed().as_secs_f64();
+                    finished.lock().unwrap().push(MvGameRecord {
+                        states: std::mem::take(&mut r.states),
+                        moves: std::mem::take(&mut r.moves),
+                        resigned_by: r.resigned_by,
+                    });
+                    let id = seed_ctr.fetch_add(1, Ordering::Relaxed);
+                    r = MvRunner::new(base_seed.wrapping_add(id), *params);
+                }
+            }
+            MvStep::NeedEval(state) => {
+                let mut planes = vec![0f32; M::PLANES];
+                M::encode_planes(&state, &mut planes);
+                ws.gather_secs += t.elapsed().as_secs_f64();
+                let _ = eval_tx.send((r, planes));
+                return;
+            }
+        }
+    }
+}
+
+/// GPU thread: block for the next leaf (waking at `deadline`), greedily pull up to
+/// `batch_size` more (a full batch in steady state thanks to overcommit), pad to a
+/// fixed shape, run ONE forward, then dispatch each result as an `Apply`. The whole
+/// policy buffer is shared via `Arc` — no per-game copy on this hot thread.
+fn mv_gpu_loop<M: MoveGame>(
+    eval_rx: crossbeam_channel::Receiver<(MvRunner<M>, Vec<f32>)>,
+    work_tx: crossbeam_channel::Sender<MvTask<M>>,
     model: &dyn BatchModel,
-    max_batch: usize,
+    batch_size: usize,
+    deadline: Instant,
+    report_secs: f64,
     stats: &Mutex<ChunkStats>,
 ) {
-    let mut local_batches = 0u64;
-    let mut local_samples = 0u64;
-    let mut local_gpu = 0.0f64;
-    let pd = M::POLICY_DIM;
+    let mut local = ChunkStats::default();
+    // Per-`report_secs` checkpoint so we can see batches stay full the WHOLE run, not
+    // just on average. 0 disables.
+    let loop_start = Instant::now();
+    let mut win_batches = 0u64;
+    let mut win_samples = 0u64;
+    let mut win_t = Instant::now();
     loop {
-        let first = match rx.recv() {
-            Ok(r) => r,
+        let mut runners = Vec::with_capacity(batch_size);
+        let mut planes = Vec::with_capacity(batch_size * M::PLANES);
+        // Block for the first leaf (waking at the deadline), then grab whatever else
+        // is already queued (non-blocking) up to batch_size. We deliberately do NOT
+        // wait for a full 256: blocking for the last few leaves micro-idles the GPU,
+        // which down-clocks it and *lowers* throughput. With enough overcommit the
+        // queue holds ~batch_size already, so batches are near-full anyway.
+        match eval_rx.recv_deadline(deadline) {
+            Ok((r, pl)) => {
+                planes.extend_from_slice(&pl);
+                runners.push(r);
+            }
             Err(_) => break,
-        };
-        let mut total = first.count;
-        let mut waves = vec![first];
-        while total < max_batch {
-            match rx.try_recv() {
-                Ok(r) => {
-                    total += r.count;
-                    waves.push(r);
+        }
+        while runners.len() < batch_size {
+            match eval_rx.try_recv() {
+                Ok((r, pl)) => {
+                    planes.extend_from_slice(&pl);
+                    runners.push(r);
                 }
                 Err(_) => break,
             }
         }
-        let mut planes = Vec::with_capacity(total * M::PLANES);
-        for w in &waves {
-            planes.extend_from_slice(&w.planes);
-        }
+        let useful = runners.len();
+        planes.resize(batch_size * M::PLANES, 0.0); // pad a partial batch to fixed shape
         let t_gpu = Instant::now();
-        let (vals, priors) = model.forward(&planes, total).expect("batched forward failed");
-        local_gpu += t_gpu.elapsed().as_secs_f64();
-        let mut off = 0usize;
-        for w in waves {
-            let mut out = Vec::with_capacity(w.count);
-            for j in 0..w.count {
-                let gi = off + j;
-                out.push((vals[gi], priors[gi * pd..(gi + 1) * pd].to_vec()));
-            }
-            off += w.count;
-            let _ = w.resp.send(out);
+        let (vals, priors) = model.forward(&planes, batch_size).expect("batched forward failed");
+        local.gpu_secs += t_gpu.elapsed().as_secs_f64();
+        local.batches += 1;
+        local.batch_samples += useful as u64;
+        win_batches += 1;
+        win_samples += useful as u64;
+        let priors = Arc::new(priors);
+        for (i, r) in runners.into_iter().enumerate() {
+            let _ = work_tx.send(MvTask::Apply(r, vals[i], Arc::clone(&priors), i));
         }
-        local_batches += 1;
-        local_samples += total as u64;
+        if report_secs > 0.0 {
+            let dt = win_t.elapsed().as_secs_f64();
+            if dt >= report_secs {
+                eprintln!(
+                    "    [+{:.0}s] avg_batch {:.0}  {:.0} nodes/s  ({} batches)",
+                    loop_start.elapsed().as_secs_f64(), win_samples as f64 / win_batches as f64,
+                    win_samples as f64 / dt, win_batches,
+                );
+                win_batches = 0;
+                win_samples = 0;
+                win_t = Instant::now();
+            }
+        }
     }
     let mut s = stats.lock().unwrap();
-    s.batches += local_batches;
-    s.batch_samples += local_samples;
-    s.gpu_secs += local_gpu;
+    s.gpu_secs += local.gpu_secs;
+    s.batches += local.batches;
+    s.batch_samples += local.batch_samples;
 }
 
-/// Run a chunk of `n_games` compound-move self-play games (see `run_chunk`).
-pub fn run_chunk_moves<M: MoveGame>(
+/// Steady-state self-play: keep `concurrency` compound-move games in flight (refill
+/// finished ones with fresh games) for `max_secs` wall-clock, then stop. Returns
+/// every game that *completed* within the window (in-flight games are discarded).
+/// `concurrency` should be several × `batch_size` so the GPU always has a full batch
+/// queued — the leaf-batching keeps it saturated; workers never idle on a leaf.
+pub fn run_selfplay_moves<M: MoveGame>(
     model: &dyn BatchModel,
-    n_games: usize,
+    concurrency: usize,
     params: SearchParams,
     threads: usize,
-    max_batch: usize,
+    batch_size: usize,
     base_seed: u64,
+    max_secs: f64,
+    report_secs: f64,
 ) -> (Vec<MvGameRecord<M>>, ChunkStats) {
+    use std::sync::atomic::AtomicU64;
     let stats = Mutex::new(ChunkStats::default());
+    let finished: Mutex<Vec<MvGameRecord<M>>> = Mutex::new(Vec::new());
+    let seed_ctr = AtomicU64::new(concurrency as u64);
+    let deadline = Instant::now() + std::time::Duration::from_secs_f64(max_secs);
+    let n_workers = threads.max(1);
+    let pd = M::POLICY_DIM;
     let t0 = Instant::now();
 
-    let w = threads.max(1).min(n_games.max(1));
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    let per = n_games.div_ceil(w);
-    let mut start = 0;
-    while start < n_games {
-        let end = (start + per).min(n_games);
-        ranges.push((start, end));
-        start = end;
+    let (work_tx, work_rx) = crossbeam_channel::unbounded::<MvTask<M>>();
+    let (eval_tx, eval_rx) = crossbeam_channel::unbounded::<(MvRunner<M>, Vec<f32>)>();
+    for i in 0..concurrency {
+        work_tx
+            .send(MvTask::Seed(MvRunner::new(base_seed.wrapping_add(i as u64), params)))
+            .unwrap();
     }
 
-    let (req_tx, req_rx) = channel::<Req>();
-    let mut all: Vec<MvGameRecord<M>> = Vec::with_capacity(n_games);
-
     std::thread::scope(|scope| {
-        let model_ref = model;
-        let stats_ref = &stats;
-        scope.spawn(move || mv_inference_server::<M>(req_rx, model_ref, max_batch, stats_ref));
-
-        let mut handles = Vec::new();
-        for (lo, hi) in ranges {
-            let req_tx = req_tx.clone();
-            handles.push(scope.spawn(move || mv_worker::<M>(lo, hi, base_seed, params, &req_tx)));
+        {
+            let eval_rx = eval_rx.clone();
+            let work_tx = work_tx.clone();
+            let stats = &stats;
+            scope.spawn(move || mv_gpu_loop::<M>(eval_rx, work_tx, model, batch_size, deadline, report_secs, stats));
         }
-        drop(req_tx);
-
+        let mut handles = Vec::new();
+        for _ in 0..n_workers {
+            let work_rx = work_rx.clone();
+            let eval_tx = eval_tx.clone();
+            let (finished, seed_ctr, stats) = (&finished, &seed_ctr, &stats);
+            handles.push(scope.spawn(move || {
+                let mut ws = WorkerStats::default();
+                loop {
+                    // recv_deadline wakes every worker exactly at the deadline — clean
+                    // fixed-time stop, no polling latency, no broadcast needed.
+                    match work_rx.recv_deadline(deadline) {
+                        Ok(MvTask::Seed(r)) => {
+                            mv_advance(r, None, &params, base_seed, seed_ctr, &eval_tx, finished, &mut ws)
+                        }
+                        Ok(MvTask::Apply(r, v, pr, off)) => {
+                            let slice = &pr[off * pd..(off + 1) * pd];
+                            mv_advance(r, Some((v, slice)), &params, base_seed, seed_ctr, &eval_tx, finished, &mut ws)
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let mut g = stats.lock().unwrap();
+                g.nodes += ws.nodes;
+                g.evals += ws.evals;
+                g.gather_secs += ws.gather_secs;
+                g.wait_secs += ws.wait_secs;
+                g.apply_secs += ws.apply_secs;
+            }));
+        }
+        drop(work_tx);
+        drop(work_rx);
+        drop(eval_tx);
+        drop(eval_rx);
         for h in handles {
-            let (recs, s) = h.join().expect("worker panicked");
-            all.extend(recs);
-            let mut g = stats.lock().unwrap();
-            g.nodes += s.nodes;
-            g.evals += s.evals;
-            g.terminal_sims += s.terminal_sims;
-            g.gather_secs += s.gather_secs;
-            g.wait_secs += s.wait_secs;
-            g.apply_secs += s.apply_secs;
+            h.join().expect("worker panicked");
         }
     });
 
     let mut s = stats.into_inner().unwrap();
     s.elapsed = t0.elapsed().as_secs_f64();
-    (all, s)
-}
-
-fn mv_worker<M: MoveGame>(
-    lo: usize,
-    hi: usize,
-    base_seed: u64,
-    params: SearchParams,
-    req_tx: &Sender<Req>,
-) -> (Vec<MvGameRecord<M>>, WorkerStats) {
-    let mut runners: Vec<MvRunner<M>> =
-        (lo..hi).map(|i| MvRunner::new(base_seed.wrapping_add(i as u64), params)).collect();
-    let mut ws = WorkerStats::default();
-    let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel::<Vec<(f32, Vec<f32>)>>(1);
-
-    loop {
-        let t_gather = Instant::now();
-        let mut wave_planes: Vec<f32> = Vec::new();
-        let mut wave_meta: Vec<(usize, M::State)> = Vec::new();
-        let mut any_active = false;
-        for (ri, r) in runners.iter_mut().enumerate() {
-            if r.finished {
-                continue;
-            }
-            any_active = true;
-            loop {
-                match r.search.next() {
-                    MvStep::Done => {
-                        r.complete_move(&params);
-                        if r.finished {
-                            break;
-                        }
-                        continue;
-                    }
-                    MvStep::NeedEval(state) => {
-                        let base = wave_planes.len();
-                        wave_planes.resize(base + M::PLANES, 0.0);
-                        M::encode_planes(&state, &mut wave_planes[base..]);
-                        wave_meta.push((ri, state));
-                        break;
-                    }
-                }
-            }
-        }
-        ws.gather_secs += t_gather.elapsed().as_secs_f64();
-        if !any_active {
-            break;
-        }
-        if wave_meta.is_empty() {
-            continue;
-        }
-
-        let t_wait = Instant::now();
-        req_tx
-            .send(Req { planes: wave_planes, count: wave_meta.len(), resp: resp_tx.clone() })
-            .expect("inference server gone");
-        let results = resp_rx.recv().expect("inference response dropped");
-        ws.wait_secs += t_wait.elapsed().as_secs_f64();
-
-        let t_apply = Instant::now();
-        for ((ri, state), (value, policy)) in wave_meta.into_iter().zip(results) {
-            let moves = M::legal_moves(&state);
-            let p = M::move_priors(&state, &moves, &policy);
-            let r = &mut runners[ri];
-            r.search.apply(MvExpand { value, moves, p }, &mut r.rng);
-            ws.evals += 1;
-            ws.nodes += 1;
-        }
-        ws.apply_secs += t_apply.elapsed().as_secs_f64();
-    }
-
-    for r in &runners {
-        ws.terminal_sims += r.search.terminal_sims;
-    }
-    let recs = runners
-        .into_iter()
-        .map(|r| MvGameRecord { states: r.states, moves: r.moves, resigned_by: r.resigned_by })
-        .collect();
-    (recs, ws)
+    (finished.into_inner().unwrap(), s)
 }

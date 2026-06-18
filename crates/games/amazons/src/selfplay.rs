@@ -140,7 +140,8 @@ pub fn run_loop(
     live_dir: &str,
     cuda: bool,
     params: SearchParams,
-    games_per_chunk: usize,
+    concurrency: usize,
+    chunk_secs: f64,
     max_chunks: usize,
     threads: usize,
     max_batch: usize,
@@ -158,24 +159,25 @@ pub fn run_loop(
     let device = if ort { None } else { Some(crate::net::pick_device(cuda)?) };
     let mut seq = max_chunk_seq(&buffer).map(|s| s + 1).unwrap_or(0);
     eprintln!(
-        "amazons actor loop: backend {backend}{}, {games_per_chunk} games/chunk, {threads} threads, \
-         buffer {} (keep {max_chunks})",
+        "amazons actor loop: backend {backend}{}, concurrency {concurrency}, {chunk_secs:.0}s/chunk, \
+         {threads} threads, buffer {} (keep {max_chunks})",
         if ort { format!("/{ep} fp16={fp16}") } else { String::new() },
         buffer.display(),
     );
     loop {
         let t0 = Instant::now();
-        let chunk_seed = base_seed.wrapping_add(seq.wrapping_mul(games_per_chunk as u64));
+        let chunk_seed = base_seed.wrapping_add(seq.wrapping_mul(concurrency as u64).wrapping_mul(64));
         let (records, cs) = if ort {
             while !Path::new(&onnx).exists() {
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
             let model = crate::ort_net::OrtModel::new(&onnx, ep, fp16, &trt_cache)?;
-            batch_search::run_chunk_moves::<Amazons>(&model, games_per_chunk, params, threads, max_batch, chunk_seed)
+            batch_search::run_selfplay_moves::<Amazons>(&model, concurrency, params, threads, max_batch, chunk_seed, chunk_secs, 0.0)
         } else {
             let model = Arc::new(LocalModel::load_on(&latest, device.clone().unwrap())?);
-            batch_search::run_chunk_moves::<Amazons>(&*model, games_per_chunk, params, threads, max_batch, chunk_seed)
+            batch_search::run_selfplay_moves::<Amazons>(&*model, concurrency, params, threads, max_batch, chunk_seed, chunk_secs, 0.0)
         };
+        let n_games = records.len().max(1);
         let resigned = records.iter().filter(|r| r.resigned_by.is_some()).count();
         let examples = examples_from_records(records);
         let path = buffer.join(format!("chunk_{seq:06}.bin"));
@@ -183,12 +185,11 @@ pub fn run_loop(
         write_dump(tmp.to_str().unwrap(), &examples)?;
         std::fs::rename(&tmp, &path)?;
         prune_buffer(&buffer, max_chunks);
-        let games = games_per_chunk.max(1) as f64;
         eprintln!(
-            "  chunk {seq}: {} ex  {:.0} plies/game  {:.0} nodes/move  avg_batch {:.0}  {:.0}% resigned  {:.1}s",
-            examples.len(), examples.len() as f64 / games,
-            cs.nodes as f64 / examples.len().max(1) as f64, cs.avg_batch(),
-            100.0 * resigned as f64 / games, t0.elapsed().as_secs_f64(),
+            "  chunk {seq}: {} games  {} ex  {:.0} plies/game  avg_batch {:.0}  gpu_duty {:.2}  \
+             {:.0}% resigned  {:.1}s",
+            n_games, examples.len(), examples.len() as f64 / n_games as f64, cs.avg_batch(),
+            cs.gpu_duty(), 100.0 * resigned as f64 / n_games as f64, t0.elapsed().as_secs_f64(),
         );
         seq += 1;
     }
@@ -199,11 +200,12 @@ pub fn run_loop(
 pub fn run_benchmark(
     model_path: &str,
     cuda: bool,
-    games: usize,
+    concurrency: usize,
     threads: usize,
     params: SearchParams,
     max_batch: usize,
     seed: u64,
+    secs: f64,
     backend: &str,
     onnx: &str,
     ep: &str,
@@ -211,19 +213,28 @@ pub fn run_benchmark(
 ) -> anyhow::Result<()> {
     let (records, cs) = if backend == "ort" {
         let model = crate::ort_net::OrtModel::new(onnx, ep, fp16, "data/amazons_trt_cache")?;
-        batch_search::run_chunk_moves::<Amazons>(&model, games, params, threads, max_batch, seed)
+        batch_search::run_selfplay_moves::<Amazons>(&model, concurrency, params, threads, max_batch, seed, secs, 1.0)
     } else {
         let device = crate::net::pick_device(cuda)?;
         let model = LocalModel::load_on(model_path, device)?;
-        batch_search::run_chunk_moves::<Amazons>(&model, games, params, threads, max_batch, seed)
+        batch_search::run_selfplay_moves::<Amazons>(&model, concurrency, params, threads, max_batch, seed, secs, 1.0)
     };
+    let games = records.len();
     let plies: usize = records.iter().map(|r| r.moves.len()).sum();
     let nps = cs.nodes as f64 / cs.elapsed;
     println!(
-        "amazons bench [{backend}{}]: {games} games  {plies} plies  {} nodes  {:.2}s  \
+        "amazons bench [{backend}{}]: conc {concurrency}  {games} games done  {plies} plies  {} nodes  {:.2}s  \
          {nps:.0} nodes/s  avg_batch {:.0}  gpu_duty {:.2}",
         if backend == "ort" { format!("/{ep}/fp16={fp16}") } else { String::new() },
         cs.nodes, cs.elapsed, cs.avg_batch(), cs.gpu_duty(),
+    );
+    // CPU worker time (summed over workers): descent (tree walk) + legal-gen
+    // (legal_moves bitboard enumeration) + priors (combine + backup).
+    let cpu = cs.gather_secs + cs.wait_secs + cs.apply_secs;
+    println!(
+        "  cpu: descent {:.0}%  legal-gen {:.0}%  priors {:.0}%  [{:.1} core-s / {} workers, {:.1} wall]  gpu {:.1}s",
+        100.0 * cs.gather_secs / cpu, 100.0 * cs.wait_secs / cpu, 100.0 * cs.apply_secs / cpu,
+        cpu, threads, cs.elapsed, cs.gpu_secs,
     );
     let _ = PLANE_COUNT;
     Ok(())

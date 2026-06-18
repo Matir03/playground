@@ -32,14 +32,18 @@ enum Cmd {
         #[arg(long, default_value = "http://127.0.0.1:7202")]
         model_uri: String,
     },
-    /// Self-play generation throughput benchmark.
+    /// Self-play generation throughput benchmark (runs for `--secs` wall-clock).
     SelfplayBench {
         #[arg(long, default_value = "")]
         model: String,
         #[arg(long)]
         cuda: bool,
-        #[arg(long, default_value_t = 128)]
-        games: usize,
+        /// Concurrent games kept in flight (overcommit, ~3× max-batch).
+        #[arg(long, default_value_t = 768)]
+        concurrency: usize,
+        /// Wall-clock seconds to run before draining.
+        #[arg(long, default_value_t = 20.0)]
+        secs: f64,
         #[arg(long)]
         threads: Option<usize>,
         #[arg(long, default_value_t = 256)]
@@ -69,8 +73,12 @@ enum Cmd {
         cuda: bool,
         #[arg(long, default_value_t = 256)]
         max_batch: usize,
-        #[arg(long, default_value_t = 128)]
-        games_per_chunk: usize,
+        /// Concurrent games kept in flight (overcommit, ~3× max-batch).
+        #[arg(long, default_value_t = 768)]
+        concurrency: usize,
+        /// Wall-clock seconds of self-play per buffer chunk.
+        #[arg(long, default_value_t = 60.0)]
+        chunk_secs: f64,
         #[arg(long, default_value_t = 60)]
         max_chunks: usize,
         #[arg(long)]
@@ -149,7 +157,7 @@ async fn main() -> anyhow::Result<()> {
             playground_engine_server::run::<Amazons, _>(addr, models).await?;
         }
         Cmd::SelfplayBench {
-            model, cuda, games, threads, max_batch, node_budget, c_puct, max_ply, seed,
+            model, cuda, concurrency, secs, threads, max_batch, node_budget, c_puct, max_ply, seed,
             backend, onnx, ep, fp16,
         } => {
             let threads = threads.unwrap_or_else(default_threads);
@@ -159,14 +167,14 @@ async fn main() -> anyhow::Result<()> {
                 resign_consecutive: 0, resign_playout_frac: 0.0,
             };
             tokio::task::spawn_blocking(move || {
-                selfplay::run_benchmark(&model, cuda, games, threads, params, max_batch, seed,
-                    &backend, &onnx, &ep, fp16)
+                selfplay::run_benchmark(&model, cuda, concurrency, threads, params, max_batch, seed,
+                    secs, &backend, &onnx, &ep, fp16)
             })
             .await??;
         }
         Cmd::SelfplayLoop {
-            live, cuda, max_batch, games_per_chunk, max_chunks, threads, node_budget, c_puct,
-            dir_alpha, dir_eps, temp_moves, max_ply, resign_threshold, resign_consecutive,
+            live, cuda, max_batch, concurrency, chunk_secs, max_chunks, threads, node_budget,
+            c_puct, dir_alpha, dir_eps, temp_moves, max_ply, resign_threshold, resign_consecutive,
             resign_playout_frac, seed, backend, ep, fp16,
         } => {
             let threads = threads.unwrap_or_else(default_threads);
@@ -175,7 +183,7 @@ async fn main() -> anyhow::Result<()> {
                 max_ply, settle_plies: 0, resign_threshold, resign_consecutive, resign_playout_frac,
             };
             tokio::task::spawn_blocking(move || {
-                selfplay::run_loop(&live, cuda, params, games_per_chunk, max_chunks, threads,
+                selfplay::run_loop(&live, cuda, params, concurrency, chunk_secs, max_chunks, threads,
                     max_batch, seed, &backend, &ep, fp16)
             })
             .await??;

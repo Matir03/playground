@@ -142,30 +142,35 @@ pub fn has_any_move(state: &AmazonsState) -> bool {
     false
 }
 
-/// All legal moves (empty iff terminal). Bitboard enumeration.
+/// All legal moves (empty iff terminal). Bitboard enumeration. The from/to
+/// coordinates are hoisted out of the hot per-arrow loop (computed per queen / per
+/// target, not per move), and the output is pre-reserved to avoid regrowth.
 pub fn legal_moves(state: &AmazonsState) -> Vec<AmazonsMove> {
     let occ = state.occupied();
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(1024);
     let mut q = state.mine();
     while q != 0 {
         let from = q.trailing_zeros() as usize;
         q &= q - 1;
-        let from_bit = 1u128 << from;
+        let from_r = (from / N) as u8;
+        let from_c = (from % N) as u8;
+        let occ_wo_from = occ & !(1u128 << from);
         let mut targets = ray_reach(occ, from);
         while targets != 0 {
             let to = targets.trailing_zeros() as usize;
             targets &= targets - 1;
+            let to_r = (to / N) as u8;
+            let to_c = (to % N) as u8;
             // After the queen moves, its origin is empty and `to` is occupied.
-            let occ2 = (occ & !from_bit) | (1u128 << to);
-            let mut shots = ray_reach(occ2, to);
+            let mut shots = ray_reach(occ_wo_from | (1u128 << to), to);
             while shots != 0 {
                 let ar = shots.trailing_zeros() as usize;
                 shots &= shots - 1;
                 out.push(AmazonsMove {
-                    from_r: (from / N) as u8,
-                    from_c: (from % N) as u8,
-                    to_r: (to / N) as u8,
-                    to_c: (to % N) as u8,
+                    from_r,
+                    from_c,
+                    to_r,
+                    to_c,
                     arrow_r: (ar / N) as u8,
                     arrow_c: (ar % N) as u8,
                 });
