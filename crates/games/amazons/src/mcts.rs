@@ -116,8 +116,13 @@ pub fn run_mcts(
     let mut arena: Vec<CNode> = vec![CNode::new(state.clone())];
     let budget = p.node_budget.max(1);
     let mut dirichlet_done = false;
+    // Saturation guard: in late-game (few moves) the tree can't grow to `budget`
+    // (all reachable leaves terminal/expanded), so without this the loop spins
+    // forever. Mirror the batched search's no-growth break.
+    let mut no_growth = 0u32;
 
     while (arena.len() as u32) < budget {
+        let len_before = arena.len();
         // Descend to a leaf.
         let mut path: Vec<(usize, usize)> = Vec::new();
         let mut node = 0usize;
@@ -174,6 +179,16 @@ pub fn run_mcts(
             v = -v;
             arena[n].n[a] += 1;
             arena[n].w[a] += v;
+        }
+
+        // No new node this iteration ⇒ the tree is saturated; stop (else infinite loop).
+        if arena.len() == len_before {
+            no_growth += 1;
+            if no_growth >= 512 {
+                break;
+            }
+        } else {
+            no_growth = 0;
         }
     }
 
