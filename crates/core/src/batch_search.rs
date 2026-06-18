@@ -849,3 +849,539 @@ fn argmax(counts: &[u32]) -> usize {
     }
     best
 }
+
+// ── Move-indexed search (compound-move games: Amazons, Arimaa) ─────────────────
+//
+// The flat `BatchGame` path above indexes everything by a small fixed `ACTIONS`.
+// Compound-move games (an Amazons turn is queen-move + arrow-shot) have thousands
+// of legal moves per position that don't fit a small flat index, so this parallel
+// path works over the per-state *legal-move list*: a node's `p/n/w/children` are
+// sized to its legal moves (computed once at expansion), and the model emits a
+// `POLICY_DIM` policy that the game maps to a prior per move (e.g. a factored
+// two-head product). It reuses the same wave protocol (`Req`), inference-server
+// batching, and `ChunkStats`/`SearchParams` as the flat path. No eval cache and
+// no eps-greedy/score-stability (Go-specific); root Dirichlet + resignation carry
+// over. Search dynamics are otherwise identical to the flat MCTS.
+
+/// A game whose moves don't fit a small fixed action index. The model output is a
+/// `POLICY_DIM`-wide policy the game maps to per-move priors.
+pub trait MoveGame: Send + Sync + 'static {
+    type State: Clone + Send + Sync;
+    type Move: Copy + Send + Sync;
+    const PLANES: usize;
+    const POLICY_DIM: usize;
+
+    fn initial_state() -> Self::State;
+    /// 1 or 2 — side to move (tags training examples).
+    fn to_move(state: &Self::State) -> u8;
+    /// All legal moves in `state` (empty iff terminal).
+    fn legal_moves(state: &Self::State) -> Vec<Self::Move>;
+    /// Apply a (legal) move.
+    fn apply(state: &Self::State, mv: &Self::Move) -> Self::State;
+    /// Terminal value for the side to move (`None` = in progress).
+    fn terminal_value(state: &Self::State) -> Option<f32>;
+    /// Write the `PLANES` network-input floats for `state` into `out`.
+    fn encode_planes(state: &Self::State, out: &mut [f32]);
+    /// Map the model's raw `POLICY_DIM` policy to a prior per legal move (the game
+    /// does the gather + combine, e.g. softmax-over-legal of summed head logits).
+    fn move_priors(state: &Self::State, moves: &[Self::Move], policy: &[f32]) -> Vec<f32>;
+}
+
+/// One move's training-relevant record: the legal moves searched, their PUCT visit
+/// counts (the policy target, projected to the net's heads by the caller), and the
+/// move actually played.
+pub struct MvMoveRecord<M: MoveGame> {
+    pub moves: Vec<M::Move>,
+    pub visits: Vec<u32>,
+    pub played: usize,
+    pub to_move: u8,
+}
+
+/// A finished compound-move self-play game.
+pub struct MvGameRecord<M: MoveGame> {
+    pub states: Vec<M::State>,
+    pub moves: Vec<MvMoveRecord<M>>,
+    pub resigned_by: Option<u8>,
+}
+
+/// Expansion result for a leaf: value + the legal moves + their priors.
+struct MvExpand<M: MoveGame> {
+    value: f32,
+    moves: Vec<M::Move>,
+    p: Vec<f32>,
+}
+
+struct MvNode<M: MoveGame> {
+    state: M::State,
+    moves: Vec<M::Move>,
+    p: Vec<f32>,
+    n: Vec<u32>,
+    w: Vec<f32>,
+    children: Vec<i32>,
+    expanded: bool,
+    terminal: bool,
+    term_v: f32,
+}
+
+impl<M: MoveGame> MvNode<M> {
+    fn new(state: M::State) -> Self {
+        Self {
+            state,
+            moves: Vec::new(),
+            p: Vec::new(),
+            n: Vec::new(),
+            w: Vec::new(),
+            children: Vec::new(),
+            expanded: false,
+            terminal: false,
+            term_v: 0.0,
+        }
+    }
+}
+
+enum MvStep<M: MoveGame> {
+    NeedEval(M::State),
+    Done,
+}
+
+struct MvSearch<M: MoveGame> {
+    arena: Vec<MvNode<M>>,
+    params: SearchParams,
+    pending_path: Vec<(usize, usize)>,
+    pending_leaf: Option<usize>,
+    pending_nodes_before: usize,
+    sims: u32,
+    no_growth: u32,
+    dirichlet_done: bool,
+    terminal_sims: u64,
+}
+
+impl<M: MoveGame> MvSearch<M> {
+    fn new(root: M::State, params: SearchParams) -> Self {
+        Self {
+            arena: vec![MvNode::new(root)],
+            params,
+            pending_path: Vec::with_capacity(64),
+            pending_leaf: None,
+            pending_nodes_before: 0,
+            sims: 0,
+            no_growth: 0,
+            dirichlet_done: false,
+            terminal_sims: 0,
+        }
+    }
+
+    fn budget_reached(&self) -> bool {
+        if self.params.node_budget > 0 {
+            self.arena.len() as u32 >= self.params.node_budget
+                || self.no_growth >= SATURATION_PATIENCE
+        } else {
+            self.sims >= self.params.sims
+        }
+    }
+
+    fn select(&self, node: usize) -> usize {
+        let nd = &self.arena[node];
+        let total: u32 = nd.n.iter().sum();
+        let sqrt_total = ((total + 1) as f32).sqrt();
+        let c_puct = self.params.c_puct;
+        let mut best = 0;
+        let mut best_score = f32::NEG_INFINITY;
+        for a in 0..nd.moves.len() {
+            let q = if nd.n[a] > 0 { nd.w[a] / nd.n[a] as f32 } else { 0.0 };
+            let u = c_puct * nd.p[a] * sqrt_total / (1 + nd.n[a]) as f32;
+            let score = q + u;
+            if score > best_score {
+                best_score = score;
+                best = a;
+            }
+        }
+        best
+    }
+
+    fn next(&mut self) -> MvStep<M> {
+        loop {
+            if self.budget_reached() {
+                return MvStep::Done;
+            }
+            self.pending_path.clear();
+            let nodes_before = self.arena.len();
+            let mut node = 0usize;
+            while self.arena[node].expanded && !self.arena[node].terminal {
+                let a = self.select(node);
+                let child = self.arena[node].children[a];
+                let next = if child >= 0 {
+                    child as usize
+                } else {
+                    let ns = M::apply(&self.arena[node].state, &self.arena[node].moves[a]);
+                    let idx = self.arena.len();
+                    self.arena.push(MvNode::new(ns));
+                    self.arena[node].children[a] = idx as i32;
+                    idx
+                };
+                self.pending_path.push((node, a));
+                node = next;
+            }
+            self.sims += 1;
+            if let Some(tv) = self.terminal_at(node) {
+                self.backup(tv);
+                if self.arena.len() == nodes_before {
+                    self.no_growth += 1;
+                } else {
+                    self.no_growth = 0;
+                }
+                self.terminal_sims += 1;
+                continue;
+            }
+            self.pending_leaf = Some(node);
+            self.pending_nodes_before = nodes_before;
+            return MvStep::NeedEval(self.arena[node].state.clone());
+        }
+    }
+
+    fn terminal_at(&mut self, node: usize) -> Option<f32> {
+        if self.arena[node].terminal {
+            return Some(self.arena[node].term_v);
+        }
+        if let Some(tv) = M::terminal_value(&self.arena[node].state) {
+            self.arena[node].terminal = true;
+            self.arena[node].term_v = tv;
+            Some(tv)
+        } else {
+            None
+        }
+    }
+
+    fn apply(&mut self, out: MvExpand<M>, rng: &mut impl Rng) {
+        let node = self.pending_leaf.take().expect("apply with no pending leaf");
+        let m = out.moves.len();
+        {
+            let nd = &mut self.arena[node];
+            nd.moves = out.moves;
+            nd.p = out.p;
+            nd.n = vec![0; m];
+            nd.w = vec![0.0; m];
+            nd.children = vec![-1; m];
+            nd.expanded = true;
+        }
+        if node == 0 && self.params.dir_eps > 0.0 && !self.dirichlet_done {
+            self.apply_dirichlet(rng);
+            self.dirichlet_done = true;
+        }
+        self.backup(out.value);
+        if self.arena.len() != self.pending_nodes_before {
+            self.no_growth = 0;
+        }
+    }
+
+    fn apply_dirichlet(&mut self, rng: &mut impl Rng) {
+        let m = self.arena[0].moves.len();
+        if m == 0 {
+            return;
+        }
+        let gamma = Gamma::new(self.params.dir_alpha, 1.0).unwrap();
+        let mut g: Vec<f32> = (0..m).map(|_| gamma.sample(rng) as f32).collect();
+        let gsum: f32 = g.iter().sum::<f32>().max(1e-12);
+        for x in &mut g {
+            *x /= gsum;
+        }
+        let eps = self.params.dir_eps;
+        for a in 0..m {
+            self.arena[0].p[a] = (1.0 - eps) * self.arena[0].p[a] + eps * g[a];
+        }
+    }
+
+    fn backup(&mut self, mut v: f32) {
+        for &(n, a) in self.pending_path.iter().rev() {
+            v = -v;
+            let nd = &mut self.arena[n];
+            nd.n[a] += 1;
+            nd.w[a] += v;
+        }
+    }
+
+    /// Visit counts at the root (the policy target, parallel to root moves).
+    fn policy_counts(&self) -> Vec<u32> {
+        self.arena[0].n.clone()
+    }
+
+    fn root_moves(&self) -> &[M::Move] {
+        &self.arena[0].moves
+    }
+
+    /// Mean action-value at the root from the side-to-move's view, for resignation.
+    fn root_value(&self) -> f32 {
+        let root = &self.arena[0];
+        let n: u32 = root.n.iter().sum();
+        if n == 0 {
+            return 0.0;
+        }
+        let w: f32 = root.w.iter().sum();
+        w / n as f32
+    }
+}
+
+struct MvRunner<M: MoveGame> {
+    search: MvSearch<M>,
+    states: Vec<M::State>,
+    moves: Vec<MvMoveRecord<M>>,
+    rng: ChaCha8Rng,
+    finished: bool,
+    resigned_by: Option<u8>,
+    resign_enabled: bool,
+    resign_run: [u32; 2],
+}
+
+impl<M: MoveGame> MvRunner<M> {
+    fn new(seed: u64, params: SearchParams) -> Self {
+        let s0 = M::initial_state();
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let resign_enabled = rng.gen::<f32>() >= params.resign_playout_frac;
+        Self {
+            search: MvSearch::new(s0.clone(), params),
+            states: vec![s0],
+            moves: Vec::new(),
+            rng,
+            finished: false,
+            resigned_by: None,
+            resign_enabled,
+            resign_run: [0, 0],
+        }
+    }
+
+    fn complete_move(&mut self, params: &SearchParams) {
+        let counts = self.search.policy_counts();
+        let root_value = self.search.root_value();
+        let sum: u32 = counts.iter().sum();
+        let cur = self.states.last().unwrap();
+        let to_move = M::to_move(cur);
+        let moves: Vec<M::Move> = self.search.root_moves().to_vec();
+
+        let played = if moves.is_empty() {
+            0 // terminal (no legal move) — shouldn't reach here, guarded below
+        } else if sum > 0 {
+            let ply = self.states.len() as u32 - 1;
+            if ply < params.temp_moves {
+                let probs: Vec<f32> = counts.iter().map(|&c| c as f32 / sum as f32).collect();
+                sample_categorical(&probs, &mut self.rng)
+            } else {
+                argmax(&counts)
+            }
+        } else {
+            0 // degenerate (no visits): first legal move
+        };
+
+        // Resignation (KataGo/AZ-style), with a calibration fraction that never resigns.
+        if params.resign_consecutive > 0 && self.resign_enabled && self.resigned_by.is_none() {
+            let si = (to_move - 1) as usize;
+            if root_value <= params.resign_threshold {
+                self.resign_run[si] += 1;
+                self.resign_run[1 - si] = 0;
+                if self.resign_run[si] >= params.resign_consecutive {
+                    self.resigned_by = Some(to_move);
+                }
+            } else {
+                self.resign_run[si] = 0;
+            }
+        }
+
+        let next = M::apply(cur, &moves[played]);
+        self.moves.push(MvMoveRecord { moves, visits: counts, played, to_move });
+        self.states.push(next.clone());
+
+        let capped = params.max_ply > 0 && self.states.len() as u32 - 1 >= params.max_ply;
+        let over = M::terminal_value(&next).is_some() || self.resigned_by.is_some() || capped;
+        if over {
+            self.finished = true;
+        } else {
+            self.search = MvSearch::new(next, *params);
+        }
+    }
+}
+
+/// Inference server for move-games: coalesce queued waves into batched forwards,
+/// slicing the per-position policy by `POLICY_DIM` (cf. `inference_server`).
+fn mv_inference_server<M: MoveGame>(
+    rx: Receiver<Req>,
+    model: &dyn BatchModel,
+    max_batch: usize,
+    stats: &Mutex<ChunkStats>,
+) {
+    let mut local_batches = 0u64;
+    let mut local_samples = 0u64;
+    let mut local_gpu = 0.0f64;
+    let pd = M::POLICY_DIM;
+    loop {
+        let first = match rx.recv() {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        let mut total = first.count;
+        let mut waves = vec![first];
+        while total < max_batch {
+            match rx.try_recv() {
+                Ok(r) => {
+                    total += r.count;
+                    waves.push(r);
+                }
+                Err(_) => break,
+            }
+        }
+        let mut planes = Vec::with_capacity(total * M::PLANES);
+        for w in &waves {
+            planes.extend_from_slice(&w.planes);
+        }
+        let t_gpu = Instant::now();
+        let (vals, priors) = model.forward(&planes, total).expect("batched forward failed");
+        local_gpu += t_gpu.elapsed().as_secs_f64();
+        let mut off = 0usize;
+        for w in waves {
+            let mut out = Vec::with_capacity(w.count);
+            for j in 0..w.count {
+                let gi = off + j;
+                out.push((vals[gi], priors[gi * pd..(gi + 1) * pd].to_vec()));
+            }
+            off += w.count;
+            let _ = w.resp.send(out);
+        }
+        local_batches += 1;
+        local_samples += total as u64;
+    }
+    let mut s = stats.lock().unwrap();
+    s.batches += local_batches;
+    s.batch_samples += local_samples;
+    s.gpu_secs += local_gpu;
+}
+
+/// Run a chunk of `n_games` compound-move self-play games (see `run_chunk`).
+pub fn run_chunk_moves<M: MoveGame>(
+    model: &dyn BatchModel,
+    n_games: usize,
+    params: SearchParams,
+    threads: usize,
+    max_batch: usize,
+    base_seed: u64,
+) -> (Vec<MvGameRecord<M>>, ChunkStats) {
+    let stats = Mutex::new(ChunkStats::default());
+    let t0 = Instant::now();
+
+    let w = threads.max(1).min(n_games.max(1));
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let per = n_games.div_ceil(w);
+    let mut start = 0;
+    while start < n_games {
+        let end = (start + per).min(n_games);
+        ranges.push((start, end));
+        start = end;
+    }
+
+    let (req_tx, req_rx) = channel::<Req>();
+    let mut all: Vec<MvGameRecord<M>> = Vec::with_capacity(n_games);
+
+    std::thread::scope(|scope| {
+        let model_ref = model;
+        let stats_ref = &stats;
+        scope.spawn(move || mv_inference_server::<M>(req_rx, model_ref, max_batch, stats_ref));
+
+        let mut handles = Vec::new();
+        for (lo, hi) in ranges {
+            let req_tx = req_tx.clone();
+            handles.push(scope.spawn(move || mv_worker::<M>(lo, hi, base_seed, params, &req_tx)));
+        }
+        drop(req_tx);
+
+        for h in handles {
+            let (recs, s) = h.join().expect("worker panicked");
+            all.extend(recs);
+            let mut g = stats.lock().unwrap();
+            g.nodes += s.nodes;
+            g.evals += s.evals;
+            g.terminal_sims += s.terminal_sims;
+            g.gather_secs += s.gather_secs;
+            g.wait_secs += s.wait_secs;
+            g.apply_secs += s.apply_secs;
+        }
+    });
+
+    let mut s = stats.into_inner().unwrap();
+    s.elapsed = t0.elapsed().as_secs_f64();
+    (all, s)
+}
+
+fn mv_worker<M: MoveGame>(
+    lo: usize,
+    hi: usize,
+    base_seed: u64,
+    params: SearchParams,
+    req_tx: &Sender<Req>,
+) -> (Vec<MvGameRecord<M>>, WorkerStats) {
+    let mut runners: Vec<MvRunner<M>> =
+        (lo..hi).map(|i| MvRunner::new(base_seed.wrapping_add(i as u64), params)).collect();
+    let mut ws = WorkerStats::default();
+    let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel::<Vec<(f32, Vec<f32>)>>(1);
+
+    loop {
+        let t_gather = Instant::now();
+        let mut wave_planes: Vec<f32> = Vec::new();
+        let mut wave_meta: Vec<(usize, M::State)> = Vec::new();
+        let mut any_active = false;
+        for (ri, r) in runners.iter_mut().enumerate() {
+            if r.finished {
+                continue;
+            }
+            any_active = true;
+            loop {
+                match r.search.next() {
+                    MvStep::Done => {
+                        r.complete_move(&params);
+                        if r.finished {
+                            break;
+                        }
+                        continue;
+                    }
+                    MvStep::NeedEval(state) => {
+                        let base = wave_planes.len();
+                        wave_planes.resize(base + M::PLANES, 0.0);
+                        M::encode_planes(&state, &mut wave_planes[base..]);
+                        wave_meta.push((ri, state));
+                        break;
+                    }
+                }
+            }
+        }
+        ws.gather_secs += t_gather.elapsed().as_secs_f64();
+        if !any_active {
+            break;
+        }
+        if wave_meta.is_empty() {
+            continue;
+        }
+
+        let t_wait = Instant::now();
+        req_tx
+            .send(Req { planes: wave_planes, count: wave_meta.len(), resp: resp_tx.clone() })
+            .expect("inference server gone");
+        let results = resp_rx.recv().expect("inference response dropped");
+        ws.wait_secs += t_wait.elapsed().as_secs_f64();
+
+        let t_apply = Instant::now();
+        for ((ri, state), (value, policy)) in wave_meta.into_iter().zip(results) {
+            let moves = M::legal_moves(&state);
+            let p = M::move_priors(&state, &moves, &policy);
+            let r = &mut runners[ri];
+            r.search.apply(MvExpand { value, moves, p }, &mut r.rng);
+            ws.evals += 1;
+            ws.nodes += 1;
+        }
+        ws.apply_secs += t_apply.elapsed().as_secs_f64();
+    }
+
+    for r in &runners {
+        ws.terminal_sims += r.search.terminal_sims;
+    }
+    let recs = runners
+        .into_iter()
+        .map(|r| MvGameRecord { states: r.states, moves: r.moves, resigned_by: r.resigned_by })
+        .collect();
+    (recs, ws)
+}
