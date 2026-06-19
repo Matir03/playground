@@ -259,7 +259,6 @@ def main() -> None:
         steps_into_snap += block
         net.eval()
         save_atomic(net, latest)
-        export_onnx_atomic(net, onnx_path)
 
         if steps_into_snap >= args.steps_per_snapshot:
             snap_gen += 1
@@ -267,6 +266,8 @@ def main() -> None:
             os.makedirs(d, exist_ok=True)
             save_checkpoint(net.to("cpu"), os.path.join(d, "checkpoint.safetensors"))
             net.to(device)
+            # Refresh the ORT actor's weights once per snapshot (not per block).
+            export_onnx_atomic(net, onnx_path)
             with open(os.path.join(d, "config.json"), "w") as f:
                 json.dump({"arch": arch_of(net), "generation": snap_gen}, f)
             print(f"snapshot gen{snap_gen}  samples {n}  chunks {len(cache)}  "
