@@ -6,6 +6,7 @@ mod book;
 mod eval;
 mod game;
 mod lgs_net;
+mod lgs_selfplay;
 mod mcts;
 mod net;
 mod selfplay;
@@ -254,6 +255,33 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
+    /// LGS self-play (reification-based latent search): generate v2 training
+    /// records from the KR-PUCT search over the embedded LGS net. Single-thread
+    /// (correctness-first); consumed by python/c4_lgs_train.py.
+    LgsGen {
+        /// Embedded LGS checkpoint (`.safetensors`; sibling config.json arch).
+        #[arg(long)]
+        model: String,
+        /// Output v2 dump (see lgs_selfplay.rs).
+        #[arg(long)]
+        out: String,
+        #[arg(long)]
+        cuda: bool,
+        #[arg(long, default_value_t = 64)]
+        games: usize,
+        #[arg(long, default_value_t = 128)]
+        sims: u32,
+        /// Opening plies that sample ∝ visits (exploration); argmax after.
+        #[arg(long, default_value_t = 10)]
+        temp_moves: u32,
+        #[arg(long, default_value_t = 1.5)]
+        c_puct: f64,
+        /// KR kernel bandwidth h over next-LGS points.
+        #[arg(long, default_value_t = 0.7)]
+        kernel_bandwidth: f64,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
     /// Absolute-strength eval: play a checkpoint's MCTS vs the perfect solver and
     /// print the net's score (the distance-to-perfect signal).
     EvalSolver {
@@ -384,6 +412,12 @@ async fn main() -> anyhow::Result<()> {
                 selfplay::run_loop(&live, cuda, params, games_per_chunk, max_chunks, threads, max_batch, seed)
             })
             .await??;
+        }
+        Cmd::LgsGen { model, out, cuda, games, sims, temp_moves, c_puct, kernel_bandwidth, seed } => {
+            lgs_selfplay::run_generate(
+                &model, cuda, &out, games, sims, temp_moves, c_puct, kernel_bandwidth, seed,
+            )
+            .await?;
         }
         Cmd::EvalSolver { model, cuda, games, node_budget, c_puct, opening, threads, max_batch, seed } => {
             // Deterministic-ish net play (argmax, no root noise) vs the solver.
