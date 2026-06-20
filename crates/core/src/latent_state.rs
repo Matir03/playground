@@ -1,4 +1,4 @@
-//! Latent game-state encoding — the "GS" of docs/algorithm.md.
+//! Latent game state (LGS) — see docs/algorithm.md.
 //!
 //! An opaque byte buffer produced by the encoder network. Only the model
 //! server and the model-client crate interpret the bytes; MCTS treats it as a

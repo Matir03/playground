@@ -133,6 +133,14 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--steps-per-snapshot", type=int, default=300)
     ap.add_argument("--max-reuse", type=float, default=4.0)
+    # Bursty training: stay idle until this many FRESH self-play examples accumulate,
+    # then train the whole generation in one burst so the actor runs uncontended in
+    # between. ~steps_per_snapshot*batch/max_reuse keeps the effective reuse at max.
+    # 0 disables the gate (cadence is then driven externally, e.g. the orchestrator).
+    ap.add_argument("--gen-examples", type=int, default=20000)
+    # Exit after producing this many snapshots (0 = run forever). The orchestrator
+    # uses 1 so the learner is a fresh, short-lived process per generation.
+    ap.add_argument("--exit-after-gens", type=int, default=0)
     ap.add_argument("--eval-lead", type=int, default=3)
     ap.add_argument("--min-samples", type=int, default=4000)
     ap.add_argument("--device", default="cuda")
@@ -162,6 +170,21 @@ def main() -> None:
         print(f"from scratch: wrote random gen-0 {latest}", flush=True)
     net.to(device)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr, weight_decay=1e-4)
+    # Persist optimizer (Adam moment) state across runs so killing/relaunching the
+    # learner each generation doesn't reset the adaptive LR every time.
+    opt_path = os.path.join(live, "opt_state.pt")
+    if os.path.exists(opt_path):
+        try:
+            opt.load_state_dict(torch.load(opt_path, map_location=device))
+            print(f"loaded optimizer state from {opt_path}", flush=True)
+        except Exception as e:
+            print(f"optimizer state load failed (fresh Adam): {e}", flush=True)
+
+    def save_opt():
+        tmp = opt_path + ".tmp"
+        torch.save(opt.state_dict(), tmp)
+        os.replace(tmp, opt_path)
+
     onnx_path = os.path.join(live, "model.onnx")
     export_onnx_atomic(net, onnx_path)
 
@@ -225,14 +248,17 @@ def main() -> None:
                 if os.path.basename(d)[3:].isdigit()]
     snap_gen = max(existing + [anchor_gen])
     refresh()
+    produced_at_gen_start = produced  # bursty pacing: fresh examples since this gen began
     print(f"amazons-az learner: device {device}  batch {args.batch_size}  "
-          f"throttle {args.max_reuse}x  eval-lead {args.eval_lead}  "
-          f"snapshot/{args.steps_per_snapshot}  after gen {snap_gen}", flush=True)
+          f"throttle {args.max_reuse}x  gen-examples {args.gen_examples} (bursty)  "
+          f"eval-lead {args.eval_lead}  snapshot/{args.steps_per_snapshot}  "
+          f"after gen {snap_gen}", flush=True)
 
     BLOCK = 50
     steps_into_snap = 0
     losses = [0.0, 0.0, 0.0]
     nblk = 0
+    gens_this_run = 0
     while True:
         if refresh() or big is None:
             if cache:
@@ -246,12 +272,18 @@ def main() -> None:
             if need > anchor_gen and processed_through() < need:
                 time.sleep(2.0)
                 continue
-        budget = int(args.max_reuse * produced) - consumed
-        if budget < args.batch_size:
-            time.sleep(2.0)
-            continue
+            # Stay fully idle (actor uncontended) until a whole generation of FRESH
+            # self-play has accumulated, then train the gen in one burst below.
+            if args.gen_examples > 0 and produced - produced_at_gen_start < args.gen_examples:
+                time.sleep(5.0)
+                continue
+            # Safety throttle, checked only at gen start; once the burst is underway
+            # we run it to completion without interleaving (no actor-contention churn).
+            if int(args.max_reuse * produced) - consumed < args.batch_size:
+                time.sleep(2.0)
+                continue
 
-        block = min(BLOCK, args.steps_per_snapshot - steps_into_snap, budget // args.batch_size)
+        block = min(BLOCK, args.steps_per_snapshot - steps_into_snap)
         acc = train_block(big, block)
         for i in range(3):
             losses[i] += acc[i]
@@ -270,13 +302,21 @@ def main() -> None:
             export_onnx_atomic(net, onnx_path)
             with open(os.path.join(d, "config.json"), "w") as f:
                 json.dump({"arch": arch_of(net), "generation": snap_gen}, f)
+            fresh = produced - produced_at_gen_start
             print(f"snapshot gen{snap_gen}  samples {n}  chunks {len(cache)}  "
+                  f"fresh {fresh} ({args.steps_per_snapshot * args.batch_size / max(1, fresh):.1f}x gen)  "
                   f"produced {produced}  consumed {consumed} ({consumed/max(1,produced):.1f}x)  "
                   f"loss v {losses[0]/max(1,nblk):.4f} q {losses[1]/max(1,nblk):.4f} "
                   f"a {losses[2]/max(1,nblk):.4f}", flush=True)
             steps_into_snap = 0
             losses = [0.0, 0.0, 0.0]
             nblk = 0
+            produced_at_gen_start = produced  # begin accumulating the next gen's data
+            save_opt()
+            gens_this_run += 1
+            if args.exit_after_gens and gens_this_run >= args.exit_after_gens:
+                print(f"learner: trained {gens_this_run} gen(s), exiting", flush=True)
+                return
 
 
 if __name__ == "__main__":

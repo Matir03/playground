@@ -25,13 +25,13 @@ import json
 import os
 
 from .net import (
-    GS_DIM,
+    LGS_DIM,
     ConnectFourModel,
     build_model,
     connect4_legal_columns,
     connect4_planes,
-    gs_from_bytes,
-    gs_to_bytes,
+    lgs_from_bytes,
+    lgs_to_bytes,
     load_checkpoint,
 )
 
@@ -76,10 +76,10 @@ class ModelServicer(model_pb2_grpc.ModelServiceServicer):
             self.model_version = f"connect4-random-seed{seed}"
             log.info("loaded model %s (random weights)", self.model_version)
 
-    def _gs_msg(self, gs_tensor) -> game_pb2.LatentGameState:
+    def _lgs_msg(self, lgs_tensor) -> game_pb2.LatentGameState:
         return game_pb2.LatentGameState(
-            payload=gs_to_bytes(gs_tensor),
-            shape=[GS_DIM],
+            payload=lgs_to_bytes(lgs_tensor),
+            shape=[LGS_DIM],
             model_version=self.model_version,
         )
 
@@ -87,26 +87,26 @@ class ModelServicer(model_pb2_grpc.ModelServiceServicer):
     def Encode(self, request, context):
         planes = connect4_planes(request.state.payload)
         with self._lock:
-            gs = self.net.encode(planes)
-        return model_pb2.EncodeResponse(gs=self._gs_msg(gs))
+            lgs = self.net.encode(planes)
+        return model_pb2.EncodeResponse(lgs=self._lgs_msg(lgs))
 
     def Eval(self, request, context):
-        gs = gs_from_bytes(request.gs.payload)
+        lgs = lgs_from_bytes(request.lgs.payload)
         with self._lock:
-            value = self.net.value(gs)
+            value = self.net.value(lgs)
         return model_pb2.EvalResponse(value=value)
 
     def Policy(self, request, context):
-        gs = gs_from_bytes(request.gs.payload)
+        lgs = lgs_from_bytes(request.lgs.payload)
         with self._lock:
-            cands = self.net.policy(gs, request.top_b or C4_DEFAULT_B)
+            cands = self.net.policy(lgs, request.top_b or C4_DEFAULT_B)
         resp = model_pb2.PolicyResponse()
-        for prior, action, next_gs in cands:
+        for prior, action, next_lgs in cands:
             resp.candidates.append(
                 model_pb2.PolicyCandidate(
                     prior=prior,
-                    action_vector=gs_to_bytes(action),
-                    next_gs=self._gs_msg(next_gs),
+                    action_vector=lgs_to_bytes(action),
+                    next_lgs=self._lgs_msg(next_lgs),
                 )
             )
         return resp
@@ -122,13 +122,13 @@ class ModelServicer(model_pb2_grpc.ModelServiceServicer):
     def EncodeBatch(self, request, context):
         resp = model_pb2.EncodeBatchResponse()
         for state in request.states:
-            resp.gs.append(self.Encode(model_pb2.EncodeRequest(state=state), context).gs)
+            resp.lgs.append(self.Encode(model_pb2.EncodeRequest(state=state), context).lgs)
         return resp
 
     def EvalBatch(self, request, context):
         resp = model_pb2.EvalBatchResponse()
-        for gs in request.gs:
-            resp.values.append(self.Eval(model_pb2.EvalRequest(gs=gs), context).value)
+        for lgs in request.lgs:
+            resp.values.append(self.Eval(model_pb2.EvalRequest(lgs=lgs), context).value)
         return resp
 
     def PolicyBatch(self, request, context):

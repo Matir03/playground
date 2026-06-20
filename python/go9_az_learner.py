@@ -2,7 +2,7 @@
 benchmark baseline against the reification net's `go9_learner.py`.
 
 Same async actor/learner setup, but the net is the vanilla AlphaZero architecture
-(direct conv policy + value heads over the board, no GS latent, no reifier), so
+(direct conv policy + value heads over the board, no LGS latent, no reifier), so
 the loss is just value MSE on the game-outcome z + policy CE over the 82 actions —
 no reifier-consistency term. Trains from scratch: if `live/latest.safetensors`
 doesn't exist, it writes a random-init gen-0 net (+config.json) so the actor has

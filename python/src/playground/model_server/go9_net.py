@@ -1,11 +1,11 @@
-"""9×9 Go network — the reification MuZero-variant heads over a tanh latent (GS).
+"""9×9 Go network — the reification MuZero-variant heads over a tanh latent (LGS).
 
 Mirrors the Connect 4 net (`net.py` `_C4Base`/`ConnectFourResNet`) but for Go 9×9:
   * input is 3 planes (own stones, opponent stones, side-to-move constant), 9×9,
     matching `crates/games/go9/src/game.rs` `Go9::to_features`;
   * the action space is 82 — board points 0..80 (a = r*9 + c) plus pass (81);
-  * heads: encoder -> GS (GS_DIM), value, policy prior over the 82 actions, and
-    the reifier `pol_next` predicting the next-GS per action (82 * GS_DIM).
+  * heads: encoder -> LGS (LGS_DIM), value, policy prior over the 82 actions, and
+    the reifier `pol_next` predicting the next-LGS per action (82 * LGS_DIM).
 
 Self-play training uses `forward`/`policy_value` (value + prior); the reifier
 `pol_next` is trained by a consistency loss (see rust_go9_selfplay_train.py) and
@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-GS_DIM = 128
+LGS_DIM = 128
 N = 9
 CELLS = N * N            # 81 board points
 ACTIONS = CELLS + 1      # 82: points + pass
@@ -45,7 +45,7 @@ class _ResBlock(nn.Module):
 
 
 class Go9ResNet(nn.Module):
-    """AlphaZero-style ResNet trunk + reification heads over a GS_DIM latent."""
+    """AlphaZero-style ResNet trunk + reification heads over a LGS_DIM latent."""
 
     def __init__(self, channels: int = 96, blocks: int = 10) -> None:
         super().__init__()
@@ -54,11 +54,11 @@ class Go9ResNet(nn.Module):
         self.stem = nn.Conv2d(3, channels, 3, padding=1)
         self.stem_bn = nn.BatchNorm2d(channels)
         self.blocks = nn.ModuleList(_ResBlock(channels) for _ in range(blocks))
-        self.enc_fc = nn.Linear(channels * CELLS, GS_DIM)
-        self.val_fc1 = nn.Linear(GS_DIM, 64)
+        self.enc_fc = nn.Linear(channels * CELLS, LGS_DIM)
+        self.val_fc1 = nn.Linear(LGS_DIM, 64)
         self.val_fc2 = nn.Linear(64, 1)
-        self.pol_prior = nn.Linear(GS_DIM, ACTIONS)
-        self.pol_next = nn.Linear(GS_DIM, ACTIONS * GS_DIM)
+        self.pol_prior = nn.Linear(LGS_DIM, ACTIONS)
+        self.pol_next = nn.Linear(LGS_DIM, ACTIONS * LGS_DIM)
 
     def _trunk(self, planes: torch.Tensor) -> torch.Tensor:
         x = F.relu(self.stem_bn(self.stem(planes)))
@@ -69,26 +69,26 @@ class Go9ResNet(nn.Module):
     def encode_batch(self, planes: torch.Tensor) -> torch.Tensor:
         return torch.tanh(self.enc_fc(self._trunk(planes)))
 
-    def value_batch(self, gs: torch.Tensor) -> torch.Tensor:
-        x = F.relu(self.val_fc1(gs))
+    def value_batch(self, lgs: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.val_fc1(lgs))
         return torch.tanh(self.val_fc2(x)).squeeze(-1)
 
     def forward(self, planes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """(B,3,9,9) -> (value (B,), policy logits (B,82)). Used by training."""
-        gs = self.encode_batch(planes)
-        return self.value_batch(gs), self.pol_prior(gs)
+        lgs = self.encode_batch(planes)
+        return self.value_batch(lgs), self.pol_prior(lgs)
 
     def policy_value(self, planes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """(B,3,9,9) -> (value (B,), policy probs (B,82)). Used by self-play MCTS."""
-        gs = self.encode_batch(planes)
-        return self.value_batch(gs), F.softmax(self.pol_prior(gs), dim=-1)
+        lgs = self.encode_batch(planes)
+        return self.value_batch(lgs), F.softmax(self.pol_prior(lgs), dim=-1)
 
 
 class Go9AZNet(nn.Module):
     """Traditional AlphaZero net (benchmark baseline): a ResNet trunk with standard
     conv policy + value heads that read the **spatial** trunk directly — no latent
-    (GS) bottleneck and no reifier. Policy is a direct softmax over the 82 actions.
-    Contrast with `Go9ResNet`, which funnels the trunk through a GS_DIM latent (for
+    (LGS) bottleneck and no reifier. Policy is a direct softmax over the 82 actions.
+    Contrast with `Go9ResNet`, which funnels the trunk through a LGS_DIM latent (for
     the reification MCTS) before its heads. Same input planes + checkpoint format;
     parameter names must stay in sync with `crates/games/go9/src/net.rs` AzNet.
     """

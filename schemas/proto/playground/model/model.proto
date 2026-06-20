@@ -22,21 +22,21 @@ service ModelService {
 }
 
 message EncodeRequest { playground.game.GameState state = 1; }
-message EncodeResponse { playground.game.LatentGameState gs = 1; }
+message EncodeResponse { playground.game.LatentGameState lgs = 1; }
 message EncodeBatchRequest { repeated playground.game.GameState states = 1; }
-message EncodeBatchResponse { repeated playground.game.LatentGameState gs = 1; }
+message EncodeBatchResponse { repeated playground.game.LatentGameState lgs = 1; }
 
-message EvalRequest { playground.game.LatentGameState gs = 1; }
+message EvalRequest { playground.game.LatentGameState lgs = 1; }
 message EvalResponse {
   // Expected outcome for the player to move, in [-1, 1].
   double value = 1;
 }
-message EvalBatchRequest { repeated playground.game.LatentGameState gs = 1; }
+message EvalBatchRequest { repeated playground.game.LatentGameState lgs = 1; }
 message EvalBatchResponse { repeated double values = 1; }
 
 message PolicyRequest {
-  playground.game.LatentGameState gs = 1;
-  // Number of (action, next_gs) pairs requested (B). Server may return fewer.
+  playground.game.LatentGameState lgs = 1;
+  // Number of (action, next_lgs) pairs requested (B). Server may return fewer.
   uint32 top_b = 2;
 }
 message PolicyResponse {
@@ -47,16 +47,16 @@ message PolicyCandidate {
   double prior = 1;
   // Raw action head output for this candidate (used by reifier as a seed).
   bytes action_vector = 2;
-  // Predicted next GS (used for MCTS expansion without reification).
-  playground.game.LatentGameState next_gs = 3;
+  // Predicted next LGS (used for MCTS expansion without reification).
+  playground.game.LatentGameState next_lgs = 3;
 }
 message PolicyBatchRequest { repeated PolicyRequest requests = 1; }
 message PolicyBatchResponse { repeated PolicyResponse responses = 1; }
 
 message ReifyRequest {
-  playground.game.LatentGameState from_gs = 1;
-  playground.game.LatentGameState to_gs = 2;
-  // Concrete state that from_gs corresponds to. The reifier produces a move
+  playground.game.LatentGameState from_lgs = 1;
+  playground.game.LatentGameState to_lgs = 2;
+  // Concrete state that from_lgs corresponds to. The reifier produces a move
   // that is legal from this state (if possible).
   playground.game.GameState from_state = 3;
   // Optional action-vector seed (from policy head or perturbed sibling).

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { engineClientFor } from "./lib/client";
 import { Connect4Board } from "./games/connect4/Board";
 import { Go9Board } from "./games/go9/Board";
+import { AmazonsBoard } from "./games/amazons/Board";
 
 // Engines are reached under same-origin proxy paths (see vite.config.ts), so the
 // whole app works behind one origin without CORS.
@@ -16,7 +17,11 @@ const GAMES = [
     blurb: "Play a human or the self-play net. The engine enforces ko / suicide / area scoring; the NN seat plays via the reification MCTS over the embedded net.",
     start: "go9-engine serve --model-local nn=<checkpoint>",
   },
-  { id: "amazons", label: "Amazons", engineUrl: "/a", playable: false, blurb: "", start: "" },
+  {
+    id: "amazons", label: "Amazons", engineUrl: "/a", playable: true,
+    blurb: "Play a human or the self-play net (gen71) on the standard 10×10 board. Pick a queen, its destination, then where to shoot the arrow; the NN seat plays via MCTS over the embedded net.",
+    start: "amazons-engine serve --model-local nn=<checkpoint> --cuda",
+  },
   { id: "arimaa", label: "Arimaa", engineUrl: "/ar", playable: false, blurb: "", start: "" },
 ] as const;
 
@@ -31,6 +36,7 @@ type EngineHealth =
 const clients: Partial<Record<GameId, ReturnType<typeof engineClientFor>>> = {
   connect4: engineClientFor("/c4"),
   go9: engineClientFor("/go9"),
+  amazons: engineClientFor("/a"),
 };
 
 export function App() {
@@ -137,6 +143,8 @@ function GameView({
         </p>
       ) : game.id === "connect4" ? (
         <Connect4Board client={client} />
+      ) : game.id === "amazons" ? (
+        <AmazonsBoard client={client} />
       ) : (
         <Go9Board client={client} />
       )}

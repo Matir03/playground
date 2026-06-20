@@ -50,7 +50,7 @@ message LatentGameState {
   // Optional shape hint, e.g. [batch, channels, h, w] or [d]. Consumers may
   // ignore if they already know the layout.
   repeated int32 shape = 2;
-  // Version of the encoder that produced this GS. Older GS are unusable
+  // Version of the encoder that produced this LGS. Older LGS are unusable
   // with a newer encoder and vice versa.
   string model_version = 3;
 }

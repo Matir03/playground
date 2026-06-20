@@ -21,6 +21,11 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (p) => p.replace(/^\/go9/, ""),
       },
+      "/a": {
+        target: "http://127.0.0.1:7102",
+        changeOrigin: true,
+        rewrite: (p) => p.replace(/^\/a/, ""),
+      },
     },
   },
 });

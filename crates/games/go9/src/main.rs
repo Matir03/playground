@@ -34,29 +34,29 @@ impl ModelClient<Go9> for Go9Model {
             Go9Model::Local(m) => m.encode(state).await,
         }
     }
-    async fn eval(&self, gs: &LatentGameState) -> anyhow::Result<f64> {
+    async fn eval(&self, lgs: &LatentGameState) -> anyhow::Result<f64> {
         match self {
-            Go9Model::Remote(m) => m.eval(gs).await,
-            Go9Model::Local(m) => m.eval(gs).await,
+            Go9Model::Remote(m) => m.eval(lgs).await,
+            Go9Model::Local(m) => m.eval(lgs).await,
         }
     }
-    async fn policy(&self, gs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>> {
+    async fn policy(&self, lgs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>> {
         match self {
-            Go9Model::Remote(m) => m.policy(gs, top_b).await,
-            Go9Model::Local(m) => m.policy(gs, top_b).await,
+            Go9Model::Remote(m) => m.policy(lgs, top_b).await,
+            Go9Model::Local(m) => m.policy(lgs, top_b).await,
         }
     }
     async fn reify(
         &self,
         from_state: &game::Go9State,
-        from_gs: &LatentGameState,
-        to_gs: &LatentGameState,
+        from_lgs: &LatentGameState,
+        to_lgs: &LatentGameState,
         action_seed: Option<&[u8]>,
         noise_scale: Option<f64>,
     ) -> anyhow::Result<game::Go9Move> {
         match self {
-            Go9Model::Remote(m) => m.reify(from_state, from_gs, to_gs, action_seed, noise_scale).await,
-            Go9Model::Local(m) => m.reify(from_state, from_gs, to_gs, action_seed, noise_scale).await,
+            Go9Model::Remote(m) => m.reify(from_state, from_lgs, to_lgs, action_seed, noise_scale).await,
+            Go9Model::Local(m) => m.reify(from_state, from_lgs, to_lgs, action_seed, noise_scale).await,
         }
     }
     async fn model_version(&self) -> anyhow::Result<String> {

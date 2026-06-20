@@ -8,9 +8,9 @@
 //! architecture from the sibling `config.json` (`{"arch": {...}}`), so the
 //! `random`, `bc-perfect`, and larger `selfplay` ResNet checkpoints all load.
 //!
-//! Contract parity with the Python server (so GS bytes are interchangeable):
+//! Contract parity with the Python server (so LGS bytes are interchangeable):
 //!   * planes are 2×6×7 (side-to-move's stones, opponent's), row 0 = bottom;
-//!   * GS is 64 little-endian f32 (`GS_DIM`), shape `[64]`;
+//!   * LGS is 64 little-endian f32 (`LGS_DIM`), shape `[64]`;
 //!   * an action vector is 16 little-endian f32 with slot 0 = the column;
 //!   * reify is a structural column decode clamped to legal moves.
 
@@ -27,7 +27,7 @@ use playground_core::{LatentGameState, ModelClient, PolicyCandidate};
 
 use crate::game::{Connect4, Connect4Move, Connect4State, C4_COLS, C4_ROWS};
 
-const GS_DIM: usize = 64;
+const LGS_DIM: usize = 64;
 const ACTION_DIM: usize = 16;
 const CELLS: usize = C4_ROWS * C4_COLS;
 
@@ -119,34 +119,34 @@ impl Net {
         };
         Ok(Self {
             trunk,
-            enc_fc: linear(trunk_features, GS_DIM, vb.pp("enc_fc"))?,
-            val_fc1: linear(GS_DIM, 64, vb.pp("val_fc1"))?,
+            enc_fc: linear(trunk_features, LGS_DIM, vb.pp("enc_fc"))?,
+            val_fc1: linear(LGS_DIM, 64, vb.pp("val_fc1"))?,
             val_fc2: linear(64, 1, vb.pp("val_fc2"))?,
-            pol_prior: linear(GS_DIM, C4_COLS, vb.pp("pol_prior"))?,
-            pol_next: linear(GS_DIM, C4_COLS * GS_DIM, vb.pp("pol_next"))?,
+            pol_prior: linear(LGS_DIM, C4_COLS, vb.pp("pol_prior"))?,
+            pol_next: linear(LGS_DIM, C4_COLS * LGS_DIM, vb.pp("pol_next"))?,
         })
     }
 
-    /// planes (1,2,6,7) -> GS (1,64), tanh-bounded.
+    /// planes (1,2,6,7) -> LGS (1,64), tanh-bounded.
     fn encode(&self, planes: &Tensor) -> candle_core::Result<Tensor> {
         self.enc_fc.forward(&self.trunk.forward(planes)?)?.tanh()
     }
 
-    /// GS (1,64) -> scalar value in [-1, 1] for the side to move.
-    fn value(&self, gs: &Tensor) -> candle_core::Result<f32> {
-        let x = self.val_fc1.forward(gs)?.relu()?;
+    /// LGS (1,64) -> scalar value in [-1, 1] for the side to move.
+    fn value(&self, lgs: &Tensor) -> candle_core::Result<f32> {
+        let x = self.val_fc1.forward(lgs)?.relu()?;
         let v = self.val_fc2.forward(&x)?.tanh()?;
         v.flatten_all()?.to_vec1::<f32>().map(|v| v[0])
     }
 
-    /// GS (1,64) -> (value, full column priors over 7). The self-play forward:
+    /// LGS (1,64) -> (value, full column priors over 7). The self-play forward:
     /// matches Python's `policy_value` (softmax over all columns, renormalised
     /// over legal moves by the caller). Skips the `pol_next` matmul, which only
     /// the reification policy head needs.
-    fn value_policy(&self, gs: &Tensor) -> candle_core::Result<(f32, Vec<f32>)> {
-        let x = self.val_fc1.forward(gs)?.relu()?;
+    fn value_policy(&self, lgs: &Tensor) -> candle_core::Result<(f32, Vec<f32>)> {
+        let x = self.val_fc1.forward(lgs)?.relu()?;
         let v = self.val_fc2.forward(&x)?.tanh()?.flatten_all()?.to_vec1::<f32>()?[0];
-        let pri = candle_nn::ops::softmax(&self.pol_prior.forward(gs)?, 1)?
+        let pri = candle_nn::ops::softmax(&self.pol_prior.forward(lgs)?, 1)?
             .flatten_all()?
             .to_vec1::<f32>()?;
         Ok((v, pri))
@@ -157,19 +157,19 @@ impl Net {
     /// inference server calls — coalescing many search threads' leaves into one
     /// forward is the whole point of the batched path.
     fn value_policy_batch(&self, planes: &Tensor) -> candle_core::Result<(Vec<f32>, Vec<f32>)> {
-        let gs = self.encode(planes)?; // (B,64)
-        let x = self.val_fc1.forward(&gs)?.relu()?;
+        let lgs = self.encode(planes)?; // (B,64)
+        let x = self.val_fc1.forward(&lgs)?.relu()?;
         let v = self.val_fc2.forward(&x)?.tanh()?; // (B,1)
         let vals = v.flatten_all()?.to_vec1::<f32>()?;
-        let pri = candle_nn::ops::softmax(&self.pol_prior.forward(&gs)?, 1)?; // (B,7)
+        let pri = candle_nn::ops::softmax(&self.pol_prior.forward(&lgs)?, 1)?; // (B,7)
         let probs = pri.flatten_all()?.to_vec1::<f32>()?;
         Ok((vals, probs))
     }
 
-    /// GS (1,64) -> (column priors over 7, predicted next-GS per column (7,64)).
-    fn policy_heads(&self, gs: &Tensor) -> candle_core::Result<(Vec<f32>, Tensor)> {
-        let priors = candle_nn::ops::softmax(&self.pol_prior.forward(gs)?, 1)?;
-        let nexts = self.pol_next.forward(gs)?.tanh()?.reshape((C4_COLS, GS_DIM))?;
+    /// LGS (1,64) -> (column priors over 7, predicted next-LGS per column (7,64)).
+    fn policy_heads(&self, lgs: &Tensor) -> candle_core::Result<(Vec<f32>, Tensor)> {
+        let priors = candle_nn::ops::softmax(&self.pol_prior.forward(lgs)?, 1)?;
+        let nexts = self.pol_next.forward(lgs)?.tanh()?.reshape((C4_COLS, LGS_DIM))?;
         Ok((priors.flatten_all()?.to_vec1::<f32>()?, nexts))
     }
 }
@@ -299,13 +299,13 @@ impl LocalModel {
         Tensor::from_vec(data, (1, 2, C4_ROWS, C4_COLS), &self.device)
     }
 
-    fn gs_tensor(&self, gs: &LatentGameState) -> candle_core::Result<Tensor> {
-        let v = f32_le(&gs.payload);
-        Tensor::from_vec(v, (1, GS_DIM), &self.device)
+    fn lgs_tensor(&self, lgs: &LatentGameState) -> candle_core::Result<Tensor> {
+        let v = f32_le(&lgs.payload);
+        Tensor::from_vec(v, (1, LGS_DIM), &self.device)
     }
 
     fn gs_state(&self, payload: Vec<f32>) -> LatentGameState {
-        LatentGameState::new(f32_to_bytes(&payload), vec![GS_DIM as i32], self.model_version.clone())
+        LatentGameState::new(f32_to_bytes(&payload), vec![LGS_DIM as i32], self.model_version.clone())
     }
 
     /// AlphaZero-style self-play forward: a concrete state -> (value for the
@@ -315,8 +315,8 @@ impl LocalModel {
     /// inference allocates fresh outputs, so concurrent forwards are safe.
     pub fn policy_value(&self, state: &Connect4State) -> anyhow::Result<(f32, [f32; C4_COLS])> {
         let planes = self.planes(state)?;
-        let gs = self.net.encode(&planes)?;
-        let (v, pri) = self.net.value_policy(&gs)?;
+        let lgs = self.net.encode(&planes)?;
+        let (v, pri) = self.net.value_policy(&lgs)?;
         let mut arr = [0f32; C4_COLS];
         arr.copy_from_slice(&pri[..C4_COLS]);
         Ok((v, arr))
@@ -336,28 +336,28 @@ impl playground_core::batch_search::BatchModel for LocalModel {
 impl ModelClient<Connect4> for LocalModel {
     async fn encode(&self, state: &Connect4State) -> anyhow::Result<LatentGameState> {
         let planes = self.planes(state)?;
-        let gs = self.net.encode(&planes)?.flatten_all()?.to_vec1::<f32>()?;
-        Ok(self.gs_state(gs))
+        let lgs = self.net.encode(&planes)?.flatten_all()?.to_vec1::<f32>()?;
+        Ok(self.gs_state(lgs))
     }
 
-    async fn eval(&self, gs: &LatentGameState) -> anyhow::Result<f64> {
-        let t = self.gs_tensor(gs)?;
+    async fn eval(&self, lgs: &LatentGameState) -> anyhow::Result<f64> {
+        let t = self.lgs_tensor(lgs)?;
         Ok(self.net.value(&t)? as f64)
     }
 
-    async fn policy(&self, gs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>> {
-        let t = self.gs_tensor(gs)?;
+    async fn policy(&self, lgs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>> {
+        let t = self.lgs_tensor(lgs)?;
         let (priors, nexts) = self.net.policy_heads(&t)?;
         // Highest-prior columns first, like the Python policy head.
         let mut order: Vec<usize> = (0..C4_COLS).collect();
         order.sort_by(|&a, &b| priors[b].total_cmp(&priors[a]));
         let mut out = Vec::with_capacity(top_b as usize);
         for &col in order.iter().take(top_b as usize) {
-            let next_gs = nexts.get(col)?.to_vec1::<f32>()?;
+            let next_lgs = nexts.get(col)?.to_vec1::<f32>()?;
             out.push(PolicyCandidate {
                 prior: priors[col] as f64,
                 action_vector: Bytes::from(action_vector_for_column(col)),
-                next_gs: self.gs_state(next_gs),
+                next_lgs: self.gs_state(next_lgs),
             });
         }
         Ok(out)
@@ -366,8 +366,8 @@ impl ModelClient<Connect4> for LocalModel {
     async fn reify(
         &self,
         from_state: &Connect4State,
-        _from_gs: &LatentGameState,
-        _to_gs: &LatentGameState,
+        _from_lgs: &LatentGameState,
+        _to_lgs: &LatentGameState,
         action_seed: Option<&[u8]>,
         _noise_scale: Option<f64>,
     ) -> anyhow::Result<Connect4Move> {
@@ -464,16 +464,16 @@ mod tests {
             }
             let m = LocalModel::load(ckpt).unwrap();
             let s = state_after(&[3, 3, 2, 4]);
-            let gs = m.encode(&s).await.unwrap();
-            let v = m.eval(&gs).await.unwrap();
-            let cands = m.policy(&gs, 7).await.unwrap();
-            let head: Vec<f32> = f32_le(&gs.payload)[..5].to_vec();
+            let lgs = m.encode(&s).await.unwrap();
+            let v = m.eval(&lgs).await.unwrap();
+            let cands = m.policy(&lgs, 7).await.unwrap();
+            let head: Vec<f32> = f32_le(&lgs.payload)[..5].to_vec();
             let mut priors = vec![0f64; C4_COLS];
             for c in &cands {
                 priors[decode_column(&c.action_vector).unwrap() as usize] = c.prior;
             }
             eprintln!("== {name} ==");
-            eprintln!("gs[:5] {head:?}");
+            eprintln!("lgs[:5] {head:?}");
             eprintln!("value {v:.5}");
             eprintln!("priors {priors:?}");
         }

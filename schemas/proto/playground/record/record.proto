@@ -4,17 +4,17 @@ package playground.record;
 
 import "playground/game/game.proto";
 
-// A node in the GS-level MCTS tree that ran during play.
+// A node in the LGS-level MCTS tree that ran during play.
 message MctsNode {
   uint32 node_id = 1;           // tree-local id
   uint32 parent_id = 2;          // 0 if root
-  playground.game.LatentGameState gs = 3;
+  playground.game.LatentGameState lgs = 3;
 
   uint32 visits = 10;
   double value_sum = 11;         // sum of backed-up values (so mean = sum/visits)
   double prior = 12;             // prior from policy head at expansion
 
-  // Children in GS-space (policy state-head outputs attached as priors).
+  // Children in LGS-space (policy state-head outputs attached as priors).
   repeated uint32 child_ids = 20;
 
   // Reifications: each time this node's edge-to-child was reified, a record.
@@ -60,7 +60,7 @@ message PlyRecord {
   playground.game.GameState state_before = 2;
   playground.game.Move move_played = 3;
 
-  // The GS-level tree as of when the move was chosen. Root is nodes[0].
+  // The LGS-level tree as of when the move was chosen. Root is nodes[0].
   repeated MctsNode nodes = 10;
 
   // Time spent thinking (informational).

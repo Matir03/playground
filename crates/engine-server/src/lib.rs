@@ -113,7 +113,7 @@ struct Chosen {
     reifications: u32,
 }
 
-/// Neural-net move: GS-space MCTS with on-demand reification, using the model's
+/// Neural-net move: LGS-space MCTS with on-demand reification, using the model's
 /// encode/eval/policy/reify heads (see playground_core::mcts and
 /// docs/algorithm.md). With random weights it plays weakly, but exercises the
 /// full planned search path rather than a 1-ply lookahead.
@@ -149,7 +149,7 @@ where
     async fn new_game(&self, req: Request<NewGameRequest>) -> Result<Response<GameHandle>, Status> {
         let inner = req.into_inner();
         let state = match inner.initial_state {
-            Some(gs) => G::decode_state(&gs.payload)
+            Some(lgs) => G::decode_state(&lgs.payload)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?,
             None => G::initial_state(),
         };

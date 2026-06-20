@@ -4,7 +4,7 @@ Each generation: dump the current net, shell out to `go9-engine selfplay-gen`
 (games on native threads, batched GPU inference server, no GIL), read the
 examples, and train in torch — value MSE on the game-outcome z, policy CE on the
 MCTS visit distribution (82 actions), and a reifier-consistency loss training
-`pol_next(gs)[a_played]` toward `stopgrad(encode(next_planes))` (MuZero 1-step).
+`pol_next(lgs)[a_played]` toward `stopgrad(encode(next_planes))` (MuZero 1-step).
 Checkpoints land in `<out>/genNNN/` for play + rating.
 
 Data stays on the host and is moved to the GPU per batch (the 96ch/10b net plus
@@ -30,7 +30,7 @@ import torch
 import torch.nn.functional as F
 
 from playground.model_server.go9_net import (
-    GS_DIM,
+    LGS_DIM,
     Go9ResNet,
     arch_of,
     load_checkpoint,
@@ -172,9 +172,9 @@ def main() -> None:
                 pl = torch.from_numpy(planes[b]).to(device)
                 tgt_pi = torch.from_numpy(policy[b]).to(device)
                 tgt_z = torch.from_numpy(value[b]).to(device)
-                gs = net.encode_batch(pl)
-                v_pred = net.value_batch(gs)
-                logits = net.pol_prior(gs)
+                lgs = net.encode_batch(pl)
+                v_pred = net.value_batch(lgs)
+                logits = net.pol_prior(lgs)
                 loss_v = F.mse_loss(v_pred, tgt_z)
                 loss_p = -(tgt_pi * F.log_softmax(logits, dim=1)).sum(1).mean()
                 loss = loss_v + loss_p
@@ -183,7 +183,7 @@ def main() -> None:
                     npl = torch.from_numpy(next_planes[b]).to(device)
                     hn = torch.from_numpy(has_next[b]).to(device)
                     pa = torch.from_numpy(played[b]).to(device)
-                    pred_next = torch.tanh(net.pol_next(gs)).view(-1, ACTIONS, GS_DIM)
+                    pred_next = torch.tanh(net.pol_next(lgs)).view(-1, ACTIONS, LGS_DIM)
                     pred_a = pred_next[torch.arange(pred_next.shape[0], device=device), pa]
                     with torch.no_grad():
                         tgt_next = net.encode_batch(npl)

@@ -45,21 +45,21 @@ impl<G: Game> ModelClient<G> for RemoteModelClient<G> {
         };
         let mut client = self.client.lock().await;
         let resp = client.encode(req).await?.into_inner();
-        let gs = resp.gs.ok_or_else(|| anyhow::anyhow!("model server returned empty GS"))?;
-        Ok(LatentGameState::new(gs.payload, gs.shape, gs.model_version))
+        let lgs = resp.lgs.ok_or_else(|| anyhow::anyhow!("model server returned empty LGS"))?;
+        Ok(LatentGameState::new(lgs.payload, lgs.shape, lgs.model_version))
     }
 
-    async fn eval(&self, gs: &LatentGameState) -> anyhow::Result<f64> {
+    async fn eval(&self, lgs: &LatentGameState) -> anyhow::Result<f64> {
         let req = pb::EvalRequest {
-            gs: Some(to_proto_gs(gs)),
+            lgs: Some(to_proto_lgs(lgs)),
         };
         let mut client = self.client.lock().await;
         Ok(client.eval(req).await?.into_inner().value)
     }
 
-    async fn policy(&self, gs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>> {
+    async fn policy(&self, lgs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>> {
         let req = pb::PolicyRequest {
-            gs: Some(to_proto_gs(gs)),
+            lgs: Some(to_proto_lgs(lgs)),
             top_b,
         };
         let mut client = self.client.lock().await;
@@ -71,7 +71,7 @@ impl<G: Game> ModelClient<G> for RemoteModelClient<G> {
                 Some(PolicyCandidate {
                     prior: c.prior,
                     action_vector: c.action_vector.into(),
-                    next_gs: from_proto_gs(c.next_gs?),
+                    next_lgs: from_proto_lgs(c.next_lgs?),
                 })
             })
             .collect())
@@ -80,14 +80,14 @@ impl<G: Game> ModelClient<G> for RemoteModelClient<G> {
     async fn reify(
         &self,
         from_state: &G::State,
-        from_gs: &LatentGameState,
-        to_gs: &LatentGameState,
+        from_lgs: &LatentGameState,
+        to_lgs: &LatentGameState,
         action_seed: Option<&[u8]>,
         noise_scale: Option<f64>,
     ) -> anyhow::Result<G::Move> {
         let req = pb::ReifyRequest {
-            from_gs: Some(to_proto_gs(from_gs)),
-            to_gs: Some(to_proto_gs(to_gs)),
+            from_lgs: Some(to_proto_lgs(from_lgs)),
+            to_lgs: Some(to_proto_lgs(to_lgs)),
             from_state: Some(playground_protocol::game_pb::GameState {
                 game_id: G::id() as i32,
                 payload: G::encode_state(from_state),
@@ -111,14 +111,14 @@ impl<G: Game> ModelClient<G> for RemoteModelClient<G> {
     }
 }
 
-fn to_proto_gs(gs: &LatentGameState) -> playground_protocol::game_pb::LatentGameState {
+fn to_proto_lgs(lgs: &LatentGameState) -> playground_protocol::game_pb::LatentGameState {
     playground_protocol::game_pb::LatentGameState {
-        payload: gs.payload.to_vec(),
-        shape: gs.shape.clone(),
-        model_version: gs.model_version.clone(),
+        payload: lgs.payload.to_vec(),
+        shape: lgs.shape.clone(),
+        model_version: lgs.model_version.clone(),
     }
 }
 
-fn from_proto_gs(gs: playground_protocol::game_pb::LatentGameState) -> LatentGameState {
-    LatentGameState::new(gs.payload, gs.shape, gs.model_version)
+fn from_proto_lgs(lgs: playground_protocol::game_pb::LatentGameState) -> LatentGameState {
+    LatentGameState::new(lgs.payload, lgs.shape, lgs.model_version)
 }

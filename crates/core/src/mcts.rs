@@ -1,4 +1,4 @@
-//! MCTS in GS (game-state latent) space with on-demand reification.
+//! MCTS in LGS (latent game state) space with on-demand reification.
 //!
 //! This implements the search described in docs/algorithm.md. All neural
 //! network access goes through [`ModelClient`]; there is no tonic/tokio-runtime
@@ -11,7 +11,7 @@
 //!      (concrete) node, decode the edge into a concrete move with `reify`,
 //!      apply it to the concrete game, and re-`encode` the result. This is what
 //!      keeps the root's chosen edge a real, legal move.
-//!   3. **Expansion** — `policy` gives up to B (prior, action-vector, next-GS)
+//!   3. **Expansion** — `policy` gives up to B (prior, action-vector, next-LGS)
 //!      children; the leaf value comes from `eval` (or the exact game result at
 //!      terminal nodes).
 //!   4. **Backup** — negamax the leaf value up the visited path.
@@ -41,7 +41,7 @@ pub struct SearchConfig {
     /// Per-move time budget in milliseconds. If > 0, run uncapped rollouts until
     /// the budget elapses instead of a fixed `simulations` count.
     pub move_millis: u64,
-    /// B — number of (action, next_gs) candidates produced by the policy head
+    /// B — number of (action, next_lgs) candidates produced by the policy head
     /// per expansion.
     pub policy_top_b: u32,
     /// K — visits between reifications at the same node. Reserved for the
@@ -90,15 +90,15 @@ pub struct SearchResult<G: Game> {
 struct Edge {
     prior: f64,
     action_vector: Bytes,
-    /// Policy state-head prediction of the child GS (before reification).
-    predicted_gs: LatentGameState,
+    /// Policy state-head prediction of the child LGS (before reification).
+    predicted_lgs: LatentGameState,
     child: usize,
     /// Concrete move, set once this edge is reified.
     mv: Option<()>, // presence flag; the move lives on the child node
 }
 
 struct Node<G: Game> {
-    gs: LatentGameState,
+    lgs: LatentGameState,
     /// Concrete state — `Some` once the node is reified. The root is reified.
     state: Option<G::State>,
     /// Move that reached this node from its parent (set on reification).
@@ -113,9 +113,9 @@ struct Node<G: Game> {
 }
 
 impl<G: Game> Node<G> {
-    fn latent(gs: LatentGameState) -> Self {
+    fn latent(lgs: LatentGameState) -> Self {
         Self {
-            gs,
+            lgs,
             state: None,
             incoming_move: None,
             terminal: false,
@@ -126,8 +126,8 @@ impl<G: Game> Node<G> {
             edges: Vec::new(),
         }
     }
-    fn reified(gs: LatentGameState, state: G::State) -> Self {
-        let mut n = Self::latent(gs);
+    fn reified(lgs: LatentGameState, state: G::State) -> Self {
+        let mut n = Self::latent(lgs);
         n.state = Some(state);
         n
     }
@@ -155,14 +155,14 @@ fn kernel(a: &[f32], b: &[f32], sigma: f64) -> f64 {
 
 // ── Search ──────────────────────────────────────────────────────────────────
 
-/// Run a GS-space MCTS from `root_state` and return the chosen concrete move.
+/// Run a LGS-space MCTS from `root_state` and return the chosen concrete move.
 pub async fn search<G: Game, M: ModelClient<G>>(
     model: &M,
     root_state: &G::State,
     config: &SearchConfig,
 ) -> anyhow::Result<SearchResult<G>> {
-    let root_gs = model.encode(root_state).await?;
-    let mut tree: Vec<Node<G>> = vec![Node::reified(root_gs, root_state.clone())];
+    let root_lgs = model.encode(root_state).await?;
+    let mut tree: Vec<Node<G>> = vec![Node::reified(root_lgs, root_state.clone())];
     let mut reifications = 0u32;
 
     if config.move_millis > 0 {
@@ -263,7 +263,7 @@ async fn simulate<G: Game, M: ModelClient<G>>(
         tree[cur].terminal_value
     } else if tree[cur].expanded {
         // Re-selected an already-expanded leaf (e.g. childless): just re-eval.
-        model.eval(&tree[cur].gs).await?
+        model.eval(&tree[cur].lgs).await?
     } else {
         expand::<G, M>(model, tree, cur, config.policy_top_b).await?
     };
@@ -287,12 +287,12 @@ async fn reify_edge<G: Game, M: ModelClient<G>>(
     child: usize,
 ) -> anyhow::Result<()> {
     let parent_state = tree[parent].state.clone().expect("reified parent has state");
-    let parent_gs = tree[parent].gs.clone();
-    let to_gs = tree[parent].edges[edge_idx].predicted_gs.clone();
+    let parent_lgs = tree[parent].lgs.clone();
+    let to_lgs = tree[parent].edges[edge_idx].predicted_lgs.clone();
     let seed = tree[parent].edges[edge_idx].action_vector.clone();
 
     let mut mv = model
-        .reify(&parent_state, &parent_gs, &to_gs, Some(&seed), None)
+        .reify(&parent_state, &parent_lgs, &to_lgs, Some(&seed), None)
         .await?;
     if !is_legal::<G>(&parent_state, &mv) {
         // A bad decode shouldn't poison the search; substitute a legal move.
@@ -301,10 +301,10 @@ async fn reify_edge<G: Game, M: ModelClient<G>>(
 
     let child_state = G::apply(&parent_state, &mv);
     let outcome = G::outcome(&child_state);
-    let child_gs = model.encode(&child_state).await?;
+    let child_lgs = model.encode(&child_state).await?;
 
     let node = &mut tree[child];
-    node.gs = child_gs;
+    node.lgs = child_lgs;
     node.terminal = outcome.is_terminal();
     node.terminal_value = if node.terminal {
         outcome.value_for(G::to_move(&child_state))
@@ -324,21 +324,21 @@ async fn expand<G: Game, M: ModelClient<G>>(
     node: usize,
     top_b: u32,
 ) -> anyhow::Result<f64> {
-    let gs = tree[node].gs.clone();
-    let candidates = model.policy(&gs, top_b).await?;
+    let lgs = tree[node].lgs.clone();
+    let candidates = model.policy(&lgs, top_b).await?;
     for c in candidates {
         let child_idx = tree.len();
-        tree.push(Node::latent(c.next_gs.clone()));
+        tree.push(Node::latent(c.next_lgs.clone()));
         tree[node].edges.push(Edge {
             prior: c.prior,
             action_vector: c.action_vector,
-            predicted_gs: c.next_gs,
+            predicted_lgs: c.next_lgs,
             child: child_idx,
             mv: None,
         });
     }
     tree[node].expanded = true;
-    Ok(model.eval(&gs).await?)
+    Ok(model.eval(&lgs).await?)
 }
 
 /// KR-UCT child selection: kernel-regression UCT (Yee et al. 2016). Value and
@@ -478,24 +478,24 @@ mod tests {
         }
     }
 
-    // Coherent mock: GS payload carries the concrete state bytes, so policy can
+    // Coherent mock: LGS payload carries the concrete state bytes, so policy can
     // enumerate real children and reify can decode the action seed to a move.
     struct MockModel;
 
-    fn gs_of(state: &State) -> LatentGameState {
+    fn lgs_of(state: &State) -> LatentGameState {
         LatentGameState::new(Countdown::encode_state(state), vec![], "mock".into())
     }
 
     #[async_trait]
     impl ModelClient<Countdown> for MockModel {
         async fn encode(&self, state: &State) -> anyhow::Result<LatentGameState> {
-            Ok(gs_of(state))
+            Ok(lgs_of(state))
         }
-        async fn eval(&self, _gs: &LatentGameState) -> anyhow::Result<f64> {
+        async fn eval(&self, _lgs: &LatentGameState) -> anyhow::Result<f64> {
             Ok(0.0)
         }
-        async fn policy(&self, gs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>> {
-            let state = Countdown::decode_state(&gs.payload)?;
+        async fn policy(&self, lgs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>> {
+            let state = Countdown::decode_state(&lgs.payload)?;
             let moves = Countdown::legal_moves(&state);
             let n = moves.len().max(1) as f64;
             Ok(moves
@@ -505,15 +505,15 @@ mod tests {
                     prior: 1.0 / n,
                     // f32 action point (one dim = the move), for the KR kernel.
                     action_vector: (mv as f32).to_le_bytes().to_vec().into(),
-                    next_gs: gs_of(&Countdown::apply(&state, &mv)),
+                    next_lgs: lgs_of(&Countdown::apply(&state, &mv)),
                 })
                 .collect())
         }
         async fn reify(
             &self,
             from_state: &State,
-            _from_gs: &LatentGameState,
-            _to_gs: &LatentGameState,
+            _from_lgs: &LatentGameState,
+            _to_lgs: &LatentGameState,
             action_seed: Option<&[u8]>,
             _noise: Option<f64>,
         ) -> anyhow::Result<u8> {

@@ -13,24 +13,24 @@ use bytes::Bytes;
 pub struct PolicyCandidate {
     pub prior: f64,
     pub action_vector: Bytes,
-    pub next_gs: LatentGameState,
+    pub next_lgs: LatentGameState,
 }
 
 #[async_trait]
 pub trait ModelClient<G: Game>: Send + Sync {
     async fn encode(&self, state: &G::State) -> anyhow::Result<LatentGameState>;
-    async fn eval(&self, gs: &LatentGameState) -> anyhow::Result<f64>;
-    async fn policy(&self, gs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>>;
+    async fn eval(&self, lgs: &LatentGameState) -> anyhow::Result<f64>;
+    async fn policy(&self, lgs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>>;
 
-    /// Given `from_state` (whose encoding is `from_gs`) and a target GS,
+    /// Given `from_state` (whose encoding is `from_lgs`) and a target LGS,
     /// produce a concrete move that approximately realizes the transition.
     /// `action_seed` is the policy action-head output for this edge, optionally
     /// perturbed with `noise_scale`.
     async fn reify(
         &self,
         from_state: &G::State,
-        from_gs: &LatentGameState,
-        to_gs: &LatentGameState,
+        from_lgs: &LatentGameState,
+        to_lgs: &LatentGameState,
         action_seed: Option<&[u8]>,
         noise_scale: Option<f64>,
     ) -> anyhow::Result<G::Move>;

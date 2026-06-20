@@ -16,7 +16,11 @@ use candle_nn::{
     VarBuilder,
 };
 
-use crate::game::{fill_planes_into, AmazonsState, CELLS, N, PLANES};
+use async_trait::async_trait;
+use bytes::Bytes;
+use playground_core::{Game, LatentGameState, ModelClient, PolicyCandidate};
+
+use crate::game::{apply, expand_into, fill_planes_into, legal_moves, Amazons, AmazonsMove, AmazonsState, CELLS, N, PLANES};
 use crate::moves::{MOVE_TYPES, PER_HEAD};
 
 const IN_PLANES: usize = PLANES; // 4
@@ -139,6 +143,7 @@ pub fn pick_device(cuda: bool) -> anyhow::Result<Device> {
 pub struct LocalModel {
     net: AzNet,
     device: Device,
+    model_version: String,
 }
 
 impl LocalModel {
@@ -153,7 +158,8 @@ impl LocalModel {
         // SAFETY: mmap lives for the load; tensors are copied.
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[checkpoint], DType::F32, &device)? };
         let net = AzNet::load(channels, blocks, vb)?;
-        Ok(Self { net, device })
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("amazons");
+        Ok(Self { net, device, model_version: format!("amazons-{stem}") })
     }
 
     #[allow(dead_code)]
@@ -184,5 +190,80 @@ impl playground_core::batch_search::BatchModel for LocalModel {
     fn forward(&self, planes: &[f32], b: usize) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
         let t = Tensor::from_slice(planes, (b, IN_PLANES, N, N), &self.device)?;
         Ok(self.net.value_policy_batch(&t)?)
+    }
+}
+
+/// AZ-net adapter for the engine-server's interactive (reification) MCTS. Amazons
+/// has no reifier, so we run the search AlphaZero-style: the latent LGS payload IS
+/// the concrete state bytes, `policy` enumerates real legal moves (priors from the
+/// two heads via `expand_into`) with `next_lgs = encode(apply(move))`, and `reify`
+/// just decodes the move. Every edge thus "reifies" trivially and the search is a
+/// plain AZ tree over real states. (Same shape as the mock in `core::mcts` tests.)
+#[async_trait]
+impl ModelClient<Amazons> for LocalModel {
+    async fn encode(&self, state: &AmazonsState) -> anyhow::Result<LatentGameState> {
+        Ok(LatentGameState::new(
+            <Amazons as Game>::encode_state(state),
+            vec![],
+            self.model_version.clone(),
+        ))
+    }
+
+    async fn eval(&self, lgs: &LatentGameState) -> anyhow::Result<f64> {
+        let state = <Amazons as Game>::decode_state(&lgs.payload)?;
+        let (vals, _) = self.value_policy_batch(&[&state])?;
+        Ok(vals[0] as f64)
+    }
+
+    async fn policy(&self, lgs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>> {
+        let state = <Amazons as Game>::decode_state(&lgs.payload)?;
+        let (_vals, logits) = self.value_policy_batch(&[&state])?;
+        let mut moves: Vec<AmazonsMove> = Vec::new();
+        let mut priors: Vec<f32> = Vec::new();
+        expand_into(&state, &logits, &mut moves, &mut priors);
+        let mut order: Vec<usize> = (0..moves.len()).collect();
+        order.sort_by(|&a, &b| priors[b].total_cmp(&priors[a]));
+        let mut out = Vec::with_capacity(top_b as usize);
+        for &i in order.iter().take(top_b as usize) {
+            let mv = &moves[i];
+            let child = apply(&state, mv);
+            out.push(PolicyCandidate {
+                prior: priors[i] as f64,
+                action_vector: Bytes::from(<Amazons as Game>::encode_move(mv)),
+                next_lgs: LatentGameState::new(
+                    <Amazons as Game>::encode_state(&child),
+                    vec![],
+                    self.model_version.clone(),
+                ),
+            });
+        }
+        Ok(out)
+    }
+
+    async fn reify(
+        &self,
+        from_state: &AmazonsState,
+        _from_lgs: &LatentGameState,
+        _to_lgs: &LatentGameState,
+        action_seed: Option<&[u8]>,
+        _noise_scale: Option<f64>,
+    ) -> anyhow::Result<AmazonsMove> {
+        let legal = legal_moves(from_state);
+        if let Some(seed) = action_seed {
+            if let Ok(mv) = <Amazons as Game>::decode_move(seed) {
+                let tgt = <Amazons as Game>::encode_move(&mv);
+                if legal.iter().any(|m| <Amazons as Game>::encode_move(m) == tgt) {
+                    return Ok(mv);
+                }
+            }
+        }
+        legal
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no legal move from a non-terminal state"))
+    }
+
+    async fn model_version(&self) -> anyhow::Result<String> {
+        Ok(self.model_version.clone())
     }
 }

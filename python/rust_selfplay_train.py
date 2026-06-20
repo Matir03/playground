@@ -27,7 +27,7 @@ import torch
 import torch.nn.functional as F
 
 from playground.model_server.net import (
-    GS_DIM,
+    LGS_DIM,
     ConnectFourResNet,
     arch_of,
     load_checkpoint,
@@ -88,7 +88,7 @@ def main() -> None:
                     help="per-move node budget; overrides --move-ms when > 0")
     ap.add_argument("--reif-weight", type=float, default=0.0,
                     help="weight of the reifier-consistency aux loss (0 = off). "
-                         "Trains pol_next(gs)[c] to match encode(child_c) "
+                         "Trains pol_next(lgs)[c] to match encode(child_c) "
                          "(stop-grad target), MuZero-style latent dynamics.")
     ap.add_argument("--threads", type=int, default=96)
     ap.add_argument("--max-batch", type=int, default=128)
@@ -197,20 +197,20 @@ def main() -> None:
             ep_v = ep_p = ep_r = ep_n = 0.0
             for i in range(0, len(idx), args.batch_size):
                 b = torch.from_numpy(idx[i : i + args.batch_size]).to(device)
-                gs = net.encode_batch(planes[b])
-                v_pred = net.value_batch(gs)
-                logits = net.pol_prior(gs)
+                lgs = net.encode_batch(planes[b])
+                v_pred = net.value_batch(lgs)
+                logits = net.pol_prior(lgs)
                 loss_v = F.mse_loss(v_pred, target_z[b])
                 loss_p = -(target_pi[b] * F.log_softmax(logits, dim=1)).sum(1).mean()
                 loss = loss_v + loss_p
                 loss_r = torch.zeros((), device=device)
                 if reif_w > 0:
-                    # Predicted next-GS per column vs the encoder's own embedding
+                    # Predicted next-LGS per column vs the encoder's own embedding
                     # of the actual child (stop-grad target), masked to legal moves.
-                    pred_next = torch.tanh(net.pol_next(gs)).view(-1, 7, GS_DIM)
+                    pred_next = torch.tanh(net.pol_next(lgs)).view(-1, 7, LGS_DIM)
                     with torch.no_grad():
                         ch = child_t[b].view(-1, 2, 6, 7)
-                        tgt_next = net.encode_batch(ch).view(-1, 7, GS_DIM)
+                        tgt_next = net.encode_batch(ch).view(-1, 7, LGS_DIM)
                     msk = mask_t[b]
                     per = ((pred_next - tgt_next) ** 2).mean(-1) * msk   # [B,7]
                     loss_r = per.sum() / msk.sum().clamp(min=1.0)

@@ -166,6 +166,14 @@ def main() -> None:
     ap.add_argument("--n-opponents", type=int, default=4,
                     help="random opponents sampled from ALL gens (plus current best)")
     ap.add_argument("--prior", type=float, default=2.0)
+    # Rate the single latest snapshot then exit (used by the orchestrator, which
+    # spawns a fresh evaluator per generation instead of keeping one resident).
+    ap.add_argument("--once", action="store_true")
+    # SIGSTOP the actor (+learner) during matches. Default OFF: pausing the actor
+    # wastes self-play time AND a lone small-batch candle eval-match doesn't keep the
+    # GPU boosted; letting the actor keep running holds the boost and it recovers its
+    # ~26k rate right after each match (the dip during a match is harmless).
+    ap.add_argument("--pause-actor", action="store_true")
     args = ap.parse_args()
 
     live = args.live
@@ -203,12 +211,21 @@ def main() -> None:
 
     existing = [int(os.path.basename(d)[3:]) for d in glob.glob(os.path.join(snaps, "gen*"))
                 if os.path.basename(d)[3:].isdigit()]
-    pt = max([anchor_gen, int(state.get("processed_through", anchor_gen))] + existing)
+    if args.once:
+        # The orchestrator spawns us right AFTER a new snapshot is made, to rate it.
+        # Resume from the persisted processed_through (do NOT skip to max existing, or
+        # we'd skip the very gen we were spawned to evaluate).
+        pt = int(state.get("processed_through", anchor_gen))
+        skip_note = "resume"
+    else:
+        # Persistent mode: skip whatever backlog accrued while eval was down.
+        pt = max([anchor_gen, int(state.get("processed_through", anchor_gen))] + existing)
+        skip_note = "backlog skipped"
     state["processed_through"] = pt
     with open(elo_path, "w") as f:
         json.dump(state, f, indent=2)
     print(f"evaluator: anchor gen {state['anchor_gen']}  best gen {state['best_gen']}  "
-          f"HoF {state['best_history']}  processed_through gen {pt} (backlog skipped)  "
+          f"HoF {state['best_history']}  processed_through gen {pt} ({skip_note})  "
           f"games {args.games}  node-budget {args.node_budget}  "
           f"gauntlet=best+{args.n_opponents}random(all gens)", flush=True)
 
@@ -220,13 +237,15 @@ def main() -> None:
                 gens.append((int(os.path.basename(d)[3:]), ck))
         # Rate only the LATEST snapshot each pass (skip intermediates) so eval — which
         # pauses the actor — runs sparsely and can't starve training when it lags.
+        rated = False
         for gen, ck in sorted(gens, reverse=True):
             if gen <= state["processed_through"]:
                 continue
             pool = select_pool(gen, snaps, state["best_gen"], args.n_opponents)
-            # Pause the actor + learner for this generation's matches (less GPU
-            # contention); always resume, even on failure/timeout.
-            set_paused(True)
+            # Optionally pause the actor+learner for the matches; default off (see
+            # --pause-actor). Always resume in finally if we did pause.
+            if args.pause_actor:
+                set_paused(True)
             try:
                 results = []
                 for i, (label, og, ock) in enumerate(pool):
@@ -235,10 +254,13 @@ def main() -> None:
                     results.append((label, og, s))
             except Exception as e:
                 print(f"gen{gen}: eval failed: {e}", flush=True)
+                if args.once:
+                    return
                 time.sleep(args.interval)
                 continue
             finally:
-                set_paused(False)
+                if args.pause_actor:
+                    set_paused(False)
 
             # Fold this pass's games into the cumulative matrix, then re-fit ALL
             # ratings (old models' ratings move too, since they're in the graph).
@@ -270,7 +292,12 @@ def main() -> None:
             vb = f"{vs_best:.2f}" if vs_best is not None else "n/a"
             print(f"gen{gen}: rating {new_elo:+.0f} (best gen{state['best_gen']} "
                   f"{best_elo:+.0f})  vs_best {vb}  [{pool_str}]  [{tag}]", flush=True)
+            rated = True
             break  # rated the latest; resume training, recheck after the interval
+        if args.once:
+            if not rated:
+                print("evaluator --once: no new snapshot to rate", flush=True)
+            return
         time.sleep(args.interval)
 
 

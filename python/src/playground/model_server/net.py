@@ -1,11 +1,11 @@
 """Connect 4 network for the ModelService.
 
 The reification-based MuZero variant's heads (see docs/algorithm.md) over a
-`GS_DIM` tanh latent (the GS / LatentGameState):
+`LGS_DIM` tanh latent (the LGS / LatentGameState):
 
-  encoder : 2×6×7 planes (side-to-move's stones, opponent's) -> GS
-  eval    : GS -> scalar value in [-1, 1] (outcome for the side to move)
-  policy  : GS -> per-column prior + predicted next-GS
+  encoder : 2×6×7 planes (side-to-move's stones, opponent's) -> LGS
+  eval    : LGS -> scalar value in [-1, 1] (outcome for the side to move)
+  policy  : LGS -> per-column prior + predicted next-LGS
   reifier : decode a policy edge back to a concrete move
 
 Connect 4's action space is just the 7 columns, so policy candidate *i*
@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-GS_DIM = 64
+LGS_DIM = 64
 ACTION_DIM = 16
 
 # Connect 4 board (must match crates/games/connect4/src/game.rs encoding).
@@ -72,17 +72,17 @@ class _C4Base(nn.Module):
     """Shared heads + inference over a `_trunk(planes) -> (B, trunk_features)`.
 
     Subclasses pick the trunk (a small 2-conv net or a ResNet); the encoder fc,
-    eval head, and policy heads (prior over columns + predicted next-GS) are
+    eval head, and policy heads (prior over columns + predicted next-LGS) are
     common, so checkpoints differ only in trunk weights.
     """
 
     def __init__(self, trunk_features: int) -> None:
         super().__init__()
-        self.enc_fc = nn.Linear(trunk_features, GS_DIM)
-        self.val_fc1 = nn.Linear(GS_DIM, 64)
+        self.enc_fc = nn.Linear(trunk_features, LGS_DIM)
+        self.val_fc1 = nn.Linear(LGS_DIM, 64)
         self.val_fc2 = nn.Linear(64, 1)
-        self.pol_prior = nn.Linear(GS_DIM, C4_COLS)
-        self.pol_next = nn.Linear(GS_DIM, C4_COLS * GS_DIM)
+        self.pol_prior = nn.Linear(LGS_DIM, C4_COLS)
+        self.pol_next = nn.Linear(LGS_DIM, C4_COLS * LGS_DIM)
 
     def _trunk(self, planes: torch.Tensor) -> torch.Tensor:  # pragma: no cover
         raise NotImplementedError
@@ -91,30 +91,30 @@ class _C4Base(nn.Module):
     def encode_batch(self, planes: torch.Tensor) -> torch.Tensor:
         return torch.tanh(self.enc_fc(self._trunk(planes)))
 
-    def value_batch(self, gs: torch.Tensor) -> torch.Tensor:
-        x = F.relu(self.val_fc1(gs))
+    def value_batch(self, lgs: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.val_fc1(lgs))
         return torch.tanh(self.val_fc2(x)).squeeze(-1)
 
     def forward(self, planes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """(B,2,6,7) -> (value (B,), policy logits (B,7)). Used by training."""
-        gs = self.encode_batch(planes)
-        return self.value_batch(gs), self.pol_prior(gs)
+        lgs = self.encode_batch(planes)
+        return self.value_batch(lgs), self.pol_prior(lgs)
 
     def policy_value(self, planes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """(B,2,6,7) -> (value (B,), policy probs (B,7)). Used by self-play MCTS."""
-        gs = self.encode_batch(planes)
-        return self.value_batch(gs), F.softmax(self.pol_prior(gs), dim=-1)
+        lgs = self.encode_batch(planes)
+        return self.value_batch(lgs), F.softmax(self.pol_prior(lgs), dim=-1)
 
     # — single-example (model server inference) —
     def encode(self, planes: torch.Tensor) -> torch.Tensor:
         return self.encode_batch(planes.unsqueeze(0)).squeeze(0)
 
-    def value(self, gs: torch.Tensor) -> float:
-        return float(self.value_batch(gs.unsqueeze(0)).item())
+    def value(self, lgs: torch.Tensor) -> float:
+        return float(self.value_batch(lgs.unsqueeze(0)).item())
 
-    def policy(self, gs: torch.Tensor, top_b: int):
-        priors = F.softmax(self.pol_prior(gs), dim=-1)
-        nexts = torch.tanh(self.pol_next(gs)).view(C4_COLS, GS_DIM)
+    def policy(self, lgs: torch.Tensor, top_b: int):
+        priors = F.softmax(self.pol_prior(lgs), dim=-1)
+        nexts = torch.tanh(self.pol_next(lgs)).view(C4_COLS, LGS_DIM)
         order = torch.argsort(priors, descending=True)
         out = []
         for i in order[: max(0, top_b)]:
@@ -200,10 +200,10 @@ def load_checkpoint(model: _C4Base, path: str) -> None:
     model.load_state_dict(load_file(path))
 
 
-def gs_to_bytes(gs: torch.Tensor) -> bytes:
-    return gs.detach().to(torch.float32).contiguous().numpy().tobytes()
+def lgs_to_bytes(lgs: torch.Tensor) -> bytes:
+    return lgs.detach().to(torch.float32).contiguous().numpy().tobytes()
 
 
-def gs_from_bytes(payload: bytes) -> torch.Tensor:
+def lgs_from_bytes(payload: bytes) -> torch.Tensor:
     arr = np.frombuffer(bytes(payload), dtype="<f4").copy()
     return torch.from_numpy(arr)

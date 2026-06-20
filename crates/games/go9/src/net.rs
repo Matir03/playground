@@ -6,10 +6,10 @@
 //! `.safetensors` Python writes; the architecture is read from the sibling
 //! `config.json` (`{"arch": {"kind": "go9-resnet", "channels", "blocks"}}`).
 //!
-//! Contract (so GS bytes are interchangeable with Python):
+//! Contract (so LGS bytes are interchangeable with Python):
 //!   * planes are 3×9×9 (side-to-move stones, opponent stones, side-to-move
 //!     constant), matching `Go9::to_features`;
-//!   * GS is `GS_DIM` little-endian f32, shape `[GS_DIM]`;
+//!   * LGS is `LGS_DIM` little-endian f32, shape `[LGS_DIM]`;
 //!   * an action vector is 16 little-endian f32 with slot 0 = the action index
 //!     (0..80 = play r*9+c, 81 = pass);
 //!   * reify is a structural action-index decode clamped to legal moves.
@@ -27,7 +27,7 @@ use playground_core::{Game, LatentGameState, ModelClient, PolicyCandidate};
 
 use crate::game::{Go9, Go9Move, Go9State, N};
 
-pub const GS_DIM: usize = 128;
+pub const LGS_DIM: usize = 128;
 const CELLS: usize = N * N; // 81
 pub const ACTIONS: usize = CELLS + 1; // 82: board points + pass
 const PASS: usize = CELLS; // action index of pass
@@ -84,15 +84,15 @@ impl Net {
             stem: conv2d(IN_PLANES, channels, 3, cfg, vb.pp("stem"))?,
             stem_bn: batch_norm(channels, BatchNormConfig::default(), vb.pp("stem_bn"))?,
             blocks,
-            enc_fc: linear(channels * CELLS, GS_DIM, vb.pp("enc_fc"))?,
-            val_fc1: linear(GS_DIM, 64, vb.pp("val_fc1"))?,
+            enc_fc: linear(channels * CELLS, LGS_DIM, vb.pp("enc_fc"))?,
+            val_fc1: linear(LGS_DIM, 64, vb.pp("val_fc1"))?,
             val_fc2: linear(64, 1, vb.pp("val_fc2"))?,
-            pol_prior: linear(GS_DIM, ACTIONS, vb.pp("pol_prior"))?,
-            pol_next: linear(GS_DIM, ACTIONS * GS_DIM, vb.pp("pol_next"))?,
+            pol_prior: linear(LGS_DIM, ACTIONS, vb.pp("pol_prior"))?,
+            pol_next: linear(LGS_DIM, ACTIONS * LGS_DIM, vb.pp("pol_next"))?,
         })
     }
 
-    /// planes (B,3,9,9) -> GS (B,GS_DIM), tanh-bounded.
+    /// planes (B,3,9,9) -> LGS (B,LGS_DIM), tanh-bounded.
     fn encode(&self, planes: &Tensor) -> candle_core::Result<Tensor> {
         let mut x = self.stem_bn.forward_t(&self.stem.forward(planes)?, false)?.relu()?;
         for blk in &self.blocks {
@@ -102,34 +102,34 @@ impl Net {
         self.enc_fc.forward(&x)?.tanh()
     }
 
-    /// GS (1,GS_DIM) -> scalar value in [-1, 1] for the side to move.
-    fn value(&self, gs: &Tensor) -> candle_core::Result<f32> {
-        let x = self.val_fc1.forward(gs)?.relu()?;
+    /// LGS (1,LGS_DIM) -> scalar value in [-1, 1] for the side to move.
+    fn value(&self, lgs: &Tensor) -> candle_core::Result<f32> {
+        let x = self.val_fc1.forward(lgs)?.relu()?;
         let v = self.val_fc2.forward(&x)?.tanh()?;
         Ok(v.flatten_all()?.to_vec1::<f32>()?[0])
     }
 
     /// Batched self-play forward: planes (B,3,9,9) -> (values[B], probs[B*82]).
     fn value_policy_batch(&self, planes: &Tensor) -> candle_core::Result<(Vec<f32>, Vec<f32>)> {
-        let gs = self.encode(planes)?;
-        let x = self.val_fc1.forward(&gs)?.relu()?;
+        let lgs = self.encode(planes)?;
+        let x = self.val_fc1.forward(&lgs)?.relu()?;
         let v = self.val_fc2.forward(&x)?.tanh()?;
         let vals = v.flatten_all()?.to_vec1::<f32>()?;
-        let pri = candle_nn::ops::softmax(&self.pol_prior.forward(&gs)?, 1)?;
+        let pri = candle_nn::ops::softmax(&self.pol_prior.forward(&lgs)?, 1)?;
         let probs = pri.flatten_all()?.to_vec1::<f32>()?;
         Ok((vals, probs))
     }
 
-    /// GS (1,GS_DIM) -> (priors over 82, predicted next-GS per action (82,GS_DIM)).
-    fn policy_heads(&self, gs: &Tensor) -> candle_core::Result<(Vec<f32>, Tensor)> {
-        let priors = candle_nn::ops::softmax(&self.pol_prior.forward(gs)?, 1)?;
-        let nexts = self.pol_next.forward(gs)?.tanh()?.reshape((ACTIONS, GS_DIM))?;
+    /// LGS (1,LGS_DIM) -> (priors over 82, predicted next-LGS per action (82,LGS_DIM)).
+    fn policy_heads(&self, lgs: &Tensor) -> candle_core::Result<(Vec<f32>, Tensor)> {
+        let priors = candle_nn::ops::softmax(&self.pol_prior.forward(lgs)?, 1)?;
+        let nexts = self.pol_next.forward(lgs)?.tanh()?.reshape((ACTIONS, LGS_DIM))?;
         Ok((priors.flatten_all()?.to_vec1::<f32>()?, nexts))
     }
 }
 
 /// Traditional AlphaZero net (benchmark baseline): ResNet trunk + standard conv
-/// policy & value heads reading the spatial trunk directly — no GS latent, no
+/// policy & value heads reading the spatial trunk directly — no LGS latent, no
 /// reifier. Mirrors `go9_net.py` Go9AZNet (parameter names must stay in sync).
 struct AzNet {
     stem: Conv2d,
@@ -287,12 +287,12 @@ impl LocalModel {
         Tensor::from_vec(data, (1, IN_PLANES, N, N), &self.device)
     }
 
-    fn gs_tensor(&self, gs: &LatentGameState) -> candle_core::Result<Tensor> {
-        Tensor::from_vec(f32_le(&gs.payload), (1, GS_DIM), &self.device)
+    fn lgs_tensor(&self, lgs: &LatentGameState) -> candle_core::Result<Tensor> {
+        Tensor::from_vec(f32_le(&lgs.payload), (1, LGS_DIM), &self.device)
     }
 
     fn gs_state(&self, payload: Vec<f32>) -> LatentGameState {
-        LatentGameState::new(f32_to_bytes(&payload), vec![GS_DIM as i32], self.model_version.clone())
+        LatentGameState::new(f32_to_bytes(&payload), vec![LGS_DIM as i32], self.model_version.clone())
     }
 
     /// AlphaZero-style self-play forward: state -> (value, softmax over 82).
@@ -339,32 +339,32 @@ impl ModelClient<Go9> for LocalModel {
         let Backbone::Reif(net) = &self.net else {
             anyhow::bail!("go9-az net has no latent encoder; reification MCTS unsupported");
         };
-        let gs = net.encode(&self.planes(state)?)?.flatten_all()?.to_vec1::<f32>()?;
-        Ok(self.gs_state(gs))
+        let lgs = net.encode(&self.planes(state)?)?.flatten_all()?.to_vec1::<f32>()?;
+        Ok(self.gs_state(lgs))
     }
 
-    async fn eval(&self, gs: &LatentGameState) -> anyhow::Result<f64> {
+    async fn eval(&self, lgs: &LatentGameState) -> anyhow::Result<f64> {
         let Backbone::Reif(net) = &self.net else {
             anyhow::bail!("go9-az net: latent eval unsupported");
         };
-        Ok(net.value(&self.gs_tensor(gs)?)? as f64)
+        Ok(net.value(&self.lgs_tensor(lgs)?)? as f64)
     }
 
-    async fn policy(&self, gs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>> {
+    async fn policy(&self, lgs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>> {
         let Backbone::Reif(net) = &self.net else {
             anyhow::bail!("go9-az net: latent policy unsupported");
         };
-        let t = self.gs_tensor(gs)?;
+        let t = self.lgs_tensor(lgs)?;
         let (priors, nexts) = net.policy_heads(&t)?;
         let mut order: Vec<usize> = (0..ACTIONS).collect();
         order.sort_by(|&a, &b| priors[b].total_cmp(&priors[a]));
         let mut out = Vec::with_capacity(top_b as usize);
         for &a in order.iter().take(top_b as usize) {
-            let next_gs = nexts.get(a)?.to_vec1::<f32>()?;
+            let next_lgs = nexts.get(a)?.to_vec1::<f32>()?;
             out.push(PolicyCandidate {
                 prior: priors[a] as f64,
                 action_vector: Bytes::from(action_vector_for(a)),
-                next_gs: self.gs_state(next_gs),
+                next_lgs: self.gs_state(next_lgs),
             });
         }
         Ok(out)
@@ -373,8 +373,8 @@ impl ModelClient<Go9> for LocalModel {
     async fn reify(
         &self,
         from_state: &Go9State,
-        _from_gs: &LatentGameState,
-        _to_gs: &LatentGameState,
+        _from_lgs: &LatentGameState,
+        _to_lgs: &LatentGameState,
         action_seed: Option<&[u8]>,
         _noise_scale: Option<f64>,
     ) -> anyhow::Result<Go9Move> {
