@@ -40,15 +40,19 @@ impl MixturePolicy {
     }
 
     /// log p(x) under the mixture (stable log-sum-exp over components). `x` has
-    /// length `dim`.
+    /// length `dim`. Allocation-free (stack scratch); this is on the search hot
+    /// path. Supports up to `MAX_COMPONENTS` mixture components.
     pub fn log_density(&self, x: &[f32]) -> f64 {
+        const MAX_COMPONENTS: usize = 64;
         let d = self.dim;
+        let k = self.k();
+        debug_assert!(k <= MAX_COMPONENTS, "mixture k={k} exceeds MAX_COMPONENTS");
         let ln_2pi = (2.0 * std::f64::consts::PI).ln();
-        let mut logs: Vec<f64> = Vec::with_capacity(self.k());
-        for c in 0..self.k() {
+        let mut logs = [f64::NEG_INFINITY; MAX_COMPONENTS];
+        let mut m = f64::NEG_INFINITY;
+        for c in 0..k.min(MAX_COMPONENTS) {
             let w = self.weights[c] as f64;
             if w <= 0.0 {
-                logs.push(f64::NEG_INFINITY);
                 continue;
             }
             let (mut quad, mut logdet) = (0.0f64, 0.0f64);
@@ -59,13 +63,20 @@ impl MixturePolicy {
                 quad += z * z;
                 logdet += sd.ln();
             }
-            logs.push(w.ln() - 0.5 * (quad + d as f64 * ln_2pi) - logdet);
+            let l = w.ln() - 0.5 * (quad + d as f64 * ln_2pi) - logdet;
+            logs[c] = l;
+            if l > m {
+                m = l;
+            }
         }
-        let m = logs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         if m == f64::NEG_INFINITY {
             return f64::NEG_INFINITY;
         }
-        m + logs.iter().map(|&l| (l - m).exp()).sum::<f64>().ln()
+        let mut s = 0.0;
+        for &l in logs.iter().take(k.min(MAX_COMPONENTS)) {
+            s += (l - m).exp();
+        }
+        m + s.ln()
     }
 
     /// p(x) under the mixture.

@@ -15,9 +15,11 @@
 //! parent and each child with the live net, so targets live in the current
 //! latent space (the policy/reifier/consistency losses need that).
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io::Write;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::time::Instant;
@@ -220,6 +222,34 @@ enum OpOut {
     Logits(Vec<f32>),
 }
 
+type PolOut = (usize, Vec<f32>, Vec<f32>, Vec<f32>);
+
+/// Transposition cache over *real-state* forwards (`encode`, `policy`), shared
+/// across worker threads. Connect 4 transposes heavily, so the same board state
+/// recurs across games/searches; caching removes the (dominant) conv forwards.
+/// `eval`/`reify` are not cached — they hit unique sampled latents and would
+/// pollute the cache. Keyed by a hash of the input floats.
+#[derive(Default)]
+struct Cache {
+    encode: Mutex<HashMap<u64, Arc<Vec<f32>>>>,
+    policy: Mutex<HashMap<u64, Arc<PolOut>>>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+/// FNV-1a over the float bit patterns (collision-safe at our scale; avoids
+/// allocating a byte-vector key on the hot path).
+fn hash_f32s(v: &[f32]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &x in v {
+        for b in x.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
 /// Per-thread wave state: each slot holds at most one pending request + its
 /// result. The `Mutex` only satisfies `LatentModel: Send + Sync`; it is
 /// uncontended (a single driver thread per lane).
@@ -340,6 +370,7 @@ struct ThreadOut {
 #[allow(clippy::too_many_arguments)]
 fn drive_thread(
     server: &LgsServer,
+    cache: &Cache,
     in_flight: usize,
     game_start: usize,
     game_end: usize,
@@ -400,13 +431,15 @@ fn drive_thread(
         if !any && next_game >= game_end {
             break;
         }
-        process_wave(server, &lane, in_flight, &mut out);
+        process_wave(server, cache, &lane, in_flight, &mut out);
     }
     out
 }
 
-/// Collect the wave's pending ops, run one batched forward per type, write back.
-fn process_wave(server: &LgsServer, lane: &Arc<Mutex<Lane>>, in_flight: usize, out: &mut ThreadOut) {
+/// Collect the wave's pending ops, serve `encode`/`policy` from the transposition
+/// cache where possible, run one batched forward per type over the misses, write
+/// results back. `eval`/`reify` are always forwarded (uncacheable inputs).
+fn process_wave(server: &LgsServer, cache: &Cache, lane: &Arc<Mutex<Lane>>, in_flight: usize, out: &mut ThreadOut) {
     let mut enc: Vec<(usize, Vec<f32>)> = Vec::new();
     let mut ev: Vec<(usize, Vec<f32>)> = Vec::new();
     let mut pol: Vec<(usize, Vec<f32>)> = Vec::new();
@@ -430,18 +463,89 @@ fn process_wave(server: &LgsServer, lane: &Arc<Mutex<Lane>>, in_flight: usize, o
     out.batches += 1;
     out.samples += total as u64;
 
+    // ENCODE — cached by planes (real states only).
     if !enc.is_empty() {
-        let b = enc.len();
-        let mut flat = Vec::with_capacity(b * PLANES);
-        for (_, p) in &enc {
-            flat.extend_from_slice(p);
+        let mut miss: Vec<(usize, Vec<f32>)> = Vec::new();
+        let mut miss_keys: Vec<u64> = Vec::new();
+        {
+            let cmap = cache.encode.lock().unwrap();
+            let mut l = lane.lock().unwrap();
+            for (slot, p) in enc {
+                let k = hash_f32s(&p);
+                if let Some(v) = cmap.get(&k) {
+                    l.result[slot] = Some(OpOut::Lgs(v.as_ref().clone()));
+                    cache.hits.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    miss_keys.push(k);
+                    miss.push((slot, p));
+                    cache.misses.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
-        let r = server.encode_batch(&flat, b).expect("encode_batch");
-        let mut l = lane.lock().unwrap();
-        for (i, (slot, _)) in enc.into_iter().enumerate() {
-            l.result[slot] = Some(OpOut::Lgs(r[i * LGS_DIM..(i + 1) * LGS_DIM].to_vec()));
+        if !miss.is_empty() {
+            let b = miss.len();
+            let mut flat = Vec::with_capacity(b * PLANES);
+            for (_, p) in &miss {
+                flat.extend_from_slice(p);
+            }
+            let r = server.encode_batch(&flat, b).expect("encode_batch");
+            let mut cmap = cache.encode.lock().unwrap();
+            let mut l = lane.lock().unwrap();
+            for (i, (slot, _)) in miss.into_iter().enumerate() {
+                let v = r[i * LGS_DIM..(i + 1) * LGS_DIM].to_vec();
+                cmap.insert(miss_keys[i], Arc::new(v.clone()));
+                l.result[slot] = Some(OpOut::Lgs(v));
+            }
         }
     }
+
+    // POLICY — cached by lgs (real node states only).
+    if !pol.is_empty() {
+        let mut miss: Vec<(usize, Vec<f32>)> = Vec::new();
+        let mut miss_keys: Vec<u64> = Vec::new();
+        {
+            let cmap = cache.policy.lock().unwrap();
+            let mut l = lane.lock().unwrap();
+            for (slot, x) in pol {
+                let k = hash_f32s(&x);
+                if let Some(v) = cmap.get(&k) {
+                    let (kk, w, mu, std) = v.as_ref();
+                    l.result[slot] = Some(OpOut::Pol(MixturePolicy {
+                        dim: LGS_DIM,
+                        weights: w.clone(),
+                        means: mu.clone(),
+                        stds: std.clone(),
+                    }));
+                    let _ = kk;
+                    cache.hits.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    miss_keys.push(k);
+                    miss.push((slot, x));
+                    cache.misses.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        if !miss.is_empty() {
+            let b = miss.len();
+            let mut flat = Vec::with_capacity(b * LGS_DIM);
+            for (_, x) in &miss {
+                flat.extend_from_slice(x);
+            }
+            let (k, w, mu, std) = server.policy_batch(&flat, b).expect("policy_batch");
+            let md = k * LGS_DIM;
+            let mut cmap = cache.policy.lock().unwrap();
+            let mut l = lane.lock().unwrap();
+            for (i, (slot, _)) in miss.into_iter().enumerate() {
+                let wi = w[i * k..(i + 1) * k].to_vec();
+                let mui = mu[i * md..(i + 1) * md].to_vec();
+                let stdi = std[i * md..(i + 1) * md].to_vec();
+                cmap.insert(miss_keys[i], Arc::new((k, wi.clone(), mui.clone(), stdi.clone())));
+                l.result[slot] = Some(OpOut::Pol(MixturePolicy { dim: LGS_DIM, weights: wi, means: mui, stds: stdi }));
+            }
+        }
+    }
+
+    // EVAL — always forwarded (candidate evals hit unique sampled latents).
     if !ev.is_empty() {
         let b = ev.len();
         let mut flat = Vec::with_capacity(b * LGS_DIM);
@@ -454,24 +558,8 @@ fn process_wave(server: &LgsServer, lane: &Arc<Mutex<Lane>>, in_flight: usize, o
             l.result[slot] = Some(OpOut::Val(r[i]));
         }
     }
-    if !pol.is_empty() {
-        let b = pol.len();
-        let mut flat = Vec::with_capacity(b * LGS_DIM);
-        for (_, x) in &pol {
-            flat.extend_from_slice(x);
-        }
-        let (k, w, mu, std) = server.policy_batch(&flat, b).expect("policy_batch");
-        let md = k * LGS_DIM;
-        let mut l = lane.lock().unwrap();
-        for (i, (slot, _)) in pol.into_iter().enumerate() {
-            l.result[slot] = Some(OpOut::Pol(MixturePolicy {
-                dim: LGS_DIM,
-                weights: w[i * k..(i + 1) * k].to_vec(),
-                means: mu[i * md..(i + 1) * md].to_vec(),
-                stds: std[i * md..(i + 1) * md].to_vec(),
-            }));
-        }
-    }
+
+    // REIFY — always forwarded.
     if !rei.is_empty() {
         let b = rei.len();
         let mut from = Vec::with_capacity(b * LGS_DIM);
@@ -515,6 +603,7 @@ pub fn run_generate_batched(
     );
 
     let t0 = Instant::now();
+    let cache = Arc::new(Cache::default());
     let per = n_games.div_ceil(threads.max(1));
     let outs: Vec<ThreadOut> = std::thread::scope(|scope| {
         let mut handles = Vec::new();
@@ -525,10 +614,11 @@ pub fn run_generate_batched(
                 break;
             }
             let server = server.clone();
+            let cache = cache.clone();
             let cfg = cfg.clone();
             let version = version.clone();
             handles.push(scope.spawn(move || {
-                drive_thread(&server, in_flight, start, end, &cfg, temp_moves, seed, &version)
+                drive_thread(&server, &cache, in_flight, start, end, &cfg, temp_moves, seed, &version)
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -544,9 +634,12 @@ pub fn run_generate_batched(
     }
     write_dump(out_path, &all)?;
     let dt = t0.elapsed().as_secs_f64();
+    let hits = cache.hits.load(Ordering::Relaxed);
+    let misses = cache.misses.load(Ordering::Relaxed);
+    let hit_rate = if hits + misses > 0 { hits as f64 / (hits + misses) as f64 } else { 0.0 };
     eprintln!(
         "  wrote {} examples ({} games) in {:.1}s  ({:.1} games/s, {} reifications)\n  \
-         avg_batch {:.0}  net-ops/s {:.0}  ({:.1}k forwards/s effective)",
+         avg_batch {:.0}  net-ops/s {:.0}  ({:.1}k forwards/s)  cache_hit {:.0}% (encode+policy)",
         all.len(),
         n_games,
         dt,
@@ -555,6 +648,7 @@ pub fn run_generate_batched(
         samples as f64 / batches.max(1) as f64,
         samples as f64 / dt,
         samples as f64 / dt / 1000.0,
+        100.0 * hit_rate,
     );
     Ok(())
 }

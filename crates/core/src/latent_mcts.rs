@@ -257,9 +257,11 @@ fn widen<G: Game>(node: &mut Node<G>, config: &SearchConfig, rng: &mut ChaCha8Rn
     if node.candidates.len() >= target {
         return;
     }
-    if let Some(pol) = node.policy.clone() {
-        while node.candidates.len() < target {
-            node.candidates.push(Candidate {
+    // Disjoint field borrows avoid cloning the (k·d) MixturePolicy each widen.
+    let Node { policy, candidates, .. } = node;
+    if let Some(pol) = policy.as_ref() {
+        while candidates.len() < target {
+            candidates.push(Candidate {
                 point: pol.sample(rng),
                 visits: 0,
                 value_sum: 0.0,
@@ -270,35 +272,41 @@ fn widen<G: Game>(node: &mut Node<G>, config: &SearchConfig, rng: &mut ChaCha8Rn
 }
 
 /// KR-PUCT child selection (with forced playouts). Returns a candidate index.
+/// Stack scratch only — this is the search hot path (no per-call allocation).
 fn kr_puct_select<G: Game>(tree: &[Node<G>], node_idx: usize, config: &SearchConfig) -> usize {
+    const MAX_CAND: usize = 64;
     let node = &tree[node_idx];
-    let m = node.candidates.len();
-    debug_assert!(m > 0, "select on a node with no candidates");
+    debug_assert!(node.candidates.len() > 0, "select on a node with no candidates");
+    debug_assert!(node.candidates.len() <= MAX_CAND, "candidates exceed MAX_CAND");
+    let m = node.candidates.len().min(MAX_CAND);
 
-    // Effective counts and parent-POV value per candidate (merged for aliases).
-    let mut n_eff = vec![0f64; m];
-    let mut q = vec![0f64; m];
-    for (j, c) in node.candidates.iter().enumerate() {
+    // Effective counts, parent-POV value, and (unnormalized) MDN priors.
+    let pol = node.policy.as_ref().expect("expanded node has a policy");
+    let mut n_eff = [0f64; MAX_CAND];
+    let mut q = [0f64; MAX_CAND];
+    let mut p = [0f64; MAX_CAND];
+    let mut mx = f64::NEG_INFINITY;
+    for (j, c) in node.candidates.iter().take(m).enumerate() {
         let (n, vsum) = match c.reified {
             Some(ci) => (tree[ci].visits as f64, tree[ci].value_sum),
             None => (c.visits as f64, c.value_sum),
         };
         n_eff[j] = n;
         q[j] = if n > 0.0 { -(vsum / n) } else { config.fpu }; // child POV → parent POV
+        let l = pol.log_density(&c.point);
+        p[j] = l;
+        if l > mx {
+            mx = l;
+        }
     }
-
-    // MDN-density priors, normalized over the candidate set (log-sum-exp).
-    let pol = node.policy.as_ref().expect("expanded node has a policy");
-    let logd: Vec<f64> = node.candidates.iter().map(|c| pol.log_density(&c.point)).collect();
-    let mx = logd.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let mut p: Vec<f64> = if mx.is_finite() {
-        logd.iter().map(|l| (l - mx).exp()).collect()
-    } else {
-        vec![1.0; m]
-    };
-    let psum: f64 = p.iter().sum();
-    for x in &mut p {
-        *x = if psum > 0.0 { *x / psum } else { 1.0 / m as f64 };
+    // Normalize priors (softmax over candidate log-densities).
+    let mut psum = 0.0;
+    for v in p.iter_mut().take(m) {
+        *v = if mx.is_finite() { (*v - mx).exp() } else { 1.0 };
+        psum += *v;
+    }
+    for v in p.iter_mut().take(m) {
+        *v = if psum > 0.0 { *v / psum } else { 1.0 / m as f64 };
     }
 
     // Forced playouts: a reified child below its floor is selected first.
