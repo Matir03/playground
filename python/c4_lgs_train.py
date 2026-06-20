@@ -88,7 +88,11 @@ def main() -> None:
     ap.add_argument("--wd", type=float, default=1e-4)
     ap.add_argument("--lpi", type=float, default=1.0, help="MDN policy weight")
     ap.add_argument("--lrho", type=float, default=1.0, help="reifier weight")
-    ap.add_argument("--lc", type=float, default=0.1, help="consistency weight")
+    # Consistency defaults OFF: the exact-match form (α·d_lat ≈ d_func) collapses
+    # the latent while the value head is still ≈constant (d_func≈0 ⇒ d_lat→0),
+    # which kills value/reifier learning (docs/algorithm.md "central tension").
+    # Re-enable later as a ramped anti-collapse (Lipschitz) term.
+    ap.add_argument("--lc", type=float, default=0.0, help="consistency weight (0 = off)")
     ap.add_argument("--ent", type=float, default=1e-3, help="mixture-entropy bonus")
     ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
@@ -142,7 +146,10 @@ def main() -> None:
             lrho = torch.zeros((), device=dev)
             for c in range(MAX_CHILDREN):
                 m = pi[:, c]  # (B,)
-                logp = M.mdn_log_prob(e_child[:, c], w, mu, std)  # (B,)
+                # Per-dimension NLL: a d-dim Gaussian log-density is ~O(d), which
+                # otherwise swamps the value/reifier gradients on the shared
+                # encoder. Normalizing by d puts all loss terms on an O(1) scale.
+                logp = M.mdn_log_prob(e_child[:, c], w, mu, std) / M.LGS_DIM  # (B,)
                 lpi = lpi - (m * logp).sum()
                 rlog = net.reify_logits(e_parent, e_child[:, c])  # (B,7)
                 ce = F.cross_entropy(rlog, bcol[:, c], reduction="none")
