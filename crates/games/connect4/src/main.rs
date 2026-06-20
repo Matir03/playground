@@ -279,13 +279,16 @@ enum Cmd {
         /// KR kernel bandwidth h over next-LGS points.
         #[arg(long, default_value_t = 0.7)]
         kernel_bandwidth: f64,
-        /// Games in flight per worker thread (>1 uses the lockstep batched path;
-        /// the batch size of each forward ≈ this value).
+        /// Games in flight per worker thread (>1 uses the central-batched path).
+        /// Pool = threads × this; keep pool ≫ max_batch.
         #[arg(long, default_value_t = 1)]
         concurrency: usize,
-        /// Worker threads driving independent lockstep waves (parallel tree work).
+        /// Worker threads (parallel tree work) feeding the inference server.
         #[arg(long)]
         threads: Option<usize>,
+        /// Fixed inference batch size the central server coalesces up to.
+        #[arg(long, default_value_t = 256)]
+        max_batch: usize,
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
@@ -422,15 +425,15 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::LgsGen {
             model, out, cuda, games, sims, temp_moves, c_puct, kernel_bandwidth,
-            concurrency, threads, seed,
+            concurrency, threads, max_batch, seed,
         } => {
             if concurrency > 1 {
                 let threads = threads.unwrap_or_else(default_threads);
-                // Lockstep self-play is synchronous + CPU-bound; run off the runtime.
+                // Central-batched self-play is synchronous + CPU-bound; run off the runtime.
                 tokio::task::spawn_blocking(move || {
                     lgs_selfplay::run_generate_batched(
-                        &model, cuda, &out, games, concurrency, threads, sims, temp_moves,
-                        c_puct, kernel_bandwidth, seed,
+                        &model, cuda, &out, games, concurrency, threads, max_batch, sims,
+                        temp_moves, c_puct, kernel_bandwidth, seed,
                     )
                 })
                 .await??;
