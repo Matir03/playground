@@ -226,17 +226,49 @@ enum OpOut {
 
 type PolOut = (usize, Vec<f32>, Vec<f32>, Vec<f32>);
 
+/// A sharded concurrent map (key → Arc<V>). Sharding + per-key-short locks keep
+/// the many worker threads from serializing on one cache mutex.
+struct ShardCache<V> {
+    shards: Vec<Mutex<HashMap<u64, Arc<V>>>>,
+}
+
+impl<V> ShardCache<V> {
+    fn new(shards: usize) -> Self {
+        Self { shards: (0..shards).map(|_| Mutex::new(HashMap::new())).collect() }
+    }
+    #[inline]
+    fn shard(&self, key: u64) -> &Mutex<HashMap<u64, Arc<V>>> {
+        &self.shards[(key % self.shards.len() as u64) as usize]
+    }
+    fn get(&self, key: u64) -> Option<Arc<V>> {
+        self.shard(key).lock().unwrap().get(&key).cloned()
+    }
+    fn insert(&self, key: u64, v: Arc<V>) {
+        self.shard(key).lock().unwrap().insert(key, v);
+    }
+}
+
 /// Transposition cache over *real-state* forwards (`encode`, `policy`), shared
 /// across worker threads. Connect 4 transposes heavily, so the same board state
 /// recurs across games/searches; caching removes the (dominant) conv forwards.
 /// `eval`/`reify` are not cached — they hit unique sampled latents and would
 /// pollute the cache. Keyed by a hash of the input floats.
-#[derive(Default)]
 struct Cache {
-    encode: Mutex<HashMap<u64, Arc<Vec<f32>>>>,
-    policy: Mutex<HashMap<u64, Arc<PolOut>>>,
+    encode: ShardCache<Vec<f32>>,
+    policy: ShardCache<PolOut>,
     hits: AtomicU64,
     misses: AtomicU64,
+}
+
+impl Default for Cache {
+    fn default() -> Self {
+        Self {
+            encode: ShardCache::new(64),
+            policy: ShardCache::new(64),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+        }
+    }
 }
 
 /// FNV-1a over the float bit patterns (collision-safe at our scale; avoids
@@ -593,8 +625,19 @@ fn worker(
             break; // no active games and the budget is exhausted
         }
 
-        // Drain this round's ops; resolve encode/policy cache hits inline; build a
-        // wave of the misses (+ all eval/reify) for the central server.
+        // Drain this round's ops (brief lane lock — the lane is per-worker).
+        let mut reqs: Vec<(usize, Pending)> = Vec::with_capacity(in_flight);
+        {
+            let mut l = lane.lock().unwrap();
+            for slot in 0..in_flight {
+                if let Some(p) = l.request[slot].take() {
+                    reqs.push((slot, p));
+                }
+            }
+        }
+
+        // Resolve encode/policy cache hits (sharded, short locks); collect misses
+        // (+ all eval/reify) into a wave.
         let mut wave = Wave::default();
         let mut enc_slot: Vec<usize> = Vec::new();
         let mut enc_key: Vec<u64> = Vec::new();
@@ -602,53 +645,54 @@ fn worker(
         let mut pol_slot: Vec<usize> = Vec::new();
         let mut pol_key: Vec<u64> = Vec::new();
         let mut reif_slot: Vec<usize> = Vec::new();
-        {
-            let enc_map = cache.encode.lock().unwrap();
-            let pol_map = cache.policy.lock().unwrap();
-            let mut l = lane.lock().unwrap();
-            for slot in 0..in_flight {
-                match l.request[slot].take() {
-                    Some(Pending::Encode(p)) => {
-                        let k = hash_f32s(&p);
-                        if let Some(v) = enc_map.get(&k) {
-                            l.result[slot] = Some(OpOut::Lgs(v.as_ref().clone()));
-                            cache.hits.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            enc_slot.push(slot);
-                            enc_key.push(k);
-                            wave.enc.push(p);
-                            cache.misses.fetch_add(1, Ordering::Relaxed);
-                        }
+        let mut hits_out: Vec<(usize, OpOut)> = Vec::new();
+        for (slot, p) in reqs {
+            match p {
+                Pending::Encode(p) => {
+                    let k = hash_f32s(&p);
+                    if let Some(v) = cache.encode.get(k) {
+                        hits_out.push((slot, OpOut::Lgs(v.as_ref().clone())));
+                        cache.hits.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        enc_slot.push(slot);
+                        enc_key.push(k);
+                        wave.enc.push(p);
+                        cache.misses.fetch_add(1, Ordering::Relaxed);
                     }
-                    Some(Pending::Policy(x)) => {
-                        let k = hash_f32s(&x);
-                        if let Some(v) = pol_map.get(&k) {
-                            let (_, w, mu, std) = v.as_ref();
-                            l.result[slot] = Some(OpOut::Pol(MixturePolicy {
-                                dim: LGS_DIM,
-                                weights: w.clone(),
-                                means: mu.clone(),
-                                stds: std.clone(),
-                            }));
-                            cache.hits.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            pol_slot.push(slot);
-                            pol_key.push(k);
-                            wave.pol.push(x);
-                            cache.misses.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    Some(Pending::Eval(x)) => {
-                        eval_slot.push(slot);
-                        wave.eval.push(x);
-                    }
-                    Some(Pending::Reify(a, b)) => {
-                        reif_slot.push(slot);
-                        wave.reif_from.push(a);
-                        wave.reif_to.push(b);
-                    }
-                    None => {}
                 }
+                Pending::Policy(x) => {
+                    let k = hash_f32s(&x);
+                    if let Some(v) = cache.policy.get(k) {
+                        let (_, w, mu, std) = v.as_ref();
+                        hits_out.push((slot, OpOut::Pol(MixturePolicy {
+                            dim: LGS_DIM,
+                            weights: w.clone(),
+                            means: mu.clone(),
+                            stds: std.clone(),
+                        })));
+                        cache.hits.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        pol_slot.push(slot);
+                        pol_key.push(k);
+                        wave.pol.push(x);
+                        cache.misses.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Pending::Eval(x) => {
+                    eval_slot.push(slot);
+                    wave.eval.push(x);
+                }
+                Pending::Reify(a, b) => {
+                    reif_slot.push(slot);
+                    wave.reif_from.push(a);
+                    wave.reif_to.push(b);
+                }
+            }
+        }
+        if !hits_out.is_empty() {
+            let mut l = lane.lock().unwrap();
+            for (slot, o) in hits_out {
+                l.result[slot] = Some(o);
             }
         }
 
@@ -658,30 +702,33 @@ fn worker(
         tx.send(Job { wave, resp: resp_tx.clone() }).expect("inference server gone");
         let wo = resp_rx.recv().expect("inference response dropped");
 
-        // Write results back and populate the caches.
-        let mut enc_map = cache.encode.lock().unwrap();
-        let mut pol_map = cache.policy.lock().unwrap();
-        let mut l = lane.lock().unwrap();
-        for (i, &slot) in enc_slot.iter().enumerate() {
-            let v = &wo.enc[i];
-            enc_map.insert(enc_key[i], Arc::new(v.clone()));
-            l.result[slot] = Some(OpOut::Lgs(v.clone()));
+        // Populate caches (sharded), then write results back (brief lane lock).
+        for (i, _) in enc_slot.iter().enumerate() {
+            cache.encode.insert(enc_key[i], Arc::new(wo.enc[i].clone()));
         }
-        for (i, &slot) in pol_slot.iter().enumerate() {
-            let (k, w, mu, std) = &wo.pol[i];
-            pol_map.insert(pol_key[i], Arc::new((*k, w.clone(), mu.clone(), std.clone())));
-            l.result[slot] = Some(OpOut::Pol(MixturePolicy {
-                dim: LGS_DIM,
-                weights: w.clone(),
-                means: mu.clone(),
-                stds: std.clone(),
-            }));
+        for (i, _) in pol_slot.iter().enumerate() {
+            cache.policy.insert(pol_key[i], Arc::new(wo.pol[i].clone()));
         }
-        for (i, &slot) in eval_slot.iter().enumerate() {
-            l.result[slot] = Some(OpOut::Val(wo.eval[i]));
-        }
-        for (i, &slot) in reif_slot.iter().enumerate() {
-            l.result[slot] = Some(OpOut::Logits(wo.reif[i].clone()));
+        {
+            let mut l = lane.lock().unwrap();
+            for (i, &slot) in enc_slot.iter().enumerate() {
+                l.result[slot] = Some(OpOut::Lgs(wo.enc[i].clone()));
+            }
+            for (i, &slot) in pol_slot.iter().enumerate() {
+                let (_, w, mu, std) = &wo.pol[i];
+                l.result[slot] = Some(OpOut::Pol(MixturePolicy {
+                    dim: LGS_DIM,
+                    weights: w.clone(),
+                    means: mu.clone(),
+                    stds: std.clone(),
+                }));
+            }
+            for (i, &slot) in eval_slot.iter().enumerate() {
+                l.result[slot] = Some(OpOut::Val(wo.eval[i]));
+            }
+            for (i, &slot) in reif_slot.iter().enumerate() {
+                l.result[slot] = Some(OpOut::Logits(wo.reif[i].clone()));
+            }
         }
     }
     out
