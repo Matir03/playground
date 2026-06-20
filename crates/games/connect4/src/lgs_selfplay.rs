@@ -1,6 +1,13 @@
 //! LGS self-play for Connect 4 — generates v2 training records from the KR-PUCT
-//! latent search (docs/algorithm.md). Single-threaded and correctness-first; the
-//! batched / PCR throughput path is stage 3.
+//! latent search (docs/algorithm.md).
+//!
+//! Two drivers share `play_game` and the v2 record format:
+//!   * `run_generate` — single game at a time (correctness-first).
+//!   * `run_generate_batched` — synchronous **lockstep**: many games advance in
+//!     lockstep per worker thread; each wave coalesces the games' net ops into one
+//!     batched forward per op type (no channels / async overhead). This is the
+//!     throughput path (we diagnosed the async-server path as CPU/overhead-bound
+//!     with the GPU starved).
 //!
 //! Record v2 (fixed stride `REC_F32` little-endian f32 per training example):
 //!   parent planes (PLANES) | z (1) | MAX_CHILDREN × [col, visits, child planes]
@@ -8,16 +15,16 @@
 //! parent and each child with the live net, so targets live in the current
 //! latent space (the policy/reifier/consistency losses need that).
 
+use std::future::Future;
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinSet;
 
 use playground_core::latent_mcts::{search, RootChild, SearchConfig};
 use playground_core::{Game, LatentGameState, LatentModel, MixturePolicy, Outcome};
@@ -146,7 +153,7 @@ fn write_dump(out_path: &str, examples: &[(MoveRec, f32)]) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Generate `n_games` of LGS self-play and write a v2 dump to `out_path`.
+/// Single-game LGS self-play (correctness path). Writes a v2 dump.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_generate(
     checkpoint: &str,
@@ -161,17 +168,11 @@ pub async fn run_generate(
 ) -> anyhow::Result<()> {
     let device = crate::net::pick_device(cuda)?;
     let model = Arc::new(LgsModel::load_on(checkpoint, device)?);
-    let cfg = SearchConfig {
-        simulations: sims,
-        c_puct,
-        kernel_bandwidth,
-        seed: None,
-        ..Default::default()
-    };
+    let cfg = SearchConfig { simulations: sims, c_puct, kernel_bandwidth, seed: None, ..Default::default() };
     eprintln!(
         "c4 LGS self-play: {n_games} games, {sims} sims/move, h {kernel_bandwidth}, model {checkpoint} -> {out_path}"
     );
-    let t0 = std::time::Instant::now();
+    let t0 = Instant::now();
     let mut all: Vec<(MoveRec, f32)> = Vec::new();
     let mut reifications = 0u64;
     for g in 0..n_games {
@@ -193,171 +194,101 @@ pub async fn run_generate(
     Ok(())
 }
 
-// ── Batched throughput path ───────────────────────────────────────────────────
+// ── Lockstep throughput path ──────────────────────────────────────────────────
 //
-// One GPU-owning server thread coalesces encode/eval/policy/reify requests from
-// many concurrent async games into batched forwards. Reuses the async
-// `latent_mcts::search` unchanged; concurrency (not thread count) drives batch
-// size, so a few hundred in-flight games give large GPU batches. The candle
-// backend is device-agnostic — `--cuda` runs it on the GPU.
+// Each worker thread drives `in_flight` game futures (reusing the async
+// latent_mcts::search) in lockstep. A "wave" = poll every active game once; each
+// yields exactly one net op (encode/eval/policy/reify) or completes. We collect
+// the wave's ops, run one batched forward per type on the shared net, write the
+// results back, and poll again. Batch size ≈ in-flight games; no channels / async
+// runtime / per-op task churn. `T` threads run independent waves for parallel
+// tree work (the diagnosed CPU bottleneck).
 
-/// A batched-inference request: payload + a oneshot for the typed reply.
-enum Req {
-    Encode(Vec<f32>, oneshot::Sender<Vec<f32>>),
-    Eval(Vec<f32>, oneshot::Sender<f32>),
-    Policy(Vec<f32>, oneshot::Sender<(usize, Vec<f32>, Vec<f32>, Vec<f32>)>),
-    Reify(Vec<f32>, Vec<f32>, oneshot::Sender<Vec<f32>>),
+/// A net op a game yields this wave.
+enum Pending {
+    Encode(Vec<f32>),
+    Eval(Vec<f32>),
+    Policy(Vec<f32>),
+    Reify(Vec<f32>, Vec<f32>),
 }
 
-/// Inference server loop (runs on its own OS thread): block for a request, then
-/// **linger** briefly to accumulate a full batch (woken games re-queue their next
-/// request on the tokio workers; without a linger each forward sees a near-empty
-/// queue and is launch/sync-bound), run one batched forward per op type, scatter.
-fn serve(
-    mut rx: mpsc::UnboundedReceiver<Req>,
-    server: LgsServer,
-    max_batch: usize,
-    linger_us: u64,
-    counters: Arc<(AtomicU64, AtomicU64)>, // (batches, samples)
-) {
-    loop {
-        let first = match rx.blocking_recv() {
-            Some(r) => r,
-            None => break, // all senders dropped: shut down
-        };
-        let mut batch = vec![first];
-        let deadline = Instant::now() + Duration::from_micros(linger_us);
-        while batch.len() < max_batch {
-            match rx.try_recv() {
-                Ok(r) => batch.push(r),
-                Err(_) => {
-                    if linger_us == 0 || Instant::now() >= deadline {
-                        break;
-                    }
-                    std::thread::yield_now(); // spin until more arrive or deadline
-                }
-            }
-        }
-        counters.0.fetch_add(1, Ordering::Relaxed);
-        counters.1.fetch_add(batch.len() as u64, Ordering::Relaxed);
+/// The driver's reply to a yielded op.
+enum OpOut {
+    Lgs(Vec<f32>),
+    Val(f32),
+    Pol(MixturePolicy),
+    Logits(Vec<f32>),
+}
 
-        let mut enc = Vec::new();
-        let mut ev = Vec::new();
-        let mut pol = Vec::new();
-        let mut rei = Vec::new();
-        for r in batch {
-            match r {
-                Req::Encode(p, tx) => enc.push((p, tx)),
-                Req::Eval(l, tx) => ev.push((l, tx)),
-                Req::Policy(l, tx) => pol.push((l, tx)),
-                Req::Reify(a, b, tx) => rei.push((a, b, tx)),
-            }
-        }
+/// Per-thread wave state: each slot holds at most one pending request + its
+/// result. The `Mutex` only satisfies `LatentModel: Send + Sync`; it is
+/// uncontended (a single driver thread per lane).
+struct Lane {
+    request: Vec<Option<Pending>>,
+    result: Vec<Option<OpOut>>,
+}
 
-        if !enc.is_empty() {
-            let b = enc.len();
-            let mut flat = Vec::with_capacity(b * PLANES);
-            for (p, _) in &enc {
-                flat.extend_from_slice(p);
-            }
-            if let Ok(out) = server.encode_batch(&flat, b) {
-                for (i, (_, tx)) in enc.into_iter().enumerate() {
-                    let _ = tx.send(out[i * LGS_DIM..(i + 1) * LGS_DIM].to_vec());
-                }
-            }
-        }
-        if !ev.is_empty() {
-            let b = ev.len();
-            let mut flat = Vec::with_capacity(b * LGS_DIM);
-            for (l, _) in &ev {
-                flat.extend_from_slice(l);
-            }
-            if let Ok(out) = server.eval_batch(&flat, b) {
-                for (i, (_, tx)) in ev.into_iter().enumerate() {
-                    let _ = tx.send(out[i]);
-                }
-            }
-        }
-        if !pol.is_empty() {
-            let b = pol.len();
-            let mut flat = Vec::with_capacity(b * LGS_DIM);
-            for (l, _) in &pol {
-                flat.extend_from_slice(l);
-            }
-            if let Ok((k, w, mu, std)) = server.policy_batch(&flat, b) {
-                let md = k * LGS_DIM;
-                for (i, (_, tx)) in pol.into_iter().enumerate() {
-                    let _ = tx.send((
-                        k,
-                        w[i * k..(i + 1) * k].to_vec(),
-                        mu[i * md..(i + 1) * md].to_vec(),
-                        std[i * md..(i + 1) * md].to_vec(),
-                    ));
-                }
-            }
-        }
-        if !rei.is_empty() {
-            let b = rei.len();
-            let mut from = Vec::with_capacity(b * LGS_DIM);
-            let mut to = Vec::with_capacity(b * LGS_DIM);
-            for (a, c, _) in &rei {
-                from.extend_from_slice(a);
-                to.extend_from_slice(c);
-            }
-            if let Ok(out) = server.reify_batch(&from, &to, b) {
-                for (i, (_, _, tx)) in rei.into_iter().enumerate() {
-                    let _ = tx.send(out[i * C4_COLS..(i + 1) * C4_COLS].to_vec());
-                }
-            }
+/// A `LatentModel` bound to one game slot: registers each op into the lane and
+/// awaits the result the driver writes after the batched forward.
+struct LockstepModel {
+    slot: usize,
+    lane: Arc<Mutex<Lane>>,
+    version: String,
+}
+
+/// Future that resolves once the driver fills `lane.result[slot]`.
+struct OpFuture {
+    slot: usize,
+    lane: Arc<Mutex<Lane>>,
+}
+
+impl Future for OpFuture {
+    type Output = OpOut;
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<OpOut> {
+        match self.lane.lock().unwrap().result[self.slot].take() {
+            Some(r) => Poll::Ready(r),
+            None => Poll::Pending,
         }
     }
 }
 
-/// A `LatentModel` that routes each call to the batched server and awaits.
-struct BatchedLatentModel {
-    tx: mpsc::UnboundedSender<Req>,
-    version: String,
-}
-
-impl BatchedLatentModel {
-    fn gone() -> anyhow::Error {
-        anyhow::anyhow!("inference server gone")
+impl LockstepModel {
+    fn submit(&self, req: Pending) -> OpFuture {
+        self.lane.lock().unwrap().request[self.slot] = Some(req);
+        OpFuture { slot: self.slot, lane: self.lane.clone() }
     }
 }
 
 #[async_trait]
-impl LatentModel<Connect4> for BatchedLatentModel {
+impl LatentModel<Connect4> for LockstepModel {
     async fn encode(&self, state: &Connect4State) -> anyhow::Result<LatentGameState> {
-        let (tx, rx) = oneshot::channel();
-        self.tx.send(Req::Encode(planes_of(state).to_vec(), tx)).map_err(|_| Self::gone())?;
-        let v = rx.await.map_err(|_| Self::gone())?;
-        Ok(LatentGameState::from_f32(&v, self.version.clone()))
+        match self.submit(Pending::Encode(planes_of(state).to_vec())).await {
+            OpOut::Lgs(v) => Ok(LatentGameState::from_f32(&v, self.version.clone())),
+            _ => unreachable!("encode reply"),
+        }
     }
-
     async fn eval(&self, lgs: &LatentGameState) -> anyhow::Result<f64> {
-        let (tx, rx) = oneshot::channel();
-        self.tx.send(Req::Eval(lgs.to_f32(), tx)).map_err(|_| Self::gone())?;
-        Ok(rx.await.map_err(|_| Self::gone())? as f64)
+        match self.submit(Pending::Eval(lgs.to_f32())).await {
+            OpOut::Val(v) => Ok(v as f64),
+            _ => unreachable!("eval reply"),
+        }
     }
-
     async fn policy(&self, lgs: &LatentGameState) -> anyhow::Result<MixturePolicy> {
-        let (tx, rx) = oneshot::channel();
-        self.tx.send(Req::Policy(lgs.to_f32(), tx)).map_err(|_| Self::gone())?;
-        let (_k, weights, means, stds) = rx.await.map_err(|_| Self::gone())?;
-        Ok(MixturePolicy { dim: LGS_DIM, weights, means, stds })
+        match self.submit(Pending::Policy(lgs.to_f32())).await {
+            OpOut::Pol(p) => Ok(p),
+            _ => unreachable!("policy reply"),
+        }
     }
-
     async fn reify(
         &self,
         from_state: &Connect4State,
         from_lgs: &LatentGameState,
         to_lgs: &LatentGameState,
     ) -> anyhow::Result<Connect4Move> {
-        let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(Req::Reify(from_lgs.to_f32(), to_lgs.to_f32(), tx))
-            .map_err(|_| Self::gone())?;
-        let logits = rx.await.map_err(|_| Self::gone())?;
+        let logits = match self.submit(Pending::Reify(from_lgs.to_f32(), to_lgs.to_f32())).await {
+            OpOut::Logits(l) => l,
+            _ => unreachable!("reify reply"),
+        };
         let legal: Vec<u8> = Connect4::legal_moves(from_state).iter().map(|m| m.col).collect();
         let best = legal
             .iter()
@@ -365,78 +296,254 @@ impl LatentModel<Connect4> for BatchedLatentModel {
             .max_by(|&a, &b| logits[a as usize].total_cmp(&logits[b as usize]));
         Ok(Connect4Move { col: best.or_else(|| legal.first().copied()).unwrap_or(0) })
     }
-
     async fn model_version(&self) -> anyhow::Result<String> {
         Ok(self.version.clone())
     }
 }
 
-/// Batched LGS self-play: `concurrency` games in flight feeding one batched
-/// inference server. Writes a v2 dump. This is the throughput path (`--cuda`).
+/// A waker that does nothing — we drive the futures manually in lockstep.
+fn noop_waker() -> Waker {
+    fn no_op(_: *const ()) {}
+    fn clone(_: *const ()) -> RawWaker {
+        RawWaker::new(std::ptr::null(), &VTABLE)
+    }
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
+    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+}
+
+type GameFut = Pin<Box<dyn Future<Output = anyhow::Result<(Vec<(MoveRec, f32)>, u32)>>>>;
+
+fn make_game(
+    slot: usize,
+    lane: Arc<Mutex<Lane>>,
+    version: String,
+    cfg: SearchConfig,
+    temp_moves: u32,
+    seed: u64,
+) -> GameFut {
+    Box::pin(async move {
+        let model = LockstepModel { slot, lane, version };
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        play_game(&model, &cfg, temp_moves, &mut rng).await
+    })
+}
+
+#[derive(Default)]
+struct ThreadOut {
+    records: Vec<(MoveRec, f32)>,
+    reifications: u64,
+    batches: u64,
+    samples: u64,
+}
+
+/// Drive games `[game_start, game_end)` in lockstep, `in_flight` at a time.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_generate_batched(
+fn drive_thread(
+    server: &LgsServer,
+    in_flight: usize,
+    game_start: usize,
+    game_end: usize,
+    cfg: &SearchConfig,
+    temp_moves: u32,
+    seed: u64,
+    version: &str,
+) -> ThreadOut {
+    let lane = Arc::new(Mutex::new(Lane {
+        request: (0..in_flight).map(|_| None).collect(),
+        result: (0..in_flight).map(|_| None).collect(),
+    }));
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut futs: Vec<Option<GameFut>> = (0..in_flight).map(|_| None).collect();
+    let mut next_game = game_start;
+    let mut out = ThreadOut::default();
+
+    loop {
+        // Fill free slots with new games while this thread's share remains.
+        for slot in 0..in_flight {
+            if futs[slot].is_none() && next_game < game_end {
+                {
+                    let mut l = lane.lock().unwrap();
+                    l.request[slot] = None;
+                    l.result[slot] = None;
+                }
+                futs[slot] = Some(make_game(
+                    slot,
+                    lane.clone(),
+                    version.to_string(),
+                    cfg.clone(),
+                    temp_moves,
+                    seed.wrapping_add(next_game as u64),
+                ));
+                next_game += 1;
+            }
+        }
+
+        // Poll every active slot once: it consumes last wave's result, runs tree
+        // work, and yields its next op (Pending) or completes (Ready).
+        let mut any = false;
+        for slot in 0..in_flight {
+            if let Some(fut) = futs[slot].as_mut() {
+                any = true;
+                if let Poll::Ready(res) = fut.as_mut().poll(&mut cx) {
+                    match res {
+                        Ok((recs, reif)) => {
+                            out.records.extend(recs);
+                            out.reifications += reif as u64;
+                        }
+                        Err(e) => eprintln!("lockstep game error: {e}"),
+                    }
+                    futs[slot] = None;
+                }
+            }
+        }
+        if !any && next_game >= game_end {
+            break;
+        }
+        process_wave(server, &lane, in_flight, &mut out);
+    }
+    out
+}
+
+/// Collect the wave's pending ops, run one batched forward per type, write back.
+fn process_wave(server: &LgsServer, lane: &Arc<Mutex<Lane>>, in_flight: usize, out: &mut ThreadOut) {
+    let mut enc: Vec<(usize, Vec<f32>)> = Vec::new();
+    let mut ev: Vec<(usize, Vec<f32>)> = Vec::new();
+    let mut pol: Vec<(usize, Vec<f32>)> = Vec::new();
+    let mut rei: Vec<(usize, Vec<f32>, Vec<f32>)> = Vec::new();
+    {
+        let mut l = lane.lock().unwrap();
+        for slot in 0..in_flight {
+            match l.request[slot].take() {
+                Some(Pending::Encode(p)) => enc.push((slot, p)),
+                Some(Pending::Eval(x)) => ev.push((slot, x)),
+                Some(Pending::Policy(x)) => pol.push((slot, x)),
+                Some(Pending::Reify(a, b)) => rei.push((slot, a, b)),
+                None => {}
+            }
+        }
+    }
+    let total = enc.len() + ev.len() + pol.len() + rei.len();
+    if total == 0 {
+        return;
+    }
+    out.batches += 1;
+    out.samples += total as u64;
+
+    if !enc.is_empty() {
+        let b = enc.len();
+        let mut flat = Vec::with_capacity(b * PLANES);
+        for (_, p) in &enc {
+            flat.extend_from_slice(p);
+        }
+        let r = server.encode_batch(&flat, b).expect("encode_batch");
+        let mut l = lane.lock().unwrap();
+        for (i, (slot, _)) in enc.into_iter().enumerate() {
+            l.result[slot] = Some(OpOut::Lgs(r[i * LGS_DIM..(i + 1) * LGS_DIM].to_vec()));
+        }
+    }
+    if !ev.is_empty() {
+        let b = ev.len();
+        let mut flat = Vec::with_capacity(b * LGS_DIM);
+        for (_, x) in &ev {
+            flat.extend_from_slice(x);
+        }
+        let r = server.eval_batch(&flat, b).expect("eval_batch");
+        let mut l = lane.lock().unwrap();
+        for (i, (slot, _)) in ev.into_iter().enumerate() {
+            l.result[slot] = Some(OpOut::Val(r[i]));
+        }
+    }
+    if !pol.is_empty() {
+        let b = pol.len();
+        let mut flat = Vec::with_capacity(b * LGS_DIM);
+        for (_, x) in &pol {
+            flat.extend_from_slice(x);
+        }
+        let (k, w, mu, std) = server.policy_batch(&flat, b).expect("policy_batch");
+        let md = k * LGS_DIM;
+        let mut l = lane.lock().unwrap();
+        for (i, (slot, _)) in pol.into_iter().enumerate() {
+            l.result[slot] = Some(OpOut::Pol(MixturePolicy {
+                dim: LGS_DIM,
+                weights: w[i * k..(i + 1) * k].to_vec(),
+                means: mu[i * md..(i + 1) * md].to_vec(),
+                stds: std[i * md..(i + 1) * md].to_vec(),
+            }));
+        }
+    }
+    if !rei.is_empty() {
+        let b = rei.len();
+        let mut from = Vec::with_capacity(b * LGS_DIM);
+        let mut to = Vec::with_capacity(b * LGS_DIM);
+        for (_, a, c) in &rei {
+            from.extend_from_slice(a);
+            to.extend_from_slice(c);
+        }
+        let r = server.reify_batch(&from, &to, b).expect("reify_batch");
+        let mut l = lane.lock().unwrap();
+        for (i, (slot, _, _)) in rei.into_iter().enumerate() {
+            l.result[slot] = Some(OpOut::Logits(r[i * C4_COLS..(i + 1) * C4_COLS].to_vec()));
+        }
+    }
+}
+
+/// Lockstep LGS self-play across `threads` worker threads, `in_flight` games per
+/// thread feeding one batched forward per op type per wave. Writes a v2 dump.
+#[allow(clippy::too_many_arguments)]
+pub fn run_generate_batched(
     checkpoint: &str,
     cuda: bool,
     out_path: &str,
     n_games: usize,
-    concurrency: usize,
+    in_flight: usize,
+    threads: usize,
     sims: u32,
     temp_moves: u32,
     c_puct: f64,
     kernel_bandwidth: f64,
-    max_batch: usize,
-    linger_us: u64,
     seed: u64,
 ) -> anyhow::Result<()> {
     let device = crate::net::pick_device(cuda)?;
-    let server = LgsServer::load_on(checkpoint, device)?;
+    let server = Arc::new(LgsServer::load_on(checkpoint, device)?);
     let version = server.model_version.clone();
-    let (tx, rx) = mpsc::unbounded_channel::<Req>();
-    let counters = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
-    let cs = counters.clone();
-    let handle = std::thread::spawn(move || serve(rx, server, max_batch, linger_us, cs));
-    let model = Arc::new(BatchedLatentModel { tx, version });
     let cfg = SearchConfig { simulations: sims, c_puct, kernel_bandwidth, seed: None, ..Default::default() };
     eprintln!(
-        "c4 LGS self-play (batched): {n_games} games, {concurrency} in flight, {sims} sims/move, \
-         max_batch {max_batch}, device {}, model {checkpoint} -> {out_path}",
+        "c4 LGS self-play (lockstep): {n_games} games, {threads} threads × {in_flight} in flight, \
+         {sims} sims/move, h {kernel_bandwidth}, device {}, model {checkpoint} -> {out_path}",
         if cuda { "cuda" } else { "cpu" }
     );
 
     let t0 = Instant::now();
-    let mut set: JoinSet<anyhow::Result<(Vec<(MoveRec, f32)>, u32)>> = JoinSet::new();
-    let mut next = 0usize;
-    let spawn = |set: &mut JoinSet<_>, gi: usize| {
-        let m = model.clone();
-        let cfgc = cfg.clone();
-        set.spawn(async move {
-            let mut rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(gi as u64));
-            play_game(&*m, &cfgc, temp_moves, &mut rng).await
-        });
-    };
-    while next < n_games && set.len() < concurrency {
-        spawn(&mut set, next);
-        next += 1;
-    }
-    let mut all: Vec<(MoveRec, f32)> = Vec::new();
-    let mut reifications = 0u64;
-    while let Some(res) = set.join_next().await {
-        let (recs, reif) = res??;
-        reifications += reif as u64;
-        all.extend(recs);
-        if next < n_games {
-            spawn(&mut set, next);
-            next += 1;
+    let per = n_games.div_ceil(threads.max(1));
+    let outs: Vec<ThreadOut> = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for t in 0..threads {
+            let start = t * per;
+            let end = ((t + 1) * per).min(n_games);
+            if start >= end {
+                break;
+            }
+            let server = server.clone();
+            let cfg = cfg.clone();
+            let version = version.clone();
+            handles.push(scope.spawn(move || {
+                drive_thread(&server, in_flight, start, end, &cfg, temp_moves, seed, &version)
+            }));
         }
-    }
-    drop(model); // last sender → server thread exits
-    let _ = handle.join();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
 
+    let mut all: Vec<(MoveRec, f32)> = Vec::new();
+    let (mut reif, mut batches, mut samples) = (0u64, 0u64, 0u64);
+    for o in outs {
+        all.extend(o.records);
+        reif += o.reifications;
+        batches += o.batches;
+        samples += o.samples;
+    }
     write_dump(out_path, &all)?;
     let dt = t0.elapsed().as_secs_f64();
-    let batches = counters.0.load(Ordering::Relaxed).max(1);
-    let samples = counters.1.load(Ordering::Relaxed);
-    let nps = samples as f64 / dt; // net forwards (encode/eval/policy/reify) per sec
     eprintln!(
         "  wrote {} examples ({} games) in {:.1}s  ({:.1} games/s, {} reifications)\n  \
          avg_batch {:.0}  net-ops/s {:.0}  ({:.1}k forwards/s effective)",
@@ -444,10 +551,10 @@ pub async fn run_generate_batched(
         n_games,
         dt,
         n_games as f64 / dt,
-        reifications,
-        samples as f64 / batches as f64,
-        nps,
-        nps / 1000.0,
+        reif,
+        samples as f64 / batches.max(1) as f64,
+        samples as f64 / dt,
+        samples as f64 / dt / 1000.0,
     );
     Ok(())
 }

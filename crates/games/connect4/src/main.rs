@@ -279,15 +279,13 @@ enum Cmd {
         /// KR kernel bandwidth h over next-LGS points.
         #[arg(long, default_value_t = 0.7)]
         kernel_bandwidth: f64,
-        /// Concurrent games in flight (>1 uses the batched inference server).
+        /// Games in flight per worker thread (>1 uses the lockstep batched path;
+        /// the batch size of each forward ≈ this value).
         #[arg(long, default_value_t = 1)]
         concurrency: usize,
-        /// Max requests coalesced into one batched forward.
-        #[arg(long, default_value_t = 512)]
-        max_batch: usize,
-        /// Batch-fill linger (µs) the server spins to accumulate a full batch.
-        #[arg(long, default_value_t = 300)]
-        linger_us: u64,
+        /// Worker threads driving independent lockstep waves (parallel tree work).
+        #[arg(long)]
+        threads: Option<usize>,
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
@@ -424,14 +422,18 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::LgsGen {
             model, out, cuda, games, sims, temp_moves, c_puct, kernel_bandwidth,
-            concurrency, max_batch, linger_us, seed,
+            concurrency, threads, seed,
         } => {
             if concurrency > 1 {
-                lgs_selfplay::run_generate_batched(
-                    &model, cuda, &out, games, concurrency, sims, temp_moves, c_puct,
-                    kernel_bandwidth, max_batch, linger_us, seed,
-                )
-                .await?;
+                let threads = threads.unwrap_or_else(default_threads);
+                // Lockstep self-play is synchronous + CPU-bound; run off the runtime.
+                tokio::task::spawn_blocking(move || {
+                    lgs_selfplay::run_generate_batched(
+                        &model, cuda, &out, games, concurrency, threads, sims, temp_moves,
+                        c_puct, kernel_bandwidth, seed,
+                    )
+                })
+                .await??;
             } else {
                 lgs_selfplay::run_generate(
                     &model, cuda, &out, games, sims, temp_moves, c_puct, kernel_bandwidth, seed,
