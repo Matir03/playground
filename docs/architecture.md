@@ -38,10 +38,11 @@
 
 ### `crates/core` (Rust, no I/O)
 - `Game` trait: move type, state type, legal moves, apply, terminal, features.
-- MCTS over GS: tree node structure, selection/expansion/backprop, KR-UCT,
-  progressive widening. Generic over `Game` and `ModelClient`.
-- Game-state encoding abstraction (`LatentGameState`, the GS) — opaque byte
-  buffer + shape metadata.
+- MCTS in latent space: tree node structure, selection/expansion/backprop,
+  KR-PUCT, reification + aliasing, progressive widening. Generic over `Game`
+  and `ModelClient`. See [algorithm.md](algorithm.md).
+- Latent-game-state abstraction (`LatentGameState`, the LGS) — opaque byte
+  buffer + shape metadata; a point in R^d as far as search is concerned.
 - Recording schema (converts in-memory tree → `record.proto` messages).
 - `ModelClient` trait: async methods mirroring `ModelService` RPCs.
 - **No I/O, no tokio runtime, no tonic.** Keeps the algorithm unit-testable.
@@ -99,10 +100,12 @@
 1. Orchestrator selects a game + model version, spawns or picks an engine
    worker in batched self-play mode.
 2. Engine worker starts N parallel games internally.
-3. For each GS node expansion, engine asks `ModelClient` for encode/eval/policy.
+3. The engine asks `ModelClient` for encode/eval/policy as it expands latent
+   nodes; the policy density seeds new continuous candidates during widening.
    `model-client` batches across games and hits the Python model server.
-4. Every K visits, engine reifies — calls `reify` on the model server, applies
-   the concrete move, encodes the new state, attaches to the tree.
+4. On a candidate's 2nd visit the engine reifies — calls `reify`, applies the
+   concrete move, re-encodes the result, and attaches it (or aliases it onto an
+   existing reified child). See [algorithm.md](algorithm.md).
 5. When a game ends, engine serializes the full tree + reification history
    as a `GameRecord` and writes it to the shared replay store.
 6. Orchestrator notices the record, updates stats, possibly triggers training.

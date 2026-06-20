@@ -12,7 +12,7 @@ before applying the algorithm to the primary target board game.
 |---|----------|--------------------------|-------------|----------------|
 | 1 | Connect 4 | ~7 | Solved, small | Sanity check: can we learn a known game end-to-end? |
 | 2 | Go 9×9   | ~80 | Large | Standard RL benchmark; validates MCTS + policy/value at scale. |
-| 3 | Amazons  | ~1000+ | Large, high branching | Stresses policy head width and rollout throughput. |
+| 3 | Amazons  | ~1000+ | Large, high branching | First compound-move reifier (move queen + shoot arrow); rollout throughput. |
 | 4 | Arimaa   | ~17000 (per step × 4 steps) | Very large, compound moves | The real stress test for reification-based action decoding. |
 
 Connect 4 and Go validate the *training* and *plumbing*. Amazons and Arimaa
@@ -24,7 +24,7 @@ action spaces that are the core reason the variant exists.
 ```
 playground/
   crates/               # Rust engines + shared libs
-    core/               # Game trait, MCTS, GS abstraction, ModelClient trait
+    core/               # Game trait, MCTS, LGS abstraction, ModelClient trait
     protocol/           # tonic-generated types from schemas/proto
     engine-server/      # tonic server implementing EngineService, generic over Game
     model-client/       # tonic client to Python ModelService, implements core::ModelClient

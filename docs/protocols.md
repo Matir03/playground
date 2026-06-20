@@ -29,10 +29,10 @@ Source of truth: [`schemas/proto`](../schemas/proto).
 
 ### `ModelService`
 
-- `Encode(EncodeRequest) → EncodeResponse` — concrete state → GS.
-- `Eval(EvalRequest) → EvalResponse` — GS → scalar value.
-- `Policy(PolicyRequest) → PolicyResponse` — GS → B (action, next-GS) pairs.
-- `Reify(ReifyRequest) → ReifyResponse` — (GS_a, GS_b) → concrete move.
+- `Encode(EncodeRequest) → EncodeResponse` — concrete state → LGS.
+- `Eval(EvalRequest) → EvalResponse` — LGS → scalar value.
+- `Policy(PolicyRequest) → PolicyResponse` — LGS → B (action, next-LGS) pairs.
+- `Reify(ReifyRequest) → ReifyResponse` — (LGS_a, LGS_b) → concrete move.
 - `EncodeBatch / EvalBatch / PolicyBatch / ReifyBatch` — batched variants
   for throughput. The `model-client` Rust crate does the micro-batching.
 - `ReloadWeights(ReloadWeightsRequest) → ReloadWeightsResponse` — swap to a

@@ -28,7 +28,7 @@ schemas/proto/playground/
   sibling `game_id` field indicating how to interpret it. Each game crate
   documents its own payload encoding (and ideally provides a sub-proto for
   inspection / debugging — but that's optional).
-- **Bytes for GS.** The GS encoding is `bytes` + shape hint; only the model
+- **Bytes for LGS.** The LGS encoding is `bytes` + shape hint; only the model
   server and `model-client` know the tensor layout.
 
 ## Evolution rules
@@ -47,12 +47,16 @@ schemas/proto/playground/
 
 The `GameRecord` message is how self-play feeds training. Key design points:
 
-- It carries the **full GS-level MCTS tree** that ran during play, including
-  per-node visits/values/priors.
-- For each GS node, any **reified concrete children** are recorded with:
-  their concrete state, the move that was applied, and the action-head
-  vector that was sampled (plus noise scale) to reify it.
+- It carries the **full latent-space MCTS tree** that ran during play,
+  including per-node visits/values and the sampled candidate targets.
+- For each node, its **reified concrete children** are recorded with: the
+  concrete state, the move that was applied, the re-encoded child latent, and
+  the **merged visit count** (counting aliased candidates). Enough to rebuild
+  the visit distribution `π_i` and the reifier pairs `(S, A_i)`.
 - The final game **Outcome** is the ground-truth signal for the eval head.
+
+  See [algorithm.md](algorithm.md#search--training-targets) for how these fields
+  become training targets.
 
 The exact proto is in [`record/record.proto`](../schemas/proto/playground/record/record.proto). Revisit the schema
 after M2 (Connect 4 training) when we have a concrete sense of what the
