@@ -279,6 +279,15 @@ enum Cmd {
         /// KR kernel bandwidth h over next-LGS points.
         #[arg(long, default_value_t = 0.7)]
         kernel_bandwidth: f64,
+        /// Concurrent games in flight (>1 uses the batched inference server).
+        #[arg(long, default_value_t = 1)]
+        concurrency: usize,
+        /// Max requests coalesced into one batched forward.
+        #[arg(long, default_value_t = 512)]
+        max_batch: usize,
+        /// Batch-fill linger (µs) the server spins to accumulate a full batch.
+        #[arg(long, default_value_t = 300)]
+        linger_us: u64,
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
@@ -413,11 +422,22 @@ async fn main() -> anyhow::Result<()> {
             })
             .await??;
         }
-        Cmd::LgsGen { model, out, cuda, games, sims, temp_moves, c_puct, kernel_bandwidth, seed } => {
-            lgs_selfplay::run_generate(
-                &model, cuda, &out, games, sims, temp_moves, c_puct, kernel_bandwidth, seed,
-            )
-            .await?;
+        Cmd::LgsGen {
+            model, out, cuda, games, sims, temp_moves, c_puct, kernel_bandwidth,
+            concurrency, max_batch, linger_us, seed,
+        } => {
+            if concurrency > 1 {
+                lgs_selfplay::run_generate_batched(
+                    &model, cuda, &out, games, concurrency, sims, temp_moves, c_puct,
+                    kernel_bandwidth, max_batch, linger_us, seed,
+                )
+                .await?;
+            } else {
+                lgs_selfplay::run_generate(
+                    &model, cuda, &out, games, sims, temp_moves, c_puct, kernel_bandwidth, seed,
+                )
+                .await?;
+            }
         }
         Cmd::EvalSolver { model, cuda, games, node_budget, c_puct, opening, threads, max_batch, seed } => {
             // Deterministic-ish net play (argmax, no root noise) vs the solver.

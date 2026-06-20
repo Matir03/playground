@@ -258,6 +258,63 @@ impl LatentModel<Connect4> for LgsModel {
     }
 }
 
+/// Batched LGS net for the central inference server (the throughput path). Owns
+/// the candle net on its device; each method runs one batched forward over a
+/// stack of requests coalesced from many concurrent searches. See lgs_selfplay.
+pub struct LgsServer {
+    net: Net,
+    device: Device,
+    pub model_version: String,
+}
+
+impl LgsServer {
+    pub fn load_on(checkpoint: &str, device: Device) -> anyhow::Result<Self> {
+        let path = Path::new(checkpoint);
+        let arch = read_arch(path);
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[checkpoint], DType::F32, &device)? };
+        let net = Net::load(&arch, vb)?;
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("local");
+        Ok(Self { net, device, model_version: format!("connect4-lgs-{stem}") })
+    }
+
+    /// `b` × planes (PLANES each) → `b` × LGS (LGS_DIM each), flattened.
+    pub fn encode_batch(&self, planes: &[f32], b: usize) -> anyhow::Result<Vec<f32>> {
+        let t = Tensor::from_vec(planes.to_vec(), (b, 2, C4_ROWS, C4_COLS), &self.device)?;
+        Ok(self.net.encode(&t)?.flatten_all()?.to_vec1::<f32>()?)
+    }
+
+    /// `b` × LGS → `b` values.
+    pub fn eval_batch(&self, lgs: &[f32], b: usize) -> anyhow::Result<Vec<f32>> {
+        let t = Tensor::from_vec(lgs.to_vec(), (b, LGS_DIM), &self.device)?;
+        Ok(self.net.value(&t)?.flatten_all()?.to_vec1::<f32>()?)
+    }
+
+    /// `b` × LGS → MDN params: `(k, weights b·k, means b·k·d, stds b·k·d)`.
+    pub fn policy_batch(
+        &self,
+        lgs: &[f32],
+        b: usize,
+    ) -> anyhow::Result<(usize, Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let t = Tensor::from_vec(lgs.to_vec(), (b, LGS_DIM), &self.device)?;
+        let (w, mu, std) = self.net.policy_mdn(&t)?;
+        Ok((
+            self.net.k,
+            w.flatten_all()?.to_vec1::<f32>()?,
+            mu.flatten_all()?.to_vec1::<f32>()?,
+            std.flatten_all()?.to_vec1::<f32>()?,
+        ))
+    }
+
+    /// `b` × (from-LGS, to-LGS) → `b` × 7 reifier logits, flattened.
+    pub fn reify_batch(&self, from: &[f32], to: &[f32], b: usize) -> anyhow::Result<Vec<f32>> {
+        let f = Tensor::from_vec(from.to_vec(), (b, LGS_DIM), &self.device)?;
+        let g = Tensor::from_vec(to.to_vec(), (b, LGS_DIM), &self.device)?;
+        let cat = Tensor::cat(&[&f, &g], 1)?;
+        let h = self.net.reif1.forward(&cat)?.relu()?;
+        Ok(self.net.reif2.forward(&h)?.flatten_all()?.to_vec1::<f32>()?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
