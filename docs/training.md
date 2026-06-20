@@ -87,6 +87,25 @@ pruning** shape the visit-count target before it's recorded. The encoder trunk
 uses **global pooling**. All four are specified in
 [algorithm.md](algorithm.md#self-play-and-training-optimizations).
 
+### Implemented (Connect 4)
+
+The Connect 4 LGS trainer ([c4_lgs_train.py](../python/c4_lgs_train.py)) fits
+value + MDN-policy + reifier + consistency over v2 self-play records, re-encoding
+parents/children with the live net each step (targets must live in the current
+latent space). Two empirical fixes were needed, both confirming the algorithm's
+predicted failure modes:
+
+- **Per-dimension MDN NLL.** The `O(d)` Gaussian log-density swamped the
+  value/reifier gradients on the shared encoder; normalize by `d` for `O(1)`
+  scale across loss terms.
+- **Consistency starts OFF.** The exact-match form collapses the latent while the
+  value head is ≈constant (`d_func≈0 ⇒ d_lat→0`) — the "central tension" made
+  real. Re-enable as a ramped anti-collapse (Lipschitz) term once the encoder is
+  healthy.
+
+Self-play data is produced by the central-batched lockstep engine documented in
+[selfplay-engine.md](selfplay-engine.md).
+
 ## Hot-swapping models
 
 Two paths, both fine, switch per situation:

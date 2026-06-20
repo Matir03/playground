@@ -38,13 +38,17 @@
 
 ### `crates/core` (Rust, no I/O)
 - `Game` trait: move type, state type, legal moves, apply, terminal, features.
-- MCTS in latent space: tree node structure, selection/expansion/backprop,
-  KR-PUCT, reification + aliasing, progressive widening. Generic over `Game`
-  and `ModelClient`. See [algorithm.md](algorithm.md).
+- MCTS in latent space (`latent_mcts`): KR-PUCT, MDN-sampled candidates,
+  reify-on-2nd-visit, aliasing, progressive widening, forced playouts. Async
+  over the `LatentModel` trait. See [algorithm.md](algorithm.md) and the
+  implemented engine in [selfplay-engine.md](selfplay-engine.md). (The older
+  discrete `mcts` + `ModelClient` path is retained for the AZ baseline games.)
 - Latent-game-state abstraction (`LatentGameState`, the LGS) — opaque byte
   buffer + shape metadata; a point in R^d as far as search is concerned.
+- `MixturePolicy` + `LatentModel` trait — the MDN-policy view of the net for the
+  reification algorithm (distinct from `ModelClient`).
 - Recording schema (converts in-memory tree → `record.proto` messages).
-- `ModelClient` trait: async methods mirroring `ModelService` RPCs.
+- `ModelClient` trait: async methods mirroring `ModelService` RPCs (discrete path).
 - **No I/O, no tokio runtime, no tonic.** Keeps the algorithm unit-testable.
 
 ### `crates/protocol` (Rust)

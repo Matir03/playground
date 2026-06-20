@@ -3,6 +3,7 @@
 - [overview.md](overview.md) — project goals, scope, milestones.
 - [algorithm.md](algorithm.md) — the custom variant: LGS encoder, MDN policy over next-LGS, reifier, KR-PUCT, and why it fits Arimaa.
 - [architecture.md](architecture.md) — components, repo layout, data flow.
+- [selfplay-engine.md](selfplay-engine.md) — the implemented Connect 4 LGS stack: nets, the central-batched lockstep self-play engine, records, training, perf.
 - [protocols.md](protocols.md) — RPC services, engine operating modes.
 - [schemas.md](schemas.md) — protobuf layout, evolution rules, record format.
 - [training.md](training.md) — self-play loop, replay buffer, model versioning.
