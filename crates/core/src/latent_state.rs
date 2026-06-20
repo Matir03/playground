@@ -22,4 +22,18 @@ impl LatentGameState {
             model_version,
         }
     }
+
+    /// Build an LGS from a float vector (little-endian f32 payload, shape `[d]`).
+    pub fn from_f32(v: &[f32], model_version: String) -> Self {
+        let payload: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        Self::new(payload, vec![v.len() as i32], model_version)
+    }
+
+    /// Decode the little-endian f32 payload into a float vector.
+    pub fn to_f32(&self) -> Vec<f32> {
+        self.payload
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
 }

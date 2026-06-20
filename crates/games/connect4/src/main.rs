@@ -5,6 +5,7 @@
 mod book;
 mod eval;
 mod game;
+mod lgs_net;
 mod mcts;
 mod net;
 mod selfplay;
