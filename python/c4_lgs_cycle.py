@@ -37,7 +37,7 @@ def main() -> None:
     ap.add_argument("--live", default="data/models/connect4_lgs/live")
     ap.add_argument("--engine", default="target/release/connect4-engine")
     ap.add_argument("--python", default=sys.executable)
-    ap.add_argument("--gens", type=int, default=20)
+    ap.add_argument("--gens", type=int, default=0, help="generations to run (0 = unbounded)")
     ap.add_argument("--games", type=int, default=512, help="self-play games per gen")
     ap.add_argument("--sims", type=int, default=96)
     ap.add_argument("--temp-moves", type=int, default=8)
@@ -56,7 +56,12 @@ def main() -> None:
     ap.add_argument("--eval-positions", type=int, default=200)
     ap.add_argument("--eval-sims", type=int, default=96)
     ap.add_argument("--eval-opening", type=int, default=6)
+    ap.add_argument("--ladder-every", type=int, default=1, help="run BT-ELO ladder + promotion every N gens (0 disables)")
+    ap.add_argument("--match-games", type=int, default=40)
+    ap.add_argument("--match-sims", type=int, default=64)
+    ap.add_argument("--match-random", type=int, default=3, help="random previous gens to also play each ladder step")
     args = ap.parse_args()
+    import c4_lgs_ladder as ladder
 
     buffer = os.path.join(args.live, "buffer")
     ckpt = os.path.join(args.live, "checkpoint.safetensors")
@@ -67,8 +72,11 @@ def main() -> None:
         print("[init] no checkpoint; seeding a random LGS net", flush=True)
         sh([args.python, train, "--init", args.live, "--channels", str(args.channels), "--blocks", str(args.blocks)])
 
+    gens_dir = os.path.join(args.live, "gens")
+    ladder_path = os.path.join(args.live, "ladder.json")
     start = len(glob.glob(os.path.join(buffer, "chunk_*.bin")))
-    for gen in range(start, start + args.gens):
+    gen = start
+    while args.gens == 0 or gen < start + args.gens:
         print(f"\n=== generation {gen} ===", flush=True)
         out = os.path.join(buffer, f"chunk_{gen:06}.bin")
         gen_cmd = [
@@ -96,6 +104,20 @@ def main() -> None:
             if args.cuda:
                 eval_cmd.append("--cuda")
             sh(eval_cmd)
+        if args.ladder_every and (gen + 1) % args.ladder_every == 0:
+            try:
+                L, name, promoted, elo = ladder.step(
+                    args.engine, ckpt, gens_dir, ladder_path, gen, args.cuda,
+                    games=args.match_games, sims=args.match_sims,
+                    n_random=args.match_random, seed=gen * 7919,
+                )
+                tag = "PROMOTED to champion" if promoted else f"champion stays {L['best']}"
+                print(f"LADDER gen {gen} elo {elo.get(name, float('nan')):.0f}  "
+                      f"best {L['best']} ({elo.get(L['best'], float('nan')):.0f})  {tag}", flush=True)
+                print(f"  top: {ladder.elo_table(L)}", flush=True)
+            except Exception as e:  # never let the ladder kill training
+                print(f"[ladder error] {e}", flush=True)
+        gen += 1
 
     print("\n[done] cycle complete", flush=True)
 

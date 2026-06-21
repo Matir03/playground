@@ -313,6 +313,44 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
+    /// Head-to-head LGS match: A vs B (each a checkpoint path or "solver"),
+    /// prints `MATCH <a_wins> <draws> <b_wins>` for the BT-ELO ladder.
+    LgsMatch {
+        #[arg(long)]
+        a: String,
+        #[arg(long)]
+        b: String,
+        #[arg(long)]
+        cuda: bool,
+        #[arg(long, default_value_t = 40)]
+        games: usize,
+        #[arg(long, default_value_t = 64)]
+        sims: u32,
+        #[arg(long, default_value_t = 4)]
+        opening: u32,
+        #[arg(long, default_value_t = 1.5)]
+        c_puct: f64,
+        #[arg(long, default_value_t = 0.7)]
+        kernel_bandwidth: f64,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Probe one position (comma-separated opening move sequence): print the net's
+    /// chosen move, root value, child visits, and the solver's move.
+    LgsMove {
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        cuda: bool,
+        #[arg(long, default_value = "")]
+        moves: String,
+        #[arg(long, default_value_t = 96)]
+        sims: u32,
+        #[arg(long, default_value_t = 1.5)]
+        c_puct: f64,
+        #[arg(long, default_value_t = 0.7)]
+        kernel_bandwidth: f64,
+    },
     /// Absolute-strength eval: play a checkpoint's MCTS vs the perfect solver and
     /// print the net's score (the distance-to-perfect signal).
     EvalSolver {
@@ -470,6 +508,15 @@ async fn main() -> anyhow::Result<()> {
                 &model, cuda, positions, opening, sims, c_puct, kernel_bandwidth, seed,
             )
             .await?;
+        }
+        Cmd::LgsMatch { a, b, cuda, games, sims, opening, c_puct, kernel_bandwidth, seed } => {
+            lgs_selfplay::run_lgs_match(
+                &a, &b, cuda, games, sims, opening, c_puct, kernel_bandwidth, seed,
+            )
+            .await?;
+        }
+        Cmd::LgsMove { model, cuda, moves, sims, c_puct, kernel_bandwidth } => {
+            lgs_selfplay::run_lgs_move(&model, cuda, &moves, sims, c_puct, kernel_bandwidth).await?;
         }
         Cmd::EvalSolver { model, cuda, games, node_budget, c_puct, opening, threads, max_batch, seed } => {
             // Deterministic-ish net play (argmax, no root noise) vs the solver.

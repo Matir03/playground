@@ -27,6 +27,7 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::time::Instant;
 
 use async_trait::async_trait;
+use candle_core::Device;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -904,5 +905,145 @@ pub async fn run_lgs_eval(
         "lgs_eval_vs_solver  move_agree {mp:.1}%  value_sign_agree {sp:.1}%  ({n} positions, {sims} sims, opening {opening})"
     );
     println!("LGSEVAL {mp:.2} {sp:.2} {n}");
+    Ok(())
+}
+
+/// Probe a single position (given as a comma-separated opening move sequence):
+/// print the net's chosen move, root value, per-child visits, and the solver's
+/// optimal move — for manual degeneracy inspection. `OK`/`WARN` flags obvious
+/// pathologies (illegal/own-loss, ignored immediate win, ignored forced block).
+pub async fn run_lgs_move(
+    checkpoint: &str,
+    cuda: bool,
+    moves: &str,
+    sims: u32,
+    c_puct: f64,
+    kernel_bandwidth: f64,
+) -> anyhow::Result<()> {
+    use playground_core::Solver;
+    let device = crate::net::pick_device(cuda)?;
+    let model = LgsModel::load_on(checkpoint, device)?;
+    let cfg =
+        SearchConfig { simulations: sims, c_puct, kernel_bandwidth, seed: None, ..Default::default() };
+
+    let mut state = Connect4::initial_state();
+    for tok in moves.split(',').filter(|s| !s.trim().is_empty()) {
+        let col: u8 = tok.trim().parse()?;
+        state = Connect4::apply(&state, &Connect4Move { col });
+    }
+    if Connect4::outcome(&state).is_terminal() {
+        println!("terminal position, no move");
+        return Ok(());
+    }
+    let res = search(&model, &state, &cfg).await?;
+    let sol = Connect4::choose_move(&state);
+    let mut kids: Vec<(u8, u32, f64)> =
+        res.root_children.iter().map(|c| (c.mv.col, c.visits, c.value)).collect();
+    kids.sort_by(|a, b| b.1.cmp(&a.1));
+    let flag = if res.chosen.col == sol.best_move.col { "OK" } else { "DIFF-from-solver" };
+    eprintln!(
+        "lgs_move  after [{moves}]: net plays col {} (root_value {:.3}); solver {} ({flag})\n  children (col,visits,value): {:?}",
+        res.chosen.col, res.root_value, sol.best_move.col, kids
+    );
+    println!("MOVE {} {} {:.4}", res.chosen.col, sol.best_move.col, res.root_value);
+    Ok(())
+}
+
+/// A match player: an LGS checkpoint (argmax KR-PUCT search) or the perfect solver.
+enum Player {
+    Lgs(LgsModel),
+    Solver,
+}
+
+impl Player {
+    fn load(spec: &str, device: &Device) -> anyhow::Result<Self> {
+        Ok(if spec == "solver" {
+            Player::Solver
+        } else {
+            Player::Lgs(LgsModel::load_on(spec, device.clone())?)
+        })
+    }
+    async fn pick(&self, state: &Connect4State, cfg: &SearchConfig) -> anyhow::Result<u8> {
+        use playground_core::Solver;
+        Ok(match self {
+            Player::Solver => Connect4::choose_move(state).best_move.col,
+            Player::Lgs(m) => search(m, state, cfg).await?.chosen.col,
+        })
+    }
+}
+
+/// Head-to-head match between two players (LGS checkpoint paths or "solver").
+/// Each game starts from a random opening (for variety); the two engines are
+/// swapped between which side moves first on alternating games (colour balance).
+/// Prints `MATCH <a_wins> <draws> <b_wins>` from A's perspective — the raw counts
+/// the BT-ELO ladder consumes.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_lgs_match(
+    a_spec: &str,
+    b_spec: &str,
+    cuda: bool,
+    games: usize,
+    sims: u32,
+    opening: u32,
+    c_puct: f64,
+    kernel_bandwidth: f64,
+    seed: u64,
+) -> anyhow::Result<()> {
+    let device = crate::net::pick_device(cuda)?;
+    let a = Player::load(a_spec, &device)?;
+    let b = Player::load(b_spec, &device)?;
+    let cfg =
+        SearchConfig { simulations: sims, c_puct, kernel_bandwidth, seed: None, ..Default::default() };
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+
+    let (mut a_wins, mut draws, mut b_wins) = (0usize, 0usize, 0usize);
+    let mut g = 0usize;
+    let mut attempts = 0usize;
+    while g < games && attempts < games * 20 {
+        attempts += 1;
+        let mut state = Connect4::initial_state();
+        for _ in 0..opening {
+            if Connect4::outcome(&state).is_terminal() {
+                break;
+            }
+            let moves = Connect4::legal_moves(&state);
+            let mv = moves[rng.gen_range(0..moves.len())].clone();
+            state = Connect4::apply(&state, &mv);
+        }
+        if Connect4::outcome(&state).is_terminal() {
+            continue;
+        }
+        // A controls the side to move at the opening on even games, B on odd.
+        let mut a_to_move = g % 2 == 0;
+        let outcome = loop {
+            let o = Connect4::outcome(&state);
+            if o.is_terminal() {
+                break o;
+            }
+            let col = if a_to_move {
+                a.pick(&state, &cfg).await?
+            } else {
+                b.pick(&state, &cfg).await?
+            };
+            state = Connect4::apply(&state, &Connect4Move { col });
+            a_to_move = !a_to_move;
+        };
+        match outcome {
+            Outcome::Draw => draws += 1,
+            // The last mover won; `a_to_move` has flipped to the loser's side.
+            _ => {
+                if !a_to_move {
+                    a_wins += 1
+                } else {
+                    b_wins += 1
+                }
+            }
+        }
+        g += 1;
+    }
+    eprintln!(
+        "lgs_match  {a_spec} vs {b_spec}:  {a_wins}-{draws}-{b_wins} (W-D-L, A's view; {g} games, {sims} sims)"
+    );
+    println!("MATCH {a_wins} {draws} {b_wins}");
     Ok(())
 }
