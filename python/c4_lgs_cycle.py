@@ -81,7 +81,10 @@ def main() -> None:
     gens_dir = os.path.join(args.live, "gens")
     ladder_path = os.path.join(args.live, "ladder.json")
     chunk_seq = len(glob.glob(os.path.join(buffer, "chunk_*.bin")))
-    gen = 0
+    # Resume gen numbering from existing archives so restarts never overwrite a
+    # gen_NNNNNN snapshot (which would corrupt the ladder's match history).
+    existing = sorted(glob.glob(os.path.join(gens_dir, "gen_*.safetensors")))
+    gen = (int(os.path.basename(existing[-1])[4:10]) + 1) if existing else 0
     while args.gens == 0 or gen < args.gens:
         # Self-play phase: keep a full replenishing pool busy generating chunks
         # (games >> pool) back-to-back until the train interval elapses, so the
