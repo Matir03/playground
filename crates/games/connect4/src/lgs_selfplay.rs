@@ -54,9 +54,18 @@ struct MoveRec {
 }
 
 /// Play one self-play game; returns per-move records with `z` filled in.
+///
+/// Playout Cap Randomization (KataGo): each move is a *full* (high-playout)
+/// search with probability `pcr_full_prob`, else a cheap *fast* search. Both pick
+/// the move and yield a value record (`z` from the game outcome), but only full
+/// moves emit a policy/reifier target (the children block) — fast moves store
+/// zeroed children, which the trainer weights to zero. So value trains on every
+/// position, policy/reifier only on the high-quality full ones.
 async fn play_game<M: LatentModel<Connect4>>(
     model: &M,
-    cfg: &SearchConfig,
+    cfg_full: &SearchConfig,
+    cfg_fast: &SearchConfig,
+    pcr_full_prob: f64,
     temp_moves: u32,
     rng: &mut ChaCha8Rng,
 ) -> anyhow::Result<(Vec<(MoveRec, f32)>, u32)> {
@@ -65,6 +74,8 @@ async fn play_game<M: LatentModel<Connect4>>(
     let mut reifications = 0u32;
 
     while !Connect4::outcome(&state).is_terminal() {
+        let full = rng.gen::<f64>() < pcr_full_prob;
+        let cfg = if full { cfg_full } else { cfg_fast };
         let res = search(model, &state, cfg).await?;
         reifications += res.reifications;
         if res.root_children.is_empty() {
@@ -72,11 +83,12 @@ async fn play_game<M: LatentModel<Connect4>>(
         }
         let sample = Connect4::ply(&state) < temp_moves;
         let pick = choose(&res.root_children, sample, rng);
-        let children = res
-            .root_children
-            .iter()
-            .map(|c| (c.mv.col, c.state.clone(), c.visits))
-            .collect();
+        // PCR: only full (high-playout) moves contribute a policy/reifier target.
+        let children = if full {
+            res.root_children.iter().map(|c| (c.mv.col, c.state.clone(), c.visits)).collect()
+        } else {
+            Vec::new()
+        };
         let mover = if state.ply % 2 == 0 { 1u8 } else { 2u8 };
         let next = res.root_children[pick].state.clone();
         recs.push(MoveRec { parent: state.clone(), mover, children });
@@ -166,6 +178,8 @@ pub async fn run_generate(
     out_path: &str,
     n_games: usize,
     sims: u32,
+    fast_sims: u32,
+    pcr_full_prob: f64,
     temp_moves: u32,
     c_puct: f64,
     kernel_bandwidth: f64,
@@ -173,16 +187,17 @@ pub async fn run_generate(
 ) -> anyhow::Result<()> {
     let device = crate::net::pick_device(cuda)?;
     let model = Arc::new(LgsModel::load_on(checkpoint, device)?);
-    let cfg = SearchConfig { simulations: sims, c_puct, kernel_bandwidth, root_explore: true, seed: None, ..Default::default() };
+    let cfg_full = SearchConfig { simulations: sims, c_puct, kernel_bandwidth, root_explore: true, seed: None, ..Default::default() };
+    let cfg_fast = SearchConfig { simulations: fast_sims, c_puct, kernel_bandwidth, root_explore: false, seed: None, ..Default::default() };
     eprintln!(
-        "c4 LGS self-play: {n_games} games, {sims} sims/move, h {kernel_bandwidth}, model {checkpoint} -> {out_path}"
+        "c4 LGS self-play: {n_games} games, PCR full {sims}/fast {fast_sims} sims (p_full {pcr_full_prob}), h {kernel_bandwidth}, model {checkpoint} -> {out_path}"
     );
     let t0 = Instant::now();
     let mut all: Vec<(MoveRec, f32)> = Vec::new();
     let mut reifications = 0u64;
     for g in 0..n_games {
         let mut rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(g as u64));
-        let (recs, reif) = play_game(model.as_ref(), &cfg, temp_moves, &mut rng).await?;
+        let (recs, reif) = play_game(model.as_ref(), &cfg_full, &cfg_fast, pcr_full_prob, temp_moves, &mut rng).await?;
         reifications += reif as u64;
         all.extend(recs);
     }
@@ -395,14 +410,16 @@ fn make_game(
     slot: usize,
     lane: Arc<Mutex<Lane>>,
     version: String,
-    cfg: SearchConfig,
+    cfg_full: SearchConfig,
+    cfg_fast: SearchConfig,
+    pcr_full_prob: f64,
     temp_moves: u32,
     seed: u64,
 ) -> GameFut {
     Box::pin(async move {
         let model = LockstepModel { slot, lane, version };
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        play_game(&model, &cfg, temp_moves, &mut rng).await
+        play_game(&model, &cfg_full, &cfg_fast, pcr_full_prob, temp_moves, &mut rng).await
     })
 }
 
@@ -593,7 +610,9 @@ fn worker(
     in_flight: usize,
     next_game: &AtomicUsize,
     n_games: usize,
-    cfg: &SearchConfig,
+    cfg_full: &SearchConfig,
+    cfg_fast: &SearchConfig,
+    pcr_full_prob: f64,
     temp_moves: u32,
     seed: u64,
     version: &str,
@@ -623,7 +642,9 @@ fn worker(
                         slot,
                         lane.clone(),
                         version.to_string(),
-                        cfg.clone(),
+                        cfg_full.clone(),
+                        cfg_fast.clone(),
+                        pcr_full_prob,
                         temp_moves,
                         seed.wrapping_add(g as u64),
                     ));
@@ -773,6 +794,8 @@ pub fn run_generate_batched(
     threads: usize,
     max_batch: usize,
     sims: u32,
+    fast_sims: u32,
+    pcr_full_prob: f64,
     temp_moves: u32,
     c_puct: f64,
     kernel_bandwidth: f64,
@@ -781,11 +804,12 @@ pub fn run_generate_batched(
     let device = crate::net::pick_device(cuda)?;
     let server = LgsServer::load_on(checkpoint, device)?;
     let version = server.model_version.clone();
-    let cfg = SearchConfig { simulations: sims, c_puct, kernel_bandwidth, root_explore: true, seed: None, ..Default::default() };
+    let cfg_full = SearchConfig { simulations: sims, c_puct, kernel_bandwidth, root_explore: true, seed: None, ..Default::default() };
+    let cfg_fast = SearchConfig { simulations: fast_sims, c_puct, kernel_bandwidth, root_explore: false, seed: None, ..Default::default() };
     let pool = threads * in_flight;
     eprintln!(
         "c4 LGS self-play (central-batched): {n_games} games, pool {pool} ({threads}×{in_flight}), \
-         max_batch {max_batch}, {sims} sims/move, h {kernel_bandwidth}, device {}, model {checkpoint} -> {out_path}",
+         max_batch {max_batch}, PCR full {sims}/fast {fast_sims} (p_full {pcr_full_prob}), h {kernel_bandwidth}, device {}, model {checkpoint} -> {out_path}",
         if cuda { "cuda" } else { "cpu" }
     );
 
@@ -804,10 +828,11 @@ pub fn run_generate_batched(
             let tx = tx.clone();
             let cache = &cache;
             let next_game = &next_game;
-            let cfg = &cfg;
+            let cfg_full = &cfg_full;
+            let cfg_fast = &cfg_fast;
             let version = version.as_str();
             handles.push(scope.spawn(move || {
-                worker(&tx, cache, in_flight, next_game, n_games, cfg, temp_moves, seed, version)
+                worker(&tx, cache, in_flight, next_game, n_games, cfg_full, cfg_fast, pcr_full_prob, temp_moves, seed, version)
             }));
         }
         drop(tx); // let the server detect shutdown once workers finish

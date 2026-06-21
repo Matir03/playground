@@ -271,6 +271,13 @@ enum Cmd {
         games: usize,
         #[arg(long, default_value_t = 128)]
         sims: u32,
+        /// Playout Cap Randomization: fast (low-playout) sims for value-only moves.
+        #[arg(long, default_value_t = 16)]
+        fast_sims: u32,
+        /// Probability a move is a full (policy-target) search; rest are fast.
+        /// 1.0 = PCR off (every move full).
+        #[arg(long, default_value_t = 1.0)]
+        pcr_full_prob: f64,
         /// Opening plies that sample ∝ visits (exploration); argmax after.
         #[arg(long, default_value_t = 10)]
         temp_moves: u32,
@@ -483,8 +490,8 @@ async fn main() -> anyhow::Result<()> {
             .await??;
         }
         Cmd::LgsGen {
-            model, out, cuda, games, sims, temp_moves, c_puct, kernel_bandwidth,
-            concurrency, threads, max_batch, seed,
+            model, out, cuda, games, sims, fast_sims, pcr_full_prob, temp_moves, c_puct,
+            kernel_bandwidth, concurrency, threads, max_batch, seed,
         } => {
             if concurrency > 1 {
                 let threads = threads.unwrap_or_else(default_threads);
@@ -492,13 +499,14 @@ async fn main() -> anyhow::Result<()> {
                 tokio::task::spawn_blocking(move || {
                     lgs_selfplay::run_generate_batched(
                         &model, cuda, &out, games, concurrency, threads, max_batch, sims,
-                        temp_moves, c_puct, kernel_bandwidth, seed,
+                        fast_sims, pcr_full_prob, temp_moves, c_puct, kernel_bandwidth, seed,
                     )
                 })
                 .await??;
             } else {
                 lgs_selfplay::run_generate(
-                    &model, cuda, &out, games, sims, temp_moves, c_puct, kernel_bandwidth, seed,
+                    &model, cuda, &out, games, sims, fast_sims, pcr_full_prob, temp_moves,
+                    c_puct, kernel_bandwidth, seed,
                 )
                 .await?;
             }

@@ -39,7 +39,9 @@ def main() -> None:
     ap.add_argument("--python", default=sys.executable)
     ap.add_argument("--gens", type=int, default=0, help="generations to run (0 = unbounded)")
     ap.add_argument("--games", type=int, default=512, help="self-play games per gen")
-    ap.add_argument("--sims", type=int, default=96)
+    ap.add_argument("--sims", type=int, default=96, help="full (high-playout) sims for policy-target moves")
+    ap.add_argument("--fast-sims", type=int, default=16, help="PCR fast (low-playout) sims for value-only moves")
+    ap.add_argument("--pcr-full-prob", type=float, default=1.0, help="prob a move is a full search (1.0 = PCR off)")
     ap.add_argument("--temp-moves", type=int, default=8)
     ap.add_argument("--threads", type=int, default=10)
     ap.add_argument("--concurrency", type=int, default=64, help="games in flight per worker")
@@ -98,6 +100,7 @@ def main() -> None:
             gen_cmd = [
                 args.engine, "lgs-gen", "--model", ckpt, "--out", out,
                 "--games", str(chunk_games), "--sims", str(args.sims),
+                "--fast-sims", str(args.fast_sims), "--pcr-full-prob", str(args.pcr_full_prob),
                 "--temp-moves", str(args.temp_moves), "--concurrency", str(args.concurrency),
                 "--threads", str(args.threads), "--max-batch", str(args.max_batch),
                 "--seed", str(chunk_seq * 1_000_003),

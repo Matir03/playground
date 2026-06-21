@@ -141,6 +141,11 @@ def main() -> None:
             e_child = net.encode(bch.reshape(B * MAX_CHILDREN, 2, 6, 7)).reshape(B, MAX_CHILDREN, -1)
             wsum = bvis.sum(dim=1, keepdim=True).clamp_min(1.0)
             pi = bvis / wsum  # (B,7), zero for absent children
+            # PCR: value trains on all positions; policy/reifier only on full
+            # (high-playout) ones, which carry visits. Normalize those losses by
+            # the count of full records so the fast (value-only) majority doesn't
+            # dilute the policy gradient.
+            nfull = (bvis.sum(dim=1) > 0).sum().clamp_min(1).float()
 
             w, mu, std = net.policy_mdn(e_parent)
             lpi = torch.zeros((), device=dev)
@@ -155,8 +160,8 @@ def main() -> None:
                 rlog = net.reify_logits(e_parent, e_child[:, c])  # (B,7)
                 ce = F.cross_entropy(rlog, bcol[:, c], reduction="none")
                 lrho = lrho + (m * ce).sum()
-            lpi = lpi / B
-            lrho = lrho / B
+            lpi = lpi / nfull
+            lrho = lrho / nfull
 
             # consistency: random within-batch pairs, value-only d_func (start)
             j = torch.randperm(B, device=dev)
