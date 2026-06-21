@@ -464,6 +464,9 @@ fn inference_server(
     max_batch: usize,
     stats: &ServerStats,
 ) {
+    // Reused across rounds (the server is serial, so its per-round marshalling is
+    // on the critical path workers block on): clear-and-refill, never realloc.
+    let mut flat = Vec::new();
     loop {
         let first = match rx.recv() {
             Ok(j) => j,
@@ -485,7 +488,7 @@ fn inference_server(
         // ENCODE_EVAL (planes → lgs + value, one fused forward)
         let n: usize = jobs.iter().map(|j| j.wave.enc_eval.len()).sum();
         if n > 0 {
-            let mut flat = Vec::with_capacity(n * PLANES);
+            flat.clear();
             for j in &jobs {
                 for p in &j.wave.enc_eval {
                     flat.extend_from_slice(p);
@@ -503,7 +506,7 @@ fn inference_server(
         // EVAL (sampled / aliased-child latents)
         let n: usize = jobs.iter().map(|j| j.wave.eval.len()).sum();
         if n > 0 {
-            let mut flat = Vec::with_capacity(n * LGS_DIM);
+            flat.clear();
             for j in &jobs {
                 for x in &j.wave.eval {
                     flat.extend_from_slice(x);
@@ -521,7 +524,7 @@ fn inference_server(
         // POLICY_EVAL (lgs → MDN + value, one fused forward)
         let n: usize = jobs.iter().map(|j| j.wave.pol_eval.len()).sum();
         if n > 0 {
-            let mut flat = Vec::with_capacity(n * LGS_DIM);
+            flat.clear();
             for j in &jobs {
                 for x in &j.wave.pol_eval {
                     flat.extend_from_slice(x);
@@ -548,17 +551,17 @@ fn inference_server(
         // REIFY
         let n: usize = jobs.iter().map(|j| j.wave.reif_from.len()).sum();
         if n > 0 {
-            let mut from = Vec::with_capacity(n * LGS_DIM);
+            flat.clear();
             let mut to = Vec::with_capacity(n * LGS_DIM);
             for j in &jobs {
                 for x in &j.wave.reif_from {
-                    from.extend_from_slice(x);
+                    flat.extend_from_slice(x);
                 }
                 for x in &j.wave.reif_to {
                     to.extend_from_slice(x);
                 }
             }
-            let r = server.reify_batch(&from, &to, n).expect("reify_batch");
+            let r = server.reify_batch(&flat, &to, n).expect("reify_batch");
             let mut off = 0;
             for (ji, j) in jobs.iter().enumerate() {
                 for _ in 0..j.wave.reif_from.len() {
