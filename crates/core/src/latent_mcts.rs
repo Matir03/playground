@@ -88,6 +88,13 @@ pub struct SearchResult<G: Game> {
 
 /// A sampled next-LGS candidate (an edge). `point` is the kernel/density anchor:
 /// the sampled target before reification, the realized child encoding after.
+///
+/// `kw`/`kv` are the incrementally-maintained kernel-regression accumulators
+/// (excluding the self term, `κ(a,a)=1`, which `kr_puct_select` adds back):
+///   kw = Σ_{b≠a} κ(a,b)·n_eff_b      kv = Σ_{b≠a} κ(a,b)·v_eff_b
+/// where v_eff is the *parent-POV* value sum. Maintaining these on every visit
+/// makes `select` O(m) instead of O(m²·d). `log_p` caches the MDN log-density at
+/// `point` (recomputed only when `point` moves on reify/alias).
 struct Candidate {
     point: Vec<f32>,
     visits: u32,
@@ -95,6 +102,9 @@ struct Candidate {
     value_sum: f64,
     /// Child node index once reified (aliases point at a shared node).
     reified: Option<usize>,
+    kw: f64,
+    kv: f64,
+    log_p: f64,
 }
 
 struct Node<G: Game> {
@@ -141,6 +151,70 @@ fn kernel(a: &[f32], b: &[f32], h: f64) -> f64 {
         sq += d * d;
     }
     (-sq / (2.0 * h * h)).exp()
+}
+
+/// Effective `(n_eff, v_eff)` of candidate `j` of `node`: visits and *parent-POV*
+/// value sum, read from the reified child node (shared by aliases) or, while
+/// still latent, from the candidate itself. `v_eff = -value_sum` because the
+/// stored `value_sum` is child-POV.
+fn cand_eff<G: Game>(tree: &[Node<G>], node: usize, j: usize) -> (f64, f64) {
+    let c = &tree[node].candidates[j];
+    match c.reified {
+        Some(ci) => (tree[ci].visits as f64, -tree[ci].value_sum),
+        None => (c.visits as f64, -c.value_sum),
+    }
+}
+
+/// Apply a `(Δn_eff, Δv_eff)` change of candidate `b` to every *other* candidate's
+/// kernel accumulators (the self term is held outside `kw`/`kv`). O(m·d). This is
+/// the incremental update that replaces the O(m²·d) re-summation in `select`.
+fn propagate<G: Game>(node: &mut Node<G>, b: usize, dn: f64, dv: f64, h: f64) {
+    if dn == 0.0 && dv == 0.0 {
+        return;
+    }
+    let (left, rest) = node.candidates.split_at_mut(b);
+    let (mid, right) = rest.split_at_mut(1);
+    let pb = &mid[0].point;
+    for c in left.iter_mut().chain(right.iter_mut()) {
+        let k = kernel(&c.point, pb, h);
+        c.kw += k * dn;
+        c.kv += k * dv;
+    }
+}
+
+/// Debug-only invariant: the incrementally-maintained `kw`/`kv` must equal the
+/// brute-force kernel-regression sums. Runs on every `select` in test/debug
+/// builds (it's compiled out of release), so the search unit tests validate the
+/// incremental bookkeeping.
+#[cfg(debug_assertions)]
+fn debug_verify_accumulators<G: Game>(tree: &[Node<G>], node_idx: usize, h: f64) {
+    let m = tree[node_idx].candidates.len();
+    let stats: Vec<(f64, f64)> = (0..m).map(|j| cand_eff(tree, node_idx, j)).collect();
+    let node = &tree[node_idx];
+    for a in 0..m {
+        let (mut kw, mut kv) = (0.0f64, 0.0f64);
+        for b in 0..m {
+            if a == b {
+                continue;
+            }
+            let k = kernel(&node.candidates[a].point, &node.candidates[b].point, h);
+            kw += k * stats[b].0;
+            kv += k * stats[b].1;
+        }
+        let c = &node.candidates[a];
+        debug_assert!(
+            (c.kw - kw).abs() <= 1e-6 * (1.0 + kw.abs()),
+            "kw drift a={a}: stored={} brute={}",
+            c.kw,
+            kw
+        );
+        debug_assert!(
+            (c.kv - kv).abs() <= 1e-6 * (1.0 + kv.abs()),
+            "kv drift a={a}: stored={} brute={}",
+            c.kv,
+            kv
+        );
+    }
 }
 
 // ── Search ──────────────────────────────────────────────────────────────────
@@ -194,6 +268,7 @@ async fn simulate<G: Game, M: LatentModel<G>>(
     rng: &mut ChaCha8Rng,
     reifications: &mut u32,
 ) -> anyhow::Result<()> {
+    let h = config.kernel_bandwidth.max(1e-6);
     let mut path = vec![0usize];
     let mut cur = 0usize;
     let value: f64;
@@ -209,7 +284,11 @@ async fn simulate<G: Game, M: LatentModel<G>>(
             break;
         }
 
-        widen(&mut tree[cur], config, rng);
+        // Widen with a snapshot of the current candidates' effective stats so a
+        // new candidate's accumulators can be seeded against the visited set.
+        let stats: Vec<(f64, f64)> =
+            (0..tree[cur].candidates.len()).map(|j| cand_eff(tree, cur, j)).collect();
+        widen(&mut tree[cur], config, rng, &stats, h);
         let a = kr_puct_select(tree, cur, config);
         tree[cur].candidates[a].visits += 1;
 
@@ -220,7 +299,7 @@ async fn simulate<G: Game, M: LatentModel<G>>(
         }
         if tree[cur].candidates[a].visits >= 2 {
             // 2nd visit: reify (decode → apply → re-encode), with aliasing.
-            let child = reify_candidate(model, tree, cur, a, reifications).await?;
+            let child = reify_candidate(model, tree, cur, a, config, reifications).await?;
             path.push(child);
             value = if tree[child].terminal {
                 tree[child].terminal_value
@@ -234,22 +313,52 @@ async fn simulate<G: Game, M: LatentModel<G>>(
             let ver = tree[cur].lgs.model_version.clone();
             let v_child = model.eval(&LatentGameState::from_f32(&pt, ver)).await?;
             tree[cur].candidates[a].value_sum += v_child; // child POV
+            // n_eff: 0→1, v_eff: 0→ -v_child. Propagate into sibling accumulators.
+            propagate(&mut tree[cur], a, 1.0, -v_child, h);
             value = -v_child; // convert to cur's POV (path ends at cur)
             break;
         }
     }
 
     // Backup (negamax): value is from the POV of the side to move at path.last().
-    for (depth_from_leaf, &idx) in path.iter().rev().enumerate() {
+    // Each node's `value_sum` delta also shifts its parent's kernel accumulators
+    // for every candidate aliasing this node (shared reified children).
+    for pos in (0..path.len()).rev() {
+        let idx = path[pos];
+        let depth_from_leaf = path.len() - 1 - pos;
         let sign = if depth_from_leaf % 2 == 0 { 1.0 } else { -1.0 };
+        let contrib = value * sign; // added to child-POV value_sum
         tree[idx].visits += 1;
-        tree[idx].value_sum += value * sign;
+        tree[idx].value_sum += contrib;
+        if pos > 0 {
+            let parent = path[pos - 1];
+            let dv = -contrib; // Δv_eff (parent POV) = -Δ(child value_sum)
+            let aliases: Vec<usize> = tree[parent]
+                .candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.reified == Some(idx))
+                .map(|(i, _)| i)
+                .collect();
+            for b in aliases {
+                propagate(&mut tree[parent], b, 1.0, dv, h);
+            }
+        }
     }
     Ok(())
 }
 
-/// Add sampled candidates until the progressive-widening target is met.
-fn widen<G: Game>(node: &mut Node<G>, config: &SearchConfig, rng: &mut ChaCha8Rng) {
+/// Add sampled candidates until the progressive-widening target is met. `stats`
+/// holds `(n_eff, v_eff)` for the candidates that existed before widening; new
+/// candidates (n_eff=0) contribute nothing, so each new candidate's accumulators
+/// are seeded by summing the kernel against that visited set only.
+fn widen<G: Game>(
+    node: &mut Node<G>,
+    config: &SearchConfig,
+    rng: &mut ChaCha8Rng,
+    stats: &[(f64, f64)],
+    h: f64,
+) {
     let n = node.visits as f64;
     let target = ((config.pw_beta * n.powf(config.pw_alpha)).ceil() as usize)
         .max(1)
@@ -261,45 +370,49 @@ fn widen<G: Game>(node: &mut Node<G>, config: &SearchConfig, rng: &mut ChaCha8Rn
     let Node { policy, candidates, .. } = node;
     if let Some(pol) = policy.as_ref() {
         while candidates.len() < target {
+            let point = pol.sample(rng);
+            let log_p = pol.log_density(&point);
+            let (mut kw, mut kv) = (0.0f64, 0.0f64);
+            for (c, &(nc, vc)) in stats.iter().enumerate() {
+                let k = kernel(&point, &candidates[c].point, h);
+                kw += k * nc;
+                kv += k * vc;
+            }
             candidates.push(Candidate {
-                point: pol.sample(rng),
+                point,
                 visits: 0,
                 value_sum: 0.0,
                 reified: None,
+                kw,
+                kv,
+                log_p,
             });
         }
     }
 }
 
 /// KR-PUCT child selection (with forced playouts). Returns a candidate index.
+/// O(m): reads the incrementally-maintained kernel accumulators (`kw`/`kv`) and
+/// cached MDN log-densities instead of re-summing the m×m kernel each call.
 /// Stack scratch only — this is the search hot path (no per-call allocation).
 fn kr_puct_select<G: Game>(tree: &[Node<G>], node_idx: usize, config: &SearchConfig) -> usize {
     const MAX_CAND: usize = 64;
+    #[cfg(debug_assertions)]
+    debug_verify_accumulators(tree, node_idx, config.kernel_bandwidth.max(1e-6));
     let node = &tree[node_idx];
     debug_assert!(node.candidates.len() > 0, "select on a node with no candidates");
     debug_assert!(node.candidates.len() <= MAX_CAND, "candidates exceed MAX_CAND");
     let m = node.candidates.len().min(MAX_CAND);
 
-    // Effective counts, parent-POV value, and (unnormalized) MDN priors.
-    let pol = node.policy.as_ref().expect("expanded node has a policy");
-    let mut n_eff = [0f64; MAX_CAND];
-    let mut q = [0f64; MAX_CAND];
+    // Normalized MDN priors from cached per-candidate log-densities (softmax).
     let mut p = [0f64; MAX_CAND];
     let mut mx = f64::NEG_INFINITY;
     for (j, c) in node.candidates.iter().take(m).enumerate() {
-        let (n, vsum) = match c.reified {
-            Some(ci) => (tree[ci].visits as f64, tree[ci].value_sum),
-            None => (c.visits as f64, c.value_sum),
-        };
-        n_eff[j] = n;
-        q[j] = if n > 0.0 { -(vsum / n) } else { config.fpu }; // child POV → parent POV
-        let l = pol.log_density(&c.point);
-        p[j] = l;
-        if l > mx {
-            mx = l;
+        p[j] = c.log_p;
+        if c.log_p > mx {
+            mx = c.log_p;
         }
     }
-    // Normalize priors (softmax over candidate log-densities).
     let mut psum = 0.0;
     for v in p.iter_mut().take(m) {
         *v = if mx.is_finite() { (*v - mx).exp() } else { 1.0 };
@@ -330,18 +443,16 @@ fn kr_puct_select<G: Game>(tree: &[Node<G>], node_idx: usize, config: &SearchCon
         return j;
     }
 
-    // KR-PUCT score.
-    let h = config.kernel_bandwidth.max(1e-6);
+    // KR-PUCT score. `kw`/`kv` already hold Σ_{b≠a} κ(a,b)·{n_eff,v_eff}; add the
+    // self term (κ(a,a)=1) from this candidate's own effective stats.
     let sqrt_total = nvis.max(1.0).sqrt();
     let mut best = 0usize;
     let mut best_s = f64::NEG_INFINITY;
     for a in 0..m {
-        let (mut w, mut num) = (0.0f64, 0.0f64);
-        for b in 0..m {
-            let k = kernel(&node.candidates[a].point, &node.candidates[b].point, h);
-            w += k * n_eff[b];
-            num += k * n_eff[b] * q[b];
-        }
+        let (n_a, v_a) = cand_eff(tree, node_idx, a);
+        let c = &node.candidates[a];
+        let w = c.kw + n_a;
+        let num = c.kv + v_a;
         let qkr = if w > 0.0 { num / w } else { config.fpu };
         let u = config.c_puct * p[a] * sqrt_total / (1.0 + w);
         let s = qkr + u;
@@ -355,13 +466,22 @@ fn kr_puct_select<G: Game>(tree: &[Node<G>], node_idx: usize, config: &SearchCon
 
 /// Reify candidate `a` of node `cur`: decode → apply → re-encode; alias onto an
 /// existing child if the concrete state already exists. Returns the child index.
+///
+/// Reification moves the candidate's kernel anchor from the sampled target to the
+/// realized child encoding, so the kernel relationships change. We (1) undo the
+/// candidate's unreified contribution, (2) repoint it and refresh its cached MDN
+/// log-density, (3) recompute its own accumulators against the sibling set at the
+/// new point, and (4) add its reified (child-derived) contribution to siblings.
+/// All four steps are O(m·d) and happen once per reification.
 async fn reify_candidate<G: Game, M: LatentModel<G>>(
     model: &M,
     tree: &mut Vec<Node<G>>,
     cur: usize,
     a: usize,
+    config: &SearchConfig,
     reifications: &mut u32,
 ) -> anyhow::Result<usize> {
+    let h = config.kernel_bandwidth.max(1e-6);
     let from_state = tree[cur].state.clone();
     let from_lgs = tree[cur].lgs.clone();
     let ver = from_lgs.model_version.clone();
@@ -375,24 +495,60 @@ async fn reify_candidate<G: Game, M: LatentModel<G>>(
     let key = G::encode_state(&child_state);
     *reifications += 1;
 
-    if let Some(&ci) = tree[cur].child_by_key.get(&key) {
+    // Resolve the child node (alias onto an existing concrete state, or create).
+    let (ci, anchor) = if let Some(&ci) = tree[cur].child_by_key.get(&key) {
         let anchor = tree[ci].lgs.to_f32();
+        (ci, anchor)
+    } else {
+        let child_lgs = model.encode(&child_state).await?;
+        let mut node = make_node::<G>(child_lgs, child_state);
+        node.incoming_move = Some(mv);
+        let ci = tree.len();
+        let anchor = node.lgs.to_f32();
+        tree.push(node);
+        tree[cur].child_by_key.insert(key, ci);
+        (ci, anchor)
+    };
+
+    // 1. Undo the unreified contribution (exactly one 1st-visit eval: n=1, the
+    //    propagated v_eff was -value_sum, so undo with +value_sum).
+    let old_vs = tree[cur].candidates[a].value_sum;
+    propagate(&mut tree[cur], a, -1.0, old_vs, h);
+
+    // 2. Repoint to the child anchor and refresh the cached MDN log-density.
+    let log_p = tree[cur]
+        .policy
+        .as_ref()
+        .map(|pol| pol.log_density(&anchor))
+        .unwrap_or(f64::NEG_INFINITY);
+    {
         let c = &mut tree[cur].candidates[a];
         c.reified = Some(ci);
-        c.point = anchor; // realize the kernel anchor onto the child encoding
-        return Ok(ci);
+        c.point = anchor.clone();
+        c.log_p = log_p;
     }
 
-    let child_lgs = model.encode(&child_state).await?;
-    let mut node = make_node::<G>(child_lgs, child_state);
-    node.incoming_move = Some(mv);
-    let ci = tree.len();
-    let anchor = node.lgs.to_f32();
-    tree.push(node);
-    tree[cur].child_by_key.insert(key, ci);
-    let c = &mut tree[cur].candidates[a];
-    c.reified = Some(ci);
-    c.point = anchor;
+    // 3. Recompute a's own accumulators against the sibling set at the new point.
+    let m = tree[cur].candidates.len();
+    let stats: Vec<(f64, f64)> = (0..m).map(|j| cand_eff(tree, cur, j)).collect();
+    let (mut kwa, mut kva) = (0.0f64, 0.0f64);
+    for c in 0..m {
+        if c == a {
+            continue;
+        }
+        let k = kernel(&anchor, &tree[cur].candidates[c].point, h);
+        kwa += k * stats[c].0;
+        kva += k * stats[c].1;
+    }
+    {
+        let c = &mut tree[cur].candidates[a];
+        c.kw = kwa;
+        c.kv = kva;
+    }
+
+    // 4. Add a's reified (child-derived) contribution to the siblings.
+    let (n_new, v_new) = stats[a];
+    propagate(&mut tree[cur], a, n_new, v_new, h);
     Ok(ci)
 }
 
@@ -584,6 +740,28 @@ mod tests {
             let res = search(&MockModel, &s, &cfg).await.unwrap();
             assert!(Countdown::legal_moves(&s).contains(&res.chosen), "h={h}");
             assert_eq!(res.visits, 64);
+        }
+    }
+
+    #[tokio::test]
+    async fn incremental_accumulators_match_brute_force_under_load() {
+        // Many candidates + many sims across bandwidths: every `select` runs the
+        // debug brute-force cross-check, so this stresses widen/reify/alias/backup
+        // accumulator maintenance. (The assertion lives in debug_verify; here we
+        // just confirm the search completes and stays well-formed.)
+        let s = Countdown::initial_state();
+        for h in [0.1, 0.7, 3.0] {
+            let cfg = SearchConfig {
+                simulations: 400,
+                max_candidates: 32,
+                kernel_bandwidth: h,
+                seed: Some(11),
+                ..Default::default()
+            };
+            let res = search(&MockModel, &s, &cfg).await.unwrap();
+            assert_eq!(res.visits, 400, "h={h}");
+            let child_visits: u32 = res.root_children.iter().map(|c| c.visits).sum();
+            assert!(child_visits > 0 && child_visits <= 400, "h={h}");
         }
     }
 
