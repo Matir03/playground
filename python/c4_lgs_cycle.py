@@ -60,8 +60,14 @@ def main() -> None:
     ap.add_argument("--match-games", type=int, default=40)
     ap.add_argument("--match-sims", type=int, default=64)
     ap.add_argument("--match-random", type=int, default=3, help="random previous gens to also play each ladder step")
+    # Continuous actor/learner: generate self-play chunks back-to-back for
+    # --train-interval-secs (full replenishing pool, games >> pool), then train
+    # once. 0 = legacy one-chunk-per-train behaviour.
+    ap.add_argument("--train-interval-secs", type=int, default=0)
+    ap.add_argument("--chunk-games", type=int, default=4096, help="games per self-play chunk (>> pool)")
     args = ap.parse_args()
     import c4_lgs_ladder as ladder
+    import time
 
     buffer = os.path.join(args.live, "buffer")
     ckpt = os.path.join(args.live, "checkpoint.safetensors")
@@ -74,22 +80,32 @@ def main() -> None:
 
     gens_dir = os.path.join(args.live, "gens")
     ladder_path = os.path.join(args.live, "ladder.json")
-    start = len(glob.glob(os.path.join(buffer, "chunk_*.bin")))
-    gen = start
-    while args.gens == 0 or gen < start + args.gens:
-        print(f"\n=== generation {gen} ===", flush=True)
-        out = os.path.join(buffer, f"chunk_{gen:06}.bin")
-        gen_cmd = [
-            args.engine, "lgs-gen", "--model", ckpt, "--out", out,
-            "--games", str(args.games), "--sims", str(args.sims),
-            "--temp-moves", str(args.temp_moves), "--concurrency", str(args.concurrency),
-            "--threads", str(args.threads), "--max-batch", str(args.max_batch),
-            "--seed", str(gen * 1_000_003),
-        ]
-        if args.cuda:
-            gen_cmd.append("--cuda")
-        sh(gen_cmd)
-        prune(buffer, args.window)
+    chunk_seq = len(glob.glob(os.path.join(buffer, "chunk_*.bin")))
+    gen = 0
+    while args.gens == 0 or gen < args.gens:
+        # Self-play phase: keep a full replenishing pool busy generating chunks
+        # (games >> pool) back-to-back until the train interval elapses, so the
+        # actor runs at bench throughput between (infrequent) training steps.
+        print(f"\n=== round {gen} : self-play ===", flush=True)
+        round_start = time.time()
+        chunk_games = args.chunk_games if args.train_interval_secs > 0 else args.games
+        while True:
+            out = os.path.join(buffer, f"chunk_{chunk_seq:06}.bin")
+            gen_cmd = [
+                args.engine, "lgs-gen", "--model", ckpt, "--out", out,
+                "--games", str(chunk_games), "--sims", str(args.sims),
+                "--temp-moves", str(args.temp_moves), "--concurrency", str(args.concurrency),
+                "--threads", str(args.threads), "--max-batch", str(args.max_batch),
+                "--seed", str(chunk_seq * 1_000_003),
+            ]
+            if args.cuda:
+                gen_cmd.append("--cuda")
+            sh(gen_cmd)
+            chunk_seq += 1
+            prune(buffer, args.window)
+            if args.train_interval_secs <= 0 or time.time() - round_start >= args.train_interval_secs:
+                break
+        print(f"=== round {gen} : train ===", flush=True)
         sh([
             args.python, train, "--buffer", buffer, "--in", ckpt, "--out", ckpt,
             "--epochs", str(args.epochs), "--batch", str(args.batch), "--lr", str(args.lr),
