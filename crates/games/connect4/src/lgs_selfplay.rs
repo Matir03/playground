@@ -208,19 +208,23 @@ pub async fn run_generate(
 // all workers into fixed-size batched forwards (one GPU consumer). Finished games
 // are replenished from a shared budget, keeping the pipeline full.
 
-/// A net op a game yields this round.
+/// A net op a game yields this round. `encode`/`policy` ride the fused ops too
+/// (value discarded by the caller), so every state-keyed forward is cacheable and
+/// the dominant standalone `eval` (value head) is folded into `EncodeEval` (reify
+/// leaf) and `PolicyEval` (node expansion). Only sampled-latent and aliased-child
+/// evals remain as standalone `Eval`s.
 enum Pending {
-    Encode(Vec<f32>),
-    Eval(Vec<f32>),
-    Policy(Vec<f32>),
-    Reify(Vec<f32>, Vec<f32>),
+    EncodeEval(Vec<f32>),       // planes  → (lgs, value)
+    Eval(Vec<f32>),             // lgs     → value
+    PolicyEval(Vec<f32>),       // lgs     → (MDN, value)
+    Reify(Vec<f32>, Vec<f32>),  // from,to → col logits
 }
 
 /// The driver's reply to a yielded op.
 enum OpOut {
-    Lgs(Vec<f32>),
+    LgsVal(Vec<f32>, f32),
     Val(f32),
-    Pol(MixturePolicy),
+    PolVal(MixturePolicy, f32),
     Logits(Vec<f32>),
 }
 
@@ -248,14 +252,15 @@ impl<V> ShardCache<V> {
     }
 }
 
-/// Transposition cache over *real-state* forwards (`encode`, `policy`), shared
-/// across worker threads. Connect 4 transposes heavily, so the same board state
-/// recurs across games/searches; caching removes the (dominant) conv forwards.
-/// `eval`/`reify` are not cached — they hit unique sampled latents and would
-/// pollute the cache. Keyed by a hash of the input floats.
+/// Transposition cache over *real-state* fused forwards, shared across worker
+/// threads. Connect 4 transposes heavily, so the same board recurs across
+/// games/searches; caching removes the dominant conv (encode) and value/policy
+/// forwards. `enc` is keyed by board planes → (lgs, value); `pol` by lgs →
+/// (MDN, value). Standalone `Eval`/`Reify` hit unique sampled latents and stay
+/// uncached. Keyed by a hash of the input floats.
 struct Cache {
-    encode: ShardCache<Vec<f32>>,
-    policy: ShardCache<PolOut>,
+    enc: ShardCache<(Vec<f32>, f32)>,
+    pol: ShardCache<(PolOut, f32)>,
     hits: AtomicU64,
     misses: AtomicU64,
 }
@@ -263,8 +268,8 @@ struct Cache {
 impl Default for Cache {
     fn default() -> Self {
         Self {
-            encode: ShardCache::new(64),
-            policy: ShardCache::new(64),
+            enc: ShardCache::new(64),
+            pol: ShardCache::new(64),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
@@ -326,9 +331,13 @@ impl LockstepModel {
 #[async_trait]
 impl LatentModel<Connect4> for LockstepModel {
     async fn encode(&self, state: &Connect4State) -> anyhow::Result<LatentGameState> {
-        match self.submit(Pending::Encode(planes_of(state).to_vec())).await {
-            OpOut::Lgs(v) => Ok(LatentGameState::from_f32(&v, self.version.clone())),
-            _ => unreachable!("encode reply"),
+        let (lgs, _) = self.encode_eval(state).await?;
+        Ok(lgs)
+    }
+    async fn encode_eval(&self, state: &Connect4State) -> anyhow::Result<(LatentGameState, f64)> {
+        match self.submit(Pending::EncodeEval(planes_of(state).to_vec())).await {
+            OpOut::LgsVal(v, val) => Ok((LatentGameState::from_f32(&v, self.version.clone()), val as f64)),
+            _ => unreachable!("encode_eval reply"),
         }
     }
     async fn eval(&self, lgs: &LatentGameState) -> anyhow::Result<f64> {
@@ -338,9 +347,13 @@ impl LatentModel<Connect4> for LockstepModel {
         }
     }
     async fn policy(&self, lgs: &LatentGameState) -> anyhow::Result<MixturePolicy> {
-        match self.submit(Pending::Policy(lgs.to_f32())).await {
-            OpOut::Pol(p) => Ok(p),
-            _ => unreachable!("policy reply"),
+        let (p, _) = self.policy_eval(lgs).await?;
+        Ok(p)
+    }
+    async fn policy_eval(&self, lgs: &LatentGameState) -> anyhow::Result<(MixturePolicy, f64)> {
+        match self.submit(Pending::PolicyEval(lgs.to_f32())).await {
+            OpOut::PolVal(p, val) => Ok((p, val as f64)),
+            _ => unreachable!("policy_eval reply"),
         }
     }
     async fn reify(
@@ -403,21 +416,25 @@ struct ThreadOut {
 struct ServerStats {
     rounds: AtomicU64,
     ops: AtomicU64,
+    n_enc: AtomicU64,
+    n_eval: AtomicU64,
+    n_pol: AtomicU64,
+    n_reif: AtomicU64,
 }
 
 /// One worker's wave of net-op *misses* for the central inference server.
 #[derive(Default)]
 struct Wave {
-    enc: Vec<Vec<f32>>,
-    eval: Vec<Vec<f32>>,
-    pol: Vec<Vec<f32>>,
+    enc_eval: Vec<Vec<f32>>, // planes
+    eval: Vec<Vec<f32>>,     // lgs (sampled / aliased child)
+    pol_eval: Vec<Vec<f32>>, // lgs
     reif_from: Vec<Vec<f32>>,
     reif_to: Vec<Vec<f32>>,
 }
 
 impl Wave {
     fn count(&self) -> usize {
-        self.enc.len() + self.eval.len() + self.pol.len() + self.reif_from.len()
+        self.enc_eval.len() + self.eval.len() + self.pol_eval.len() + self.reif_from.len()
     }
     fn is_empty(&self) -> bool {
         self.count() == 0
@@ -426,9 +443,9 @@ impl Wave {
 
 #[derive(Default)]
 struct WaveOut {
-    enc: Vec<Vec<f32>>,
+    enc_eval: Vec<(Vec<f32>, f32)>,
     eval: Vec<f32>,
-    pol: Vec<PolOut>,
+    pol_eval: Vec<(PolOut, f32)>,
     reif: Vec<Vec<f32>>,
 }
 
@@ -465,25 +482,25 @@ fn inference_server(
         }
         let mut outs: Vec<WaveOut> = (0..jobs.len()).map(|_| WaveOut::default()).collect();
 
-        // ENCODE
-        let n: usize = jobs.iter().map(|j| j.wave.enc.len()).sum();
+        // ENCODE_EVAL (planes → lgs + value, one fused forward)
+        let n: usize = jobs.iter().map(|j| j.wave.enc_eval.len()).sum();
         if n > 0 {
             let mut flat = Vec::with_capacity(n * PLANES);
             for j in &jobs {
-                for p in &j.wave.enc {
+                for p in &j.wave.enc_eval {
                     flat.extend_from_slice(p);
                 }
             }
-            let r = server.encode_batch(&flat, n).expect("encode_batch");
+            let (lgs, val) = server.encode_eval_batch(&flat, n).expect("encode_eval_batch");
             let mut off = 0;
             for (ji, j) in jobs.iter().enumerate() {
-                for _ in 0..j.wave.enc.len() {
-                    outs[ji].enc.push(r[off * LGS_DIM..(off + 1) * LGS_DIM].to_vec());
+                for _ in 0..j.wave.enc_eval.len() {
+                    outs[ji].enc_eval.push((lgs[off * LGS_DIM..(off + 1) * LGS_DIM].to_vec(), val[off]));
                     off += 1;
                 }
             }
         }
-        // EVAL
+        // EVAL (sampled / aliased-child latents)
         let n: usize = jobs.iter().map(|j| j.wave.eval.len()).sum();
         if n > 0 {
             let mut flat = Vec::with_capacity(n * LGS_DIM);
@@ -501,25 +518,28 @@ fn inference_server(
                 }
             }
         }
-        // POLICY
-        let n: usize = jobs.iter().map(|j| j.wave.pol.len()).sum();
+        // POLICY_EVAL (lgs → MDN + value, one fused forward)
+        let n: usize = jobs.iter().map(|j| j.wave.pol_eval.len()).sum();
         if n > 0 {
             let mut flat = Vec::with_capacity(n * LGS_DIM);
             for j in &jobs {
-                for x in &j.wave.pol {
+                for x in &j.wave.pol_eval {
                     flat.extend_from_slice(x);
                 }
             }
-            let (k, w, mu, std) = server.policy_batch(&flat, n).expect("policy_batch");
+            let (k, w, mu, std, val) = server.policy_eval_batch(&flat, n).expect("policy_eval_batch");
             let md = k * LGS_DIM;
             let mut off = 0;
             for (ji, j) in jobs.iter().enumerate() {
-                for _ in 0..j.wave.pol.len() {
-                    outs[ji].pol.push((
-                        k,
-                        w[off * k..(off + 1) * k].to_vec(),
-                        mu[off * md..(off + 1) * md].to_vec(),
-                        std[off * md..(off + 1) * md].to_vec(),
+                for _ in 0..j.wave.pol_eval.len() {
+                    outs[ji].pol_eval.push((
+                        (
+                            k,
+                            w[off * k..(off + 1) * k].to_vec(),
+                            mu[off * md..(off + 1) * md].to_vec(),
+                            std[off * md..(off + 1) * md].to_vec(),
+                        ),
+                        val[off],
                     ));
                     off += 1;
                 }
@@ -550,6 +570,10 @@ fn inference_server(
 
         stats.rounds.fetch_add(1, Ordering::Relaxed);
         stats.ops.fetch_add(total as u64, Ordering::Relaxed);
+        stats.n_enc.fetch_add(jobs.iter().map(|j| j.wave.enc_eval.len() as u64).sum(), Ordering::Relaxed);
+        stats.n_eval.fetch_add(jobs.iter().map(|j| j.wave.eval.len() as u64).sum(), Ordering::Relaxed);
+        stats.n_pol.fetch_add(jobs.iter().map(|j| j.wave.pol_eval.len() as u64).sum(), Ordering::Relaxed);
+        stats.n_reif.fetch_add(jobs.iter().map(|j| j.wave.reif_from.len() as u64).sum(), Ordering::Relaxed);
         for (j, o) in jobs.into_iter().zip(outs) {
             let _ = j.resp.send(o);
         }
@@ -636,8 +660,8 @@ fn worker(
             }
         }
 
-        // Resolve encode/policy cache hits (sharded, short locks); collect misses
-        // (+ all eval/reify) into a wave.
+        // Resolve fused encode/policy cache hits (sharded, short locks); collect
+        // misses (+ all eval/reify) into a wave.
         let mut wave = Wave::default();
         let mut enc_slot: Vec<usize> = Vec::new();
         let mut enc_key: Vec<u64> = Vec::new();
@@ -648,33 +672,32 @@ fn worker(
         let mut hits_out: Vec<(usize, OpOut)> = Vec::new();
         for (slot, p) in reqs {
             match p {
-                Pending::Encode(p) => {
+                Pending::EncodeEval(p) => {
                     let k = hash_f32s(&p);
-                    if let Some(v) = cache.encode.get(k) {
-                        hits_out.push((slot, OpOut::Lgs(v.as_ref().clone())));
+                    if let Some(v) = cache.enc.get(k) {
+                        let (lgs, val) = v.as_ref();
+                        hits_out.push((slot, OpOut::LgsVal(lgs.clone(), *val)));
                         cache.hits.fetch_add(1, Ordering::Relaxed);
                     } else {
                         enc_slot.push(slot);
                         enc_key.push(k);
-                        wave.enc.push(p);
+                        wave.enc_eval.push(p);
                         cache.misses.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                Pending::Policy(x) => {
+                Pending::PolicyEval(x) => {
                     let k = hash_f32s(&x);
-                    if let Some(v) = cache.policy.get(k) {
-                        let (_, w, mu, std) = v.as_ref();
-                        hits_out.push((slot, OpOut::Pol(MixturePolicy {
-                            dim: LGS_DIM,
-                            weights: w.clone(),
-                            means: mu.clone(),
-                            stds: std.clone(),
-                        })));
+                    if let Some(v) = cache.pol.get(k) {
+                        let ((_, w, mu, std), val) = v.as_ref();
+                        hits_out.push((slot, OpOut::PolVal(
+                            MixturePolicy { dim: LGS_DIM, weights: w.clone(), means: mu.clone(), stds: std.clone() },
+                            *val,
+                        )));
                         cache.hits.fetch_add(1, Ordering::Relaxed);
                     } else {
                         pol_slot.push(slot);
                         pol_key.push(k);
-                        wave.pol.push(x);
+                        wave.pol_eval.push(x);
                         cache.misses.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -703,25 +726,24 @@ fn worker(
         let wo = resp_rx.recv().expect("inference response dropped");
 
         // Populate caches (sharded), then write results back (brief lane lock).
-        for (i, _) in enc_slot.iter().enumerate() {
-            cache.encode.insert(enc_key[i], Arc::new(wo.enc[i].clone()));
+        for (i, &k) in enc_key.iter().enumerate() {
+            cache.enc.insert(k, Arc::new(wo.enc_eval[i].clone()));
         }
-        for (i, _) in pol_slot.iter().enumerate() {
-            cache.policy.insert(pol_key[i], Arc::new(wo.pol[i].clone()));
+        for (i, &k) in pol_key.iter().enumerate() {
+            cache.pol.insert(k, Arc::new(wo.pol_eval[i].clone()));
         }
         {
             let mut l = lane.lock().unwrap();
             for (i, &slot) in enc_slot.iter().enumerate() {
-                l.result[slot] = Some(OpOut::Lgs(wo.enc[i].clone()));
+                let (lgs, val) = &wo.enc_eval[i];
+                l.result[slot] = Some(OpOut::LgsVal(lgs.clone(), *val));
             }
             for (i, &slot) in pol_slot.iter().enumerate() {
-                let (_, w, mu, std) = &wo.pol[i];
-                l.result[slot] = Some(OpOut::Pol(MixturePolicy {
-                    dim: LGS_DIM,
-                    weights: w.clone(),
-                    means: mu.clone(),
-                    stds: std.clone(),
-                }));
+                let ((_, w, mu, std), val) = &wo.pol_eval[i];
+                l.result[slot] = Some(OpOut::PolVal(
+                    MixturePolicy { dim: LGS_DIM, weights: w.clone(), means: mu.clone(), stds: std.clone() },
+                    *val,
+                ));
             }
             for (i, &slot) in eval_slot.iter().enumerate() {
                 l.result[slot] = Some(OpOut::Val(wo.eval[i]));
@@ -803,7 +825,8 @@ pub fn run_generate_batched(
     let ops = stats.ops.load(Ordering::Relaxed);
     eprintln!(
         "  wrote {} examples ({} games) in {:.1}s  ({:.1} games/s, {} reifications)\n  \
-         avg_batch {:.0}  forwards/s {:.0} ({:.1}k)  cache_hit {:.0}% (encode+policy)",
+         avg_batch {:.0}  forwards/s {:.0} ({:.1}k)  cache_hit {:.0}% (encode+policy)\n  \
+         ops: enc {} eval {} pol {} reif {}",
         all.len(),
         n_games,
         dt,
@@ -813,6 +836,10 @@ pub fn run_generate_batched(
         ops as f64 / dt,
         ops as f64 / dt / 1000.0,
         100.0 * hit_rate,
+        stats.n_enc.load(Ordering::Relaxed),
+        stats.n_eval.load(Ordering::Relaxed),
+        stats.n_pol.load(Ordering::Relaxed),
+        stats.n_reif.load(Ordering::Relaxed),
     );
     Ok(())
 }

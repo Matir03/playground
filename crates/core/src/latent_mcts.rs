@@ -278,9 +278,12 @@ async fn simulate<G: Game, M: LatentModel<G>>(
             break;
         }
         if !tree[cur].expanded {
-            tree[cur].policy = Some(model.policy(&tree[cur].lgs).await?);
+            // Expansion always needs both the MDN policy and the node value;
+            // fuse them into one round-trip.
+            let (pol, val) = model.policy_eval(&tree[cur].lgs).await?;
+            tree[cur].policy = Some(pol);
             tree[cur].expanded = true;
-            value = model.eval(&tree[cur].lgs).await?;
+            value = val;
             break;
         }
 
@@ -298,14 +301,11 @@ async fn simulate<G: Game, M: LatentModel<G>>(
             continue;
         }
         if tree[cur].candidates[a].visits >= 2 {
-            // 2nd visit: reify (decode → apply → re-encode), with aliasing.
-            let child = reify_candidate(model, tree, cur, a, config, reifications).await?;
+            // 2nd visit: reify (decode → apply → re-encode), with aliasing. The
+            // child's value comes back fused with its encode (no separate eval).
+            let (child, cval) = reify_candidate(model, tree, cur, a, config, reifications).await?;
             path.push(child);
-            value = if tree[child].terminal {
-                tree[child].terminal_value
-            } else {
-                model.eval(&tree[child].lgs).await?
-            };
+            value = cval;
             break;
         } else {
             // 1st visit: evaluate the still-latent target (cheap; no concrete game).
@@ -480,7 +480,7 @@ async fn reify_candidate<G: Game, M: LatentModel<G>>(
     a: usize,
     config: &SearchConfig,
     reifications: &mut u32,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<(usize, f64)> {
     let h = config.kernel_bandwidth.max(1e-6);
     let from_state = tree[cur].state.clone();
     let from_lgs = tree[cur].lgs.clone();
@@ -495,19 +495,27 @@ async fn reify_candidate<G: Game, M: LatentModel<G>>(
     let key = G::encode_state(&child_state);
     *reifications += 1;
 
-    // Resolve the child node (alias onto an existing concrete state, or create).
-    let (ci, anchor) = if let Some(&ci) = tree[cur].child_by_key.get(&key) {
+    // Resolve the child node (alias onto an existing concrete state, or create)
+    // and obtain its value: an existing child re-evals its real encoding; a new
+    // child encodes+evals in one fused round-trip.
+    let (ci, anchor, child_value) = if let Some(&ci) = tree[cur].child_by_key.get(&key) {
         let anchor = tree[ci].lgs.to_f32();
-        (ci, anchor)
+        let v = if tree[ci].terminal {
+            tree[ci].terminal_value
+        } else {
+            model.eval(&tree[ci].lgs).await?
+        };
+        (ci, anchor, v)
     } else {
-        let child_lgs = model.encode(&child_state).await?;
+        let (child_lgs, v0) = model.encode_eval(&child_state).await?;
         let mut node = make_node::<G>(child_lgs, child_state);
         node.incoming_move = Some(mv);
         let ci = tree.len();
         let anchor = node.lgs.to_f32();
+        let v = if node.terminal { node.terminal_value } else { v0 };
         tree.push(node);
         tree[cur].child_by_key.insert(key, ci);
-        (ci, anchor)
+        (ci, anchor, v)
     };
 
     // 1. Undo the unreified contribution (exactly one 1st-visit eval: n=1, the
@@ -549,7 +557,7 @@ async fn reify_candidate<G: Game, M: LatentModel<G>>(
     // 4. Add a's reified (child-derived) contribution to the siblings.
     let (n_new, v_new) = stats[a];
     propagate(&mut tree[cur], a, n_new, v_new, h);
-    Ok(ci)
+    Ok((ci, child_value))
 }
 
 fn is_legal<G: Game>(state: &G::State, mv: &G::Move) -> bool {

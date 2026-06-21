@@ -289,6 +289,35 @@ impl LgsServer {
         Ok(self.net.value(&t)?.flatten_all()?.to_vec1::<f32>()?)
     }
 
+    /// Fused encode+value: `b` × planes → (`b` × LGS, `b` values). One forward
+    /// (shared trunk) so the reify-leaf value rides along with the child encode
+    /// instead of a separate eval round-trip.
+    pub fn encode_eval_batch(&self, planes: &[f32], b: usize) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
+        let t = Tensor::from_vec(planes.to_vec(), (b, 2, C4_ROWS, C4_COLS), &self.device)?;
+        let lgs = self.net.encode(&t)?;
+        let val = self.net.value(&lgs)?;
+        Ok((lgs.flatten_all()?.to_vec1::<f32>()?, val.flatten_all()?.to_vec1::<f32>()?))
+    }
+
+    /// Fused policy+value: `b` × LGS → (MDN params, `b` values). One round-trip
+    /// for node expansion (which always needs both the policy and the value).
+    pub fn policy_eval_batch(
+        &self,
+        lgs: &[f32],
+        b: usize,
+    ) -> anyhow::Result<(usize, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let t = Tensor::from_vec(lgs.to_vec(), (b, LGS_DIM), &self.device)?;
+        let (w, mu, std) = self.net.policy_mdn(&t)?;
+        let val = self.net.value(&t)?;
+        Ok((
+            self.net.k,
+            w.flatten_all()?.to_vec1::<f32>()?,
+            mu.flatten_all()?.to_vec1::<f32>()?,
+            std.flatten_all()?.to_vec1::<f32>()?,
+            val.flatten_all()?.to_vec1::<f32>()?,
+        ))
+    }
+
     /// `b` × LGS → MDN params: `(k, weights b·k, means b·k·d, stds b·k·d)`.
     pub fn policy_batch(
         &self,

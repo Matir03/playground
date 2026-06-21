@@ -116,6 +116,24 @@ pub trait LatentModel<G: Game>: Send + Sync {
     async fn eval(&self, lgs: &LatentGameState) -> anyhow::Result<f64>;
     /// MDN policy: a Gaussian mixture over next-LGS space.
     async fn policy(&self, lgs: &LatentGameState) -> anyhow::Result<MixturePolicy>;
+
+    /// Fused encode + value (shared trunk). The search uses this when creating a
+    /// node, where it needs both the encoding and its value at once (e.g. the
+    /// reify leaf). Default delegates to `encode` + `eval`; the batched self-play
+    /// model overrides it to a single round-trip.
+    async fn encode_eval(&self, state: &G::State) -> anyhow::Result<(LatentGameState, f64)> {
+        let lgs = self.encode(state).await?;
+        let v = self.eval(&lgs).await?;
+        Ok((lgs, v))
+    }
+
+    /// Fused policy + value: node expansion always needs both. Default delegates;
+    /// the batched model overrides it to one round-trip.
+    async fn policy_eval(&self, lgs: &LatentGameState) -> anyhow::Result<(MixturePolicy, f64)> {
+        let p = self.policy(lgs).await?;
+        let v = self.eval(lgs).await?;
+        Ok((p, v))
+    }
     /// Decode the edge `from_lgs → to_lgs` into a concrete move legal from
     /// `from_state` (the engine remains authoritative on legality).
     async fn reify(
