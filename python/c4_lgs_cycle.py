@@ -48,6 +48,7 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=2)
     ap.add_argument("--batch", type=int, default=512)
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--lv", type=float, default=1.0, help="value-loss weight (>1 prioritizes value)")
     ap.add_argument("--channels", type=int, default=32)
     ap.add_argument("--blocks", type=int, default=3)
     ap.add_argument("--cuda", action="store_true")
@@ -112,7 +113,7 @@ def main() -> None:
         sh([
             args.python, train, "--buffer", buffer, "--in", ckpt, "--out", ckpt,
             "--epochs", str(args.epochs), "--batch", str(args.batch), "--lr", str(args.lr),
-            "--device", args.device,
+            "--lv", str(args.lv), "--device", args.device,
         ])
         if args.eval_every and (gen + 1) % args.eval_every == 0:
             eval_cmd = [

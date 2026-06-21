@@ -86,6 +86,7 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--wd", type=float, default=1e-4)
+    ap.add_argument("--lv", type=float, default=1.0, help="value (MSE) weight")
     ap.add_argument("--lpi", type=float, default=1.0, help="MDN policy weight")
     ap.add_argument("--lrho", type=float, default=1.0, help="reifier weight")
     # Consistency defaults OFF: the exact-match form (α·d_lat ≈ d_func) collapses
@@ -166,7 +167,7 @@ def main() -> None:
             # mixture-entropy bonus (encourage spread, discourage collapse)
             ent = -(w.clamp_min(1e-9).log() * w).sum(-1).mean()
 
-            loss = lv + args.lpi * lpi + args.lrho * lrho + args.lc * lc - args.ent * ent
+            loss = args.lv * lv + args.lpi * lpi + args.lrho * lrho + args.lc * lc - args.ent * ent
             opt.zero_grad()
             loss.backward()
             opt.step()
