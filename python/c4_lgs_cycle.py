@@ -52,6 +52,10 @@ def main() -> None:
     ap.add_argument("--blocks", type=int, default=3)
     ap.add_argument("--cuda", action="store_true")
     ap.add_argument("--device", default="cpu", help="learner device (cpu/cuda)")
+    ap.add_argument("--eval-every", type=int, default=1, help="run lgs-eval vs solver every N gens (0 disables)")
+    ap.add_argument("--eval-positions", type=int, default=200)
+    ap.add_argument("--eval-sims", type=int, default=96)
+    ap.add_argument("--eval-opening", type=int, default=6)
     args = ap.parse_args()
 
     buffer = os.path.join(args.live, "buffer")
@@ -83,6 +87,15 @@ def main() -> None:
             "--epochs", str(args.epochs), "--batch", str(args.batch), "--lr", str(args.lr),
             "--device", args.device,
         ])
+        if args.eval_every and (gen + 1) % args.eval_every == 0:
+            eval_cmd = [
+                args.engine, "lgs-eval", "--model", ckpt,
+                "--positions", str(args.eval_positions), "--sims", str(args.eval_sims),
+                "--opening", str(args.eval_opening), "--seed", str(gen),
+            ]
+            if args.cuda:
+                eval_cmd.append("--cuda")
+            sh(eval_cmd)
 
     print("\n[done] cycle complete", flush=True)
 

@@ -292,6 +292,27 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
+    /// Absolute-strength eval for the LGS net: from random openings, run the
+    /// KR-PUCT latent search and report move/value agreement with the solver.
+    LgsEval {
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        cuda: bool,
+        #[arg(long, default_value_t = 200)]
+        positions: usize,
+        /// Random opening plies before each evaluated position.
+        #[arg(long, default_value_t = 6)]
+        opening: u32,
+        #[arg(long, default_value_t = 96)]
+        sims: u32,
+        #[arg(long, default_value_t = 1.5)]
+        c_puct: f64,
+        #[arg(long, default_value_t = 0.7)]
+        kernel_bandwidth: f64,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
     /// Absolute-strength eval: play a checkpoint's MCTS vs the perfect solver and
     /// print the net's score (the distance-to-perfect signal).
     EvalSolver {
@@ -443,6 +464,12 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await?;
             }
+        }
+        Cmd::LgsEval { model, cuda, positions, opening, sims, c_puct, kernel_bandwidth, seed } => {
+            lgs_selfplay::run_lgs_eval(
+                &model, cuda, positions, opening, sims, c_puct, kernel_bandwidth, seed,
+            )
+            .await?;
         }
         Cmd::EvalSolver { model, cuda, games, node_budget, c_puct, opening, threads, max_batch, seed } => {
             // Deterministic-ish net play (argmax, no root noise) vs the solver.

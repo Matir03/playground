@@ -846,3 +846,63 @@ pub fn run_generate_batched(
     );
     Ok(())
 }
+
+/// Absolute-strength eval for the LGS net (the deferred Stage 4c). From random
+/// openings, run the KR-PUCT latent search and compare its chosen move + root
+/// value to the perfect solver: `move_agree` is how often the net plays a
+/// solver-optimal column, `value_sign_agree` how often it knows who's winning.
+/// Single-thread, argmax (no temperature / root noise). Prints a human line and
+/// a machine-readable `LGSEVAL <move%> <sign%> <n>` line for log scraping.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_lgs_eval(
+    checkpoint: &str,
+    cuda: bool,
+    positions: usize,
+    opening: u32,
+    sims: u32,
+    c_puct: f64,
+    kernel_bandwidth: f64,
+    seed: u64,
+) -> anyhow::Result<()> {
+    use playground_core::Solver;
+    let device = crate::net::pick_device(cuda)?;
+    let model = LgsModel::load_on(checkpoint, device)?;
+    let cfg =
+        SearchConfig { simulations: sims, c_puct, kernel_bandwidth, seed: None, ..Default::default() };
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+
+    let (mut move_ok, mut sign_ok, mut n) = (0usize, 0usize, 0usize);
+    let mut attempts = 0usize;
+    while n < positions && attempts < positions * 20 {
+        attempts += 1;
+        // Random opening; reject if it ends the game before `opening` plies.
+        let mut state = Connect4::initial_state();
+        for _ in 0..opening {
+            if Connect4::outcome(&state).is_terminal() {
+                break;
+            }
+            let moves = Connect4::legal_moves(&state);
+            let mv = moves[rng.gen_range(0..moves.len())].clone();
+            state = Connect4::apply(&state, &mv);
+        }
+        if Connect4::outcome(&state).is_terminal() {
+            continue;
+        }
+        let res = search(&model, &state, &cfg).await?;
+        let sol = Connect4::choose_move(&state);
+        if res.chosen.col == sol.best_move.col {
+            move_ok += 1;
+        }
+        if res.root_value.signum() == (sol.value as f64).signum() {
+            sign_ok += 1;
+        }
+        n += 1;
+    }
+    let nn = n.max(1) as f64;
+    let (mp, sp) = (100.0 * move_ok as f64 / nn, 100.0 * sign_ok as f64 / nn);
+    eprintln!(
+        "lgs_eval_vs_solver  move_agree {mp:.1}%  value_sign_agree {sp:.1}%  ({n} positions, {sims} sims, opening {opening})"
+    );
+    println!("LGSEVAL {mp:.2} {sp:.2} {n}");
+    Ok(())
+}
