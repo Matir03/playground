@@ -39,6 +39,11 @@ pub struct SearchConfig {
     pub k_forced: f64,
     /// First-play-urgency value for unvisited candidates (parent POV).
     pub fpu: f64,
+    /// Self-play exploration: seed the root with *every* legal move as a reified
+    /// child and use uniform root priors, so visits are value-driven over all
+    /// moves (not just whatever the MDN/reifier currently favours). Breaks the
+    /// reifier-collapse feedback loop. Off for eval/match (pure learned policy).
+    pub root_explore: bool,
     /// Optional RNG seed for deterministic tests.
     pub seed: Option<u64>,
 }
@@ -54,6 +59,7 @@ impl Default for SearchConfig {
             max_candidates: 16,
             k_forced: 2.0,
             fpu: 0.0,
+            root_explore: false,
             seed: None,
         }
     }
@@ -233,6 +239,10 @@ pub async fn search<G: Game, M: LatentModel<G>>(
     };
     let mut reifications = 0u32;
 
+    if config.root_explore && !tree[0].terminal {
+        seed_root_coverage(model, &mut tree).await?;
+    }
+
     for _ in 0..config.simulations.max(1) {
         simulate(model, &mut tree, config, &mut rng, &mut reifications).await?;
     }
@@ -289,9 +299,13 @@ async fn simulate<G: Game, M: LatentModel<G>>(
 
         // Widen with a snapshot of the current candidates' effective stats so a
         // new candidate's accumulators can be seeded against the visited set.
-        let stats: Vec<(f64, f64)> =
-            (0..tree[cur].candidates.len()).map(|j| cand_eff(tree, cur, j)).collect();
-        widen(&mut tree[cur], config, rng, &stats, h);
+        // The root under `root_explore` is already seeded with all legal moves —
+        // don't widen it (MDN samples would just alias onto those children).
+        if !(cur == 0 && config.root_explore) {
+            let stats: Vec<(f64, f64)> =
+                (0..tree[cur].candidates.len()).map(|j| cand_eff(tree, cur, j)).collect();
+            widen(&mut tree[cur], config, rng, &stats, h);
+        }
         let a = kr_puct_select(tree, cur, config);
         tree[cur].candidates[a].visits += 1;
 
@@ -404,22 +418,30 @@ fn kr_puct_select<G: Game>(tree: &[Node<G>], node_idx: usize, config: &SearchCon
     debug_assert!(node.candidates.len() <= MAX_CAND, "candidates exceed MAX_CAND");
     let m = node.candidates.len().min(MAX_CAND);
 
-    // Normalized MDN priors from cached per-candidate log-densities (softmax).
+    // Priors. At the root under `root_explore`, use uniform priors so visits are
+    // value-driven over all seeded legal moves (breaks MDN/reifier collapse).
+    // Elsewhere, normalized MDN densities from cached log-densities (softmax).
     let mut p = [0f64; MAX_CAND];
-    let mut mx = f64::NEG_INFINITY;
-    for (j, c) in node.candidates.iter().take(m).enumerate() {
-        p[j] = c.log_p;
-        if c.log_p > mx {
-            mx = c.log_p;
+    if node_idx == 0 && config.root_explore {
+        for v in p.iter_mut().take(m) {
+            *v = 1.0 / m as f64;
         }
-    }
-    let mut psum = 0.0;
-    for v in p.iter_mut().take(m) {
-        *v = if mx.is_finite() { (*v - mx).exp() } else { 1.0 };
-        psum += *v;
-    }
-    for v in p.iter_mut().take(m) {
-        *v = if psum > 0.0 { *v / psum } else { 1.0 / m as f64 };
+    } else {
+        let mut mx = f64::NEG_INFINITY;
+        for (j, c) in node.candidates.iter().take(m).enumerate() {
+            p[j] = c.log_p;
+            if c.log_p > mx {
+                mx = c.log_p;
+            }
+        }
+        let mut psum = 0.0;
+        for v in p.iter_mut().take(m) {
+            *v = if mx.is_finite() { (*v - mx).exp() } else { 1.0 };
+            psum += *v;
+        }
+        for v in p.iter_mut().take(m) {
+            *v = if psum > 0.0 { *v / psum } else { 1.0 / m as f64 };
+        }
     }
 
     // Forced playouts: a reified child below its floor is selected first.
@@ -558,6 +580,46 @@ async fn reify_candidate<G: Game, M: LatentModel<G>>(
     let (n_new, v_new) = stats[a];
     propagate(&mut tree[cur], a, n_new, v_new, h);
     Ok((ci, child_value))
+}
+
+/// Self-play exploration: expand the root and seed a reified child for *every*
+/// legal move, so the search evaluates the whole move space regardless of what
+/// the (possibly collapsed) MDN/reifier currently samples. All seeded candidates
+/// start at zero visits (accumulators zero); the normal backup fills them in, and
+/// `kr_puct_select` uses uniform priors at the root (see `root_explore`).
+async fn seed_root_coverage<G: Game, M: LatentModel<G>>(
+    model: &M,
+    tree: &mut Vec<Node<G>>,
+) -> anyhow::Result<()> {
+    let (pol, _v) = model.policy_eval(&tree[0].lgs).await?;
+    let from_state = tree[0].state.clone();
+    for mv in G::legal_moves(&from_state) {
+        let child_state = G::apply(&from_state, &mv);
+        let key = G::encode_state(&child_state);
+        if tree[0].child_by_key.contains_key(&key) {
+            continue;
+        }
+        let (child_lgs, _v0) = model.encode_eval(&child_state).await?;
+        let mut node = make_node::<G>(child_lgs, child_state);
+        node.incoming_move = Some(mv);
+        let ci = tree.len();
+        let anchor = node.lgs.to_f32();
+        let log_p = pol.log_density(&anchor);
+        tree.push(node);
+        tree[0].child_by_key.insert(key, ci);
+        tree[0].candidates.push(Candidate {
+            point: anchor,
+            visits: 0,
+            value_sum: 0.0,
+            reified: Some(ci),
+            kw: 0.0,
+            kv: 0.0,
+            log_p,
+        });
+    }
+    tree[0].policy = Some(pol);
+    tree[0].expanded = true;
+    Ok(())
 }
 
 fn is_legal<G: Game>(state: &G::State, mv: &G::Move) -> bool {
@@ -771,6 +833,21 @@ mod tests {
             let child_visits: u32 = res.root_children.iter().map(|c| c.visits).sum();
             assert!(child_visits > 0 && child_visits <= 400, "h={h}");
         }
+    }
+
+    #[tokio::test]
+    async fn root_explore_covers_all_legal_moves() {
+        // With root_explore, the root must seed a child for every legal move
+        // (Countdown has 2 from the start), regardless of the MDN.
+        let cfg = SearchConfig { simulations: 16, root_explore: true, seed: Some(1), ..Default::default() };
+        let s = Countdown::initial_state();
+        let res = search(&MockModel, &s, &cfg).await.unwrap();
+        let cols: std::collections::HashSet<u8> = res.root_children.iter().map(|c| c.mv).collect();
+        assert_eq!(
+            cols.len(),
+            Countdown::legal_moves(&s).len(),
+            "root_explore must cover all legal moves, got {cols:?}"
+        );
     }
 
     #[test]

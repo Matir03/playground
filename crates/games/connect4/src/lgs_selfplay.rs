@@ -173,7 +173,7 @@ pub async fn run_generate(
 ) -> anyhow::Result<()> {
     let device = crate::net::pick_device(cuda)?;
     let model = Arc::new(LgsModel::load_on(checkpoint, device)?);
-    let cfg = SearchConfig { simulations: sims, c_puct, kernel_bandwidth, seed: None, ..Default::default() };
+    let cfg = SearchConfig { simulations: sims, c_puct, kernel_bandwidth, root_explore: true, seed: None, ..Default::default() };
     eprintln!(
         "c4 LGS self-play: {n_games} games, {sims} sims/move, h {kernel_bandwidth}, model {checkpoint} -> {out_path}"
     );
@@ -781,7 +781,7 @@ pub fn run_generate_batched(
     let device = crate::net::pick_device(cuda)?;
     let server = LgsServer::load_on(checkpoint, device)?;
     let version = server.model_version.clone();
-    let cfg = SearchConfig { simulations: sims, c_puct, kernel_bandwidth, seed: None, ..Default::default() };
+    let cfg = SearchConfig { simulations: sims, c_puct, kernel_bandwidth, root_explore: true, seed: None, ..Default::default() };
     let pool = threads * in_flight;
     eprintln!(
         "c4 LGS self-play (central-batched): {n_games} games, pool {pool} ({threads}×{in_flight}), \
