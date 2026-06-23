@@ -203,7 +203,11 @@ struct Arch {
 
 fn read_arch(checkpoint: &Path) -> Arch {
     let mut a = Arch { channels: 64, blocks: 5, k: 8, val_hidden: None };
-    let cfg = checkpoint.with_file_name("config.json");
+    // Prefer a per-checkpoint sidecar (e.g. gen_000153.config.json) so a single
+    // gens/ dir can hold mixed archs (legacy + grown value heads); fall back to
+    // config.json in the same dir (live/ uses that).
+    let sidecar = checkpoint.with_extension("config.json");
+    let cfg = if sidecar.exists() { sidecar } else { checkpoint.with_file_name("config.json") };
     if let Ok(text) = std::fs::read_to_string(&cfg) {
         let text = text.replace("NaN", "null").replace("Infinity", "null");
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {

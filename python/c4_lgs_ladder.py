@@ -98,8 +98,10 @@ def step(engine, live_ckpt, gens_dir, ladder_path, gen, cuda,
     """Archive the live checkpoint, run matches, refit ELO, maybe promote.
     Returns (ladder, name, promoted, elo). Raises on match failure."""
     os.makedirs(gens_dir, exist_ok=True)
-    # Archived checkpoints need a sibling config.json so the engine reads the arch
-    # (else it defaults to 64ch and the load shape-mismatches). One per gens dir.
+    # Archived checkpoints need their arch so the engine loads the right shapes.
+    # Each gen gets a per-checkpoint sidecar (gen_NNNNNN.config.json) — the engine
+    # reads that first — so a single gens/ dir can hold mixed archs (e.g. legacy
+    # vs grown value heads). A shared config.json is kept as a fallback.
     src_cfg = os.path.join(os.path.dirname(os.path.abspath(live_ckpt)), "config.json")
     dst_cfg = os.path.join(gens_dir, "config.json")
     if os.path.exists(src_cfg) and not os.path.exists(dst_cfg):
@@ -108,6 +110,8 @@ def step(engine, live_ckpt, gens_dir, ladder_path, gen, cuda,
     name = f"gen_{gen:06d}"
     arch = os.path.join(gens_dir, name + ".safetensors")
     shutil.copy(live_ckpt, arch)
+    if os.path.exists(src_cfg):
+        shutil.copy(src_cfg, os.path.join(gens_dir, name + ".config.json"))
     L["ckpt"][name] = arch
     if "solver" not in L["players"]:
         L["players"].append("solver")
