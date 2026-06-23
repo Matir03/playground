@@ -94,8 +94,12 @@ def fit_bt(players, matches, anchor="solver", iters=2000):
 
 
 def step(engine, live_ckpt, gens_dir, ladder_path, gen, cuda,
-         games=40, sims=64, n_random=3, seed=0):
+         games=40, sims=64, n_random=3, seed=0, margin=0.0):
     """Archive the live checkpoint, run matches, refit ELO, maybe promote.
+
+    Promotes only when the new gen's ELO clears the champion's by ``margin``
+    (ELO points), so the sparse, noisy head-to-head matches don't promote
+    marginally-worse gens (which slowly regresses the champion).
     Returns (ladder, name, promoted, elo). Raises on match failure."""
     os.makedirs(gens_dir, exist_ok=True)
     # Archived checkpoints need their arch so the engine loads the right shapes.
@@ -133,7 +137,7 @@ def step(engine, live_ckpt, gens_dir, ladder_path, gen, cuda,
     promoted = False
     cur = elo.get(name, float("nan"))
     champ = elo.get(L["best"], float("-inf")) if L["best"] else float("-inf")
-    if L["best"] is None or (not math.isnan(cur) and cur > champ):
+    if L["best"] is None or (not math.isnan(cur) and cur > champ + margin):
         L["best"] = name
         promoted = True
     save_ladder(ladder_path, L)

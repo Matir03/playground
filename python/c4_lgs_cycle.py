@@ -63,6 +63,7 @@ def main() -> None:
     ap.add_argument("--match-games", type=int, default=40)
     ap.add_argument("--match-sims", type=int, default=64)
     ap.add_argument("--match-random", type=int, default=3, help="random previous gens to also play each ladder step")
+    ap.add_argument("--promote-margin", type=float, default=0.0, help="ELO margin a gen must clear the champion by to promote (anti-noise)")
     # Continuous actor/learner: generate self-play chunks back-to-back for
     # --train-interval-secs (full replenishing pool, games >> pool), then train
     # once. 0 = legacy one-chunk-per-train behaviour.
@@ -133,6 +134,7 @@ def main() -> None:
                     args.engine, ckpt, gens_dir, ladder_path, gen, args.cuda,
                     games=args.match_games, sims=args.match_sims,
                     n_random=args.match_random, seed=gen * 7919,
+                    margin=args.promote_margin,
                 )
                 tag = "PROMOTED to champion" if promoted else f"champion stays {L['best']}"
                 print(f"LADDER gen {gen} elo {elo.get(name, float('nan')):.0f}  "
