@@ -69,14 +69,62 @@ impl GlobalPoolBias {
     }
 }
 
+/// Value head over the (shared) LGS. `Legacy` is the original single 64-wide
+/// hidden layer (val_fc1/val_fc2); `Mlp` is a deeper/wider stack
+/// (val_hidden_layers.{i} + val_out) produced by c4_lgs_grow_value.py. The
+/// config.json's optional `val_hidden` array selects which one to load.
+enum ValueHead {
+    Legacy { val_fc1: Linear, val_fc2: Linear },
+    Mlp { layers: Vec<Linear>, out: Linear },
+}
+
+impl ValueHead {
+    fn load(arch: &Arch, vb: &VarBuilder) -> candle_core::Result<Self> {
+        match &arch.val_hidden {
+            None => Ok(ValueHead::Legacy {
+                val_fc1: linear(LGS_DIM, 64, vb.pp("val_fc1"))?,
+                val_fc2: linear(64, 1, vb.pp("val_fc2"))?,
+            }),
+            Some(hidden) => {
+                let lvb = vb.pp("val_hidden_layers");
+                let mut layers = Vec::with_capacity(hidden.len());
+                let mut in_dim = LGS_DIM;
+                for (i, &h) in hidden.iter().enumerate() {
+                    layers.push(linear(in_dim, h, lvb.pp(i.to_string()))?);
+                    in_dim = h;
+                }
+                Ok(ValueHead::Mlp {
+                    layers,
+                    out: linear(in_dim, 1, vb.pp("val_out"))?,
+                })
+            }
+        }
+    }
+
+    fn forward(&self, lgs: &Tensor) -> candle_core::Result<Tensor> {
+        match self {
+            ValueHead::Legacy { val_fc1, val_fc2 } => {
+                let x = val_fc1.forward(lgs)?.relu()?;
+                val_fc2.forward(&x)?.tanh()
+            }
+            ValueHead::Mlp { layers, out } => {
+                let mut x = lgs.clone();
+                for layer in layers {
+                    x = layer.forward(&x)?.relu()?;
+                }
+                out.forward(&x)?.tanh()
+            }
+        }
+    }
+}
+
 struct Net {
     stem: Conv2d,
     stem_bn: BatchNorm,
     blocks: Vec<ResBlock>,
     gpool: GlobalPoolBias,
     enc_fc: Linear,
-    val_fc1: Linear,
-    val_fc2: Linear,
+    value_head: ValueHead,
     mix_logits: Linear,
     means: Linear,
     log_stds: Linear,
@@ -101,8 +149,7 @@ impl Net {
             blocks,
             gpool: GlobalPoolBias::load(c, vb.pp("gpool"))?,
             enc_fc: linear(feat, LGS_DIM, vb.pp("enc_fc"))?,
-            val_fc1: linear(LGS_DIM, 64, vb.pp("val_fc1"))?,
-            val_fc2: linear(64, 1, vb.pp("val_fc2"))?,
+            value_head: ValueHead::load(arch, &vb)?,
             mix_logits: linear(LGS_DIM, arch.k, vb.pp("mix_logits"))?,
             means: linear(LGS_DIM, arch.k * LGS_DIM, vb.pp("means"))?,
             log_stds: linear(LGS_DIM, arch.k * LGS_DIM, vb.pp("log_stds"))?,
@@ -124,8 +171,7 @@ impl Net {
     }
 
     fn value(&self, lgs: &Tensor) -> candle_core::Result<Tensor> {
-        let x = self.val_fc1.forward(lgs)?.relu()?;
-        self.val_fc2.forward(&x)?.tanh() // (B,1)
+        self.value_head.forward(lgs) // (B,1)
     }
 
     /// LGS (B,64) -> (weights (B,k), means (B,k,d), stds (B,k,d)).
@@ -151,10 +197,12 @@ struct Arch {
     channels: usize,
     blocks: usize,
     k: usize,
+    /// Hidden widths of an enlarged value-head MLP (None = legacy 64-wide head).
+    val_hidden: Option<Vec<usize>>,
 }
 
 fn read_arch(checkpoint: &Path) -> Arch {
-    let mut a = Arch { channels: 64, blocks: 5, k: 8 };
+    let mut a = Arch { channels: 64, blocks: 5, k: 8, val_hidden: None };
     let cfg = checkpoint.with_file_name("config.json");
     if let Ok(text) = std::fs::read_to_string(&cfg) {
         let text = text.replace("NaN", "null").replace("Infinity", "null");
@@ -164,6 +212,9 @@ fn read_arch(checkpoint: &Path) -> Arch {
                 a.channels = arch["channels"].as_u64().unwrap_or(64) as usize;
                 a.blocks = arch["blocks"].as_u64().unwrap_or(5) as usize;
                 a.k = arch["k"].as_u64().unwrap_or(8) as usize;
+                if let Some(vh) = arch["val_hidden"].as_array() {
+                    a.val_hidden = Some(vh.iter().map(|x| x.as_u64().unwrap_or(64) as usize).collect());
+                }
             }
         }
     }

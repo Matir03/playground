@@ -45,7 +45,13 @@ class GlobalPoolBias(nn.Module):
 
 
 class C4LGSNet(nn.Module):
-    def __init__(self, channels: int = 64, blocks: int = 5, k: int = K_COMPONENTS) -> None:
+    def __init__(
+        self,
+        channels: int = 64,
+        blocks: int = 5,
+        k: int = K_COMPONENTS,
+        val_hidden: list[int] | None = None,
+    ) -> None:
         super().__init__()
         self.channels, self.blocks_n, self.k = channels, blocks, k
         self.stem = nn.Conv2d(2, channels, 3, padding=1)
@@ -54,9 +60,22 @@ class C4LGSNet(nn.Module):
         self.gpool = GlobalPoolBias(channels)
         feat = channels * C4_CELLS
         self.enc_fc = nn.Linear(feat, LGS_DIM)
-        # eval
-        self.val_fc1 = nn.Linear(LGS_DIM, 64)
-        self.val_fc2 = nn.Linear(64, 1)
+        # eval — value head over the (shared) LGS. The default is a single
+        # 64-wide hidden layer (val_fc1/val_fc2), kept under its original key
+        # names so existing checkpoints load unchanged. Passing ``val_hidden``
+        # (e.g. [256, 256]) builds a deeper/wider MLP under val_hidden_layers/
+        # val_out — used by c4_lgs_grow_value.py to grow just this head while
+        # the encoder/policy/reifier stay byte-identical.
+        self.val_hidden = list(val_hidden) if val_hidden else None
+        if self.val_hidden is None:
+            self.val_fc1 = nn.Linear(LGS_DIM, 64)
+            self.val_fc2 = nn.Linear(64, 1)
+        else:
+            dims = [LGS_DIM, *self.val_hidden]
+            self.val_hidden_layers = nn.ModuleList(
+                nn.Linear(dims[i], dims[i + 1]) for i in range(len(self.val_hidden))
+            )
+            self.val_out = nn.Linear(dims[-1], 1)
         # MDN policy over next-LGS
         self.mix_logits = nn.Linear(LGS_DIM, k)
         self.means = nn.Linear(LGS_DIM, k * LGS_DIM)
@@ -81,7 +100,18 @@ class C4LGSNet(nn.Module):
 
     # — heads —
     def value(self, lgs: torch.Tensor) -> torch.Tensor:
-        return torch.tanh(self.val_fc2(F.relu(self.val_fc1(lgs)))).squeeze(-1)  # (B,)
+        if self.val_hidden is None:
+            return torch.tanh(self.val_fc2(F.relu(self.val_fc1(lgs)))).squeeze(-1)  # (B,)
+        x = lgs
+        for layer in self.val_hidden_layers:
+            x = F.relu(layer(x))
+        return torch.tanh(self.val_out(x)).squeeze(-1)  # (B,)
+
+    def value_parameters(self):
+        """Parameters of the value head only (for the grow-value retrain)."""
+        if self.val_hidden is None:
+            return [*self.val_fc1.parameters(), *self.val_fc2.parameters()]
+        return [*self.val_hidden_layers.parameters(), *self.val_out.parameters()]
 
     def policy_mdn(self, lgs: torch.Tensor):
         """LGS (B,d) -> mixture (weights (B,k), means (B,k,d), stds (B,k,d))."""
@@ -143,15 +173,20 @@ def mmd2_mixtures(
 # — checkpoint / arch helpers (mirror net.py) —
 def build_lgs_model(arch: dict | None) -> C4LGSNet:
     arch = arch or {}
+    vh = arch.get("val_hidden")
     return C4LGSNet(
         channels=int(arch.get("channels", 64)),
         blocks=int(arch.get("blocks", 5)),
         k=int(arch.get("k", K_COMPONENTS)),
+        val_hidden=[int(x) for x in vh] if vh else None,
     )
 
 
 def arch_of(model: C4LGSNet) -> dict:
-    return {"kind": "lgs", "channels": model.channels, "blocks": model.blocks_n, "k": model.k}
+    a = {"kind": "lgs", "channels": model.channels, "blocks": model.blocks_n, "k": model.k}
+    if model.val_hidden is not None:
+        a["val_hidden"] = list(model.val_hidden)
+    return a
 
 
 def save_checkpoint(model: C4LGSNet, path: str) -> None:
