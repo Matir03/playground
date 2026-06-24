@@ -98,7 +98,7 @@ def alias_decode_loss(net, w, mu, std, e_child, bch, bvis, nfull):
 
 def do_init(args) -> None:
     os.makedirs(args.init, exist_ok=True)
-    net = M.build_lgs_model({"channels": args.channels, "blocks": args.blocks, "k": args.k})
+    net = M.build_lgs_model({"channels": args.channels, "blocks": args.blocks, "k": args.k, "decoder": args.decoder})
     M.save_checkpoint(net, os.path.join(args.init, "checkpoint.safetensors"))
     json.dump({"arch": M.arch_of(net)}, open(os.path.join(args.init, "config.json"), "w"))
     print(f"init: random LGS net -> {args.init} (arch {M.arch_of(net)})")
@@ -110,6 +110,7 @@ def main() -> None:
     ap.add_argument("--channels", type=int, default=32)
     ap.add_argument("--blocks", type=int, default=3)
     ap.add_argument("--k", type=int, default=M.K_COMPONENTS)
+    ap.add_argument("--decoder", action="store_true", help="build a position-decoder edge head (vs reifier)")
     ap.add_argument("--buffer", help="dump file or dir of *.bin")
     ap.add_argument("--in", dest="inp", help="checkpoint to resume from")
     ap.add_argument("--out", help="checkpoint to write")
