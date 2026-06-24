@@ -241,21 +241,37 @@ impl Net {
 }
 
 /// Infer the move that maps `from_state` to the decoder's target board. `decoded`
-/// is the 84-value plane-logit output (2×6×7; cell filled when either channel's
-/// logit > 0). If the decode is a legal single-drop successor of `from_state`
-/// (exactly one new stone, at its column's drop cell, none removed) we play that
-/// column; otherwise we pick a random legal move (per design).
-pub fn move_from_decoded(from_state: &Connect4State, decoded: &[f32]) -> Connect4Move {
-    let legal: Vec<u8> = Connect4::legal_moves(from_state).iter().map(|m| m.col).collect();
+/// is the 84-value plane-logit output (2×6×7). We always play the legal move
+/// whose true successor board is *closest* to the decoder output (nearest legal
+/// target — no random fallback), comparing σ(decoded) to each successor's planes.
+/// Returns `(move, valid)` where `valid` marks an *exact* decode (the closest
+/// successor's occupancy matches the decode: exactly one new stone at its drop
+/// cell, none removed) — that flag drives the valid-decode-rate metric.
+pub fn move_from_decoded(from_state: &Connect4State, decoded: &[f32]) -> (Connect4Move, bool) {
+    let legal: Vec<Connect4Move> = Connect4::legal_moves(from_state);
     if legal.is_empty() {
-        return Connect4Move { col: 0 };
+        return (Connect4Move { col: 0 }, false);
     }
-    let random_legal = || Connect4Move {
-        col: legal[rand::random::<u32>() as usize % legal.len()],
-    };
+    let sig = |x: f32| 1.0f32 / (1.0 + (-x).exp());
+    // Nearest legal successor by L2(σ(decoded), successor planes).
+    let mut best = &legal[0];
+    let mut best_d = f32::INFINITY;
+    for mv in &legal {
+        let child = Connect4::apply(from_state, mv);
+        let planes = crate::mcts::planes_of(&child);
+        let mut d = 0.0f32;
+        for i in 0..2 * CELLS {
+            let diff = sig(decoded[i]) - planes[i];
+            d += diff * diff;
+        }
+        if d < best_d {
+            best_d = d;
+            best = mv;
+        }
+    }
+    // Exact-decode flag: decoded occupancy = parent + one stone at a legal drop cell.
     let mut new_cell: Option<(usize, usize)> = None;
-    let mut new_count = 0usize;
-    let mut removed = 0usize;
+    let (mut new_count, mut removed) = (0usize, 0usize);
     for r in 0..C4_ROWS {
         for c in 0..C4_COLS {
             let idx = r * C4_COLS + c;
@@ -269,15 +285,12 @@ pub fn move_from_decoded(from_state: &Connect4State, decoded: &[f32]) -> Connect
             }
         }
     }
-    if new_count == 1 && removed == 0 {
-        let (r, c) = new_cell.unwrap();
-        // valid iff (r,c) is the actual drop cell of a legal column
-        let drop_row = (0..C4_ROWS).find(|&rr| from_state.cells[rr][c] == 0);
-        if legal.contains(&(c as u8)) && drop_row == Some(r) {
-            return Connect4Move { col: c as u8 };
-        }
-    }
-    random_legal()
+    let exact = new_count == 1
+        && removed == 0
+        && new_cell.is_some_and(|(r, c)| {
+            (0..C4_ROWS).find(|&rr| from_state.cells[rr][c] == 0) == Some(r)
+        });
+    (best.clone(), exact)
 }
 
 struct Arch {
@@ -392,7 +405,7 @@ impl LatentModel<Connect4> for LgsModel {
             // Decode the target next-LGS to a board and infer the move.
             let decoded = self.net.decode(&self.lgs_tensor(to_lgs)?)?
                 .flatten_all()?.to_vec1::<f32>()?;
-            return Ok(move_from_decoded(from_state, &decoded));
+            return Ok(move_from_decoded(from_state, &decoded).0);
         }
         let legal: Vec<u8> = Connect4::legal_moves(from_state).iter().map(|m| m.col).collect();
         let logits = self.net.reify_logits(&self.lgs_tensor(from_lgs)?, &self.lgs_tensor(to_lgs)?)?;

@@ -319,6 +319,10 @@ struct LockstepModel {
     slot: usize,
     lane: Arc<Mutex<Lane>>,
     version: String,
+    /// (valid_decodes, total_decodes) shared across the run for the
+    /// valid-decode-rate metric (fraction of reify calls whose decoded board was
+    /// a legal single-drop successor vs a random fallback).
+    decode_stats: Arc<(AtomicU64, AtomicU64)>,
 }
 
 /// Future that resolves once the worker fills `lane.result[slot]`.
@@ -383,7 +387,12 @@ impl LatentModel<Connect4> for LockstepModel {
             OpOut::Decoded(p) => p,
             _ => unreachable!("reify reply"),
         };
-        Ok(move_from_decoded(from_state, &decoded))
+        let (mv, valid) = move_from_decoded(from_state, &decoded);
+        self.decode_stats.1.fetch_add(1, Ordering::Relaxed);
+        if valid {
+            self.decode_stats.0.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(mv)
     }
     async fn model_version(&self) -> anyhow::Result<String> {
         Ok(self.version.clone())
@@ -411,9 +420,10 @@ fn make_game(
     pcr_full_prob: f64,
     temp_moves: u32,
     seed: u64,
+    decode_stats: Arc<(AtomicU64, AtomicU64)>,
 ) -> GameFut {
     Box::pin(async move {
-        let model = LockstepModel { slot, lane, version };
+        let model = LockstepModel { slot, lane, version, decode_stats };
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         play_game(&model, &cfg_full, &cfg_fast, pcr_full_prob, temp_moves, &mut rng).await
     })
@@ -607,6 +617,7 @@ fn worker(
     temp_moves: u32,
     seed: u64,
     version: &str,
+    decode_stats: &Arc<(AtomicU64, AtomicU64)>,
 ) -> ThreadOut {
     let lane = Arc::new(Mutex::new(Lane {
         request: (0..in_flight).map(|_| None).collect(),
@@ -638,6 +649,7 @@ fn worker(
                         pcr_full_prob,
                         temp_moves,
                         seed.wrapping_add(g as u64),
+                        decode_stats.clone(),
                     ));
                 }
                 // else: budget exhausted; leave the slot empty.
@@ -807,6 +819,8 @@ pub fn run_generate_batched(
     let cache = Cache::default();
     let stats = ServerStats::default();
     let next_game = AtomicUsize::new(0);
+    // (valid_decodes, total_decodes) across all workers — valid-decode-rate metric.
+    let decode_stats = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
     let (tx, rx) = std::sync::mpsc::channel::<Job>();
 
     let outs: Vec<ThreadOut> = std::thread::scope(|scope| {
@@ -821,8 +835,9 @@ pub fn run_generate_batched(
             let cfg_full = &cfg_full;
             let cfg_fast = &cfg_fast;
             let version = version.as_str();
+            let decode_stats = &decode_stats;
             handles.push(scope.spawn(move || {
-                worker(&tx, cache, in_flight, next_game, n_games, cfg_full, cfg_fast, pcr_full_prob, temp_moves, seed, version)
+                worker(&tx, cache, in_flight, next_game, n_games, cfg_full, cfg_fast, pcr_full_prob, temp_moves, seed, version, decode_stats)
             }));
         }
         drop(tx); // let the server detect shutdown once workers finish
@@ -842,9 +857,13 @@ pub fn run_generate_batched(
     let hit_rate = if hits + misses > 0 { hits as f64 / (hits + misses) as f64 } else { 0.0 };
     let rounds = stats.rounds.load(Ordering::Relaxed).max(1);
     let ops = stats.ops.load(Ordering::Relaxed);
+    let dec_valid = decode_stats.0.load(Ordering::Relaxed);
+    let dec_total = decode_stats.1.load(Ordering::Relaxed);
+    let dec_rate = if dec_total > 0 { 100.0 * dec_valid as f64 / dec_total as f64 } else { 0.0 };
     eprintln!(
         "  wrote {} examples ({} games) in {:.1}s  ({:.1} games/s, {} reifications)\n  \
          avg_batch {:.0}  forwards/s {:.0} ({:.1}k)  cache_hit {:.0}% (encode+policy)\n  \
+         valid_decode {:.0}% ({}/{})\n  \
          ops: enc {} eval {} pol {} reif {}",
         all.len(),
         n_games,
@@ -855,6 +874,9 @@ pub fn run_generate_batched(
         ops as f64 / dt,
         ops as f64 / dt / 1000.0,
         100.0 * hit_rate,
+        dec_rate,
+        dec_valid,
+        dec_total,
         stats.n_enc.load(Ordering::Relaxed),
         stats.n_eval.load(Ordering::Relaxed),
         stats.n_pol.load(Ordering::Relaxed),
