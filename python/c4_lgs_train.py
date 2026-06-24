@@ -149,19 +149,35 @@ def main() -> None:
 
             w, mu, std = net.policy_mdn(e_parent)
             lpi = torch.zeros((), device=dev)
-            lrho = torch.zeros((), device=dev)
             for c in range(MAX_CHILDREN):
                 m = pi[:, c]  # (B,)
                 # Per-dimension NLL: a d-dim Gaussian log-density is ~O(d), which
-                # otherwise swamps the value/reifier gradients on the shared
+                # otherwise swamps the value/edge gradients on the shared
                 # encoder. Normalizing by d puts all loss terms on an O(1) scale.
                 logp = M.mdn_log_prob(e_child[:, c], w, mu, std) / M.LGS_DIM  # (B,)
                 lpi = lpi - (m * logp).sum()
-                rlog = net.reify_logits(e_parent, e_child[:, c])  # (B,7)
-                ce = F.cross_entropy(rlog, bcol[:, c], reduction="none")
-                lrho = lrho + (m * ce).sum()
             lpi = lpi / nfull
-            lrho = lrho / nfull
+
+            # Edge head: reifier cross-entropy, or position-decoder reconstruction
+            # (BCE of decode(E(S)) vs board planes — the decoder inverts the
+            # encoder). Decoder trains on the parent (all records) plus the
+            # visit-weighted full-move children (the positions search decodes).
+            if getattr(net, "decoder", False):
+                lrho = F.binary_cross_entropy_with_logits(net.decode(e_parent), bp.reshape(B, -1))
+                crec = torch.zeros((), device=dev)
+                for c in range(MAX_CHILDREN):
+                    rec = F.binary_cross_entropy_with_logits(
+                        net.decode(e_child[:, c]), bch[:, c].reshape(B, -1), reduction="none"
+                    ).mean(dim=1)  # (B,)
+                    crec = crec + (pi[:, c] * rec).sum()
+                lrho = lrho + crec / nfull
+            else:
+                lrho = torch.zeros((), device=dev)
+                for c in range(MAX_CHILDREN):
+                    rlog = net.reify_logits(e_parent, e_child[:, c])  # (B,7)
+                    ce = F.cross_entropy(rlog, bcol[:, c], reduction="none")
+                    lrho = lrho + (pi[:, c] * ce).sum()
+                lrho = lrho / nfull
 
             # consistency: random within-batch pairs, value-only d_func (start)
             j = torch.randperm(B, device=dev)

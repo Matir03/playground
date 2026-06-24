@@ -118,6 +118,34 @@ impl ValueHead {
     }
 }
 
+/// Edge head: turns a latent edge / next-LGS into a concrete action.
+/// `Reifier` is the original ((LGS, next-LGS) -> 7 column logits). `Decoder` is a
+/// position decoder (next-LGS -> board-plane logits); the search decodes a sampled
+/// next-LGS to a target board and infers the move (see `move_from_decoded`).
+/// config.json's optional `decoder` bool selects which one to load, so a gens/
+/// dir can hold both kinds for ladder matches.
+enum EdgeHead {
+    Reifier { reif1: Linear, reif2: Linear },
+    Decoder { dec_fc1: Linear, dec_fc2: Linear, dec_out: Linear },
+}
+
+impl EdgeHead {
+    fn load(arch: &Arch, vb: &VarBuilder) -> candle_core::Result<Self> {
+        if arch.decoder {
+            Ok(EdgeHead::Decoder {
+                dec_fc1: linear(LGS_DIM, 256, vb.pp("dec_fc1"))?,
+                dec_fc2: linear(256, 256, vb.pp("dec_fc2"))?,
+                dec_out: linear(256, 2 * CELLS, vb.pp("dec_out"))?,
+            })
+        } else {
+            Ok(EdgeHead::Reifier {
+                reif1: linear(2 * LGS_DIM, 128, vb.pp("reif1"))?,
+                reif2: linear(128, C4_COLS, vb.pp("reif2"))?,
+            })
+        }
+    }
+}
+
 struct Net {
     stem: Conv2d,
     stem_bn: BatchNorm,
@@ -128,8 +156,7 @@ struct Net {
     mix_logits: Linear,
     means: Linear,
     log_stds: Linear,
-    reif1: Linear,
-    reif2: Linear,
+    edge: EdgeHead,
     k: usize,
 }
 
@@ -153,8 +180,7 @@ impl Net {
             mix_logits: linear(LGS_DIM, arch.k, vb.pp("mix_logits"))?,
             means: linear(LGS_DIM, arch.k * LGS_DIM, vb.pp("means"))?,
             log_stds: linear(LGS_DIM, arch.k * LGS_DIM, vb.pp("log_stds"))?,
-            reif1: linear(2 * LGS_DIM, 128, vb.pp("reif1"))?,
-            reif2: linear(128, C4_COLS, vb.pp("reif2"))?,
+            edge: EdgeHead::load(arch, &vb)?,
             k: arch.k,
         })
     }
@@ -185,12 +211,73 @@ impl Net {
         Ok((w, mu, std))
     }
 
-    /// (LGS (1,64), next-LGS (1,64)) -> column logits (7,).
+    /// (LGS (1,64), next-LGS (1,64)) -> column logits (7,). Reifier nets only.
     fn reify_logits(&self, lgs: &Tensor, next_lgs: &Tensor) -> candle_core::Result<Vec<f32>> {
-        let cat = Tensor::cat(&[lgs, next_lgs], 1)?;
-        let h = self.reif1.forward(&cat)?.relu()?;
-        self.reif2.forward(&h)?.flatten_all()?.to_vec1::<f32>()
+        match &self.edge {
+            EdgeHead::Reifier { reif1, reif2 } => {
+                let cat = Tensor::cat(&[lgs, next_lgs], 1)?;
+                let h = reif1.forward(&cat)?.relu()?;
+                reif2.forward(&h)?.flatten_all()?.to_vec1::<f32>()
+            }
+            EdgeHead::Decoder { .. } => candle_core::bail!("reify_logits called on a decoder net"),
+        }
     }
+
+    /// next-LGS (B,64) -> board-plane logits (B, 2*CELLS). Decoder nets only.
+    fn decode(&self, lgs: &Tensor) -> candle_core::Result<Tensor> {
+        match &self.edge {
+            EdgeHead::Decoder { dec_fc1, dec_fc2, dec_out } => {
+                let h = dec_fc1.forward(lgs)?.relu()?;
+                let h = dec_fc2.forward(&h)?.relu()?;
+                dec_out.forward(&h)
+            }
+            EdgeHead::Reifier { .. } => candle_core::bail!("decode called on a reifier net"),
+        }
+    }
+
+    fn is_decoder(&self) -> bool {
+        matches!(self.edge, EdgeHead::Decoder { .. })
+    }
+}
+
+/// Infer the move that maps `from_state` to the decoder's target board. `decoded`
+/// is the 84-value plane-logit output (2×6×7; cell filled when either channel's
+/// logit > 0). If the decode is a legal single-drop successor of `from_state`
+/// (exactly one new stone, at its column's drop cell, none removed) we play that
+/// column; otherwise we pick a random legal move (per design).
+pub fn move_from_decoded(from_state: &Connect4State, decoded: &[f32]) -> Connect4Move {
+    let legal: Vec<u8> = Connect4::legal_moves(from_state).iter().map(|m| m.col).collect();
+    if legal.is_empty() {
+        return Connect4Move { col: 0 };
+    }
+    let random_legal = || Connect4Move {
+        col: legal[rand::random::<u32>() as usize % legal.len()],
+    };
+    let mut new_cell: Option<(usize, usize)> = None;
+    let mut new_count = 0usize;
+    let mut removed = 0usize;
+    for r in 0..C4_ROWS {
+        for c in 0..C4_COLS {
+            let idx = r * C4_COLS + c;
+            let dec_filled = decoded[idx] > 0.0 || decoded[CELLS + idx] > 0.0;
+            let par_filled = from_state.cells[r][c] != 0;
+            if dec_filled && !par_filled {
+                new_count += 1;
+                new_cell = Some((r, c));
+            } else if !dec_filled && par_filled {
+                removed += 1;
+            }
+        }
+    }
+    if new_count == 1 && removed == 0 {
+        let (r, c) = new_cell.unwrap();
+        // valid iff (r,c) is the actual drop cell of a legal column
+        let drop_row = (0..C4_ROWS).find(|&rr| from_state.cells[rr][c] == 0);
+        if legal.contains(&(c as u8)) && drop_row == Some(r) {
+            return Connect4Move { col: c as u8 };
+        }
+    }
+    random_legal()
 }
 
 struct Arch {
@@ -199,10 +286,12 @@ struct Arch {
     k: usize,
     /// Hidden widths of an enlarged value-head MLP (None = legacy 64-wide head).
     val_hidden: Option<Vec<usize>>,
+    /// Edge head is a position decoder (true) vs the reifier (false, default).
+    decoder: bool,
 }
 
 fn read_arch(checkpoint: &Path) -> Arch {
-    let mut a = Arch { channels: 64, blocks: 5, k: 8, val_hidden: None };
+    let mut a = Arch { channels: 64, blocks: 5, k: 8, val_hidden: None, decoder: false };
     // Prefer a per-checkpoint sidecar (e.g. gen_000153.config.json) so a single
     // gens/ dir can hold mixed archs (legacy + grown value heads); fall back to
     // config.json in the same dir (live/ uses that).
@@ -219,6 +308,7 @@ fn read_arch(checkpoint: &Path) -> Arch {
                 if let Some(vh) = arch["val_hidden"].as_array() {
                     a.val_hidden = Some(vh.iter().map(|x| x.as_u64().unwrap_or(64) as usize).collect());
                 }
+                a.decoder = arch["decoder"].as_bool().unwrap_or(false);
             }
         }
     }
@@ -298,6 +388,12 @@ impl LatentModel<Connect4> for LgsModel {
         from_lgs: &LatentGameState,
         to_lgs: &LatentGameState,
     ) -> anyhow::Result<Connect4Move> {
+        if self.net.is_decoder() {
+            // Decode the target next-LGS to a board and infer the move.
+            let decoded = self.net.decode(&self.lgs_tensor(to_lgs)?)?
+                .flatten_all()?.to_vec1::<f32>()?;
+            return Ok(move_from_decoded(from_state, &decoded));
+        }
         let legal: Vec<u8> = Connect4::legal_moves(from_state).iter().map(|m| m.col).collect();
         let logits = self.net.reify_logits(&self.lgs_tensor(from_lgs)?, &self.lgs_tensor(to_lgs)?)?;
         // Pick the highest-logit *legal* column; structural fallback keeps play legal.
@@ -389,13 +485,12 @@ impl LgsServer {
         ))
     }
 
-    /// `b` × (from-LGS, to-LGS) → `b` × 7 reifier logits, flattened.
-    pub fn reify_batch(&self, from: &[f32], to: &[f32], b: usize) -> anyhow::Result<Vec<f32>> {
-        let f = Tensor::from_vec(from.to_vec(), (b, LGS_DIM), &self.device)?;
-        let g = Tensor::from_vec(to.to_vec(), (b, LGS_DIM), &self.device)?;
-        let cat = Tensor::cat(&[&f, &g], 1)?;
-        let h = self.net.reif1.forward(&cat)?.relu()?;
-        Ok(self.net.reif2.forward(&h)?.flatten_all()?.to_vec1::<f32>()?)
+    /// `b` × next-LGS → `b` × (2*CELLS) decoder plane-logits, flattened.
+    /// Self-play runs the decoder net; the move is inferred CPU-side from the
+    /// decoded board via `move_from_decoded`.
+    pub fn decode_batch(&self, lgs: &[f32], b: usize) -> anyhow::Result<Vec<f32>> {
+        let t = Tensor::from_vec(lgs.to_vec(), (b, LGS_DIM), &self.device)?;
+        Ok(self.net.decode(&t)?.flatten_all()?.to_vec1::<f32>()?)
     }
 }
 

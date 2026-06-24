@@ -51,6 +51,7 @@ class C4LGSNet(nn.Module):
         blocks: int = 5,
         k: int = K_COMPONENTS,
         val_hidden: list[int] | None = None,
+        decoder: bool = False,
     ) -> None:
         super().__init__()
         self.channels, self.blocks_n, self.k = channels, blocks, k
@@ -80,9 +81,20 @@ class C4LGSNet(nn.Module):
         self.mix_logits = nn.Linear(LGS_DIM, k)
         self.means = nn.Linear(LGS_DIM, k * LGS_DIM)
         self.log_stds = nn.Linear(LGS_DIM, k * LGS_DIM)
-        # reifier: (LGS, next-LGS) -> column logits
-        self.reif1 = nn.Linear(2 * LGS_DIM, 128)
-        self.reif2 = nn.Linear(128, C4_COLS)
+        # Edge head: maps a latent edge / next-LGS to a concrete action. Default
+        # is the reifier ((LGS, next-LGS) -> 7 column logits). With decoder=True
+        # we instead learn a *position decoder* (next-LGS -> board planes); the
+        # search decodes a sampled next-LGS to a target board and infers the move
+        # (the single newly-occupied cell's column), falling back to a random
+        # legal move if the decode isn't a legal single-drop successor.
+        self.decoder = bool(decoder)
+        if not self.decoder:
+            self.reif1 = nn.Linear(2 * LGS_DIM, 128)
+            self.reif2 = nn.Linear(128, C4_COLS)
+        else:
+            self.dec_fc1 = nn.Linear(LGS_DIM, 256)
+            self.dec_fc2 = nn.Linear(256, 256)
+            self.dec_out = nn.Linear(256, 2 * C4_CELLS)  # 84 plane logits
         # auxiliary heads
         self.aux_oppreply = nn.Linear(LGS_DIM, C4_COLS)
         self.aux_stv = nn.Linear(LGS_DIM, 1)
@@ -123,6 +135,19 @@ class C4LGSNet(nn.Module):
     def reify_logits(self, lgs: torch.Tensor, next_lgs: torch.Tensor) -> torch.Tensor:
         h = F.relu(self.reif1(torch.cat([lgs, next_lgs], dim=-1)))
         return self.reif2(h)  # (B, 7)
+
+    def decode(self, lgs: torch.Tensor) -> torch.Tensor:
+        """Position decoder: LGS (B,d) -> board-plane logits (B, 2*C4_CELLS).
+        Per-cell-channel Bernoulli (sigmoid); trained to invert the encoder."""
+        h = F.relu(self.dec_fc1(lgs))
+        h = F.relu(self.dec_fc2(h))
+        return self.dec_out(h)  # (B, 84) logits
+
+    def edge_parameters(self):
+        """Parameters of the edge head only (reifier or decoder)."""
+        if not self.decoder:
+            return [*self.reif1.parameters(), *self.reif2.parameters()]
+        return [*self.dec_fc1.parameters(), *self.dec_fc2.parameters(), *self.dec_out.parameters()]
 
     def aux(self, lgs: torch.Tensor):
         return self.aux_oppreply(lgs), torch.tanh(self.aux_stv(lgs)).squeeze(-1)
@@ -179,6 +204,7 @@ def build_lgs_model(arch: dict | None) -> C4LGSNet:
         blocks=int(arch.get("blocks", 5)),
         k=int(arch.get("k", K_COMPONENTS)),
         val_hidden=[int(x) for x in vh] if vh else None,
+        decoder=bool(arch.get("decoder", False)),
     )
 
 
@@ -186,6 +212,8 @@ def arch_of(model: C4LGSNet) -> dict:
     a = {"kind": "lgs", "channels": model.channels, "blocks": model.blocks_n, "k": model.k}
     if model.val_hidden is not None:
         a["val_hidden"] = list(model.val_hidden)
+    if model.decoder:
+        a["decoder"] = True
     return a
 
 

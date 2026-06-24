@@ -35,7 +35,7 @@ use playground_core::latent_mcts::{search, RootChild, SearchConfig};
 use playground_core::{Game, LatentGameState, LatentModel, MixturePolicy, Outcome};
 
 use crate::game::{Connect4, Connect4Move, Connect4State, C4_COLS};
-use crate::lgs_net::{LgsModel, LgsServer};
+use crate::lgs_net::{move_from_decoded, LgsModel, LgsServer};
 use crate::mcts::{planes_of, PLANES};
 
 /// Latent dimension (must match the LGS net / lgs_net.rs).
@@ -233,7 +233,7 @@ enum Pending {
     EncodeEval(Vec<f32>),       // planes  → (lgs, value)
     Eval(Vec<f32>),             // lgs     → value
     PolicyEval(Vec<f32>),       // lgs     → (MDN, value)
-    Reify(Vec<f32>, Vec<f32>),  // from,to → col logits
+    Reify(Vec<f32>),            // next-LGS → decoded board planes
 }
 
 /// The driver's reply to a yielded op.
@@ -241,7 +241,7 @@ enum OpOut {
     LgsVal(Vec<f32>, f32),
     Val(f32),
     PolVal(MixturePolicy, f32),
-    Logits(Vec<f32>),
+    Decoded(Vec<f32>),  // decoder plane logits (2*CELLS)
 }
 
 type PolOut = (usize, Vec<f32>, Vec<f32>, Vec<f32>);
@@ -378,16 +378,12 @@ impl LatentModel<Connect4> for LockstepModel {
         from_lgs: &LatentGameState,
         to_lgs: &LatentGameState,
     ) -> anyhow::Result<Connect4Move> {
-        let logits = match self.submit(Pending::Reify(from_lgs.to_f32(), to_lgs.to_f32())).await {
-            OpOut::Logits(l) => l,
+        let _ = from_lgs; // decoder reifies from the target next-LGS alone
+        let decoded = match self.submit(Pending::Reify(to_lgs.to_f32())).await {
+            OpOut::Decoded(p) => p,
             _ => unreachable!("reify reply"),
         };
-        let legal: Vec<u8> = Connect4::legal_moves(from_state).iter().map(|m| m.col).collect();
-        let best = legal
-            .iter()
-            .copied()
-            .max_by(|&a, &b| logits[a as usize].total_cmp(&logits[b as usize]));
-        Ok(Connect4Move { col: best.or_else(|| legal.first().copied()).unwrap_or(0) })
+        Ok(move_from_decoded(from_state, &decoded))
     }
     async fn model_version(&self) -> anyhow::Result<String> {
         Ok(self.version.clone())
@@ -446,13 +442,12 @@ struct Wave {
     enc_eval: Vec<Vec<f32>>, // planes
     eval: Vec<Vec<f32>>,     // lgs (sampled / aliased child)
     pol_eval: Vec<Vec<f32>>, // lgs
-    reif_from: Vec<Vec<f32>>,
-    reif_to: Vec<Vec<f32>>,
+    reif: Vec<Vec<f32>>,     // next-LGS to decode
 }
 
 impl Wave {
     fn count(&self) -> usize {
-        self.enc_eval.len() + self.eval.len() + self.pol_eval.len() + self.reif_from.len()
+        self.enc_eval.len() + self.eval.len() + self.pol_eval.len() + self.reif.len()
     }
     fn is_empty(&self) -> bool {
         self.count() == 0
@@ -566,24 +561,20 @@ fn inference_server(
                 }
             }
         }
-        // REIFY
-        let n: usize = jobs.iter().map(|j| j.wave.reif_from.len()).sum();
+        // REIFY (decode next-LGS → board planes; move inferred CPU-side)
+        let n: usize = jobs.iter().map(|j| j.wave.reif.len()).sum();
         if n > 0 {
             flat.clear();
-            let mut to = Vec::with_capacity(n * LGS_DIM);
             for j in &jobs {
-                for x in &j.wave.reif_from {
+                for x in &j.wave.reif {
                     flat.extend_from_slice(x);
                 }
-                for x in &j.wave.reif_to {
-                    to.extend_from_slice(x);
-                }
             }
-            let r = server.reify_batch(&flat, &to, n).expect("reify_batch");
+            let r = server.decode_batch(&flat, n).expect("decode_batch");
             let mut off = 0;
             for (ji, j) in jobs.iter().enumerate() {
-                for _ in 0..j.wave.reif_from.len() {
-                    outs[ji].reif.push(r[off * C4_COLS..(off + 1) * C4_COLS].to_vec());
+                for _ in 0..j.wave.reif.len() {
+                    outs[ji].reif.push(r[off * PLANES..(off + 1) * PLANES].to_vec());
                     off += 1;
                 }
             }
@@ -594,7 +585,7 @@ fn inference_server(
         stats.n_enc.fetch_add(jobs.iter().map(|j| j.wave.enc_eval.len() as u64).sum(), Ordering::Relaxed);
         stats.n_eval.fetch_add(jobs.iter().map(|j| j.wave.eval.len() as u64).sum(), Ordering::Relaxed);
         stats.n_pol.fetch_add(jobs.iter().map(|j| j.wave.pol_eval.len() as u64).sum(), Ordering::Relaxed);
-        stats.n_reif.fetch_add(jobs.iter().map(|j| j.wave.reif_from.len() as u64).sum(), Ordering::Relaxed);
+        stats.n_reif.fetch_add(jobs.iter().map(|j| j.wave.reif.len() as u64).sum(), Ordering::Relaxed);
         for (j, o) in jobs.into_iter().zip(outs) {
             let _ = j.resp.send(o);
         }
@@ -730,10 +721,9 @@ fn worker(
                     eval_slot.push(slot);
                     wave.eval.push(x);
                 }
-                Pending::Reify(a, b) => {
+                Pending::Reify(to) => {
                     reif_slot.push(slot);
-                    wave.reif_from.push(a);
-                    wave.reif_to.push(b);
+                    wave.reif.push(to);
                 }
             }
         }
@@ -774,7 +764,7 @@ fn worker(
                 l.result[slot] = Some(OpOut::Val(wo.eval[i]));
             }
             for (i, &slot) in reif_slot.iter().enumerate() {
-                l.result[slot] = Some(OpOut::Logits(wo.reif[i].clone()));
+                l.result[slot] = Some(OpOut::Decoded(wo.reif[i].clone()));
             }
         }
     }
