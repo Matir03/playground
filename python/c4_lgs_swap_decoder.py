@@ -35,7 +35,7 @@ import torch
 import torch.nn.functional as F
 
 from playground.model_server import c4_lgs_net as M
-from c4_lgs_train import load_buffer, MAX_CHILDREN
+from c4_lgs_train import load_buffer, MAX_CHILDREN, alias_decode_loss
 
 
 def main() -> None:
@@ -97,6 +97,7 @@ def main() -> None:
             with torch.no_grad():
                 e_parent = net.encode(bp)  # frozen encoder
                 e_child = net.encode(bch.reshape(B * MAX_CHILDREN, 2, 6, 7)).reshape(B, MAX_CHILDREN, -1)
+                w, mu, std = net.policy_mdn(e_parent)  # frozen MDN (for aliased samples)
             wsum = bvis.sum(dim=1, keepdim=True).clamp_min(1.0)
             pi = bvis / wsum  # (B,7), zero for absent children
             nfull = (bvis.sum(dim=1) > 0).sum().clamp_min(1).float()
@@ -109,6 +110,8 @@ def main() -> None:
                 ).mean(dim=1)  # (B,)
                 crec = crec + (pi[:, c] * rec).sum()
             loss = loss + crec / nfull
+            # aliased intermediate points -> nearest child's board (see c4_lgs_train)
+            loss = loss + alias_decode_loss(net, w, mu, std, e_child, bch, bvis, nfull)
 
             opt.zero_grad()
             loss.backward()

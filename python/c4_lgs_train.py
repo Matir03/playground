@@ -65,6 +65,37 @@ def load_buffer(path: str):
     return tuple(np.concatenate([p[i] for p in parts], axis=0) for i in range(5))
 
 
+N_ALIAS_SAMPLES = 4
+
+
+def alias_decode_loss(net, w, mu, std, e_child, bch, bvis, nfull):
+    """Decoder loss on intermediate ('aliased') latent points.
+
+    The search queries the decoder on MDN *samples*, not exact encodings, so the
+    decoder must map the latent neighborhood of real children to legal positions.
+    Sample from the MDN (detached -> trains the decoder only, not the MDN/encoder),
+    assign each sample to its nearest recorded child (latent NN over present
+    children), and BCE-reconstruct that child's board. Normalized by nfull."""
+    B, _, d = e_child.shape
+    present = bvis > 0                                   # (B, MAX_CHILDREN)
+    has_child = present.any(dim=1).float()               # (B,)
+    comp = torch.multinomial(w.detach(), N_ALIAS_SAMPLES, replacement=True)  # (B, n)
+    idx = comp.unsqueeze(-1).expand(-1, -1, d)
+    mu_s = torch.gather(mu.detach(), 1, idx)
+    std_s = torch.gather(std.detach(), 1, idx)
+    samples = mu_s + std_s * torch.randn_like(std_s)     # (B, n, d)
+    ec = e_child.detach()
+    d2 = ((samples.unsqueeze(2) - ec.unsqueeze(1)) ** 2).sum(-1)  # (B, n, MAX_CHILDREN)
+    d2 = d2.masked_fill(~present.unsqueeze(1), float("inf"))
+    nn = d2.argmin(-1)                                   # (B, n) nearest present child
+    tgt = torch.gather(
+        bch.reshape(B, MAX_CHILDREN, -1), 1, nn.unsqueeze(-1).expand(-1, -1, PLANES)
+    )                                                    # (B, n, PLANES)
+    dec = net.decode(samples.reshape(B * N_ALIAS_SAMPLES, d)).reshape(B, N_ALIAS_SAMPLES, -1)
+    bce = F.binary_cross_entropy_with_logits(dec, tgt, reduction="none").mean(-1)  # (B, n)
+    return (bce.mean(-1) * has_child).sum() / nfull
+
+
 def do_init(args) -> None:
     os.makedirs(args.init, exist_ok=True)
     net = M.build_lgs_model({"channels": args.channels, "blocks": args.blocks, "k": args.k})
@@ -171,6 +202,13 @@ def main() -> None:
                     ).mean(dim=1)  # (B,)
                     crec = crec + (pi[:, c] * rec).sum()
                 lrho = lrho + crec / nfull
+                # Intermediate ("aliased") latent points: the search queries the
+                # decoder on MDN *samples*, not exact encodings. Sample from the
+                # MDN and teach the decoder to map each sample to its nearest
+                # recorded child's concrete board, so the latent neighborhood
+                # around real children decodes to legal positions. Samples are
+                # detached -> this shapes the decoder, not the MDN/encoder.
+                lrho = lrho + alias_decode_loss(net, w, mu, std, e_child, bch, bvis, nfull)
             else:
                 lrho = torch.zeros((), device=dev)
                 for c in range(MAX_CHILDREN):
