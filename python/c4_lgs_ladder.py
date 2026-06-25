@@ -122,11 +122,19 @@ def step(engine, live_ckpt, gens_dir, ladder_path, gen, cuda,
     if name not in L["players"]:
         L["players"].append(name)
 
+    # Fixed O(1) opponent set, so every gen is scored on the *same* yardsticks
+    # (random per-step opponents are the main source of ELO noise): always the
+    # solver, the current champion, and any persistent anchors declared in the
+    # ladder (e.g. the original baseline). `n_random` random previous gens are
+    # added only if explicitly requested (default 0 = fully fixed).
     prev_gens = [p for p in L["players"] if p.startswith("gen_") and p != name]
     opps = {"solver"}
     if L["best"]:
         opps.add(L["best"])
-    if prev_gens:
+    for anchor in L.get("anchors", []):
+        if anchor in L["ckpt"] and anchor != name:
+            opps.add(anchor)
+    if n_random > 0 and prev_gens:
         opps.update(random.sample(prev_gens, min(n_random, len(prev_gens))))
     for i, opp in enumerate(sorted(opps)):
         wa, d, wb = _run_match(engine, arch, L["ckpt"][opp], games, sims, cuda, seed + i)
