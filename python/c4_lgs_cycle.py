@@ -59,10 +59,10 @@ def main() -> None:
     ap.add_argument("--eval-positions", type=int, default=200)
     ap.add_argument("--eval-sims", type=int, default=96)
     ap.add_argument("--eval-opening", type=int, default=6)
-    ap.add_argument("--ladder-every", type=int, default=1, help="run BT-ELO ladder + promotion every N gens (0 disables)")
+    ap.add_argument("--ladder-every", type=int, default=3, help="run BT-ELO ladder + promotion every N gens (0 disables)")
     ap.add_argument("--match-games", type=int, default=40)
     ap.add_argument("--match-sims", type=int, default=64)
-    ap.add_argument("--match-random", type=int, default=3, help="random previous gens to also play each ladder step")
+    ap.add_argument("--match-random", type=int, default=0, help="extra random previous gens per ladder step (0 = fixed O(1) anchors only: solver + champion + ladder.json anchors)")
     ap.add_argument("--promote-margin", type=float, default=0.0, help="ELO margin a gen must clear the champion by to promote (anti-noise)")
     # Continuous actor/learner: generate self-play chunks back-to-back for
     # --train-interval-secs (full replenishing pool, games >> pool), then train
