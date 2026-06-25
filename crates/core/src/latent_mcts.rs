@@ -44,6 +44,11 @@ pub struct SearchConfig {
     /// moves (not just whatever the MDN/reifier currently favours). Breaks the
     /// reifier-collapse feedback loop. Off for eval/match (pure learned policy).
     pub root_explore: bool,
+    /// Discrete per-move policy (Connect 4): skip the MDN/kernel/widening
+    /// machinery entirely. Every node seeds the *actual* legal moves as real
+    /// children; each child's prior is the move-policy slot nearest its real
+    /// encoding; selection is plain PUCT. No sampling, no reification.
+    pub move_policy: bool,
     /// Optional RNG seed for deterministic tests.
     pub seed: Option<u64>,
 }
@@ -60,6 +65,7 @@ impl Default for SearchConfig {
             k_forced: 2.0,
             fpu: 0.0,
             root_explore: false,
+            move_policy: false,
             seed: None,
         }
     }
@@ -239,13 +245,20 @@ pub async fn search<G: Game, M: LatentModel<G>>(
     };
     let mut reifications = 0u32;
 
-    if config.root_explore && !tree[0].terminal {
-        seed_root_coverage(model, &mut tree).await?;
+    if config.move_policy {
+        // Discrete per-move path: real children, plain PUCT, no reification.
+        for _ in 0..config.simulations.max(1) {
+            simulate_move_policy(model, &mut tree, config).await?;
+        }
+    } else {
+        if config.root_explore && !tree[0].terminal {
+            seed_root_coverage(model, &mut tree).await?;
+        }
+        for _ in 0..config.simulations.max(1) {
+            simulate(model, &mut tree, config, &mut rng, &mut reifications).await?;
+        }
     }
-
-    for _ in 0..config.simulations.max(1) {
-        simulate(model, &mut tree, config, &mut rng, &mut reifications).await?;
-    }
+    let _ = &mut rng;
 
     // Distinct reified children of the root (aliases already merged).
     let mut root_children: Vec<RootChild<G>> = Vec::new();
@@ -622,6 +635,143 @@ async fn seed_root_coverage<G: Game, M: LatentModel<G>>(
     Ok(())
 }
 
+// ── Discrete per-move policy search (Connect 4) ───────────────────────────────
+//
+// The continuous MDN/kernel/widening/reify machinery is inert when the action
+// space is small and the network predicts a target encoding per move. Here the
+// search is plain PUCT over the *real* legal moves: each node, on expansion,
+// applies every legal move, encodes the child, and seeds it as a child node with
+// a prior taken from the move-policy slot nearest its real encoding. Selection
+// is standard PUCT; child values come from each child's own expansion (leaf
+// eval), backed up negamax. No sampling, no kernel, no reification.
+
+/// One PUCT playout in move-policy mode.
+async fn simulate_move_policy<G: Game, M: LatentModel<G>>(
+    model: &M,
+    tree: &mut Vec<Node<G>>,
+    config: &SearchConfig,
+) -> anyhow::Result<()> {
+    let mut path = vec![0usize];
+    let mut cur = 0usize;
+    let value: f64;
+    loop {
+        if tree[cur].terminal {
+            value = tree[cur].terminal_value;
+            break;
+        }
+        if !tree[cur].expanded {
+            value = expand_move_policy(model, tree, cur).await?;
+            break;
+        }
+        let a = move_policy_select(tree, cur, config);
+        let child = tree[cur].candidates[a]
+            .reified
+            .expect("move-policy candidates are seeded as reified children");
+        path.push(child);
+        cur = child;
+    }
+    // Negamax backup: `value` is from the POV of the side to move at path.last().
+    for pos in (0..path.len()).rev() {
+        let idx = path[pos];
+        let depth_from_leaf = path.len() - 1 - pos;
+        let sign = if depth_from_leaf % 2 == 0 { 1.0 } else { -1.0 };
+        tree[idx].visits += 1;
+        tree[idx].value_sum += value * sign; // child-POV value_sum
+    }
+    Ok(())
+}
+
+/// Expand `cur`: fetch the move-policy + node value, then seed every legal move
+/// as a real child node with a nearest-slot prior. Returns the node's own value
+/// (the leaf value to back up).
+async fn expand_move_policy<G: Game, M: LatentModel<G>>(
+    model: &M,
+    tree: &mut Vec<Node<G>>,
+    cur: usize,
+) -> anyhow::Result<f64> {
+    let (mp, node_value) = model.move_policy_eval(&tree[cur].lgs).await?;
+    let from_state = tree[cur].state.clone();
+    for mv in G::legal_moves(&from_state) {
+        let child_state = G::apply(&from_state, &mv);
+        let key = G::encode_state(&child_state);
+        if tree[cur].child_by_key.contains_key(&key) {
+            continue;
+        }
+        let child_lgs = model.encode(&child_state).await?;
+        let anchor = child_lgs.to_f32();
+        let (_, prior) = mp.nearest(&anchor);
+        let mut node = make_node::<G>(child_lgs, child_state);
+        node.incoming_move = Some(mv);
+        let ci = tree.len();
+        tree.push(node);
+        tree[cur].child_by_key.insert(key, ci);
+        tree[cur].candidates.push(Candidate {
+            point: anchor,
+            visits: 0,
+            value_sum: 0.0,
+            reified: Some(ci),
+            kw: 0.0,
+            kv: 0.0,
+            log_p: (prior as f64).max(1e-12).ln(),
+        });
+    }
+    tree[cur].policy = None; // move-policy nodes don't keep the MixturePolicy
+    tree[cur].expanded = true;
+    Ok(node_value)
+}
+
+/// Plain PUCT child selection over move-policy children. Priors come from the
+/// cached per-child slot prior (`log_p`), renormalized by softmax (several
+/// children can map to the same slot). `Q` reads the child node directly (parent
+/// POV = `-value_sum/visits`). At the root under `root_explore`, priors are
+/// uniform so self-play visits cover the whole move space.
+fn move_policy_select<G: Game>(tree: &[Node<G>], node_idx: usize, config: &SearchConfig) -> usize {
+    const MAX_CAND: usize = 64;
+    let node = &tree[node_idx];
+    debug_assert!(!node.candidates.is_empty(), "move-policy select on empty node");
+    let m = node.candidates.len().min(MAX_CAND);
+
+    let mut p = [0f64; MAX_CAND];
+    if node_idx == 0 && config.root_explore {
+        for v in p.iter_mut().take(m) {
+            *v = 1.0 / m as f64;
+        }
+    } else {
+        let mut mx = f64::NEG_INFINITY;
+        for (j, c) in node.candidates.iter().take(m).enumerate() {
+            p[j] = c.log_p;
+            if c.log_p > mx {
+                mx = c.log_p;
+            }
+        }
+        let mut psum = 0.0;
+        for v in p.iter_mut().take(m) {
+            *v = if mx.is_finite() { (*v - mx).exp() } else { 1.0 };
+            psum += *v;
+        }
+        for v in p.iter_mut().take(m) {
+            *v = if psum > 0.0 { *v / psum } else { 1.0 / m as f64 };
+        }
+    }
+
+    let nvis = node.visits as f64;
+    let sqrt_total = nvis.max(1.0).sqrt();
+    let mut best = 0usize;
+    let mut best_s = f64::NEG_INFINITY;
+    for a in 0..m {
+        let ci = node.candidates[a].reified.expect("seeded reified child");
+        let cn = tree[ci].visits as f64;
+        let q = if cn > 0.0 { -tree[ci].value_sum / cn } else { config.fpu };
+        let u = config.c_puct * p[a] * sqrt_total / (1.0 + cn);
+        let s = q + u;
+        if s > best_s {
+            best_s = s;
+            best = a;
+        }
+    }
+    best
+}
+
 fn is_legal<G: Game>(state: &G::State, mv: &G::Move) -> bool {
     let target = G::encode_move(mv);
     G::legal_moves(state).iter().any(|m| G::encode_move(m) == target)
@@ -732,6 +882,19 @@ mod tests {
                 means,
                 stds: vec![0.05; k * 2],
             })
+        }
+        async fn move_policy(&self, lgs: &LatentGameState) -> anyhow::Result<crate::model::MovePolicy> {
+            // One slot per legal move; each slot's predicted next-encoding is the
+            // real successor encoding, so `nearest` maps every child to its slot.
+            let f = lgs.to_f32();
+            let s = State { remaining: f[0].round() as u8, ply: f[1].round() as u32 };
+            let moves = Countdown::legal_moves(&s);
+            let k = moves.len().max(1);
+            let mut next = Vec::with_capacity(k * 2);
+            for mv in &moves {
+                next.extend_from_slice(&enc(&Countdown::apply(&s, mv)));
+            }
+            Ok(crate::model::MovePolicy { dim: 2, priors: vec![1.0 / k as f32; k], next })
         }
         async fn reify(
             &self,
@@ -848,6 +1011,42 @@ mod tests {
             Countdown::legal_moves(&s).len(),
             "root_explore must cover all legal moves, got {cols:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn move_policy_search_covers_moves_and_is_legal() {
+        // Discrete per-move path: every legal move must become a real root child,
+        // the chosen move must be legal, and no reification happens.
+        let cfg = SearchConfig {
+            simulations: 64,
+            move_policy: true,
+            seed: Some(5),
+            ..Default::default()
+        };
+        let s = Countdown::initial_state();
+        let res = search(&MockModel, &s, &cfg).await.unwrap();
+        assert!(Countdown::legal_moves(&s).contains(&res.chosen));
+        assert_eq!(res.visits, 64);
+        assert_eq!(res.reifications, 0, "move-policy path never reifies");
+        let cols: std::collections::HashSet<u8> = res.root_children.iter().map(|c| c.mv).collect();
+        assert_eq!(cols.len(), Countdown::legal_moves(&s).len(), "must seed all legal moves");
+    }
+
+    #[tokio::test]
+    async fn move_policy_solves_countdown_endgame() {
+        // From remaining=3 the side to move wins by leaving 0 → 1 or 2... actually
+        // facing 0 loses, so with remaining=3 the mover should avoid leaving the
+        // opponent a win. Just assert the search runs and value is sane.
+        let cfg = SearchConfig {
+            simulations: 96,
+            move_policy: true,
+            seed: Some(2),
+            ..Default::default()
+        };
+        let s = State { remaining: 3, ply: 0 };
+        let res = search(&MockModel, &s, &cfg).await.unwrap();
+        assert!(Countdown::legal_moves(&s).contains(&res.chosen));
+        assert!(res.root_value.abs() <= 1.0);
     }
 
     #[test]

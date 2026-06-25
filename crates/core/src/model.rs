@@ -107,6 +107,47 @@ impl MixturePolicy {
     }
 }
 
+/// Discrete per-move policy head (the Connect 4 specialization). Instead of a
+/// continuous density over next-LGS, the net predicts, for `A` move slots, a
+/// prior `priors[j]` and a target next-encoding `next[j·dim..]`. The search seeds
+/// the *actual* legal moves as children and assigns each its prior by matching
+/// the child's real encoding to the nearest predicted slot (`nearest`). Training
+/// pairs slots to children by decreasing-lex ordering, so the slot↔child
+/// association the search recovers via `nearest` is the one the loss optimized.
+#[derive(Clone, Debug)]
+pub struct MovePolicy {
+    pub dim: usize,
+    pub priors: Vec<f32>, // length A, sums to 1
+    pub next: Vec<f32>,   // A*dim, row-major, predicted next-encodings in (-1, 1)
+}
+
+impl MovePolicy {
+    pub fn slots(&self) -> usize {
+        self.priors.len()
+    }
+
+    /// The slot whose predicted next-encoding is nearest (L2) to `x`, and its
+    /// prior. Used to assign a real child's PUCT prior. Allocation-free.
+    pub fn nearest(&self, x: &[f32]) -> (usize, f32) {
+        let d = self.dim;
+        let a = self.slots();
+        let mut best = 0usize;
+        let mut best_d = f64::INFINITY;
+        for j in 0..a {
+            let mut s = 0.0f64;
+            for i in 0..d.min(x.len()) {
+                let z = (x[i] - self.next[j * d + i]) as f64;
+                s += z * z;
+            }
+            if s < best_d {
+                best_d = s;
+                best = j;
+            }
+        }
+        (best, self.priors.get(best).copied().unwrap_or(0.0))
+    }
+}
+
 /// The reification-based algorithm's view of the network (docs/algorithm.md).
 /// Distinct from `ModelClient`: the policy is an MDN over next-LGS and the
 /// reifier decodes an LGS→LGS edge directly (no action-vector seed).
@@ -116,6 +157,25 @@ pub trait LatentModel<G: Game>: Send + Sync {
     async fn eval(&self, lgs: &LatentGameState) -> anyhow::Result<f64>;
     /// MDN policy: a Gaussian mixture over next-LGS space.
     async fn policy(&self, lgs: &LatentGameState) -> anyhow::Result<MixturePolicy>;
+
+    /// Discrete per-move policy (Connect 4). Default bails; the move-policy nets
+    /// override it. The search uses this instead of `policy` when
+    /// `SearchConfig.move_policy` is set.
+    async fn move_policy(&self, lgs: &LatentGameState) -> anyhow::Result<MovePolicy> {
+        let _ = lgs;
+        anyhow::bail!("move_policy not supported by this model")
+    }
+
+    /// Fused move-policy + value (node expansion needs both). Default delegates;
+    /// the batched model overrides it to one round-trip.
+    async fn move_policy_eval(
+        &self,
+        lgs: &LatentGameState,
+    ) -> anyhow::Result<(MovePolicy, f64)> {
+        let p = self.move_policy(lgs).await?;
+        let v = self.eval(lgs).await?;
+        Ok((p, v))
+    }
 
     /// Fused encode + value (shared trunk). The search uses this when creating a
     /// node, where it needs both the encoding and its value at once (e.g. the

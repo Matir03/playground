@@ -32,10 +32,10 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 use playground_core::latent_mcts::{search, RootChild, SearchConfig};
-use playground_core::{Game, LatentGameState, LatentModel, MixturePolicy, Outcome};
+use playground_core::{Game, LatentGameState, LatentModel, MixturePolicy, MovePolicy, Outcome};
 
 use crate::game::{Connect4, Connect4Move, Connect4State, C4_COLS};
-use crate::lgs_net::{move_from_decoded, LgsModel, LgsServer};
+use crate::lgs_net::{checkpoint_is_move_policy, move_from_decoded, LgsModel, LgsServer};
 use crate::mcts::{planes_of, PLANES};
 
 /// Latent dimension (must match the LGS net / lgs_net.rs).
@@ -187,8 +187,9 @@ pub async fn run_generate(
 ) -> anyhow::Result<()> {
     let device = crate::net::pick_device(cuda)?;
     let model = Arc::new(LgsModel::load_on(checkpoint, device)?);
-    let cfg_full = SearchConfig { simulations: sims, c_puct, kernel_bandwidth, root_explore: true, seed: None, ..Default::default() };
-    let cfg_fast = SearchConfig { simulations: fast_sims, c_puct, kernel_bandwidth, root_explore: false, seed: None, ..Default::default() };
+    let mp = checkpoint_is_move_policy(checkpoint);
+    let cfg_full = SearchConfig { simulations: sims, c_puct, kernel_bandwidth, root_explore: true, move_policy: mp, seed: None, ..Default::default() };
+    let cfg_fast = SearchConfig { simulations: fast_sims, c_puct, kernel_bandwidth, root_explore: false, move_policy: mp, seed: None, ..Default::default() };
     eprintln!(
         "c4 LGS self-play: {n_games} games, PCR full {sims}/fast {fast_sims} sims (p_full {pcr_full_prob}), h {kernel_bandwidth}, model {checkpoint} -> {out_path}"
     );
@@ -233,6 +234,7 @@ enum Pending {
     EncodeEval(Vec<f32>),       // planes  → (lgs, value)
     Eval(Vec<f32>),             // lgs     → value
     PolicyEval(Vec<f32>),       // lgs     → (MDN, value)
+    MovePolicyEval(Vec<f32>),   // lgs     → (move-policy, value)
     Reify(Vec<f32>),            // next-LGS → decoded board planes
 }
 
@@ -241,6 +243,7 @@ enum OpOut {
     LgsVal(Vec<f32>, f32),
     Val(f32),
     PolVal(MixturePolicy, f32),
+    MovePolVal(MovePolicy, f32),
     Decoded(Vec<f32>),  // decoder plane logits (2*CELLS)
 }
 
@@ -277,6 +280,8 @@ impl<V> ShardCache<V> {
 struct Cache {
     enc: ShardCache<(Vec<f32>, f32)>,
     pol: ShardCache<(PolOut, f32)>,
+    /// Move-policy cache: lgs → (priors A, next A·d, value).
+    mvpol: ShardCache<(Vec<f32>, Vec<f32>, f32)>,
     hits: AtomicU64,
     misses: AtomicU64,
 }
@@ -286,6 +291,7 @@ impl Default for Cache {
         Self {
             enc: ShardCache::new(64),
             pol: ShardCache::new(64),
+            mvpol: ShardCache::new(64),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
@@ -376,6 +382,16 @@ impl LatentModel<Connect4> for LockstepModel {
             _ => unreachable!("policy_eval reply"),
         }
     }
+    async fn move_policy(&self, lgs: &LatentGameState) -> anyhow::Result<MovePolicy> {
+        let (p, _) = self.move_policy_eval(lgs).await?;
+        Ok(p)
+    }
+    async fn move_policy_eval(&self, lgs: &LatentGameState) -> anyhow::Result<(MovePolicy, f64)> {
+        match self.submit(Pending::MovePolicyEval(lgs.to_f32())).await {
+            OpOut::MovePolVal(p, val) => Ok((p, val as f64)),
+            _ => unreachable!("move_policy_eval reply"),
+        }
+    }
     async fn reify(
         &self,
         from_state: &Connect4State,
@@ -443,6 +459,7 @@ struct ServerStats {
     n_enc: AtomicU64,
     n_eval: AtomicU64,
     n_pol: AtomicU64,
+    n_mvpol: AtomicU64,
     n_reif: AtomicU64,
 }
 
@@ -452,12 +469,13 @@ struct Wave {
     enc_eval: Vec<Vec<f32>>, // planes
     eval: Vec<Vec<f32>>,     // lgs (sampled / aliased child)
     pol_eval: Vec<Vec<f32>>, // lgs
+    mvpol_eval: Vec<Vec<f32>>, // lgs (move-policy)
     reif: Vec<Vec<f32>>,     // next-LGS to decode
 }
 
 impl Wave {
     fn count(&self) -> usize {
-        self.enc_eval.len() + self.eval.len() + self.pol_eval.len() + self.reif.len()
+        self.enc_eval.len() + self.eval.len() + self.pol_eval.len() + self.mvpol_eval.len() + self.reif.len()
     }
     fn is_empty(&self) -> bool {
         self.count() == 0
@@ -469,6 +487,7 @@ struct WaveOut {
     enc_eval: Vec<(Vec<f32>, f32)>,
     eval: Vec<f32>,
     pol_eval: Vec<(PolOut, f32)>,
+    mvpol_eval: Vec<(Vec<f32>, Vec<f32>, f32)>, // (priors, next, value)
     reif: Vec<Vec<f32>>,
 }
 
@@ -571,6 +590,29 @@ fn inference_server(
                 }
             }
         }
+        // MOVE_POLICY_EVAL (lgs → priors + next-latents + value, one fused forward)
+        let n: usize = jobs.iter().map(|j| j.wave.mvpol_eval.len()).sum();
+        if n > 0 {
+            flat.clear();
+            for j in &jobs {
+                for x in &j.wave.mvpol_eval {
+                    flat.extend_from_slice(x);
+                }
+            }
+            let (pri, nxt, val) = server.move_policy_eval_batch(&flat, n).expect("move_policy_eval_batch");
+            let nd = C4_COLS * LGS_DIM;
+            let mut off = 0;
+            for (ji, j) in jobs.iter().enumerate() {
+                for _ in 0..j.wave.mvpol_eval.len() {
+                    outs[ji].mvpol_eval.push((
+                        pri[off * C4_COLS..(off + 1) * C4_COLS].to_vec(),
+                        nxt[off * nd..(off + 1) * nd].to_vec(),
+                        val[off],
+                    ));
+                    off += 1;
+                }
+            }
+        }
         // REIFY (decode next-LGS → board planes; move inferred CPU-side)
         let n: usize = jobs.iter().map(|j| j.wave.reif.len()).sum();
         if n > 0 {
@@ -595,6 +637,7 @@ fn inference_server(
         stats.n_enc.fetch_add(jobs.iter().map(|j| j.wave.enc_eval.len() as u64).sum(), Ordering::Relaxed);
         stats.n_eval.fetch_add(jobs.iter().map(|j| j.wave.eval.len() as u64).sum(), Ordering::Relaxed);
         stats.n_pol.fetch_add(jobs.iter().map(|j| j.wave.pol_eval.len() as u64).sum(), Ordering::Relaxed);
+        stats.n_mvpol.fetch_add(jobs.iter().map(|j| j.wave.mvpol_eval.len() as u64).sum(), Ordering::Relaxed);
         stats.n_reif.fetch_add(jobs.iter().map(|j| j.wave.reif.len() as u64).sum(), Ordering::Relaxed);
         for (j, o) in jobs.into_iter().zip(outs) {
             let _ = j.resp.send(o);
@@ -696,6 +739,8 @@ fn worker(
         let mut eval_slot: Vec<usize> = Vec::new();
         let mut pol_slot: Vec<usize> = Vec::new();
         let mut pol_key: Vec<u64> = Vec::new();
+        let mut mvpol_slot: Vec<usize> = Vec::new();
+        let mut mvpol_key: Vec<u64> = Vec::new();
         let mut reif_slot: Vec<usize> = Vec::new();
         let mut hits_out: Vec<(usize, OpOut)> = Vec::new();
         for (slot, p) in reqs {
@@ -729,6 +774,22 @@ fn worker(
                         cache.misses.fetch_add(1, Ordering::Relaxed);
                     }
                 }
+                Pending::MovePolicyEval(x) => {
+                    let k = hash_f32s(&x);
+                    if let Some(v) = cache.mvpol.get(k) {
+                        let (pri, nxt, val) = v.as_ref();
+                        hits_out.push((slot, OpOut::MovePolVal(
+                            MovePolicy { dim: LGS_DIM, priors: pri.clone(), next: nxt.clone() },
+                            *val,
+                        )));
+                        cache.hits.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        mvpol_slot.push(slot);
+                        mvpol_key.push(k);
+                        wave.mvpol_eval.push(x);
+                        cache.misses.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 Pending::Eval(x) => {
                     eval_slot.push(slot);
                     wave.eval.push(x);
@@ -759,6 +820,9 @@ fn worker(
         for (i, &k) in pol_key.iter().enumerate() {
             cache.pol.insert(k, Arc::new(wo.pol_eval[i].clone()));
         }
+        for (i, &k) in mvpol_key.iter().enumerate() {
+            cache.mvpol.insert(k, Arc::new(wo.mvpol_eval[i].clone()));
+        }
         {
             let mut l = lane.lock().unwrap();
             for (i, &slot) in enc_slot.iter().enumerate() {
@@ -769,6 +833,13 @@ fn worker(
                 let ((_, w, mu, std), val) = &wo.pol_eval[i];
                 l.result[slot] = Some(OpOut::PolVal(
                     MixturePolicy { dim: LGS_DIM, weights: w.clone(), means: mu.clone(), stds: std.clone() },
+                    *val,
+                ));
+            }
+            for (i, &slot) in mvpol_slot.iter().enumerate() {
+                let (pri, nxt, val) = &wo.mvpol_eval[i];
+                l.result[slot] = Some(OpOut::MovePolVal(
+                    MovePolicy { dim: LGS_DIM, priors: pri.clone(), next: nxt.clone() },
                     *val,
                 ));
             }
@@ -806,8 +877,9 @@ pub fn run_generate_batched(
     let device = crate::net::pick_device(cuda)?;
     let server = LgsServer::load_on(checkpoint, device)?;
     let version = server.model_version.clone();
-    let cfg_full = SearchConfig { simulations: sims, c_puct, kernel_bandwidth, root_explore: true, seed: None, ..Default::default() };
-    let cfg_fast = SearchConfig { simulations: fast_sims, c_puct, kernel_bandwidth, root_explore: false, seed: None, ..Default::default() };
+    let mp = checkpoint_is_move_policy(checkpoint);
+    let cfg_full = SearchConfig { simulations: sims, c_puct, kernel_bandwidth, root_explore: true, move_policy: mp, seed: None, ..Default::default() };
+    let cfg_fast = SearchConfig { simulations: fast_sims, c_puct, kernel_bandwidth, root_explore: false, move_policy: mp, seed: None, ..Default::default() };
     let pool = threads * in_flight;
     eprintln!(
         "c4 LGS self-play (central-batched): {n_games} games, pool {pool} ({threads}×{in_flight}), \
@@ -864,7 +936,7 @@ pub fn run_generate_batched(
         "  wrote {} examples ({} games) in {:.1}s  ({:.1} games/s, {} reifications)\n  \
          avg_batch {:.0}  forwards/s {:.0} ({:.1}k)  cache_hit {:.0}% (encode+policy)\n  \
          valid_decode {:.0}% ({}/{})\n  \
-         ops: enc {} eval {} pol {} reif {}",
+         ops: enc {} eval {} pol {} mvpol {} reif {}",
         all.len(),
         n_games,
         dt,
@@ -880,6 +952,7 @@ pub fn run_generate_batched(
         stats.n_enc.load(Ordering::Relaxed),
         stats.n_eval.load(Ordering::Relaxed),
         stats.n_pol.load(Ordering::Relaxed),
+        stats.n_mvpol.load(Ordering::Relaxed),
         stats.n_reif.load(Ordering::Relaxed),
     );
     Ok(())
@@ -905,8 +978,14 @@ pub async fn run_lgs_eval(
     use playground_core::Solver;
     let device = crate::net::pick_device(cuda)?;
     let model = LgsModel::load_on(checkpoint, device)?;
-    let cfg =
-        SearchConfig { simulations: sims, c_puct, kernel_bandwidth, seed: None, ..Default::default() };
+    let cfg = SearchConfig {
+        simulations: sims,
+        c_puct,
+        kernel_bandwidth,
+        move_policy: checkpoint_is_move_policy(checkpoint),
+        seed: None,
+        ..Default::default()
+    };
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
     let (mut move_ok, mut sign_ok, mut n) = (0usize, 0usize, 0usize);
@@ -960,8 +1039,14 @@ pub async fn run_lgs_move(
     use playground_core::Solver;
     let device = crate::net::pick_device(cuda)?;
     let model = LgsModel::load_on(checkpoint, device)?;
-    let cfg =
-        SearchConfig { simulations: sims, c_puct, kernel_bandwidth, seed: None, ..Default::default() };
+    let cfg = SearchConfig {
+        simulations: sims,
+        c_puct,
+        kernel_bandwidth,
+        move_policy: checkpoint_is_move_policy(checkpoint),
+        seed: None,
+        ..Default::default()
+    };
 
     let mut state = Connect4::initial_state();
     for tok in moves.split(',').filter(|s| !s.trim().is_empty()) {
@@ -988,7 +1073,7 @@ pub async fn run_lgs_move(
 
 /// A match player: an LGS checkpoint (argmax KR-PUCT search) or the perfect solver.
 enum Player {
-    Lgs(LgsModel),
+    Lgs(LgsModel, bool), // (model, move_policy net?)
     Solver,
 }
 
@@ -997,14 +1082,19 @@ impl Player {
         Ok(if spec == "solver" {
             Player::Solver
         } else {
-            Player::Lgs(LgsModel::load_on(spec, device.clone())?)
+            Player::Lgs(LgsModel::load_on(spec, device.clone())?, checkpoint_is_move_policy(spec))
         })
     }
     async fn pick(&self, state: &Connect4State, cfg: &SearchConfig) -> anyhow::Result<u8> {
         use playground_core::Solver;
         Ok(match self {
             Player::Solver => Connect4::choose_move(state).best_move.col,
-            Player::Lgs(m) => search(m, state, cfg).await?.chosen.col,
+            // The search path must match this player's net arch, regardless of the
+            // opponent's (a move-policy net can face a reifier/MDN baseline).
+            Player::Lgs(m, mp) => {
+                let cfg = SearchConfig { move_policy: *mp, ..cfg.clone() };
+                search(m, state, &cfg).await?.chosen.col
+            }
         })
     }
 }

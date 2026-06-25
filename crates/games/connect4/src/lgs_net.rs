@@ -17,7 +17,7 @@ use std::path::Path;
 use async_trait::async_trait;
 use candle_core::{DType, Device, Module, ModuleT, Tensor};
 use candle_nn::{batch_norm, conv2d, linear, BatchNorm, BatchNormConfig, Conv2d, Conv2dConfig, Linear, VarBuilder};
-use playground_core::{Game, LatentGameState, LatentModel, MixturePolicy};
+use playground_core::{Game, LatentGameState, LatentModel, MixturePolicy, MovePolicy};
 
 use crate::game::{Connect4, Connect4Move, Connect4State, C4_COLS, C4_ROWS};
 
@@ -374,6 +374,13 @@ fn read_arch(checkpoint: &Path) -> Arch {
     a
 }
 
+/// Whether a checkpoint's arch is the discrete per-move policy (vs the MDN), read
+/// from its sidecar/config.json. Self-play/eval set `SearchConfig.move_policy`
+/// from this so the search path matches the net without a separate CLI flag.
+pub fn checkpoint_is_move_policy(checkpoint: &str) -> bool {
+    read_arch(Path::new(checkpoint)).move_policy
+}
+
 /// A `LatentModel` running the Connect 4 LGS net in-process via candle.
 pub struct LgsModel {
     net: Net,
@@ -438,6 +445,16 @@ impl LatentModel<Connect4> for LgsModel {
             weights: w.flatten_all()?.to_vec1::<f32>()?,
             means: mu.flatten_all()?.to_vec1::<f32>()?,
             stds: std.flatten_all()?.to_vec1::<f32>()?,
+        })
+    }
+
+    async fn move_policy(&self, lgs: &LatentGameState) -> anyhow::Result<MovePolicy> {
+        let t = self.lgs_tensor(lgs)?;
+        let (prior, nxt) = self.net.move_policy(&t)?;
+        Ok(MovePolicy {
+            dim: LGS_DIM,
+            priors: prior.flatten_all()?.to_vec1::<f32>()?,
+            next: nxt.flatten_all()?.to_vec1::<f32>()?,
         })
     }
 
