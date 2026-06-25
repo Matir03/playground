@@ -52,6 +52,7 @@ class C4LGSNet(nn.Module):
         k: int = K_COMPONENTS,
         val_hidden: list[int] | None = None,
         decoder: bool = False,
+        move_policy: bool = False,
     ) -> None:
         super().__init__()
         self.channels, self.blocks_n, self.k = channels, blocks, k
@@ -77,10 +78,22 @@ class C4LGSNet(nn.Module):
                 nn.Linear(dims[i], dims[i + 1]) for i in range(len(self.val_hidden))
             )
             self.val_out = nn.Linear(dims[-1], 1)
-        # MDN policy over next-LGS
-        self.mix_logits = nn.Linear(LGS_DIM, k)
-        self.means = nn.Linear(LGS_DIM, k * LGS_DIM)
-        self.log_stds = nn.Linear(LGS_DIM, k * LGS_DIM)
+        # Policy over next-LGS. Default is the MDN (continuous mixture, for
+        # general games). With move_policy=True (discrete action games like C4) we
+        # instead output one predicted next-latent per move plus a move-prior:
+        #   pol_prior : LGS -> A logits          (AlphaZero-style move prior P(a))
+        #   pol_next  : LGS -> A * LGS_DIM        (predicted E(child) per move)
+        # The search then uses the A per-move latents directly as candidates (no
+        # sampling/widening) with action = move index; decode/valid-decode of
+        # pol_next becomes a policy-quality diagnostic, off the action path.
+        self.move_policy = bool(move_policy)
+        if not self.move_policy:
+            self.mix_logits = nn.Linear(LGS_DIM, k)
+            self.means = nn.Linear(LGS_DIM, k * LGS_DIM)
+            self.log_stds = nn.Linear(LGS_DIM, k * LGS_DIM)
+        else:
+            self.pol_prior = nn.Linear(LGS_DIM, C4_COLS)
+            self.pol_next = nn.Linear(LGS_DIM, C4_COLS * LGS_DIM)
         # Edge head: maps a latent edge / next-LGS to a concrete action. Default
         # is the reifier ((LGS, next-LGS) -> 7 column logits). With decoder=True
         # we instead learn a *position decoder* (next-LGS -> board planes); the
@@ -131,6 +144,13 @@ class C4LGSNet(nn.Module):
         mu = torch.tanh(self.means(lgs)).view(-1, self.k, LGS_DIM)
         std = F.softplus(self.log_stds(lgs)).view(-1, self.k, LGS_DIM) + SIGMA_MIN
         return w, mu, std
+
+    def move_policy_fwd(self, lgs: torch.Tensor):
+        """Discrete per-move policy: LGS (B,d) -> (prior_logits (B,A),
+        next_latents (B,A,d) tanh-bounded). A = C4_COLS moves."""
+        prior = self.pol_prior(lgs)  # (B, A) logits
+        nxt = torch.tanh(self.pol_next(lgs)).view(-1, C4_COLS, LGS_DIM)  # (B, A, d)
+        return prior, nxt
 
     def reify_logits(self, lgs: torch.Tensor, next_lgs: torch.Tensor) -> torch.Tensor:
         h = F.relu(self.reif1(torch.cat([lgs, next_lgs], dim=-1)))
@@ -205,6 +225,7 @@ def build_lgs_model(arch: dict | None) -> C4LGSNet:
         k=int(arch.get("k", K_COMPONENTS)),
         val_hidden=[int(x) for x in vh] if vh else None,
         decoder=bool(arch.get("decoder", False)),
+        move_policy=bool(arch.get("move_policy", False)),
     )
 
 
@@ -214,6 +235,8 @@ def arch_of(model: C4LGSNet) -> dict:
         a["val_hidden"] = list(model.val_hidden)
     if model.decoder:
         a["decoder"] = True
+    if model.move_policy:
+        a["move_policy"] = True
     return a
 
 

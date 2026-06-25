@@ -65,6 +65,22 @@ def load_buffer(path: str):
     return tuple(np.concatenate([p[i] for p in parts], axis=0) for i in range(5))
 
 
+def lex_perm(ec, present):
+    """Per-row permutation ordering children by *decreasing lexicographic* order of
+    their encoding (present first, absent last). ec:(B,A,d) detached, present:(B,A).
+    Returns (B,A) long indices. Gives the discrete move-policy a canonical, stable
+    target assignment for set-prediction (pol_next[i] <- i-th lex child)."""
+    e = ec.cpu().numpy()
+    pres = (present > 0).cpu().numpy()
+    d = e.shape[-1]
+    # np.lexsort: last key is primary. Want primary = present-flag (absent last),
+    # then dim0 desc, dim1 desc, ...  -> least-significant first: -dim_{d-1}..-dim0, flag.
+    keys = [(-e[:, :, i]) for i in range(d - 1, -1, -1)]
+    keys.append((~pres).astype(np.int8))
+    perm = np.lexsort(keys, axis=1)  # (B,A) ascending => present-first, lex-desc
+    return torch.from_numpy(perm).to(ec.device)
+
+
 N_ALIAS_SAMPLES = 4
 
 
@@ -98,7 +114,8 @@ def alias_decode_loss(net, w, mu, std, e_child, bch, bvis, nfull):
 
 def do_init(args) -> None:
     os.makedirs(args.init, exist_ok=True)
-    net = M.build_lgs_model({"channels": args.channels, "blocks": args.blocks, "k": args.k, "decoder": args.decoder})
+    net = M.build_lgs_model({"channels": args.channels, "blocks": args.blocks, "k": args.k,
+                             "decoder": args.decoder, "move_policy": args.move_policy})
     M.save_checkpoint(net, os.path.join(args.init, "checkpoint.safetensors"))
     json.dump({"arch": M.arch_of(net)}, open(os.path.join(args.init, "config.json"), "w"))
     print(f"init: random LGS net -> {args.init} (arch {M.arch_of(net)})")
@@ -111,6 +128,7 @@ def main() -> None:
     ap.add_argument("--blocks", type=int, default=3)
     ap.add_argument("--k", type=int, default=M.K_COMPONENTS)
     ap.add_argument("--decoder", action="store_true", help="build a position-decoder edge head (vs reifier)")
+    ap.add_argument("--move-policy", action="store_true", help="discrete per-move latent policy (vs MDN) — C4")
     ap.add_argument("--buffer", help="dump file or dir of *.bin")
     ap.add_argument("--in", dest="inp", help="checkpoint to resume from")
     ap.add_argument("--out", help="checkpoint to write")
@@ -179,16 +197,42 @@ def main() -> None:
             # dilute the policy gradient.
             nfull = (bvis.sum(dim=1) > 0).sum().clamp_min(1).float()
 
-            w, mu, std = net.policy_mdn(e_parent)
-            lpi = torch.zeros((), device=dev)
-            for c in range(MAX_CHILDREN):
-                m = pi[:, c]  # (B,)
-                # Per-dimension NLL: a d-dim Gaussian log-density is ~O(d), which
-                # otherwise swamps the value/edge gradients on the shared
-                # encoder. Normalizing by d puts all loss terms on an O(1) scale.
-                logp = M.mdn_log_prob(e_child[:, c], w, mu, std) / M.LGS_DIM  # (B,)
-                lpi = lpi - (m * logp).sum()
-            lpi = lpi / nfull
+            present = (bvis > 0).float()  # (B,7) real children
+            npresent = present.sum().clamp_min(1.0)
+            move_policy = getattr(net, "move_policy", False)
+            sorted_planes = sorted_present = None
+            if move_policy:
+                # Discrete per-move policy (C4): the 7 outputs are a *set*; assign
+                # targets by sorting the real children by encoding (decreasing lex,
+                # absent last) — a canonical, stable permutation. pol_next[i] -> i-th
+                # lex child encoding (MSE, the learned dynamics); pol_prior[i] ->
+                # that child's visit-prob (CE). Search matches real children to the
+                # nearest pol_next slot, so this lex convention is train-only.
+                prior_logits, pol_nxt = net.move_policy_fwd(e_parent)  # (B,7),(B,7,d)
+                lp = lex_perm(e_child.detach(), present)  # (B,7) lex order (not the batch perm!)
+                pe = lp.unsqueeze(-1).expand(-1, -1, M.LGS_DIM)
+                sorted_child = torch.gather(e_child, 1, pe)  # (B,7,d)
+                sorted_vis = torch.gather(bvis, 1, lp)  # (B,7)
+                sorted_present = torch.gather(present, 1, lp)  # (B,7)
+                sorted_planes = torch.gather(
+                    bch.reshape(B, MAX_CHILDREN, -1), 1, lp.unsqueeze(-1).expand(-1, -1, PLANES)
+                )  # (B,7,PLANES) lex-ordered child boards (for the decoder loss)
+                ptgt = sorted_vis / sorted_vis.sum(dim=1, keepdim=True).clamp_min(1.0)  # (B,7)
+                ce = -(ptgt * F.log_softmax(prior_logits, dim=1)).sum(dim=1)  # (B,)
+                lpi = (ce * (bvis.sum(dim=1) > 0)).sum() / nfull
+                nmse = ((pol_nxt - sorted_child) ** 2).sum(-1)  # (B,7)
+                lpi = lpi + (nmse * sorted_present).sum() / npresent
+            else:
+                w, mu, std = net.policy_mdn(e_parent)
+                lpi = torch.zeros((), device=dev)
+                for c in range(MAX_CHILDREN):
+                    m = pi[:, c]  # (B,)
+                    # Per-dimension NLL: a d-dim Gaussian log-density is ~O(d), which
+                    # otherwise swamps the value/edge gradients on the shared
+                    # encoder. Normalizing by d puts all loss terms on an O(1) scale.
+                    logp = M.mdn_log_prob(e_child[:, c], w, mu, std) / M.LGS_DIM  # (B,)
+                    lpi = lpi - (m * logp).sum()
+                lpi = lpi / nfull
 
             # Edge head: reifier cross-entropy, or position-decoder reconstruction
             # (BCE of decode(E(S)) vs board planes — the decoder inverts the
@@ -203,13 +247,20 @@ def main() -> None:
                     ).mean(dim=1)  # (B,)
                     crec = crec + (pi[:, c] * rec).sum()
                 lrho = lrho + crec / nfull
-                # Intermediate ("aliased") latent points: the search queries the
-                # decoder on MDN *samples*, not exact encodings. Sample from the
-                # MDN and teach the decoder to map each sample to its nearest
-                # recorded child's concrete board, so the latent neighborhood
-                # around real children decodes to legal positions. Samples are
-                # detached -> this shapes the decoder, not the MDN/encoder.
-                lrho = lrho + alias_decode_loss(net, w, mu, std, e_child, bch, bvis, nfull)
+                if move_policy:
+                    # Decoder on the policy's predicted points: decode(pol_next[i])
+                    # -> the i-th lex child's board (detached -> trains the decoder,
+                    # the diagnostic the search's valid-decode rate measures).
+                    dpx = net.decode(pol_nxt.detach().reshape(B * MAX_CHILDREN, M.LGS_DIM)).reshape(B, MAX_CHILDREN, -1)
+                    pbce = F.binary_cross_entropy_with_logits(
+                        dpx, sorted_planes, reduction="none"
+                    ).mean(-1)  # (B,7)
+                    lrho = lrho + (pbce * sorted_present).sum() / npresent
+                else:
+                    # Intermediate ("aliased") latent points: the search queries the
+                    # decoder on MDN *samples*, not exact encodings. Teach it to map
+                    # each sample to its nearest recorded child's board (detached).
+                    lrho = lrho + alias_decode_loss(net, w, mu, std, e_child, bch, bvis, nfull)
             else:
                 lrho = torch.zeros((), device=dev)
                 for c in range(MAX_CHILDREN):
@@ -224,8 +275,10 @@ def main() -> None:
             d_func = (net.value(e_parent) - net.value(e_parent)[j]).abs()
             lc = (alpha * d_lat - d_func).pow(2).mean()
 
-            # mixture-entropy bonus (encourage spread, discourage collapse)
-            ent = -(w.clamp_min(1e-9).log() * w).sum(-1).mean()
+            # mixture-entropy bonus (encourage spread, discourage collapse).
+            # Only meaningful for the MDN; the discrete move-policy uses prior CE.
+            ent = torch.zeros((), device=dev) if move_policy else \
+                -(w.clamp_min(1e-9).log() * w).sum(-1).mean()
 
             loss = args.lv * lv + args.lpi * lpi + args.lrho * lrho + args.lc * lc - args.ent * ent
             opt.zero_grad()
