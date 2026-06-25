@@ -146,6 +146,31 @@ impl EdgeHead {
     }
 }
 
+/// Policy head over next-LGS. `Mdn` is the continuous mixture (general games).
+/// `Move` is the discrete per-move head for C4: `pol_prior` (A move-prior logits)
+/// + `pol_next` (A predicted next-encodings). Selected by config `move_policy`.
+enum PolicyHead {
+    Mdn { mix_logits: Linear, means: Linear, log_stds: Linear },
+    Move { pol_prior: Linear, pol_next: Linear },
+}
+
+impl PolicyHead {
+    fn load(arch: &Arch, vb: &VarBuilder) -> candle_core::Result<Self> {
+        if arch.move_policy {
+            Ok(PolicyHead::Move {
+                pol_prior: linear(LGS_DIM, C4_COLS, vb.pp("pol_prior"))?,
+                pol_next: linear(LGS_DIM, C4_COLS * LGS_DIM, vb.pp("pol_next"))?,
+            })
+        } else {
+            Ok(PolicyHead::Mdn {
+                mix_logits: linear(LGS_DIM, arch.k, vb.pp("mix_logits"))?,
+                means: linear(LGS_DIM, arch.k * LGS_DIM, vb.pp("means"))?,
+                log_stds: linear(LGS_DIM, arch.k * LGS_DIM, vb.pp("log_stds"))?,
+            })
+        }
+    }
+}
+
 struct Net {
     stem: Conv2d,
     stem_bn: BatchNorm,
@@ -153,9 +178,7 @@ struct Net {
     gpool: GlobalPoolBias,
     enc_fc: Linear,
     value_head: ValueHead,
-    mix_logits: Linear,
-    means: Linear,
-    log_stds: Linear,
+    policy: PolicyHead,
     edge: EdgeHead,
     k: usize,
 }
@@ -177,9 +200,7 @@ impl Net {
             gpool: GlobalPoolBias::load(c, vb.pp("gpool"))?,
             enc_fc: linear(feat, LGS_DIM, vb.pp("enc_fc"))?,
             value_head: ValueHead::load(arch, &vb)?,
-            mix_logits: linear(LGS_DIM, arch.k, vb.pp("mix_logits"))?,
-            means: linear(LGS_DIM, arch.k * LGS_DIM, vb.pp("means"))?,
-            log_stds: linear(LGS_DIM, arch.k * LGS_DIM, vb.pp("log_stds"))?,
+            policy: PolicyHead::load(arch, &vb)?,
             edge: EdgeHead::load(arch, &vb)?,
             k: arch.k,
         })
@@ -200,15 +221,37 @@ impl Net {
         self.value_head.forward(lgs) // (B,1)
     }
 
-    /// LGS (B,64) -> (weights (B,k), means (B,k,d), stds (B,k,d)).
+    /// LGS (B,64) -> (weights (B,k), means (B,k,d), stds (B,k,d)). MDN nets only.
     fn policy_mdn(&self, lgs: &Tensor) -> candle_core::Result<(Tensor, Tensor, Tensor)> {
         let b = lgs.dim(0)?;
-        let w = candle_nn::ops::softmax(&self.mix_logits.forward(lgs)?, 1)?;
-        let mu = self.means.forward(lgs)?.tanh()?.reshape((b, self.k, LGS_DIM))?;
-        let raw = self.log_stds.forward(lgs)?;
-        // softplus(z) = ln(1+exp(z)); + SIGMA_MIN floor.
-        let std = ((raw.exp()? + 1.0)?.log()? + SIGMA_MIN)?.reshape((b, self.k, LGS_DIM))?;
-        Ok((w, mu, std))
+        match &self.policy {
+            PolicyHead::Mdn { mix_logits, means, log_stds } => {
+                let w = candle_nn::ops::softmax(&mix_logits.forward(lgs)?, 1)?;
+                let mu = means.forward(lgs)?.tanh()?.reshape((b, self.k, LGS_DIM))?;
+                let raw = log_stds.forward(lgs)?;
+                // softplus(z) = ln(1+exp(z)); + SIGMA_MIN floor.
+                let std = ((raw.exp()? + 1.0)?.log()? + SIGMA_MIN)?.reshape((b, self.k, LGS_DIM))?;
+                Ok((w, mu, std))
+            }
+            PolicyHead::Move { .. } => candle_core::bail!("policy_mdn called on a move-policy net"),
+        }
+    }
+
+    /// LGS (B,64) -> (prior softmax (B,A), next-latents (B,A,d) tanh). Move nets only.
+    fn move_policy(&self, lgs: &Tensor) -> candle_core::Result<(Tensor, Tensor)> {
+        let b = lgs.dim(0)?;
+        match &self.policy {
+            PolicyHead::Move { pol_prior, pol_next } => {
+                let prior = candle_nn::ops::softmax(&pol_prior.forward(lgs)?, 1)?; // (B,A)
+                let nxt = pol_next.forward(lgs)?.tanh()?.reshape((b, C4_COLS, LGS_DIM))?; // (B,A,d)
+                Ok((prior, nxt))
+            }
+            PolicyHead::Mdn { .. } => candle_core::bail!("move_policy called on an MDN net"),
+        }
+    }
+
+    fn is_move_policy(&self) -> bool {
+        matches!(self.policy, PolicyHead::Move { .. })
     }
 
     /// (LGS (1,64), next-LGS (1,64)) -> column logits (7,). Reifier nets only.
@@ -301,10 +344,12 @@ struct Arch {
     val_hidden: Option<Vec<usize>>,
     /// Edge head is a position decoder (true) vs the reifier (false, default).
     decoder: bool,
+    /// Policy is the discrete per-move head (true) vs the MDN (false, default).
+    move_policy: bool,
 }
 
 fn read_arch(checkpoint: &Path) -> Arch {
-    let mut a = Arch { channels: 64, blocks: 5, k: 8, val_hidden: None, decoder: false };
+    let mut a = Arch { channels: 64, blocks: 5, k: 8, val_hidden: None, decoder: false, move_policy: false };
     // Prefer a per-checkpoint sidecar (e.g. gen_000153.config.json) so a single
     // gens/ dir can hold mixed archs (legacy + grown value heads); fall back to
     // config.json in the same dir (live/ uses that).
@@ -322,6 +367,7 @@ fn read_arch(checkpoint: &Path) -> Arch {
                     a.val_hidden = Some(vh.iter().map(|x| x.as_u64().unwrap_or(64) as usize).collect());
                 }
                 a.decoder = arch["decoder"].as_bool().unwrap_or(false);
+                a.move_policy = arch["move_policy"].as_bool().unwrap_or(false);
             }
         }
     }
@@ -461,6 +507,23 @@ impl LgsServer {
         let lgs = self.net.encode(&t)?;
         let val = self.net.value(&lgs)?;
         Ok((lgs.flatten_all()?.to_vec1::<f32>()?, val.flatten_all()?.to_vec1::<f32>()?))
+    }
+
+    /// Fused move-policy+value: `b` × LGS → (priors `b·A`, next-latents `b·A·d`,
+    /// values `b`). One round-trip for discrete-policy node expansion.
+    pub fn move_policy_eval_batch(
+        &self,
+        lgs: &[f32],
+        b: usize,
+    ) -> anyhow::Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let t = Tensor::from_vec(lgs.to_vec(), (b, LGS_DIM), &self.device)?;
+        let (prior, nxt) = self.net.move_policy(&t)?;
+        let val = self.net.value(&t)?;
+        Ok((
+            prior.flatten_all()?.to_vec1::<f32>()?,
+            nxt.flatten_all()?.to_vec1::<f32>()?,
+            val.flatten_all()?.to_vec1::<f32>()?,
+        ))
     }
 
     /// Fused policy+value: `b` × LGS → (MDN params, `b` values). One round-trip
