@@ -81,6 +81,34 @@ def lex_perm(ec, present):
     return torch.from_numpy(perm).to(ec.device)
 
 
+def min_loss_perm(pol_next, e_child, present, ptgt, prior_logits, ce_ratio):
+    """Per-row assignment (slot j <- child) that MINIMIZES the move-policy loss —
+    the optimal bipartite matching (DETR-style Hungarian), replacing the fixed lex
+    order. The lex convention forced the policy to predict a target ordering it
+    never uses at inference (search assigns priors by the *nearest* pol_next slot);
+    matching to the loss-minimizing assignment removes that train/infer mismatch.
+
+    Per-example cost of assigning slot j to child c:
+        C[j,c] = present[c]*||pol_next[j]-e_child[c]||^2  -  ce_ratio*ptgt[c]*logp[j]
+    (logp = log_softmax(prior_logits)) — i.e. the latent-MSE + prior-CE terms of
+    the loss, with ce_ratio = npresent/nfull so the two match the loss's relative
+    weighting (lpi = nmse/npresent + ce/nfull). Absent children give zero-cost
+    columns and fill leftover slots. All inputs are detached (the matching is a
+    discrete target choice, not differentiated). Returns (B,A) long indices with
+    lp[b,j] = child assigned to slot j (gather-compatible with the lex path)."""
+    from scipy.optimize import linear_sum_assignment
+    B, A, _ = pol_next.shape
+    mse = ((pol_next.unsqueeze(2) - e_child.unsqueeze(1)) ** 2).sum(-1)  # (B,slot,child)
+    logp = torch.log_softmax(prior_logits, dim=1)                        # (B,slot)
+    cost = present.unsqueeze(1) * mse - ce_ratio * (ptgt.unsqueeze(1) * logp.unsqueeze(2))
+    C = cost.detach().cpu().numpy()
+    perm = np.empty((B, A), dtype=np.int64)
+    for b in range(B):
+        _, col = linear_sum_assignment(C[b])  # rows 0..A-1 sorted -> col[j] = child for slot j
+        perm[b] = col
+    return torch.from_numpy(perm).to(pol_next.device)
+
+
 N_ALIAS_SAMPLES = 4
 
 
@@ -203,13 +231,19 @@ def main() -> None:
             sorted_planes = sorted_present = None
             if move_policy:
                 # Discrete per-move policy (C4): the 7 outputs are a *set*; assign
-                # targets by sorting the real children by encoding (decreasing lex,
-                # absent last) — a canonical, stable permutation. pol_next[i] -> i-th
-                # lex child encoding (MSE, the learned dynamics); pol_prior[i] ->
-                # that child's visit-prob (CE). Search matches real children to the
-                # nearest pol_next slot, so this lex convention is train-only.
+                # each slot to a real child by the loss-MINIMIZING bipartite matching
+                # (min_loss_perm), so the policy is trained against the same
+                # slot<->child association search recovers (nearest pol_next slot)
+                # rather than an arbitrary lex order. pol_next[i] -> matched child
+                # encoding (MSE, the learned dynamics); pol_prior[i] -> that child's
+                # visit-prob (CE).
                 prior_logits, pol_nxt = net.move_policy_fwd(e_parent)  # (B,7),(B,7,d)
-                lp = lex_perm(e_child.detach(), present)  # (B,7) lex order (not the batch perm!)
+                child_ptgt = bvis / bvis.sum(dim=1, keepdim=True).clamp_min(1.0)  # (B,7) over children
+                ce_ratio = float(npresent / nfull)
+                lp = min_loss_perm(
+                    pol_nxt.detach(), e_child.detach(), present, child_ptgt,
+                    prior_logits.detach(), ce_ratio,
+                )  # (B,7) optimal slot<-child assignment (not the batch perm!)
                 pe = lp.unsqueeze(-1).expand(-1, -1, M.LGS_DIM)
                 sorted_child = torch.gather(e_child, 1, pe)  # (B,7,d)
                 sorted_vis = torch.gather(bvis, 1, lp)  # (B,7)
