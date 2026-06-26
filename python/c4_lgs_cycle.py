@@ -39,7 +39,7 @@ def main() -> None:
     ap.add_argument("--python", default=sys.executable)
     ap.add_argument("--gens", type=int, default=0, help="generations to run (0 = unbounded)")
     ap.add_argument("--games", type=int, default=512, help="self-play games per gen")
-    ap.add_argument("--sims", type=int, default=96, help="full (high-playout) sims for policy-target moves")
+    ap.add_argument("--sims", type=int, default=250, help="full (high-playout) sims for policy-target moves")
     ap.add_argument("--fast-sims", type=int, default=16, help="PCR fast (low-playout) sims for value-only moves")
     ap.add_argument("--pcr-full-prob", type=float, default=1.0, help="prob a move is a full search (1.0 = PCR off)")
     ap.add_argument("--temp-moves", type=int, default=8)
@@ -60,8 +60,9 @@ def main() -> None:
     ap.add_argument("--eval-sims", type=int, default=96)
     ap.add_argument("--eval-opening", type=int, default=6)
     ap.add_argument("--ladder-every", type=int, default=3, help="run BT-ELO ladder + promotion every N gens (0 disables)")
-    ap.add_argument("--match-games", type=int, default=40)
+    ap.add_argument("--match-games", type=int, default=24)
     ap.add_argument("--match-sims", type=int, default=64)
+    ap.add_argument("--match-threads", type=int, default=11, help="CPU threads for ladder matches (run while self-play is paused)")
     ap.add_argument("--match-random", type=int, default=0, help="extra random previous gens per ladder step (0 = fixed O(1) anchors only: solver + champion + ladder.json anchors)")
     ap.add_argument("--promote-margin", type=float, default=0.0, help="ELO margin a gen must clear the champion by to promote (anti-noise)")
     # Continuous actor/learner: generate self-play chunks back-to-back for
@@ -134,7 +135,7 @@ def main() -> None:
                     args.engine, ckpt, gens_dir, ladder_path, gen, args.cuda,
                     games=args.match_games, sims=args.match_sims,
                     n_random=args.match_random, seed=gen * 7919,
-                    margin=args.promote_margin,
+                    margin=args.promote_margin, match_threads=args.match_threads,
                 )
                 tag = "PROMOTED to champion" if promoted else f"champion stays {L['best']}"
                 print(f"LADDER gen {gen} elo {elo.get(name, float('nan')):.0f}  "

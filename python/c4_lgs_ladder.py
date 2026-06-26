@@ -24,11 +24,14 @@ import shutil
 import subprocess
 
 
-def _run_match(engine, a, b, games, sims, cuda, seed):
+def _run_match(engine, a, b, games, sims, cuda, seed, threads=11):
+    # Matches run multi-threaded on CPU: candle CUDA serializes across threads
+    # (one GPU consumer), but each game's search is CPU-bound, so parallel games
+    # on free cores beat single-thread GPU ~4x. Self-play is paused during the
+    # ladder, so the cores are free. (`cuda` is ignored here by design.)
     cmd = [engine, "lgs-match", "--a", a, "--b", b,
-           "--games", str(games), "--sims", str(sims), "--seed", str(seed)]
-    if cuda:
-        cmd.append("--cuda")
+           "--games", str(games), "--sims", str(sims), "--seed", str(seed),
+           "--threads", str(threads)]
     out = subprocess.run(cmd, capture_output=True, text=True)
     for line in out.stdout.splitlines():
         if line.startswith("MATCH"):
@@ -94,7 +97,7 @@ def fit_bt(players, matches, anchor="solver", iters=2000):
 
 
 def step(engine, live_ckpt, gens_dir, ladder_path, gen, cuda,
-         games=40, sims=64, n_random=3, seed=0, margin=0.0):
+         games=40, sims=64, n_random=3, seed=0, margin=0.0, match_threads=11):
     """Archive the live checkpoint, run matches, refit ELO, maybe promote.
 
     Promotes only when the new gen's ELO clears the champion's by ``margin``
@@ -137,7 +140,7 @@ def step(engine, live_ckpt, gens_dir, ladder_path, gen, cuda,
     if n_random > 0 and prev_gens:
         opps.update(random.sample(prev_gens, min(n_random, len(prev_gens))))
     for i, opp in enumerate(sorted(opps)):
-        wa, d, wb = _run_match(engine, arch, L["ckpt"][opp], games, sims, cuda, seed + i)
+        wa, d, wb = _run_match(engine, arch, L["ckpt"][opp], games, sims, cuda, seed + i, match_threads)
         L["matches"].append([name, opp, wa, d, wb])
 
     elo = fit_bt(L["players"], L["matches"])

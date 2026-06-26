@@ -341,6 +341,8 @@ enum Cmd {
         kernel_bandwidth: f64,
         #[arg(long, default_value_t = 0)]
         seed: u64,
+        #[arg(long, default_value_t = 8)]
+        threads: usize,
     },
     /// Probe one position (comma-separated opening move sequence): print the net's
     /// chosen move, root value, child visits, and the solver's move.
@@ -517,11 +519,14 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
         }
-        Cmd::LgsMatch { a, b, cuda, games, sims, opening, c_puct, kernel_bandwidth, seed } => {
-            lgs_selfplay::run_lgs_match(
-                &a, &b, cuda, games, sims, opening, c_puct, kernel_bandwidth, seed,
-            )
-            .await?;
+        Cmd::LgsMatch { a, b, cuda, games, sims, opening, c_puct, kernel_bandwidth, seed, threads } => {
+            // Multi-threaded, CPU-bound per game; run off the async runtime.
+            tokio::task::spawn_blocking(move || {
+                lgs_selfplay::run_lgs_match(
+                    &a, &b, cuda, games, sims, opening, c_puct, kernel_bandwidth, seed, threads,
+                )
+            })
+            .await??;
         }
         Cmd::LgsMove { model, cuda, moves, sims, c_puct, kernel_bandwidth } => {
             lgs_selfplay::run_lgs_move(&model, cuda, &moves, sims, c_puct, kernel_bandwidth).await?;

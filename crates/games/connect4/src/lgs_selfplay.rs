@@ -1099,13 +1099,85 @@ impl Player {
     }
 }
 
+/// Drive an in-process (`LgsModel`/Solver) future to completion on the current
+/// thread. The single-thread `LatentModel`s never park (their async methods do
+/// synchronous candle work and return `Ready`), so one poll resumes the whole
+/// `search` chain — this is just a thin scope-friendly executor for the threaded
+/// match (no tokio runtime inside the worker threads).
+fn block_on<F: Future>(fut: F) -> F::Output {
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = Box::pin(fut);
+    loop {
+        if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+            return v;
+        }
+        std::hint::spin_loop(); // unreachable for in-process models (never Pending)
+    }
+}
+
+/// Play one match game from a random `opening`; `a_first` decides which engine
+/// moves at the opening position (colour balance). Returns the outcome with
+/// `a_won`/`b_won` resolved (None = draw / no legal opening).
+fn play_match_game(
+    a: &Player,
+    b: &Player,
+    cfg: &SearchConfig,
+    opening: u32,
+    a_first: bool,
+    seed: u64,
+) -> anyhow::Result<Option<bool>> {
+    // Random opening; retry (bounded) if it ends the game before play starts.
+    let mut state = None;
+    for attempt in 0..20u64 {
+        let mut s = Connect4::initial_state();
+        let mut r = ChaCha8Rng::seed_from_u64(seed.wrapping_add(attempt.wrapping_mul(7919)));
+        for _ in 0..opening {
+            if Connect4::outcome(&s).is_terminal() {
+                break;
+            }
+            let moves = Connect4::legal_moves(&s);
+            let mv = moves[r.gen_range(0..moves.len())].clone();
+            s = Connect4::apply(&s, &mv);
+        }
+        if !Connect4::outcome(&s).is_terminal() {
+            state = Some(s);
+            break;
+        }
+    }
+    let mut state = match state {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let mut a_to_move = a_first;
+    let outcome = loop {
+        let o = Connect4::outcome(&state);
+        if o.is_terminal() {
+            break o;
+        }
+        let col = if a_to_move {
+            block_on(a.pick(&state, cfg))?
+        } else {
+            block_on(b.pick(&state, cfg))?
+        };
+        state = Connect4::apply(&state, &Connect4Move { col });
+        a_to_move = !a_to_move;
+    };
+    Ok(match outcome {
+        Outcome::Draw => None,
+        // The last mover won; `a_to_move` has flipped to the loser's side.
+        _ => Some(!a_to_move), // true => A won
+    })
+}
+
 /// Head-to-head match between two players (LGS checkpoint paths or "solver").
-/// Each game starts from a random opening (for variety); the two engines are
-/// swapped between which side moves first on alternating games (colour balance).
-/// Prints `MATCH <a_wins> <draws> <b_wins>` from A's perspective — the raw counts
-/// the BT-ELO ladder consumes.
+/// Games run across `threads` worker threads (each with its own model instances
+/// on the shared device); each game starts from a random opening, with the side
+/// that moves first swapped on alternating game indices (colour balance). The
+/// caller (ladder) pauses self-play while this runs, so the device is free.
+/// Prints `MATCH <a_wins> <draws> <b_wins>` from A's perspective.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_lgs_match(
+pub fn run_lgs_match(
     a_spec: &str,
     b_spec: &str,
     cuda: bool,
@@ -1115,61 +1187,53 @@ pub async fn run_lgs_match(
     c_puct: f64,
     kernel_bandwidth: f64,
     seed: u64,
+    threads: usize,
 ) -> anyhow::Result<()> {
     let device = crate::net::pick_device(cuda)?;
-    let a = Player::load(a_spec, &device)?;
-    let b = Player::load(b_spec, &device)?;
-    let cfg =
-        SearchConfig { simulations: sims, c_puct, kernel_bandwidth, seed: None, ..Default::default() };
-    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let threads = threads.max(1).min(games.max(1));
+
+    let counts: Vec<anyhow::Result<(usize, usize, usize)>> = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for t in 0..threads {
+            let device = device.clone();
+            handles.push(scope.spawn(move || -> anyhow::Result<(usize, usize, usize)> {
+                // Per-thread model instances (matches are CPU-bound per game, so
+                // parallel games overlap their search work on the otherwise-idle GPU).
+                let a = Player::load(a_spec, &device)?;
+                let b = Player::load(b_spec, &device)?;
+                let cfg = SearchConfig {
+                    simulations: sims,
+                    c_puct,
+                    kernel_bandwidth,
+                    seed: None,
+                    ..Default::default()
+                };
+                let (mut aw, mut dr, mut bw) = (0usize, 0usize, 0usize);
+                let mut g = t;
+                while g < games {
+                    match play_match_game(&a, &b, &cfg, opening, g % 2 == 0, seed.wrapping_add(g as u64))? {
+                        Some(true) => aw += 1,
+                        Some(false) => bw += 1,
+                        None => dr += 1,
+                    }
+                    g += threads;
+                }
+                Ok((aw, dr, bw))
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
 
     let (mut a_wins, mut draws, mut b_wins) = (0usize, 0usize, 0usize);
-    let mut g = 0usize;
-    let mut attempts = 0usize;
-    while g < games && attempts < games * 20 {
-        attempts += 1;
-        let mut state = Connect4::initial_state();
-        for _ in 0..opening {
-            if Connect4::outcome(&state).is_terminal() {
-                break;
-            }
-            let moves = Connect4::legal_moves(&state);
-            let mv = moves[rng.gen_range(0..moves.len())].clone();
-            state = Connect4::apply(&state, &mv);
-        }
-        if Connect4::outcome(&state).is_terminal() {
-            continue;
-        }
-        // A controls the side to move at the opening on even games, B on odd.
-        let mut a_to_move = g % 2 == 0;
-        let outcome = loop {
-            let o = Connect4::outcome(&state);
-            if o.is_terminal() {
-                break o;
-            }
-            let col = if a_to_move {
-                a.pick(&state, &cfg).await?
-            } else {
-                b.pick(&state, &cfg).await?
-            };
-            state = Connect4::apply(&state, &Connect4Move { col });
-            a_to_move = !a_to_move;
-        };
-        match outcome {
-            Outcome::Draw => draws += 1,
-            // The last mover won; `a_to_move` has flipped to the loser's side.
-            _ => {
-                if !a_to_move {
-                    a_wins += 1
-                } else {
-                    b_wins += 1
-                }
-            }
-        }
-        g += 1;
+    for c in counts {
+        let (aw, dr, bw) = c?;
+        a_wins += aw;
+        draws += dr;
+        b_wins += bw;
     }
     eprintln!(
-        "lgs_match  {a_spec} vs {b_spec}:  {a_wins}-{draws}-{b_wins} (W-D-L, A's view; {g} games, {sims} sims)"
+        "lgs_match  {a_spec} vs {b_spec}:  {a_wins}-{draws}-{b_wins} (W-D-L, A's view; {} games, {sims} sims, {threads} threads)",
+        a_wins + draws + b_wins
     );
     println!("MATCH {a_wins} {draws} {b_wins}");
     Ok(())
