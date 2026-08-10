@@ -1252,6 +1252,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "clap",
+ "ort",
  "playground-core",
  "playground-engine-server",
  "playground-model-client",

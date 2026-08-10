@@ -131,6 +131,15 @@ enum Cmd {
         temp_moves: u32,
         #[arg(long, default_value_t = 0)]
         seed: u64,
+        /// Inference backend: `candle` (latest.safetensors) or `ort` (model.onnx).
+        #[arg(long, default_value = "candle")]
+        backend: String,
+        /// ORT execution provider: `trt` or `cuda`.
+        #[arg(long, default_value = "trt")]
+        ep: String,
+        /// fp16 for the TensorRT engine.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        fp16: bool,
     },
     /// Self-play throughput benchmark (runs for `--secs` wall-clock).
     SelfplayBench {
@@ -152,6 +161,13 @@ enum Cmd {
         c_puct: f32,
         #[arg(long, default_value_t = 0)]
         seed: u64,
+        /// Inference backend: `candle` (a .safetensors) or `ort` (a .onnx).
+        #[arg(long, default_value = "candle")]
+        backend: String,
+        #[arg(long, default_value = "trt")]
+        ep: String,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        fp16: bool,
     },
     /// Head-to-head between two checkpoints (relative strength / ELO).
     EvalMatch {
@@ -241,6 +257,14 @@ enum Cmd {
         moves: String,
         #[arg(long, default_value_t = 5)]
         top: usize,
+        /// Inference backend: `candle` (a .safetensors) or `ort` (a .onnx). Run it
+        /// on both to check a backend (notably TensorRT fp16) still agrees.
+        #[arg(long, default_value = "candle")]
+        backend: String,
+        #[arg(long, default_value = "trt")]
+        ep: String,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        fp16: bool,
     },
     /// Raw forward throughput of the net (positions/s), with no search around it —
     /// the ceiling `selfplay-bench` can approach, and how you tell a GPU-bound
@@ -254,6 +278,13 @@ enum Cmd {
         batch: usize,
         #[arg(long, default_value_t = 50)]
         iters: usize,
+        /// Inference backend: `candle` (a .safetensors) or `ort` (a .onnx).
+        #[arg(long, default_value = "candle")]
+        backend: String,
+        #[arg(long, default_value = "trt")]
+        ep: String,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        fp16: bool,
     },
     /// Random-playout throughput of the rules (moves/s), the AZ self-play floor.
     Bench {
@@ -281,21 +312,23 @@ async fn main() -> anyhow::Result<()> {
         Cmd::SelfPlay { addr, model_uri, .. } => serve(addr, &model_uri, &[], false).await?,
         Cmd::SelfplayLoop {
             live, cuda, concurrency, max_batch, chunk_secs, max_chunks, threads, node_budget,
-            c_puct, dir_alpha, dir_eps, temp_moves, seed,
+            c_puct, dir_alpha, dir_eps, temp_moves, seed, backend, ep, fp16,
         } => {
             let params = search_params(node_budget, c_puct, dir_alpha, dir_eps, temp_moves);
             selfplay::run_loop(
                 &live, cuda, params, concurrency, chunk_secs, max_chunks,
                 threads.unwrap_or_else(default_threads), max_batch, seed,
+                parse_backend(&backend, &ep, fp16)?,
             )?;
         }
         Cmd::SelfplayBench {
             model, cuda, concurrency, secs, threads, max_batch, node_budget, c_puct, seed,
+            backend, ep, fp16,
         } => {
             let params = search_params(node_budget, c_puct, 0.3, 0.25, 12);
             selfplay::run_benchmark(
                 &model, cuda, concurrency, threads.unwrap_or_else(default_threads), params,
-                max_batch, seed, secs,
+                max_batch, seed, secs, parse_backend(&backend, &ep, fp16)?,
             )?;
         }
         Cmd::EvalMatch { a, b, cuda, games, node_budget, c_puct, temp_moves, threads, max_batch, seed } => {
@@ -322,8 +355,12 @@ async fn main() -> anyhow::Result<()> {
                 moves[(rng >> 33) as usize % moves.len()]
             })?;
         }
-        Cmd::NetEval { model, moves, top } => net_eval(&model, &moves, top)?,
-        Cmd::NetBench { model, cuda, batch, iters } => net_bench(&model, cuda, batch, iters)?,
+        Cmd::NetEval { model, moves, top, backend, ep, fp16 } => {
+            net_eval(&model, &moves, top, parse_backend(&backend, &ep, fp16)?)?
+        }
+        Cmd::NetBench { model, cuda, batch, iters, backend, ep, fp16 } => {
+            net_bench(&model, cuda, batch, iters, parse_backend(&backend, &ep, fp16)?)?
+        }
         Cmd::Bench { games } => bench(games),
         Cmd::Stdio => anyhow::bail!("stdio: implement when needed"),
     }
@@ -386,15 +423,31 @@ fn default_threads() -> usize {
 
 /// Value + top policy cells for a position, as JSON. `moves` is a comma-separated
 /// list of cells played from the empty board.
-fn net_eval(model: &str, moves: &str, top: usize) -> anyhow::Result<()> {
+fn net_eval(
+    model: &str,
+    moves: &str,
+    top: usize,
+    backend: selfplay::Backend,
+) -> anyhow::Result<()> {
+    use playground_core::batch_search::BatchModel;
     let mut state = <Hex as Game>::initial_state();
     for token in moves.split(',').filter(|t| !t.trim().is_empty()) {
         let (r, c) = hex_engine::game::parse_cell(token)
             .ok_or_else(|| anyhow::anyhow!("bad cell {token:?}"))?;
         state = <Hex as Game>::apply(&state, &HexMove::Play { r: r as u8, c: c as u8 });
     }
-    let m = net::LocalModel::load(model)?;
-    let (vals, logits) = m.value_policy_batch(&[&state])?;
+    let m: Box<dyn BatchModel> = match backend {
+        selfplay::Backend::Candle => Box::new(net::LocalModel::load(model)?),
+        selfplay::Backend::Ort { ep, fp16 } => Box::new(hex_engine::ort_net::OrtModel::new(
+            model,
+            ep,
+            fp16,
+            &format!("{}/trt_cache", std::path::Path::new(model).parent().unwrap_or(std::path::Path::new(".")).display()),
+        )?),
+    };
+    let mut planes = vec![0f32; hex_engine::mcts::PLANES];
+    hex_engine::game::fill_planes_into(&state, &mut planes);
+    let (vals, logits) = m.forward(&planes, 1)?;
     // Report in board terms: the priors the search would actually use.
     let (mut mvs, mut priors) = (Vec::new(), Vec::new());
     <Hex as playground_core::batch_search::MoveGame>::expand(&state, &logits, &mut mvs, &mut priors);
@@ -423,13 +476,42 @@ fn net_eval(model: &str, moves: &str, top: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `--backend`/`--ep`/`--fp16` → the self-play backend. `ep` is leaked because
+/// ORT's provider names live for the process anyway and `Backend` is `Copy`.
+fn parse_backend(backend: &str, ep: &str, fp16: bool) -> anyhow::Result<selfplay::Backend> {
+    match backend {
+        "candle" => Ok(selfplay::Backend::Candle),
+        "ort" => match ep {
+            "trt" => Ok(selfplay::Backend::Ort { ep: "trt", fp16 }),
+            "cuda" => Ok(selfplay::Backend::Ort { ep: "cuda", fp16 }),
+            other => anyhow::bail!("unknown --ep {other:?} (use cuda|trt)"),
+        },
+        other => anyhow::bail!("unknown --backend {other:?} (use candle|ort)"),
+    }
+}
+
 /// Time `iters` forwards of `batch` positions (after a warm-up).
-fn net_bench(model: &str, cuda: bool, batch: usize, iters: usize) -> anyhow::Result<()> {
+fn net_bench(
+    model: &str,
+    cuda: bool,
+    batch: usize,
+    iters: usize,
+    backend: selfplay::Backend,
+) -> anyhow::Result<()> {
     use playground_core::batch_search::BatchModel;
-    let device = net::pick_device(cuda)?;
-    let m = net::LocalModel::load_on(model, device)?;
+    let m: Box<dyn BatchModel> = match backend {
+        selfplay::Backend::Candle => {
+            Box::new(net::LocalModel::load_on(model, net::pick_device(cuda)?)?)
+        }
+        selfplay::Backend::Ort { ep, fp16 } => Box::new(hex_engine::ort_net::OrtModel::new(
+            model,
+            ep,
+            fp16,
+            &format!("{}/trt_cache", std::path::Path::new(model).parent().unwrap_or(std::path::Path::new(".")).display()),
+        )?),
+    };
     let planes = vec![0f32; batch * hex_engine::mcts::PLANES];
-    m.forward(&planes, batch)?; // warm-up (kernel load, allocator)
+    m.forward(&planes, batch)?; // warm-up (kernel load / TRT engine build)
     let t0 = Instant::now();
     for _ in 0..iters {
         m.forward(&planes, batch)?;
@@ -437,7 +519,11 @@ fn net_bench(model: &str, cuda: bool, batch: usize, iters: usize) -> anyhow::Res
     let secs = t0.elapsed().as_secs_f64();
     println!(
         "net-bench [{}]: batch {batch} × {iters} in {secs:.2}s — {:.1} forwards/s, {:.0} positions/s",
-        if cuda { "cuda" } else { "cpu" },
+        match backend {
+            selfplay::Backend::Candle if cuda => "candle/cuda".to_string(),
+            selfplay::Backend::Candle => "candle/cpu".to_string(),
+            b => b.label(),
+        },
         iters as f64 / secs,
         (batch * iters) as f64 / secs,
     );

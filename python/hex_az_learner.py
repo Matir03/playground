@@ -71,6 +71,27 @@ def save_atomic(net: HexAZNet, path: str) -> None:
     os.replace(tmp, path)
 
 
+def export_onnx_atomic(net: HexAZNet, path: str) -> None:
+    """Export for the actor's ORT/TensorRT backend (`--backend ort`).
+
+    Dynamic batch axis: the actor's batch varies with how many games have a leaf
+    pending, and TensorRT builds (and caches) an engine per shape it sees.
+    """
+    was_training = net.training
+    net.eval()
+    dev = next(net.parameters()).device
+    tmp = path + ".tmp"
+    torch.onnx.export(
+        net, torch.zeros(1, IN_PLANES, N, N, device=dev), tmp,
+        input_names=["planes"], output_names=["value", "policy"],
+        dynamic_axes={k: {0: "b"} for k in ("planes", "value", "policy")},
+        opset_version=17, dynamo=False,
+    )
+    os.replace(tmp, path)
+    if was_training:
+        net.train()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", default="data/models/hex_az/live")
@@ -130,6 +151,9 @@ def main() -> None:
         tmp = opt_path + ".tmp"
         torch.save(opt.state_dict(), tmp)
         os.replace(tmp, opt_path)
+
+    onnx_path = os.path.join(live, "model.onnx")
+    export_onnx_atomic(net, onnx_path)
 
     anchor_gen = int(json.load(open(cfg_path)).get("generation", 0)) if os.path.exists(cfg_path) else 0
 
@@ -232,6 +256,8 @@ def main() -> None:
             os.makedirs(d, exist_ok=True)
             save_checkpoint(net.to("cpu"), os.path.join(d, "checkpoint.safetensors"))
             net.to(device)
+            # Refresh the ORT actor's weights once per snapshot, not per block.
+            export_onnx_atomic(net, onnx_path)
             for path in (os.path.join(d, "config.json"), cfg_path):
                 with open(path, "w") as f:
                     json.dump({"arch": arch_of(net), "generation": snap_gen}, f)

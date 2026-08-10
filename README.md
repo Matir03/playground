@@ -257,6 +257,7 @@ cargo build --release -p hex-engine --features cuda
     --concurrency 384 --max-batch 128 --node-budget 400
 
 # Terminal B — the learner. Trains a generation per burst of fresh self-play.
+# It writes both latest.safetensors (candle) and model.onnx (ort) each snapshot.
 PYTHONPATH=python/src python/.venv/bin/python python/hex_az_learner.py \
     --live data/models/hex_az/live
 
@@ -273,13 +274,41 @@ hex-engine eval-match --a <new.safetensors> --b <old.safetensors> --cuda --games
 hex-engine vs-mohex  --model <ckpt> --cuda --games 10 --sims 400 --mohex-playouts 1000
 ```
 
-Two throughput probes, because "self-play is slow" has two very different causes:
-`net-bench` times the raw forward (the ceiling), `selfplay-bench` the whole
-search (what you actually get). On this box (laptop 4060, 64ch/6b) the candle
-forward tops out around **4.5k positions/s**, and self-play reaches ~3k nodes/s
-against it — i.e. GPU-forward-bound. The lever, if that matters, is the
-ORT/TensorRT backend amazons already has (`amazons/src/ort_net.rs`); it is not
-wired up for Hex yet.
+#### Inference backends
+
+Self-play runs the net through one of two backends, chosen with `--backend`:
+
+| Backend | Weights file | Forward (batch 256) | Self-play |
+|---------|--------------|--------------------:|----------:|
+| `candle` (default) | `latest.safetensors` | 4.6k pos/s | 3.0k nodes/s |
+| `ort --ep cuda` | `model.onnx` | 38k pos/s | 26k nodes/s |
+| `ort --ep trt` (fp16) | `model.onnx` | **187k pos/s** | **50–63k nodes/s** |
+
+Measured on a laptop RTX 4060 with a 64ch/6b net, `--node-budget 200`;
+self-play at `--concurrency 768 --max-batch 256`, and the top figure at
+`--concurrency 3072 --max-batch 768`. TensorRT is ~20× candle end to end,
+which is the difference between a generation per day and one per hour. Past
+that the pipeline is **CPU**-bound (`gpu_duty` ~0.46 — the workers can't
+descend trees and generate moves fast enough to keep the GPU fed).
+
+ORT needs its shared libraries located at runtime:
+
+```bash
+source scripts/ort-env.sh    # ORT_DYLIB_PATH + the CUDA/TensorRT libs from the venv
+./target/release/hex-engine selfplay-loop --live data/models/hex_az/live \
+    --backend ort --ep trt --concurrency 768 --max-batch 256 --node-budget 400
+```
+
+Without it ORT quietly falls back to the CPU provider — slower than candle on
+the GPU — so check the log for `CUDAExecutionProvider` registration errors if
+the numbers look wrong. TensorRT builds an engine per batch shape on first use
+(a few seconds) and caches it under `<live>/trt_cache`. fp16 costs about 4
+decimal places on the value head and nothing on the move ranking:
+`net-eval --backend ort --ep trt` against `--backend candle` is the check.
+
+Two throughput probes, because "self-play is slow" has two very different
+causes: `net-bench` times the raw forward (the ceiling), `selfplay-bench` the
+whole search (what you actually get).
 
 `hex-engine net-eval --model <ckpt> --moves g7,d4` prints the net's value and top
 priors for a position — the quickest way to see what a checkpoint believes.

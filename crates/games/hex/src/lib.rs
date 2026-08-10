@@ -11,4 +11,5 @@ pub mod game;
 pub mod mcts;
 pub mod mohex;
 pub mod net;
+pub mod ort_net;
 pub mod selfplay;

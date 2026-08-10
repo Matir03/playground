@@ -20,6 +20,68 @@ use crate::game::{canon_index, fill_planes_into, Hex, HexMove, N};
 use crate::mcts::{PLANES, POLICY_DIM};
 use crate::net::LocalModel;
 
+/// Which inference backend runs the net during self-play.
+///
+/// `Candle` loads `latest.safetensors` in-process; `Ort` loads the learner's
+/// `model.onnx` through ONNX Runtime on the CUDA or TensorRT execution provider.
+/// TensorRT with fp16 is several times faster here (tensor cores + a fused
+/// engine vs candle's per-op kernels), at the cost of a one-off engine build
+/// per shape, cached under `<live>/trt_cache`.
+#[derive(Clone, Copy, Debug)]
+pub enum Backend {
+    Candle,
+    /// `ep` is "trt" or "cuda"; `fp16` applies to TensorRT.
+    Ort { ep: &'static str, fp16: bool },
+}
+
+impl Backend {
+    pub fn is_ort(self) -> bool {
+        matches!(self, Backend::Ort { .. })
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            Backend::Candle => "candle".to_string(),
+            Backend::Ort { ep, fp16 } => format!("ort/{ep}/fp16={fp16}"),
+        }
+    }
+
+    /// The file whose mtime signals "the learner published new weights".
+    pub fn weights_path(self, live_dir: &str) -> String {
+        match self {
+            Backend::Candle => format!("{live_dir}/latest.safetensors"),
+            Backend::Ort { .. } => format!("{live_dir}/model.onnx"),
+        }
+    }
+
+    fn load(self, live_dir: &str, device: Option<candle_core::Device>) -> anyhow::Result<Arc<dyn BatchModel>> {
+        let path = self.weights_path(live_dir);
+        match self {
+            Backend::Candle => Ok(Arc::new(LocalModel::load_on(&path, device.unwrap())?)),
+            Backend::Ort { ep, fp16 } => Ok(Arc::new(crate::ort_net::OrtModel::new(
+                &path,
+                ep,
+                fp16,
+                &format!("{live_dir}/trt_cache"),
+            )?)),
+        }
+    }
+
+    /// Same, for a checkpoint given directly (the bench takes a path, not a live dir).
+    fn load_file(self, path: &str, device: Option<candle_core::Device>) -> anyhow::Result<Arc<dyn BatchModel>> {
+        match self {
+            Backend::Candle => Ok(Arc::new(LocalModel::load_on(path, device.unwrap())?)),
+            Backend::Ort { ep, fp16 } => {
+                let cache = Path::new(path)
+                    .parent()
+                    .map(|d| d.join("trt_cache").to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "trt_cache".to_string());
+                Ok(Arc::new(crate::ort_net::OrtModel::new(path, ep, fp16, &cache)?))
+            }
+        }
+    }
+}
+
 /// One self-play training example.
 pub struct Example {
     pub planes: Vec<f32>, // PLANES floats, canonical frame
@@ -135,25 +197,26 @@ pub fn run_loop(
     threads: usize,
     max_batch: usize,
     base_seed: u64,
+    backend: Backend,
 ) -> anyhow::Result<()> {
-    let latest = format!("{live_dir}/latest.safetensors");
     let buffer = Path::new(live_dir).join("buffer");
     std::fs::create_dir_all(&buffer)?;
-    let device = crate::net::pick_device(cuda)?;
+    // The file the learner rewrites, and thus the one whose mtime means "new weights".
+    let weights = backend.weights_path(live_dir);
 
-    while !Path::new(&latest).exists() {
-        eprintln!("waiting for the learner's first export at {latest} ...");
+    while !Path::new(&weights).exists() {
+        eprintln!("waiting for the learner's first export at {weights} ...");
         std::thread::sleep(Duration::from_secs(5));
     }
-    let make_model = || -> anyhow::Result<Arc<dyn BatchModel>> {
-        Ok(Arc::new(LocalModel::load_on(&latest, device.clone())?) as Arc<dyn BatchModel>)
-    };
+    let device = if backend.is_ort() { None } else { Some(crate::net::pick_device(cuda)?) };
+    let make_model = || backend.load(live_dir, device.clone());
     let model: Mutex<Arc<dyn BatchModel>> = Mutex::new(make_model()?);
-    let mut last_mtime = std::fs::metadata(&latest).and_then(|m| m.modified()).ok();
+    let mut last_mtime = std::fs::metadata(&weights).and_then(|m| m.modified()).ok();
     let mut seq = max_chunk_seq(&buffer).map(|s| s + 1).unwrap_or(0);
     eprintln!(
-        "hex continuous actor: concurrency {concurrency}, flush {chunk_secs:.0}s, batch \
+        "hex continuous actor [{}]: concurrency {concurrency}, flush {chunk_secs:.0}s, batch \
          {max_batch}, {threads} threads, {} sims/move, buffer {} (keep {max_chunks})",
+        backend.label(),
         if params.node_budget > 0 { params.node_budget } else { params.sims },
         buffer.display(),
     );
@@ -189,7 +252,7 @@ pub fn run_loop(
                 100.0 * black_wins as f64 / n_games as f64,
             );
         }
-        let mt = std::fs::metadata(&latest).and_then(|m| m.modified()).ok();
+        let mt = std::fs::metadata(&weights).and_then(|m| m.modified()).ok();
         if mt != last_mtime {
             match make_model() {
                 Ok(nm) => {
@@ -227,11 +290,12 @@ pub fn run_benchmark(
     max_batch: usize,
     seed: u64,
     secs: f64,
+    backend: Backend,
 ) -> anyhow::Result<()> {
-    let device = crate::net::pick_device(cuda)?;
-    let model = LocalModel::load_on(model_path, device)?;
+    let device = if backend.is_ort() { None } else { Some(crate::net::pick_device(cuda)?) };
+    let model = backend.load_file(model_path, device)?;
     let (records, cs) = batch_search::run_selfplay_moves::<Hex>(
-        &model,
+        &*model,
         concurrency,
         params,
         threads,
@@ -243,8 +307,9 @@ pub fn run_benchmark(
     let games = records.len();
     let plies: usize = records.iter().map(|r| r.moves.len()).sum();
     println!(
-        "hex bench: conc {concurrency}  {games} games  {plies} plies  {} nodes  {:.2}s  \
+        "hex bench [{}]: conc {concurrency}  {games} games  {plies} plies  {} nodes  {:.2}s  \
          {:.0} nodes/s  avg_batch {:.0}  gpu_duty {:.2}",
+        backend.label(),
         cs.nodes,
         cs.elapsed,
         cs.nodes as f64 / cs.elapsed,
