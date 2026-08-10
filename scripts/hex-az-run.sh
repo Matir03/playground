@@ -26,11 +26,12 @@ PYTHON="${PYTHON:-$repo/python/.venv/bin/python}"
 CONCURRENCY="${CONCURRENCY:-768}"
 MAX_BATCH="${MAX_BATCH:-256}"
 NODE_BUDGET="${NODE_BUDGET:-400}"
-# PUCT exploration. With an untrained (uniform) policy the exploration term
-# c*p*sqrt(N) swamps the value differences between moves, so the search spreads
-# ~400 visits over ~50 of 169 moves and the policy target is nearly uniform —
-# nothing for the policy head to learn. Lower c concentrates it.
-C_PUCT="${C_PUCT:-0.6}"
+# PUCT exploration. 0.6 was tried on 2026-08-10 to concentrate the search: it
+# worked mechanically (target entropy 3.97 -> 1.21 nats) and bought no strength,
+# because sharper targets that disagree with each other are still noise. Target
+# quality now comes from policy target pruning and the ownership signal instead,
+# so this is back to the AZ-standard value.
+C_PUCT="${C_PUCT:-1.5}"
 CHUNK_SECS="${CHUNK_SECS:-60}"
 MAX_CHUNKS="${MAX_CHUNKS:-40}"
 BACKEND="${BACKEND:-ort}"
@@ -41,6 +42,13 @@ EP="${EP:-trt}"
 CHANNELS="${CHANNELS:-64}"
 BLOCKS="${BLOCKS:-6}"
 GEN_EXAMPLES="${GEN_EXAMPLES:-100000}"
+
+# Gate. MoHex at 1000 playouts is a modest but real yardstick; 8 games keeps the
+# actor paused only briefly, and every 3rd generation keeps that rare.
+EVAL_GAMES="${EVAL_GAMES:-8}"
+EVAL_SIMS="${EVAL_SIMS:-400}"
+MOHEX_PLAYOUTS="${MOHEX_PLAYOUTS:-1000}"
+EVAL_EVERY="${EVAL_EVERY:-3}"
 STEPS="${STEPS:-600}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
 
@@ -62,6 +70,17 @@ start() {
   supervise actor "$ENGINE selfplay-loop --live $LIVE --backend $BACKEND --ep $EP \
       --concurrency $CONCURRENCY --max-batch $MAX_BATCH --node-budget $NODE_BUDGET \
       --c-puct $C_PUCT --chunk-secs $CHUNK_SECS --max-chunks $MAX_CHUNKS"
+
+  # The gate: scores snapshots against MoHex and promotes the best to best.*,
+  # which is what the actor plays from. Without it every snapshot becomes the
+  # generator and a net that gets worse feeds itself worse data. GATE=0 to skip.
+  if [[ "${GATE:-1}" == "1" ]]; then
+    supervise evaluator "$PYTHON $repo/python/hex_eval_loop.py --live $LIVE \
+        --engine $ENGINE --mohex-bin ${MOHEX_BIN:-mohex} --cuda \
+        --games $EVAL_GAMES --sims $EVAL_SIMS --mohex-playouts $MOHEX_PLAYOUTS \
+        --every $EVAL_EVERY --channels $CHANNELS --blocks $BLOCKS" \
+        PYTHONPATH="$repo/python/src"
+  fi
 
   echo "started. logs in $LOGS"
 }
@@ -86,6 +105,7 @@ stop() {
   pkill -f "hex-az-run.sh" 2>/dev/null   # the supervisor loops
   pkill -f "hex-engine selfplay-loop --live $LIVE"
   pkill -f "hex_az_learner.py --live $LIVE"
+  pkill -f "hex_eval_loop.py --live $LIVE"
   echo "stopped"
 }
 
@@ -96,6 +116,9 @@ status() {
   echo "generation $gen, $ex chunks buffered"
   pgrep -af "hex-engine selfplay-loop --live $LIVE" | head -1 || echo "  actor:   DOWN"
   pgrep -af "hex_az_learner.py --live $LIVE" | head -1 || echo "  learner: DOWN"
+  if [[ "${GATE:-1}" == "1" ]]; then
+    pgrep -af "hex_eval_loop.py --live $LIVE" | head -1 || echo "  evaluator: DOWN"
+  fi
   tail -2 "$LOGS/learner.log" 2>/dev/null
 }
 
