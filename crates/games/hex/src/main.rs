@@ -27,6 +27,16 @@ enum Cmd {
         addr: SocketAddr,
         #[arg(long, default_value = "http://127.0.0.1:7204")]
         model_uri: String,
+        /// Play MoHex for `RequestMove(player = EXTERNAL)` seats. Needs
+        /// scripts/fetch-mohex.sh; without it those requests are refused.
+        #[arg(long)]
+        mohex_bin: Option<String>,
+        /// Default MoHex playouts per move (a request's budget overrides it).
+        #[arg(long, default_value_t = 10_000)]
+        mohex_playouts: u32,
+        /// Default MoHex seconds per move (0 = budget by playouts only).
+        #[arg(long, default_value_t = 0.0)]
+        mohex_time: f64,
     },
     SelfPlay {
         #[arg(long, default_value = "127.0.0.1:7104")]
@@ -77,11 +87,14 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Serve { addr, model_uri } | Cmd::SelfPlay { addr, model_uri, .. } => {
-            let model = RemoteModelClient::<Hex>::connect(&model_uri).await?;
-            let models = std::collections::HashMap::from([("nn".to_string(), model)]);
-            playground_engine_server::run::<Hex, _>(addr, models).await?;
+        Cmd::Serve { addr, model_uri, mohex_bin, mohex_playouts, mohex_time } => {
+            if let Some(bin) = &mohex_bin {
+                mohex::install(bin, mohex_playouts, mohex_time)?;
+                tracing::info!(bin, mohex_playouts, mohex_time, "mohex opponent ready");
+            }
+            serve(addr, &model_uri).await?;
         }
+        Cmd::SelfPlay { addr, model_uri, .. } => serve(addr, &model_uri).await?,
         Cmd::Verify { mohex_bin, games, seed } => {
             mohex::verify_rules(&mohex_bin, games, seed)?;
         }
@@ -99,6 +112,12 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Stdio => anyhow::bail!("stdio: implement when needed"),
     }
     Ok(())
+}
+
+async fn serve(addr: SocketAddr, model_uri: &str) -> anyhow::Result<()> {
+    let model = RemoteModelClient::<Hex>::connect(model_uri).await?;
+    let models = std::collections::HashMap::from([("nn".to_string(), model)]);
+    playground_engine_server::run::<Hex, _>(addr, models).await
 }
 
 /// Random playouts to completion, measuring rules throughput (legal-move

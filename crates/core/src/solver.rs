@@ -19,8 +19,30 @@ pub struct SearchOutcome<M> {
     pub nodes: u64,
 }
 
+/// Per-move budget for a solver, as asked for by `RequestMove`. Built-in
+/// solvers may ignore it; external engines usually map it onto their own
+/// time/playout controls.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SolverBudget {
+    pub max_millis: Option<u32>,
+    pub max_visits: Option<u32>,
+}
+
 /// A game that can choose a move without a neural-network model.
 pub trait Solver: Game {
     /// Choose a move for a non-terminal `state`.
     fn choose_move(state: &Self::State) -> SearchOutcome<Self::Move>;
+
+    /// Choose a move using an *external* reference engine the game crate drives
+    /// itself — MoHex over GTP for Hex, and the obvious home for GNU Go in go9.
+    /// `None` (the default) means no such engine is configured, and the engine
+    /// server turns that into a failed-precondition rather than silently
+    /// falling back to [`Solver::choose_move`]: a caller that asked to play the
+    /// reference engine must not be answered by a different one.
+    fn choose_move_external(
+        _state: &Self::State,
+        _budget: SolverBudget,
+    ) -> Option<anyhow::Result<SearchOutcome<Self::Move>>> {
+        None
+    }
 }

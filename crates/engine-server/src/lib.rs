@@ -8,7 +8,7 @@ use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use playground_core::{Game, ModelClient, Outcome, Player, Solver};
+use playground_core::{Game, ModelClient, Outcome, Player, Solver, SolverBudget};
 use playground_protocol::engine_pb::engine_service_server::{EngineService, EngineServiceServer};
 use playground_protocol::engine_pb::*;
 use playground_protocol::game_pb::{self, GameHandle, GameState};
@@ -245,6 +245,30 @@ where
                 nn_choose_move::<G, M>(&model, &state, inner.budget.as_ref())
                     .await
                     .map_err(|e| Status::internal(format!("nn move failed: {e}")))?
+            }
+            // An external reference engine (MoHex, GNU Go, …), driven by the
+            // game crate. Blocking (usually a subprocess over GTP), and absent
+            // unless the engine was started with one configured.
+            EnginePlayer::External => {
+                let budget = SolverBudget {
+                    max_millis: inner.budget.as_ref().and_then(|b| b.max_millis),
+                    max_visits: inner.budget.as_ref().and_then(|b| b.max_visits),
+                };
+                tokio::task::spawn_blocking(move || G::choose_move_external(&state, budget))
+                    .await
+                    .map_err(|e| Status::internal(format!("external engine panicked: {e}")))?
+                    .ok_or_else(|| {
+                        Status::failed_precondition(
+                            "no external engine configured (start the engine with one)",
+                        )
+                    })?
+                    .map(|out| Chosen {
+                        payload: G::encode_move(&out.best_move),
+                        value: out.value,
+                        nodes: out.nodes,
+                        reifications: 0,
+                    })
+                    .map_err(|e| Status::internal(format!("external engine failed: {e}")))?
             }
             // Default / Solver: the built-in perfect solver. The solve can be
             // CPU-heavy, so keep it off the async runtime's worker threads.

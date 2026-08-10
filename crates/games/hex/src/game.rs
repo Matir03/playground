@@ -17,7 +17,7 @@
 //!
 //! **Swap (pie) rule**: off by default, see [`ALLOW_SWAP`].
 
-use playground_core::{Game, Outcome, Player, SearchOutcome, Solver};
+use playground_core::{Game, Outcome, Player, SearchOutcome, Solver, SolverBudget};
 
 use crate::bitboard::{Bb, BOARD_MASK};
 
@@ -443,19 +443,34 @@ pub fn swap_available(state: &HexState) -> bool {
     ALLOW_SWAP && state.ply == 1 && state.to_move == 2
 }
 
-/// Placeholder built-in engine: centre if free, else the first empty cell. Hex
-/// gets its strength from the AZ net (and MoHex is the external reference
-/// opponent) — this only exists so `RequestMove` can answer without a model.
+/// Placeholder mover: centre if free, else the first empty cell. Not a player —
+/// it exists so a seat is answerable with no net and no MoHex.
+pub fn placeholder_move(state: &HexState) -> HexMove {
+    let centre = (N / 2) * N + N / 2;
+    let i = if state.cell_at(centre) == 0 {
+        centre
+    } else {
+        state.empty().iter().next().expect("non-terminal position has an empty cell")
+    };
+    HexMove::Play { r: (i / N) as u8, c: (i % N) as u8 }
+}
+
+/// Hex gets its strength from the AZ net (not written yet) and from MoHex, the
+/// external reference engine: `choose_move` is the placeholder, while
+/// `choose_move_external` plays through MoHex when the binary was configured at
+/// startup (`hex-engine serve --mohex-bin …`).
 impl Solver for Hex {
     fn choose_move(state: &Self::State) -> SearchOutcome<Self::Move> {
-        let centre = (N / 2) * N + N / 2;
-        let i = if state.cell_at(centre) == 0 {
-            centre
-        } else {
-            state.empty().iter().next().expect("non-terminal position has an empty cell")
-        };
-        let best_move = HexMove::Play { r: (i / N) as u8, c: (i % N) as u8 };
-        SearchOutcome { best_move, value: 0.0, nodes: 0 }
+        SearchOutcome { best_move: placeholder_move(state), value: 0.0, nodes: 0 }
+    }
+
+    fn choose_move_external(
+        state: &Self::State,
+        budget: SolverBudget,
+    ) -> Option<anyhow::Result<SearchOutcome<Self::Move>>> {
+        let chosen = crate::mohex::choose_move(state, budget.max_millis, budget.max_visits)?;
+        // MoHex reports no node count over GTP; `visits` stays 0 in the UI.
+        Some(chosen.map(|best_move| SearchOutcome { best_move, value: 0.0, nodes: 0 }))
     }
 }
 

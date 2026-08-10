@@ -38,6 +38,9 @@ enum EnginePlayer {
   ENGINE_PLAYER_UNSPECIFIED = 0;  // engine default (perfect solver)
   ENGINE_PLAYER_SOLVER = 1;       // perfect solver / opening book
   ENGINE_PLAYER_NN = 2;           // neural-network model (via model server)
+  // External reference engine the game crate drives itself (e.g. MoHex over
+  // GTP for Hex). Only answers if that engine was configured at startup.
+  ENGINE_PLAYER_EXTERNAL = 3;
 }
 
 message RequestMoveRequest {

@@ -196,8 +196,8 @@ swap rule is off by default; see `ALLOW_SWAP` in `src/game.rs` for what that
 costs and how to turn it on. No AZ net yet: `RequestMove` is answered by a
 placeholder, and the strength work comes next.
 
-The web UI has a playable board (`hex-engine serve --addr 127.0.0.1:7104`,
-then `cd web && npm run dev`); the engine seat is that same placeholder.
+The web UI has a playable board (`cd web && npm run dev`) with three seat
+options per colour: human, the placeholder, and **MoHex**.
 
 **MoHex 2.0** (benzene) is the reference engine — the Hex equivalent of go9's
 GNU Go. Build it once; the script clones, patches the 2015 source for a modern
@@ -207,6 +207,11 @@ into a micromamba env if the system lacks them, and symlinks the binary into
 
 ```bash
 scripts/fetch-mohex.sh
+
+# Serve with MoHex as a selectable opponent (UI seat "MoHex 2.0"); the seat's
+# seconds/move becomes its per-move time budget.
+cargo run --release -p hex-engine -- serve --addr 127.0.0.1:7104 \
+    --mohex-bin "$(which mohex)" --mohex-playouts 10000
 
 # Cross-check our rules against MoHex: random games, ply-by-ply agreement on
 # who has connected. This is the real test that the board geometry is right.
@@ -220,6 +225,14 @@ cargo run --release -p hex-engine -- bench --games 3000
 ```
 
 `HEX_GTP_DEBUG=1` traces the GTP conversation and keeps MoHex's own search log.
+
+Interactive MoHex play goes through `RequestMove(player = EXTERNAL)`, a
+protocol-level seat for "the reference engine this game crate drives itself"
+(`Solver::choose_move_external`; the natural home for GNU Go in go9 too). The
+engine holds one MoHex process and syncs it to each position — incrementally
+when the position extends what it last saw, so MoHex keeps its search tree.
+Without `--mohex-bin` those requests fail with a failed-precondition rather
+than quietly falling back to a weaker mover.
 
 ### Python — model server
 

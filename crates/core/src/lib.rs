@@ -15,4 +15,4 @@ pub mod solver;
 pub use game::{Game, Outcome, Player};
 pub use latent_state::LatentGameState;
 pub use model::{LatentModel, MixturePolicy, ModelClient, MovePolicy, PolicyCandidate};
-pub use solver::{SearchOutcome, Solver};
+pub use solver::{SearchOutcome, Solver, SolverBudget};

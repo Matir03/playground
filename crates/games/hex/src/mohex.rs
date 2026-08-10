@@ -1,13 +1,16 @@
 //! MoHex bridge — a GTP client for the reference Hex engine (benzene's MoHex
 //! 2.0), mirroring go9's GNU Go bridge.
 //!
-//! MoHex serves two purposes here:
+//! MoHex serves three purposes here:
 //!   * **rules oracle** — `mohex verify` plays random games through both
 //!     implementations and asserts our `winner` agrees with MoHex's
 //!     `final_score` on every game, which is the cheapest way to be sure the
 //!     board geometry (neighbourhood, edges, colour-to-edge mapping) is right;
 //!   * **absolute-strength opponent** — once the AZ net exists, the same client
-//!     drives `hex-engine match`, exactly as `go9_vs_gnugo` does.
+//!     drives `hex-engine match`, exactly as `go9_vs_gnugo` does;
+//!   * **interactive opponent** — [`install`] hands a MoHex process to the
+//!     engine server, which answers `RequestMove(player = EXTERNAL)` with it,
+//!     so the web UI can offer MoHex as a seat.
 //!
 //! Build it with `scripts/fetch-mohex.sh`. MoHex's `param_game allow_swap`
 //! defaults to off, matching [`crate::game::ALLOW_SWAP`]; we set it explicitly
@@ -112,6 +115,41 @@ impl Mohex {
         parse_move(&reply)
     }
 
+    /// Set MoHex's per-move budget: playouts and/or seconds (0 = leave as is).
+    pub fn set_budget(&mut self, max_games: u32, max_time: f64) -> anyhow::Result<()> {
+        if max_games > 0 {
+            self.send(&format!("param_mohex max_games {max_games}"))?;
+        }
+        if max_time > 0.0 {
+            self.send(&format!("param_mohex max_time {max_time}"))?;
+        }
+        Ok(())
+    }
+
+    /// Make MoHex's board match `state`.
+    ///
+    /// The usual case is that `state` extends the position we last synced by a
+    /// move or two, so we send just those — MoHex keeps its search tree, which
+    /// is worth real strength. Otherwise (a new game, an undo, a handle we've
+    /// never seen) we replay from an empty board. Hex is order-independent —
+    /// no captures, and the winner depends only on the stones — so any replay
+    /// order gives the same position; we alternate colours anyway so MoHex's
+    /// move history looks like a real game.
+    pub fn set_position(&mut self, state: &HexState, last: Option<&HexState>) -> anyhow::Result<()> {
+        let empty = HexState::default();
+        let (prev, reset) = match last.filter(|p| extends(p, state)) {
+            Some(prev) => (prev, false),
+            None => (&empty, true),
+        };
+        if reset {
+            self.clear_board()?;
+        }
+        for (player, mv) in replay_moves(prev, state) {
+            self.play(player, &mv)?;
+        }
+        Ok(())
+    }
+
     /// MoHex's verdict on the current position: `Some(1)` black, `Some(2)`
     /// white, `None` if neither side has connected yet.
     pub fn winner(&mut self) -> anyhow::Result<Option<u8>> {
@@ -139,6 +177,37 @@ impl Drop for Mohex {
     }
 }
 
+/// Is `state` reachable from `prev` by adding stones? (Then MoHex only needs the
+/// new ones, and keeps its search tree.)
+fn extends(prev: &HexState, state: &HexState) -> bool {
+    prev.ply <= state.ply
+        && prev.black.andnot(state.black).is_empty()
+        && prev.white.andnot(state.white).is_empty()
+}
+
+/// The stones `state` has and `prev` doesn't, as plays. Alternates colours where
+/// it can and plays out whatever is left over otherwise (a swap leaves the
+/// counts lopsided). Hex is order-independent — no captures, and the winner
+/// depends only on the stones — so any order reproduces the position; we
+/// alternate so MoHex's move history looks like a real game.
+fn replay_moves(prev: &HexState, state: &HexState) -> Vec<(u8, HexMove)> {
+    let mut pools = [
+        state.black.andnot(prev.black).iter().collect::<Vec<_>>(),
+        state.white.andnot(prev.white).iter().collect::<Vec<_>>(),
+    ];
+    let mut moves = Vec::with_capacity(pools[0].len() + pools[1].len());
+    let mut side = prev.to_move;
+    while !pools[0].is_empty() || !pools[1].is_empty() {
+        if pools[side as usize - 1].is_empty() {
+            side = 3 - side;
+        }
+        let i = pools[side as usize - 1].pop().expect("a non-empty pool");
+        moves.push((side, HexMove::Play { r: (i / N) as u8, c: (i % N) as u8 }));
+        side = 3 - side;
+    }
+    moves
+}
+
 fn color_name(player: u8) -> &'static str {
     if player == 1 { "black" } else { "white" }
 }
@@ -162,6 +231,76 @@ pub fn parse_move(token: &str) -> anyhow::Result<Option<HexMove>> {
     }
     let (r, c) = parse_cell(&t).ok_or_else(|| anyhow::anyhow!("bad GTP move {token:?}"))?;
     Ok(Some(HexMove::Play { r: r as u8, c: c as u8 }))
+}
+
+// ── The interactive opponent ─────────────────────────────────────────────────
+
+/// The MoHex process the engine server plays through, plus the position we last
+/// synced to it (so the common case is a one-move update that keeps its tree).
+struct Session {
+    mohex: Mohex,
+    last: Option<HexState>,
+    default_playouts: u32,
+    default_seconds: f64,
+}
+
+static SESSION: std::sync::OnceLock<std::sync::Mutex<Session>> = std::sync::OnceLock::new();
+
+/// Spawn the MoHex that answers `RequestMove(player = EXTERNAL)`, with the
+/// default per-move budget (a request may override it). One process, serialised
+/// by a mutex — MoHex is a single GTP conversation, and interactive play is one
+/// move at a time.
+pub fn install(bin: &str, playouts: u32, seconds: f64) -> anyhow::Result<()> {
+    let mohex = Mohex::new(bin, playouts, seconds)?;
+    SESSION
+        .set(std::sync::Mutex::new(Session {
+            mohex,
+            last: None,
+            default_playouts: playouts,
+            default_seconds: seconds,
+        }))
+        .map_err(|_| anyhow::anyhow!("mohex opponent already installed"))?;
+    Ok(())
+}
+
+pub fn is_installed() -> bool {
+    SESSION.get().is_some()
+}
+
+/// MoHex's move for `state`, or `None` if no MoHex was installed. `millis` /
+/// `visits` override the startup budget when set.
+pub fn choose_move(
+    state: &HexState,
+    millis: Option<u32>,
+    visits: Option<u32>,
+) -> Option<anyhow::Result<HexMove>> {
+    let cell = SESSION.get()?;
+    let mut guard = match cell.lock() {
+        Ok(g) => g,
+        // A previous call panicked mid-conversation, so the GTP stream may be
+        // desynced; keep going but force a full resync.
+        Err(poisoned) => {
+            let mut g = poisoned.into_inner();
+            g.last = None;
+            g
+        }
+    };
+    let session = &mut *guard;
+    Some((|| {
+        let playouts = visits.unwrap_or(session.default_playouts);
+        let seconds = millis.map_or(session.default_seconds, |ms| f64::from(ms) / 1000.0);
+        session.mohex.set_budget(playouts, seconds)?;
+        session.mohex.set_position(state, session.last.as_ref())?;
+        session.last = Some(*state);
+        let mv = session
+            .mohex
+            .genmove(state.to_move)?
+            // MoHex resigns only when it has proven the game lost; the UI has
+            // no resignation concept, so play on with the placeholder move.
+            .unwrap_or_else(|| crate::game::placeholder_move(state));
+        session.last = Some(Hex::apply(state, &mv));
+        Ok(mv)
+    })())
 }
 
 /// Cross-check our rules against MoHex: play `games` random games, feeding
@@ -270,6 +409,49 @@ pub fn play_match(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn play(state: &HexState, cell: &str) -> HexState {
+        let (r, c) = crate::game::parse_cell(cell).unwrap();
+        Hex::apply(state, &HexMove::Play { r: r as u8, c: c as u8 })
+    }
+
+    #[test]
+    fn syncing_an_extended_position_sends_only_the_new_stones() {
+        let mut s = Hex::initial_state();
+        for cell in ["g7", "d4", "h7", "e4"] {
+            s = play(&s, cell);
+        }
+        let after = play(&play(&s, "i7"), "f4");
+
+        assert!(extends(&s, &after));
+        let moves = replay_moves(&s, &after);
+        assert_eq!(moves.len(), 2, "only the two new stones");
+        assert_eq!(moves[0].0, s.to_move, "the side to move plays first");
+        assert_eq!(moves[1].0, 3 - s.to_move);
+
+        // A full replay reproduces every stone, alternating from Black.
+        let all = replay_moves(&HexState::default(), &after);
+        assert_eq!(all.len(), 6);
+        assert_eq!(all.iter().filter(|(p, _)| *p == 1).count(), 3);
+        let mut rebuilt = Hex::initial_state();
+        for (_, mv) in &all {
+            rebuilt = Hex::apply(&rebuilt, mv);
+        }
+        assert_eq!(rebuilt.black, after.black);
+        assert_eq!(rebuilt.white, after.white);
+    }
+
+    #[test]
+    fn a_position_that_removes_or_recolours_a_stone_forces_a_resync() {
+        let base = play(&play(&Hex::initial_state(), "g7"), "d4");
+        assert!(!extends(&base, &Hex::initial_state()), "fewer stones");
+        // Same cell, other colour: white g7 instead of black.
+        let mut recoloured = Hex::initial_state();
+        recoloured.white = base.black;
+        recoloured.black = base.white;
+        recoloured.ply = base.ply;
+        assert!(!extends(&base, &recoloured));
+    }
 
     #[test]
     fn gtp_move_tokens_roundtrip() {

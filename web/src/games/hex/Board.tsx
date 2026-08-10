@@ -1,11 +1,15 @@
 /**
- * Hex 13×13 play surface. Each seat is a human or the engine; the Rust engine
- * owns the rules (connection detection, legality, terminal state).
+ * Hex 13×13 play surface. The Rust engine owns the rules (connection detection,
+ * legality, terminal state); each seat is a human or one of its movers:
  *
- * The engine seat currently plays the *placeholder* mover in
- * crates/games/hex/src/game.rs (`Solver for Hex`: centre, then first empty
- * cell) — there is no Hex net yet. It exists so the seat is playable, not to
- * give you a game.
+ *   - "Placeholder" (EnginePlayer.SOLVER) — centre, then the first empty cell.
+ *     Not a player; it just makes the seat answerable with nothing configured.
+ *   - "MoHex 2.0" (EnginePlayer.EXTERNAL) — the reference Hex engine, driven
+ *     over GTP by the engine process. Only available when it was started with
+ *     `--mohex-bin`; otherwise the request fails and the error shows below the
+ *     board. "Seconds/move" becomes MoHex's per-move time budget.
+ *
+ * There is no Hex net yet — that seat arrives with the AZ run.
  *
  * Wire format (must match crates/games/hex/src/game.rs):
  *   GameState.payload = 169 cell bytes (row-major; 0 empty, 1 black, 2 white),
@@ -45,9 +49,20 @@ import {
 const N = 13;
 
 type Cell = 0 | 1 | 2;
-type Seat = "human" | "engine";
+type Seat = "human" | "engine" | "mohex";
 
-const SEAT_LABELS: Record<Seat, string> = { human: "Human", engine: "Engine — placeholder" };
+const SEAT_LABELS: Record<Seat, string> = {
+  human: "Human",
+  engine: "Placeholder",
+  mohex: "MoHex 2.0",
+};
+
+// MoHex only answers if the engine was started with `--mohex-bin`; otherwise
+// the RPC fails with a failed-precondition that we surface as-is.
+const SEAT_PLAYER: Record<Exclude<Seat, "human">, EnginePlayer> = {
+  engine: EnginePlayer.SOLVER,
+  mohex: EnginePlayer.EXTERNAL,
+};
 
 const BLACK = "#1f2937";
 const WHITE = "#f8fafc";
@@ -164,8 +179,11 @@ export function HexBoard({ client }: { client: Client<typeof EngineService> }) {
 
   const sendMove = useCallback(
     async (payload: Uint8Array) => {
-      if (!handle || !state || busy || thinking) return;
+      if (!handle || !state || busy) return;
       if (state.outcome !== Outcome.IN_PROGRESS) return;
+      // Whose turn it is already gates this; deliberately *not* gated on
+      // `thinking`, which stays true for a tick after the engine's move lands
+      // and would otherwise swallow an immediate reply.
       if (seatToMove(state) !== "human") return;
       setError(null);
       setBusy(true);
@@ -184,7 +202,7 @@ export function HexBoard({ client }: { client: Client<typeof EngineService> }) {
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [client, handle, state, busy, thinking, blackSeat, whiteSeat],
+    [client, handle, state, busy, blackSeat, whiteSeat],
   );
 
   const play = (r: number, c: number) => void sendMove(new Uint8Array([1, r, c]));
@@ -193,7 +211,8 @@ export function HexBoard({ client }: { client: Client<typeof EngineService> }) {
   useEffect(() => {
     if (!handle || !state) return;
     if (state.outcome !== Outcome.IN_PROGRESS) return;
-    if (seatToMove(state) !== "engine") return;
+    const seat = seatToMove(state);
+    if (seat === "human") return;
 
     const tag = `${handle.handleId}:${state.ply}`;
     if (engineTurnRef.current === tag) return;
@@ -211,7 +230,7 @@ export function HexBoard({ client }: { client: Client<typeof EngineService> }) {
             for await (const prog of client.requestMove(
               create(RequestMoveRequestSchema, {
                 handle,
-                player: EnginePlayer.SOLVER,
+                player: SEAT_PLAYER[seat],
                 budget: create(SearchBudgetSchema, {
                   maxMillis: Math.max(1, Math.round(seconds * 1000)),
                 }),
@@ -269,6 +288,7 @@ export function HexBoard({ client }: { client: Client<typeof EngineService> }) {
 
   const inProgress = state?.outcome === Outcome.IN_PROGRESS;
   const humanTurn = !!state && inProgress && seatToMove(state) === "human";
+  const engineSeatLabel = state ? SEAT_LABELS[seatToMove(state)] : "";
   const toMove = state?.toMove === Player.FIRST ? "Black" : "White";
 
   return (
@@ -277,7 +297,7 @@ export function HexBoard({ client }: { client: Client<typeof EngineService> }) {
         <SeatPicker label="Black (first) — top↕bottom" seat={blackSeat} onChange={setBlackSeat} />
         <SeatPicker label="White (second) — left↔right" seat={whiteSeat} onChange={setWhiteSeat} />
         <label style={{ display: "flex", flexDirection: "column", fontSize: "0.85rem", color: "#555" }}>
-          Engine seconds/move
+          Seconds/move
           <input type="number" min={0.1} step={0.1} value={seconds}
             onChange={(e) => setSeconds(Number(e.target.value))} style={{ width: 70 }} />
         </label>
@@ -287,7 +307,7 @@ export function HexBoard({ client }: { client: Client<typeof EngineService> }) {
       <div style={{ marginBottom: "0.5rem", minHeight: "1.5em" }}>
         <strong>
           {state == null ? "Loading…"
-            : inProgress ? (thinking ? `${toMove} (engine) thinking…` : `${toMove} to move`)
+            : inProgress ? (thinking ? `${toMove} — ${engineSeatLabel} thinking…` : `${toMove} to move`)
             : outcomeLabel(state.outcome)}
         </strong>
         {lastMove && (
@@ -352,7 +372,18 @@ export function HexBoard({ client }: { client: Client<typeof EngineService> }) {
         })}
       </svg>
 
-      {error && <p style={{ color: "crimson", marginTop: "0.75rem" }}>Error: {error}</p>}
+      {error && (
+        <p style={{ color: "crimson", marginTop: "0.75rem" }}>
+          Error: {error}
+          {error.includes("no external engine") && (
+            <>
+              <br />
+              Start it with <code>hex-engine serve --mohex-bin $(which mohex)</code> (build MoHex
+              first: <code>scripts/fetch-mohex.sh</code>).
+            </>
+          )}
+        </p>
+      )}
     </section>
   );
 }
