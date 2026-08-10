@@ -57,6 +57,13 @@ start() {
     || pgrep -f "hex_az_learner.py --live $LIVE" >/dev/null; then
     echo "already running (stop first):"; status; exit 1
   fi
+  # A plain `cargo build` overwrites the cuda binary at the same path, and the
+  # only symptom is the evaluator failing at its first match. Check up front.
+  if ! "$ENGINE" --version 2>/dev/null | grep -q '+cuda'; then
+    echo "$ENGINE was built without cuda ($("$ENGINE" --version 2>&1))." >&2
+    echo "Rebuild:  source /tmp/cuda_env.sh && cargo build --release -p hex-engine --features cuda" >&2
+    exit 1
+  fi
   mkdir -p "$LOGS" "$LIVE/buffer"
   # shellcheck disable=SC1091
   source /tmp/cuda_env.sh

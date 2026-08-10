@@ -65,8 +65,16 @@ impl ModelClient<Hex> for HexModel {
     }
 }
 
+/// Version string that names the compiled backends, because a `cargo build`
+/// without `--features cuda` silently replaces a cuda binary at the same path —
+/// and the only symptom is `--cuda` failing at run time, possibly hours later.
+#[cfg(feature = "cuda")]
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " +cuda");
+#[cfg(not(feature = "cuda"))]
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (built without cuda)");
+
 #[derive(Parser)]
-#[command(name = "hex-engine", version)]
+#[command(name = "hex-engine", version = VERSION)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
