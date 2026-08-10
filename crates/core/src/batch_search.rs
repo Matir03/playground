@@ -1757,6 +1757,11 @@ pub fn run_actor_continuous<M, F>(
             .send(MvTask::Seed(MvRunner::new(base_seed.wrapping_add(i as u64), params)))
             .unwrap();
     }
+    // Set just before we exit, so the forward thread can tell "the model is being
+    // torn down under me" from "the model is broken" — an inference error during
+    // shutdown is expected and must not look like a crash.
+    let stopping = std::sync::atomic::AtomicBool::new(false);
+    let stopping = &stopping;
 
     std::thread::scope(|scope| {
         // Gather thread: assembles the next batch while the forward thread is inside
@@ -1781,7 +1786,15 @@ pub fn run_actor_continuous<M, F>(
                     };
                     let useful = runners.len();
                     let m = model.lock().unwrap().clone(); // current weights (cheap Arc clone)
-                    let (vals, priors) = m.forward(&planes, batch_size).expect("batched forward failed");
+                    let (vals, priors) = match m.forward(&planes, batch_size) {
+                        Ok(out) => out,
+                        Err(e) => {
+                            if stopping.load(std::sync::atomic::Ordering::Acquire) {
+                                return; // teardown race; the finished games are already written
+                            }
+                            panic!("batched forward failed: {e}");
+                        }
+                    };
                     drop(m);
                     mv_scatter(&work_tx, runners, &vals, Arc::new(priors), n_workers);
                     win_b += 1;
@@ -1840,6 +1853,7 @@ pub fn run_actor_continuous<M, F>(
             std::thread::sleep(std::time::Duration::from_secs_f64(flush_secs));
             let games = std::mem::take(&mut *finished.lock().unwrap());
             if !on_flush(games) {
+                stopping.store(true, std::sync::atomic::Ordering::Release);
                 std::process::exit(0);
             }
         }
