@@ -25,7 +25,27 @@ fn e2a<E: std::fmt::Display>(e: E) -> anyhow::Error {
 }
 
 pub struct OrtModel {
-    session: Mutex<Session>,
+    /// `Option` only so [`Drop`] can take it out — see there.
+    session: Option<Mutex<Session>>,
+}
+
+impl Drop for OrtModel {
+    /// Deliberately leak the session.
+    ///
+    /// Dropping one built on the **TensorRT** EP aborts the process with heap
+    /// corruption roughly one time in three (`corrupted double-linked list`),
+    /// always at teardown and never under a debugger — a race inside ORT/TRT's
+    /// own shutdown. The CUDA EP and candle never do it. That would be a
+    /// nuisance in the bench and a real problem in the actor, which drops the
+    /// old model every time the learner publishes new weights.
+    ///
+    /// The cost is one leaked session (engine + arena) per hot-reload, i.e. per
+    /// generation; the win is an actor that survives them. Revisit if a later
+    /// `ort` release fixes the shutdown, or if a long run's RSS becomes a
+    /// problem.
+    fn drop(&mut self) {
+        std::mem::forget(self.session.take());
+    }
 }
 
 impl OrtModel {
@@ -57,7 +77,7 @@ impl OrtModel {
             .map_err(e2a)?
             .commit_from_file(onnx_path)
             .map_err(e2a)?;
-        Ok(Self { session: Mutex::new(session) })
+        Ok(Self { session: Some(Mutex::new(session)) })
     }
 }
 
@@ -68,7 +88,7 @@ impl BatchModel for OrtModel {
             planes.to_vec(),
         ))
         .map_err(e2a)?;
-        let mut sess = self.session.lock().unwrap();
+        let mut sess = self.session.as_ref().expect("session outlives forward").lock().unwrap();
         let outputs = sess.run(ort::inputs!["planes" => input]).map_err(e2a)?;
         let (_vs, vals) = outputs["value"].try_extract_tensor::<f32>().map_err(e2a)?;
         let (shape, policy) = outputs["policy"].try_extract_tensor::<f32>().map_err(e2a)?;

@@ -316,6 +316,40 @@ pub fn run_benchmark(
         cs.avg_batch(),
         cs.gpu_duty(),
     );
+    // Where the time goes. A node costs one forward *plus* the CPU work around
+    // it, so nodes/s sits below the raw positions/s `net-bench` reports; this
+    // says which side is actually the limit.
+    let cpu = cs.gather_secs + cs.wait_secs + cs.apply_secs;
+    if cpu > 0.0 {
+        println!(
+            "  cpu: descent {:.0}%  wait-for-eval {:.0}%  expand+backup {:.0}%  \
+             [{:.1} core-s / {threads} workers, {:.1} wall]",
+            100.0 * cs.gather_secs / cpu,
+            100.0 * cs.wait_secs / cpu,
+            100.0 * cs.apply_secs / cpu,
+            cpu,
+            cs.elapsed,
+        );
+    }
+    let gt = cs.gpu_secs + cs.gpu_block_secs + cs.gpu_dispatch_secs;
+    if gt > 0.0 {
+        println!(
+            "  gpu thread: forward {:.0}%  starved {:.0}%  dispatch {:.0}%  \
+             [{:.1}s forward, {:.1}s wall]",
+            100.0 * cs.gpu_secs / gt,
+            100.0 * cs.gpu_block_secs / gt,
+            100.0 * cs.gpu_dispatch_secs / gt,
+            cs.gpu_secs,
+            cs.elapsed,
+        );
+    }
+    println!(
+        "  evals {} ({:.0}/s)  cache hits {:.0}%  batches {}",
+        cs.evals,
+        cs.evals as f64 / cs.elapsed,
+        100.0 * cs.cache_hit_rate(),
+        cs.batches,
+    );
     Ok(())
 }
 

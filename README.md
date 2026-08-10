@@ -282,14 +282,25 @@ Self-play runs the net through one of two backends, chosen with `--backend`:
 |---------|--------------|--------------------:|----------:|
 | `candle` (default) | `latest.safetensors` | 4.6k pos/s | 3.0k nodes/s |
 | `ort --ep cuda` | `model.onnx` | 38k pos/s | 26k nodes/s |
-| `ort --ep trt` (fp16) | `model.onnx` | **187k pos/s** | **50–63k nodes/s** |
+| `ort --ep trt` (fp16) | `model.onnx` | **158k pos/s** | **38–63k nodes/s** |
 
-Measured on a laptop RTX 4060 with a 64ch/6b net, `--node-budget 200`;
-self-play at `--concurrency 768 --max-batch 256`, and the top figure at
-`--concurrency 3072 --max-batch 768`. TensorRT is ~20× candle end to end,
-which is the difference between a generation per day and one per hour. Past
-that the pipeline is **CPU**-bound (`gpu_duty` ~0.46 — the workers can't
-descend trees and generate moves fast enough to keep the GPU fed).
+Measured on a laptop RTX 4060 with a 64ch/6b net, `--node-budget 200`,
+`--concurrency 768 --max-batch 256` (the top self-play figure at 3072/768).
+TensorRT is ~15× candle end to end, which is the difference between a
+generation per day and one per hour. The self-play range is run-to-run
+variance on a thermally-capped laptop GPU, so compare backends within a
+sitting, not across.
+
+**Why self-play nodes/s is far below the raw forward rate**, and why that's
+not a contradiction: in Hex every search node is one network evaluation
+(`cache hits 0%` — no transpositions worth the lookup), so the two figures
+are the same unit. `selfplay-bench`'s breakdown shows where the difference
+goes — of the single inference thread's time, only ~46% is inside `forward`;
+~49% is *dispatch* (gathering each leaf batch and scattering results back to
+their games) and ~5% starved. The workers themselves are nearly idle (8.5
+core-seconds out of 220 available), so the limit is that one thread's serial
+bookkeeping, not tree search. `net-bench` is an upper bound by construction:
+one preallocated buffer, no encoding, no scatter, nothing else running.
 
 ORT needs its shared libraries located at runtime:
 
@@ -305,6 +316,12 @@ the numbers look wrong. TensorRT builds an engine per batch shape on first use
 (a few seconds) and caches it under `<live>/trt_cache`. fp16 costs about 4
 decimal places on the value head and nothing on the move ranking:
 `net-eval --backend ort --ep trt` against `--backend candle` is the check.
+
+One upstream wart: dropping a TensorRT session aborts the process with heap
+corruption about one time in three (never under a debugger — it's a race in
+ORT's shutdown; the CUDA EP and candle are clean). `OrtModel` therefore leaks
+its session rather than dropping it, which costs one session per hot-reload
+and keeps the actor alive across weight updates. See `ort_net.rs`.
 
 Two throughput probes, because "self-play is slow" has two very different
 causes: `net-bench` times the raw forward (the ceiling), `selfplay-bench` the

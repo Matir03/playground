@@ -326,10 +326,20 @@ async fn main() -> anyhow::Result<()> {
             backend, ep, fp16,
         } => {
             let params = search_params(node_budget, c_puct, 0.3, 0.25, 12);
+            let backend = parse_backend(&backend, &ep, fp16)?;
             selfplay::run_benchmark(
                 &model, cuda, concurrency, threads.unwrap_or_else(default_threads), params,
-                max_batch, seed, secs, parse_backend(&backend, &ep, fp16)?,
+                max_batch, seed, secs, backend,
             )?;
+            // ONNX Runtime's TensorRT EP intermittently aborts inside its own
+            // teardown (heap corruption, ~1 run in 3, always *after* the results
+            // are printed). Everything we own is already written, so leave
+            // without unwinding rather than let a shutdown bug fail the run.
+            if backend.is_ort() {
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+                std::process::exit(0);
+            }
         }
         Cmd::EvalMatch { a, b, cuda, games, node_budget, c_puct, temp_moves, threads, max_batch, seed } => {
             eval::run_match(
