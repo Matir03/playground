@@ -196,6 +196,9 @@ swap rule is off by default; see `ALLOW_SWAP` in `src/game.rs` for what that
 costs and how to turn it on. No AZ net yet: `RequestMove` is answered by a
 placeholder, and the strength work comes next.
 
+The web UI has a playable board (`hex-engine serve --addr 127.0.0.1:7104`,
+then `cd web && npm run dev`); the engine seat is that same placeholder.
+
 **MoHex 2.0** (benzene) is the reference engine — the Hex equivalent of go9's
 GNU Go. Build it once; the script clones, patches the 2015 source for a modern
 toolchain (see [scripts/patches](scripts/patches)), pulls Boost + Berkeley DB
@@ -311,7 +314,10 @@ npm run typecheck # tsc --noEmit; run this after regenerating protos
 ```
 
 The app pings `EngineService.Health` on each engine port at load time, so
-start whichever engines you want to exercise before opening the page.
+start whichever engines you want to exercise before opening the page. Engines
+are reached through same-origin proxy paths (`/c4`, `/go9`, `/a`, `/hex` — see
+[web/vite.config.ts](web/vite.config.ts)), so restart the dev server after
+adding one. Playable boards today: Connect 4, Go 9×9, Amazons, Hex 13×13.
 
 ### Full local stack (once M2 lands)
 

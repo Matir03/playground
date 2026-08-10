@@ -3,6 +3,7 @@ import { engineClientFor } from "./lib/client";
 import { Connect4Board } from "./games/connect4/Board";
 import { Go9Board } from "./games/go9/Board";
 import { AmazonsBoard } from "./games/amazons/Board";
+import { HexBoard } from "./games/hex/Board";
 
 // Engines are reached under same-origin proxy paths (see vite.config.ts), so the
 // whole app works behind one origin without CORS.
@@ -22,6 +23,11 @@ const GAMES = [
     blurb: "Play a human or the self-play net (gen71) on the standard 10×10 board. Pick a queen, its destination, then where to shoot the arrow; the NN seat plays via MCTS over the embedded net.",
     start: "amazons-engine serve --model-local nn=<checkpoint> --cuda",
   },
+  {
+    id: "hex", label: "Hex 13×13", engineUrl: "/hex", playable: true,
+    blurb: "Black connects top↕bottom, White left↔right; first to link their two edges wins, and there are no draws. The engine seat plays the placeholder mover for now — there is no Hex net yet. Swap rule off.",
+    start: "hex-engine serve --addr 127.0.0.1:7104",
+  },
   { id: "arimaa", label: "Arimaa", engineUrl: "/ar", playable: false, blurb: "", start: "" },
 ] as const;
 
@@ -37,6 +43,7 @@ const clients: Partial<Record<GameId, ReturnType<typeof engineClientFor>>> = {
   connect4: engineClientFor("/c4"),
   go9: engineClientFor("/go9"),
   amazons: engineClientFor("/a"),
+  hex: engineClientFor("/hex"),
 };
 
 export function App() {
@@ -145,6 +152,8 @@ function GameView({
         <Connect4Board client={client} />
       ) : game.id === "amazons" ? (
         <AmazonsBoard client={client} />
+      ) : game.id === "hex" ? (
+        <HexBoard client={client} />
       ) : (
         <Go9Board client={client} />
       )}
