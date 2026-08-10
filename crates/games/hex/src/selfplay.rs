@@ -358,6 +358,7 @@ mod tests {
     use super::*;
     use playground_core::batch_search::{MvMoveRecord, SearchParams};
     use playground_core::Game;
+    use rand::SeedableRng;
 
     /// A stand-in net: every position is even, every move equally likely. Enough to
     /// drive the real pipeline without a checkpoint.
@@ -367,6 +368,157 @@ mod tests {
         fn forward(&self, _planes: &[f32], b: usize) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
             Ok((vec![0.0; b], vec![0.0; b * POLICY_DIM]))
         }
+    }
+
+    /// Stand-in for a barely-trained net: a flat policy and a value that varies
+    /// with the position but means nothing (what the real value head looks like
+    /// for the first few generations).
+    struct FlatPolicyNoisyValue;
+
+    impl BatchModel for FlatPolicyNoisyValue {
+        fn forward(&self, planes: &[f32], b: usize) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
+            let mut vals = vec![0.0f32; b];
+            for i in 0..b {
+                let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                for (k, &x) in planes[i * PLANES..(i + 1) * PLANES].iter().enumerate() {
+                    if x != 0.0 {
+                        h ^= k as u64;
+                        h = h.wrapping_mul(0x100_0000_01b3);
+                    }
+                }
+                vals[i] = ((h >> 40) as f32 / 8388608.0 - 1.0) * 0.9; // ±0.9
+            }
+            Ok((vals, vec![0.5; b * POLICY_DIM]))
+        }
+    }
+
+    /// The batched engine and the sequential `mcts::run_search` implement the
+    /// same PUCT; on the same model and budget they should concentrate their
+    /// root visits to the same degree. They did not — the batched search spread
+    /// 400 visits over ~53 moves where the sequential one put a third of them on
+    /// one move — which is what sent self-play targets to near-uniform and
+    /// stalled the policy loss.
+    #[test]
+    fn both_searches_concentrate_alike_on_the_same_model() {
+        let budget = 400u32;
+        let params = SearchParams {
+            sims: 0,
+            node_budget: budget,
+            c_puct: 1.5,
+            dir_alpha: 0.3,
+            dir_eps: 0.0,
+            temp_moves: 0,
+            explore_eps: 0.0,
+            max_ply: 0,
+            settle_plies: 0,
+            resign_threshold: 0.0,
+            resign_consecutive: 0,
+            resign_playout_frac: 0.0,
+        };
+        let (records, _) =
+            batch_search::run_selfplay_moves::<Hex>(&FlatPolicyNoisyValue, 2, params, 2, 2, 5, 30.0, 0.0);
+        assert!(!records.is_empty(), "no game finished in 30s");
+        let opening = &records[0].moves[0];
+        let total: u32 = opening.visits.iter().sum();
+        let batched_top = *opening.visits.iter().max().unwrap() as f32 / total as f32;
+        let batched_spread = opening.visits.iter().filter(|&&v| v > 0).count();
+
+        struct Adapter;
+        impl crate::mcts::Evaluator for Adapter {
+            fn evaluate(&self, state: &crate::game::HexState) -> anyhow::Result<(f32, Vec<f32>)> {
+                let mut planes = vec![0f32; PLANES];
+                fill_planes_into(state, &mut planes);
+                let (v, p) = FlatPolicyNoisyValue.forward(&planes, 1)?;
+                Ok((v[0], p))
+            }
+        }
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(5);
+        let seq_params = crate::mcts::Params {
+            sims: budget,
+            c_puct: 1.5,
+            dir_alpha: 0.3,
+            dir_eps: 0.0,
+            temp_moves: 0,
+        };
+        let (_m, visits, _v) =
+            crate::mcts::run_search(&Adapter, &Hex::initial_state(), &seq_params, &mut rng).unwrap();
+        let st: u32 = visits.iter().sum();
+        let seq_top = *visits.iter().max().unwrap() as f32 / st as f32;
+        let seq_spread = visits.iter().filter(|&&v| v > 0).count();
+
+        println!(
+            "batched: top {batched_top:.3} over {batched_spread} moves ({total} visits)\n             sequential: top {seq_top:.3} over {seq_spread} moves ({st} visits)"
+        );
+        assert!(
+            batched_top > seq_top / 2.0,
+            "batched search is far flatter: top {batched_top:.3} vs {seq_top:.3}"
+        );
+    }
+
+    /// A model whose policy is a *function of the planes it is handed*: all the
+    /// mass on the first empty cell it can see. If the engine ever pairs a
+    /// position with another position's row of the batch, the spike lands on a
+    /// cell that is occupied here, `expand` masks it away, and the search falls
+    /// back to a flat distribution — so a misalignment shows up as visits that
+    /// don't concentrate where the model asked.
+    struct SpikeFirstEmpty;
+
+    impl BatchModel for SpikeFirstEmpty {
+        fn forward(&self, planes: &[f32], b: usize) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
+            let mut policy = vec![0.0f32; b * POLICY_DIM];
+            for i in 0..b {
+                let row = &planes[i * PLANES..(i + 1) * PLANES];
+                let first_empty = (0..POLICY_DIM)
+                    .find(|&c| row[c] == 0.0 && row[POLICY_DIM + c] == 0.0)
+                    .unwrap_or(0);
+                policy[i * POLICY_DIM + first_empty] = 20.0; // ≫ the 0.0 elsewhere
+            }
+            Ok((vec![0.0; b], policy))
+        }
+    }
+
+    /// Every game in a batch must be scored with *its own* row of the forward.
+    #[test]
+    fn batched_evaluation_pairs_each_game_with_its_own_policy_row() {
+        let params = SearchParams {
+            sims: 0,
+            node_budget: 12,
+            c_puct: 1.5,
+            dir_alpha: 0.3,
+            dir_eps: 0.0,
+            temp_moves: 0,
+            explore_eps: 0.0,
+            max_ply: 0,
+            settle_plies: 0,
+            resign_threshold: 0.0,
+            resign_consecutive: 0,
+            resign_playout_frac: 0.0,
+        };
+        // Many games in flight against a small batch, so rows are mixed.
+        let (records, _stats) =
+            batch_search::run_selfplay_moves::<Hex>(&SpikeFirstEmpty, 24, params, 4, 8, 7, 25.0, 0.0);
+        assert!(!records.is_empty(), "no game finished in 25s");
+        let (mut checked, mut agreed) = (0usize, 0usize);
+        for rec in &records {
+            for (i, mv) in rec.moves.iter().enumerate() {
+                let state = &rec.states[i];
+                // What the model would have asked for, given this position.
+                let want = state.empty().iter().map(|c| canon_index(state, c)).min().unwrap();
+                let best = (0..mv.moves.len()).max_by_key(|&k| mv.visits[k]).unwrap();
+                let got = match mv.moves[best] {
+                    HexMove::Play { r, c } => canon_index(state, r as usize * N + c as usize),
+                    HexMove::Swap => usize::MAX,
+                };
+                checked += 1;
+                agreed += usize::from(got == want);
+            }
+        }
+        // A spike 20 logits above everything else wins every search that sees it.
+        assert!(
+            agreed * 100 >= checked * 99,
+            "only {agreed}/{checked} moves followed the model's own policy row — \
+             batch rows are being paired with the wrong games"
+        );
     }
 
     /// The value target of every example is `winner == states[i].to_move`, so a

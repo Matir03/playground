@@ -287,6 +287,11 @@ enum Cmd {
         /// Sample from the visit counts for this many opening plies, then argmax.
         #[arg(long, default_value_t = 0)]
         temp_moves: u32,
+        /// Root Dirichlet noise, as self-play uses it (0 = off, the eval default).
+        #[arg(long, default_value_t = 0.0)]
+        dir_eps: f32,
+        #[arg(long, default_value_t = 0.3)]
+        dir_alpha: f32,
         #[arg(long, default_value_t = 0)]
         seed: u64,
         /// Print the final board.
@@ -399,8 +404,8 @@ async fn main() -> anyhow::Result<()> {
         Cmd::NetEval { model, moves, top, mirror, backend, ep, fp16 } => {
             net_eval(&model, &moves, top, mirror, parse_backend(&backend, &ep, fp16)?)?
         }
-        Cmd::PlayGame { model, cuda, sims, c_puct, temp_moves, seed, board, verbose } => {
-            play_game(&model, cuda, sims, c_puct, temp_moves, seed, board, verbose)?
+        Cmd::PlayGame { model, cuda, sims, c_puct, temp_moves, dir_eps, dir_alpha, seed, board, verbose } => {
+            play_game(&model, cuda, sims, c_puct, temp_moves, dir_eps, dir_alpha, seed, board, verbose)?
         }
         Cmd::NetBench { model, cuda, batch, iters, backend, ep, fp16 } => {
             net_bench(&model, cuda, batch, iters, parse_backend(&backend, &ep, fp16)?)?
@@ -552,6 +557,8 @@ fn play_game(
     sims: u32,
     c_puct: f32,
     temp_moves: u32,
+    dir_eps: f32,
+    dir_alpha: f32,
     seed: u64,
     show_board: bool,
     verbose: bool,
@@ -560,7 +567,7 @@ fn play_game(
     use rand::SeedableRng;
 
     let m = net::LocalModel::load_on(model, net::pick_device(cuda)?)?;
-    let params = Params { sims, c_puct, dir_alpha: 0.3, dir_eps: 0.0, temp_moves };
+    let params = Params { sims, c_puct, dir_alpha, dir_eps, temp_moves };
     let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
     let mut state = <Hex as Game>::initial_state();
     let mut played: Vec<String> = Vec::new();

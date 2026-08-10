@@ -26,6 +26,11 @@ PYTHON="${PYTHON:-$repo/python/.venv/bin/python}"
 CONCURRENCY="${CONCURRENCY:-768}"
 MAX_BATCH="${MAX_BATCH:-256}"
 NODE_BUDGET="${NODE_BUDGET:-400}"
+# PUCT exploration. With an untrained (uniform) policy the exploration term
+# c*p*sqrt(N) swamps the value differences between moves, so the search spreads
+# ~400 visits over ~50 of 169 moves and the policy target is nearly uniform —
+# nothing for the policy head to learn. Lower c concentrates it.
+C_PUCT="${C_PUCT:-0.6}"
 CHUNK_SECS="${CHUNK_SECS:-60}"
 MAX_CHUNKS="${MAX_CHUNKS:-40}"
 BACKEND="${BACKEND:-ort}"
@@ -56,7 +61,7 @@ start() {
       --steps-per-snapshot $STEPS --batch-size $BATCH_SIZE" PYTHONPATH="$repo/python/src"
   supervise actor "$ENGINE selfplay-loop --live $LIVE --backend $BACKEND --ep $EP \
       --concurrency $CONCURRENCY --max-batch $MAX_BATCH --node-budget $NODE_BUDGET \
-      --chunk-secs $CHUNK_SECS --max-chunks $MAX_CHUNKS"
+      --c-puct $C_PUCT --chunk-secs $CHUNK_SECS --max-chunks $MAX_CHUNKS"
 
   echo "started. logs in $LOGS"
 }
