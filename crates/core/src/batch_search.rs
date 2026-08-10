@@ -1232,12 +1232,63 @@ impl<M: MoveGame> MvRunner<M> {
 // Each game still has exactly one outstanding leaf at a time, so search dynamics
 // are identical to the sequential MCTS.
 
-/// CPU work item: a game to advance. `Apply` carries the value + a shared ref to the
-/// whole batch's policy logits + this game's row offset, so the GPU thread never
-/// copies a per-game 14400-float slice.
+/// CPU work item: games to advance. `Apply` carries a *slice of the batch* —
+/// several (game, value, row-offset) triples plus one shared ref to the whole
+/// batch's policy logits — so the GPU thread never copies a per-game policy row.
+///
+/// Chunked rather than one message per game because each send to an idle worker
+/// costs a park/unpark (~13 µs measured): at batch 256 that scatter cost more
+/// than the forward it was delivering. One chunk per worker keeps every worker
+/// busy while cutting the wakeups by the batch/worker ratio.
 enum MvTask<M: MoveGame> {
     Seed(MvRunner<M>),
-    Apply(MvRunner<M>, f32, Arc<Vec<f32>>, usize),
+    Apply(Vec<(MvRunner<M>, f32, usize)>, Arc<Vec<f32>>),
+}
+
+/// Hand a finished batch back to the workers as at most `n_workers` messages.
+fn mv_scatter<M: MoveGame>(
+    work_tx: &crossbeam_channel::Sender<MvTask<M>>,
+    runners: Vec<MvRunner<M>>,
+    vals: &[f32],
+    priors: Arc<Vec<f32>>,
+    n_workers: usize,
+) {
+    let n = runners.len();
+    if n == 0 {
+        return;
+    }
+    let chunk = n.div_ceil(n_workers.max(1));
+    let mut entries: Vec<(MvRunner<M>, f32, usize)> =
+        runners.into_iter().enumerate().map(|(i, r)| (r, vals[i], i)).collect();
+    while !entries.is_empty() {
+        let tail = entries.split_off(entries.len().saturating_sub(chunk));
+        let _ = work_tx.send(MvTask::Apply(tail, Arc::clone(&priors)));
+    }
+}
+
+/// Apply one chunk: each entry is an independent game, so the order within the
+/// chunk is irrelevant to search behaviour.
+#[allow(clippy::too_many_arguments)]
+fn mv_apply_chunk<M: MoveGame>(
+    entries: Vec<(MvRunner<M>, f32, usize)>,
+    priors: &Arc<Vec<f32>>,
+    params: &SearchParams,
+    base_seed: u64,
+    seed_ctr: &std::sync::atomic::AtomicU64,
+    eval_tx: &crossbeam_channel::Sender<(MvRunner<M>, Vec<f32>)>,
+    finished: &Mutex<Vec<MvGameRecord<M>>>,
+    moves_buf: &mut Vec<M::Move>,
+    prior_buf: &mut Vec<f32>,
+    ws: &mut WorkerStats,
+) {
+    let pd = M::POLICY_DIM;
+    for (r, v, off) in entries {
+        let slice = &priors[off * pd..(off + 1) * pd];
+        mv_advance(
+            r, Some((v, slice)), params, base_seed, seed_ctr, eval_tx, finished, moves_buf,
+            prior_buf, ws,
+        );
+    }
 }
 
 /// Advance one runner: apply the pending eval (if any), then descend to its next leaf
@@ -1295,42 +1346,37 @@ fn mv_advance<M: MoveGame>(
     }
 }
 
-/// GPU thread: block for the next leaf (waking at `deadline`), greedily pull up to
-/// `batch_size` more (a full batch in steady state thanks to overcommit), pad to a
-/// fixed shape, run ONE forward, then dispatch each result as an `Apply`. The whole
-/// policy buffer is shared via `Arc` — no per-game copy on this hot thread.
-fn mv_gpu_loop<M: MoveGame>(
+/// One assembled batch: the games it belongs to, their planes padded to the fixed
+/// shape, and how long the gatherer blocked for the first leaf.
+type GatheredBatch<M> = (Vec<MvRunner<M>>, Vec<f32>, f64);
+
+/// Assemble batches and hand them to the forward thread. Blocks for the first leaf,
+/// then takes whatever else is already queued (forward-what's-ready, so the GPU never
+/// waits on a straggler); with enough games in flight the queue already holds a full
+/// batch. Ends when the leaf channel closes or `deadline` passes.
+fn mv_gather_loop<M: MoveGame>(
     eval_rx: crossbeam_channel::Receiver<(MvRunner<M>, Vec<f32>)>,
-    work_tx: crossbeam_channel::Sender<MvTask<M>>,
-    model: &dyn BatchModel,
+    batch_tx: crossbeam_channel::Sender<GatheredBatch<M>>,
     batch_size: usize,
-    deadline: Instant,
-    report_secs: f64,
-    stats: &Mutex<ChunkStats>,
+    deadline: Option<Instant>,
 ) {
-    let mut local = ChunkStats::default();
-    // Per-`report_secs` checkpoint so we can see batches stay full the WHOLE run, not
-    // just on average. 0 disables.
-    let loop_start = Instant::now();
-    let mut win_batches = 0u64;
-    let mut win_samples = 0u64;
-    let mut win_t = Instant::now();
     loop {
-        if Instant::now() >= deadline {
-            break; // explicit stop: recv_deadline won't fire while the queue is never empty
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return; // explicit stop: recv won't fire while the queue is never empty
         }
         let mut runners = Vec::with_capacity(batch_size);
         let mut planes = Vec::with_capacity(batch_size * M::PLANES);
-        // Block for the first leaf, then take whatever else is queued (forward-what's-
-        // ready, no waiting → GPU never idles for the last leaf). With fast-enough
-        // workers the queue holds ~batch_size already, so batches stay near-full.
         let t_block = Instant::now();
-        match eval_rx.recv_deadline(deadline) {
-            Ok((r, pl)) => {
+        let first = match deadline {
+            Some(d) => eval_rx.recv_deadline(d).ok(),
+            None => eval_rx.recv().ok(),
+        };
+        match first {
+            Some((r, pl)) => {
                 planes.extend_from_slice(&pl);
                 runners.push(r);
             }
-            Err(_) => break,
+            None => return,
         }
         while runners.len() < batch_size {
             match eval_rx.try_recv() {
@@ -1341,36 +1387,80 @@ fn mv_gpu_loop<M: MoveGame>(
                 Err(_) => break,
             }
         }
-        local.gpu_block_secs += t_block.elapsed().as_secs_f64();
-        let useful = runners.len();
+        let blocked = t_block.elapsed().as_secs_f64();
         planes.resize(batch_size * M::PLANES, 0.0); // pad a partial batch to fixed shape
-        let t_gpu = Instant::now();
-        let (vals, priors) = model.forward(&planes, batch_size).expect("batched forward failed");
-        local.gpu_secs += t_gpu.elapsed().as_secs_f64();
-        local.batches += 1;
-        local.batch_samples += useful as u64;
-        win_batches += 1;
-        win_samples += useful as u64;
-        let t_disp = Instant::now();
-        let priors = Arc::new(priors);
-        for (i, r) in runners.into_iter().enumerate() {
-            let _ = work_tx.send(MvTask::Apply(r, vals[i], Arc::clone(&priors), i));
-        }
-        local.gpu_dispatch_secs += t_disp.elapsed().as_secs_f64();
-        if report_secs > 0.0 {
-            let dt = win_t.elapsed().as_secs_f64();
-            if dt >= report_secs {
-                eprintln!(
-                    "    [+{:.0}s] avg_batch {:.0}  {:.0} nodes/s  ({} batches)",
-                    loop_start.elapsed().as_secs_f64(), win_samples as f64 / win_batches as f64,
-                    win_samples as f64 / dt, win_batches,
-                );
-                win_batches = 0;
-                win_samples = 0;
-                win_t = Instant::now();
-            }
+        if batch_tx.send((runners, planes, blocked)).is_err() {
+            return; // forward thread gone
         }
     }
+}
+
+/// GPU thread: block for the next leaf (waking at `deadline`), greedily pull up to
+/// `batch_size` more (a full batch in steady state thanks to overcommit), pad to a
+/// fixed shape, run ONE forward, then dispatch each result as an `Apply`. The whole
+/// policy buffer is shared via `Arc` — no per-game copy on this hot thread.
+#[allow(clippy::too_many_arguments)]
+fn mv_gpu_loop<M: MoveGame>(
+    eval_rx: crossbeam_channel::Receiver<(MvRunner<M>, Vec<f32>)>,
+    work_tx: crossbeam_channel::Sender<MvTask<M>>,
+    model: &dyn BatchModel,
+    batch_size: usize,
+    deadline: Instant,
+    report_secs: f64,
+    stats: &Mutex<ChunkStats>,
+    n_workers: usize,
+) {
+    let mut local = ChunkStats::default();
+    // Per-`report_secs` checkpoint so we can see batches stay full the WHOLE run, not
+    // just on average. 0 disables.
+    let loop_start = Instant::now();
+    let mut win_batches = 0u64;
+    let mut win_samples = 0u64;
+    let mut win_t = Instant::now();
+    // Double-buffer: a gather thread assembles the next batch while this thread is
+    // inside `forward`, so the GPU doesn't sit idle through the collect. Bounded at
+    // one so the gatherer runs at most a batch ahead (leaves stay in the queue, where
+    // they can still join a fuller batch).
+    let (batch_tx, batch_rx) = crossbeam_channel::bounded::<GatheredBatch<M>>(1);
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            mv_gather_loop::<M>(eval_rx, batch_tx, batch_size, Some(deadline));
+        });
+        loop {
+            let (runners, planes, blocked) = match batch_rx.recv() {
+                Ok(b) => b,
+                Err(_) => break, // gatherer stopped (deadline / channel closed)
+            };
+            local.gpu_block_secs += blocked;
+            let useful = runners.len();
+            let t_gpu = Instant::now();
+            let (vals, priors) =
+                model.forward(&planes, batch_size).expect("batched forward failed");
+            local.gpu_secs += t_gpu.elapsed().as_secs_f64();
+            local.batches += 1;
+            local.batch_samples += useful as u64;
+            win_batches += 1;
+            win_samples += useful as u64;
+            let t_disp = Instant::now();
+            mv_scatter(&work_tx, runners, &vals, Arc::new(priors), n_workers);
+            local.gpu_dispatch_secs += t_disp.elapsed().as_secs_f64();
+            if report_secs > 0.0 {
+                let dt = win_t.elapsed().as_secs_f64();
+                if dt >= report_secs {
+                    eprintln!(
+                        "    [+{:.0}s] avg_batch {:.0}  {:.0} nodes/s  ({} batches)",
+                        loop_start.elapsed().as_secs_f64(),
+                        win_samples as f64 / win_batches as f64,
+                        win_samples as f64 / dt,
+                        win_batches,
+                    );
+                    win_batches = 0;
+                    win_samples = 0;
+                    win_t = Instant::now();
+                }
+            }
+        }
+    });
     let mut s = stats.lock().unwrap();
     s.gpu_secs += local.gpu_secs;
     s.gpu_block_secs += local.gpu_block_secs;
@@ -1400,7 +1490,6 @@ pub fn run_selfplay_moves<M: MoveGame>(
     let seed_ctr = AtomicU64::new(concurrency as u64);
     let deadline = Instant::now() + std::time::Duration::from_secs_f64(max_secs);
     let n_workers = threads.max(1);
-    let pd = M::POLICY_DIM;
     let t0 = Instant::now();
 
     let (work_tx, work_rx) = crossbeam_channel::unbounded::<MvTask<M>>();
@@ -1416,7 +1505,11 @@ pub fn run_selfplay_moves<M: MoveGame>(
             let eval_rx = eval_rx.clone();
             let work_tx = work_tx.clone();
             let stats = &stats;
-            scope.spawn(move || mv_gpu_loop::<M>(eval_rx, work_tx, model, batch_size, deadline, report_secs, stats));
+            scope.spawn(move || {
+                mv_gpu_loop::<M>(
+                    eval_rx, work_tx, model, batch_size, deadline, report_secs, stats, n_workers,
+                )
+            });
         }
         let mut handles = Vec::new();
         for _ in 0..n_workers {
@@ -1438,13 +1531,10 @@ pub fn run_selfplay_moves<M: MoveGame>(
                             r, None, &params, base_seed, seed_ctr, &eval_tx, finished,
                             &mut moves_buf, &mut prior_buf, &mut ws,
                         ),
-                        Ok(MvTask::Apply(r, v, pr, off)) => {
-                            let slice = &pr[off * pd..(off + 1) * pd];
-                            mv_advance(
-                                r, Some((v, slice)), &params, base_seed, seed_ctr, &eval_tx, finished,
-                                &mut moves_buf, &mut prior_buf, &mut ws,
-                            )
-                        }
+                        Ok(MvTask::Apply(entries, pr)) => mv_apply_chunk(
+                            entries, &pr, &params, base_seed, seed_ctr, &eval_tx, finished,
+                            &mut moves_buf, &mut prior_buf, &mut ws,
+                        ),
                         Err(_) => break,
                     }
                 }
@@ -1495,7 +1585,6 @@ pub fn run_actor_continuous<M, F>(
     let finished: Mutex<Vec<MvGameRecord<M>>> = Mutex::new(Vec::new());
     let seed_ctr = AtomicU64::new(concurrency as u64);
     let n_workers = threads.max(1);
-    let pd = M::POLICY_DIM;
 
     let (work_tx, work_rx) = crossbeam_channel::unbounded::<MvTask<M>>();
     let (eval_tx, eval_rx) = crossbeam_channel::unbounded::<(MvRunner<M>, Vec<f32>)>();
@@ -1506,42 +1595,30 @@ pub fn run_actor_continuous<M, F>(
     }
 
     std::thread::scope(|scope| {
-        // GPU thread: reads the *current* model each batch (hot-swappable).
+        // Gather thread: assembles the next batch while the forward thread is inside
+        // `forward` (bounded at one batch ahead).
+        let (batch_tx, batch_rx) = crossbeam_channel::bounded::<GatheredBatch<M>>(1);
         {
             let eval_rx = eval_rx.clone();
+            scope.spawn(move || mv_gather_loop::<M>(eval_rx, batch_tx, batch_size, None));
+        }
+        // Forward thread: reads the *current* model each batch (hot-swappable).
+        {
             let work_tx = work_tx.clone();
             scope.spawn(move || {
                 let mut win_b = 0u64;
                 let mut win_s = 0u64;
                 let mut win_t = Instant::now();
                 loop {
-                    let mut runners = Vec::with_capacity(batch_size);
-                    let mut planes = Vec::with_capacity(batch_size * M::PLANES);
-                    match eval_rx.recv() {
-                        Ok((r, pl)) => {
-                            planes.extend_from_slice(&pl);
-                            runners.push(r);
-                        }
+                    let (runners, planes, _blocked) = match batch_rx.recv() {
+                        Ok(b) => b,
                         Err(_) => break,
-                    }
-                    while runners.len() < batch_size {
-                        match eval_rx.try_recv() {
-                            Ok((r, pl)) => {
-                                planes.extend_from_slice(&pl);
-                                runners.push(r);
-                            }
-                            Err(_) => break,
-                        }
-                    }
+                    };
                     let useful = runners.len();
-                    planes.resize(batch_size * M::PLANES, 0.0);
                     let m = model.lock().unwrap().clone(); // current weights (cheap Arc clone)
                     let (vals, priors) = m.forward(&planes, batch_size).expect("batched forward failed");
                     drop(m);
-                    let priors = Arc::new(priors);
-                    for (i, r) in runners.into_iter().enumerate() {
-                        let _ = work_tx.send(MvTask::Apply(r, vals[i], Arc::clone(&priors), i));
-                    }
+                    mv_scatter(&work_tx, runners, &vals, Arc::new(priors), n_workers);
                     win_b += 1;
                     win_s += useful as u64;
                     if report_secs > 0.0 {
@@ -1575,13 +1652,10 @@ pub fn run_actor_continuous<M, F>(
                             r, None, &params, base_seed, seed_ctr, &eval_tx, finished,
                             &mut moves_buf, &mut prior_buf, &mut ws,
                         ),
-                        Ok(MvTask::Apply(r, v, pr, off)) => {
-                            let slice = &pr[off * pd..(off + 1) * pd];
-                            mv_advance(
-                                r, Some((v, slice)), &params, base_seed, seed_ctr, &eval_tx, finished,
-                                &mut moves_buf, &mut prior_buf, &mut ws,
-                            )
-                        }
+                        Ok(MvTask::Apply(entries, pr)) => mv_apply_chunk(
+                            entries, &pr, &params, base_seed, seed_ctr, &eval_tx, finished,
+                            &mut moves_buf, &mut prior_buf, &mut ws,
+                        ),
                         Err(_) => break,
                     }
                 }
@@ -1672,6 +1746,7 @@ fn eval_gpu_loop<M: MoveGame>(
     models: &[&dyn BatchModel],
     batch_size: usize,
     done: &std::sync::atomic::AtomicBool,
+    n_workers: usize,
 ) {
     use std::sync::atomic::Ordering;
     let timeout = std::time::Duration::from_millis(20);
@@ -1712,9 +1787,21 @@ fn eval_gpu_loop<M: MoveGame>(
                 results[i] = Some((vals[slot], std::sync::Arc::clone(&priors), slot));
             }
         }
-        for ((r, _planes, _mid), res) in leaves.into_iter().zip(results) {
+        // Chunked scatter, as in self-play: one message per worker rather than per
+        // leaf. Each chunk's entries share a `priors` Arc, so group by model first.
+        let mut by_model: HashMap<usize, (Vec<(MvRunner<M>, f32, usize)>, Arc<Vec<f32>>)> =
+            HashMap::new();
+        for ((r, _planes, mid), res) in leaves.into_iter().zip(results) {
             let (value, priors, off) = res.unwrap();
-            let _ = work_tx.send(MvTask::Apply(r, value, priors, off));
+            by_model.entry(mid).or_insert_with(|| (Vec::new(), priors)).0.push((r, value, off));
+        }
+        for (_mid, (entries, priors)) in by_model {
+            let chunk = entries.len().div_ceil(n_workers.max(1));
+            let mut entries = entries;
+            while !entries.is_empty() {
+                let tail = entries.split_off(entries.len().saturating_sub(chunk));
+                let _ = work_tx.send(MvTask::Apply(tail, Arc::clone(&priors)));
+            }
         }
     }
 }
@@ -1752,7 +1839,7 @@ pub fn run_eval_moves<M: MoveGame>(
             let eval_rx = eval_rx.clone();
             let work_tx = work_tx.clone();
             let (models, done) = (&models, &done);
-            scope.spawn(move || eval_gpu_loop::<M>(eval_rx, work_tx, models, batch_size, done));
+            scope.spawn(move || eval_gpu_loop::<M>(eval_rx, work_tx, models, batch_size, done, n_workers));
         }
         for _ in 0..n_workers {
             let work_rx = work_rx.clone();
@@ -1768,12 +1855,14 @@ pub fn run_eval_moves<M: MoveGame>(
                             r, None, &params, &eval_tx, score_x2, remaining, done,
                             &mut moves_buf, &mut prior_buf,
                         ),
-                        Ok(MvTask::Apply(r, v, pr, off)) => {
-                            let slice = &pr[off * pd..(off + 1) * pd];
-                            eval_advance(
-                                r, Some((v, slice)), &params, &eval_tx, score_x2, remaining, done,
-                                &mut moves_buf, &mut prior_buf,
-                            )
+                        Ok(MvTask::Apply(entries, pr)) => {
+                            for (r, v, off) in entries {
+                                let slice = &pr[off * pd..(off + 1) * pd];
+                                eval_advance(
+                                    r, Some((v, slice)), &params, &eval_tx, score_x2, remaining,
+                                    done, &mut moves_buf, &mut prior_buf,
+                                );
+                            }
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                             if done.load(Ordering::Acquire) {

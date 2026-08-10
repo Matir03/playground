@@ -282,25 +282,24 @@ Self-play runs the net through one of two backends, chosen with `--backend`:
 |---------|--------------|--------------------:|----------:|
 | `candle` (default) | `latest.safetensors` | 4.6k pos/s | 3.0k nodes/s |
 | `ort --ep cuda` | `model.onnx` | 38k pos/s | 26k nodes/s |
-| `ort --ep trt` (fp16) | `model.onnx` | **158k pos/s** | **38–63k nodes/s** |
+| `ort --ep trt` (fp16) | `model.onnx` | **158k pos/s** | **134–140k nodes/s** |
 
 Measured on a laptop RTX 4060 with a 64ch/6b net, `--node-budget 200`,
 `--concurrency 768 --max-batch 256` (the top self-play figure at 3072/768).
-TensorRT is ~15× candle end to end, which is the difference between a
-generation per day and one per hour. The self-play range is run-to-run
-variance on a thermally-capped laptop GPU, so compare backends within a
-sitting, not across.
+TensorRT is ~45× candle end to end, which is the difference between a
+generation per day and one per half-hour. (The candle figures are from before
+the pipeline was fixed; both backends gained from that.) Self-play figures
+vary run to run on a thermally-capped laptop GPU, so compare backends within
+a sitting, not across.
 
-**Why self-play nodes/s is far below the raw forward rate**, and why that's
-not a contradiction: in Hex every search node is one network evaluation
-(`cache hits 0%` — no transpositions worth the lookup), so the two figures
-are the same unit. `selfplay-bench`'s breakdown shows where the difference
-goes — of the single inference thread's time, only ~46% is inside `forward`;
-~49% is *dispatch* (gathering each leaf batch and scattering results back to
-their games) and ~5% starved. The workers themselves are nearly idle (8.5
-core-seconds out of 220 available), so the limit is that one thread's serial
-bookkeeping, not tree search. `net-bench` is an upper bound by construction:
-one preallocated buffer, no encoding, no scatter, nothing else running.
+**Reading the two throughput numbers**: in Hex every search node is one network
+evaluation (`cache hits 0%` — no transpositions worth the lookup), so nodes/s
+and positions/s are the same unit and the gap between them is pure pipeline
+overhead. `selfplay-bench` prints the breakdown that tells you which side is
+at fault; self-play now runs at ~88% of the raw forward rate, with the
+inference thread 83% inside `forward`. `net-bench` remains an upper bound by
+construction: one preallocated buffer, no encoding, no scatter, nothing else
+running.
 
 ORT needs its shared libraries located at runtime:
 
