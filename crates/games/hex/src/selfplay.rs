@@ -297,8 +297,11 @@ pub fn run_loop(
                 prune_buffer(&buffer, max_chunks);
                 seq += 1;
             }
+            // "ex/game", not "plies/game": with playout cap randomization only a
+            // fraction of plies are recorded, so the two stopped being the same
+            // number.
             eprintln!(
-                "  chunk {}: {n_games} games  {} ex  {:.0} plies/game  black won {:.0}%",
+                "  chunk {}: {n_games} games  {} ex  {:.0} ex/game  black won {:.0}%",
                 seq.saturating_sub(1),
                 examples.len(),
                 examples.len() as f64 / n_games as f64,
