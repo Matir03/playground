@@ -1,0 +1,27 @@
+[package]
+name = "hex-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "hex_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hex-engine"
+path = "src/main.rs"
+
+[dependencies]
+playground-core.workspace = true
+playground-engine-server.workspace = true
+playground-model-client.workspace = true
+playground-protocol.workspace = true
+
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+async-trait.workspace = true

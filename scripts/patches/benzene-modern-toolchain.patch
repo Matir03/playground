@@ -1,0 +1,123 @@
+benzene (MoHex 2.0) on a modern toolchain, and two genmove crashes.
+
+Upstream (github.com/cgao3/benzene-vanilla-cmake) has been unmaintained since
+2015. Three fixes are needed to build it and to survive a full 13x13 game:
+
+1. src/util/Misc.cpp -- Boost.Filesystem v2 calls (`branch_path`, `normalize`)
+   that Boost removed; replaced by the v3 spellings (needs Boost >= 1.60).
+
+2. src/hex/Resistance.cpp -- a segfault, hit several times per 13x13 game.
+   ComputeScores() indexes `pointToIndex[source]`, but that entry is only
+   assigned while iterating the groups *excluding* the sink's. When ICE
+   fill-in inside the search connects the two edges of `color`, source and
+   sink share a captain, the entry is never written, and the uninitialised
+   value is used as an array index. Guard the already-connected case (the
+   position is won for `color`: zero resistance) and initialise the table.
+
+3. src/mohex/MoHexPlayer.cpp -- `genmove` answering with an illegal move.
+   When the search proves the root a win after a single simulation it returns
+   an empty sequence, and the fallback asks the *fill-in* board for a random
+   empty cell -- but in a proven-won position the fill-in can cover every
+   cell, so the fallback is INVALID_POINT and the engine plays "invalid".
+   Fall back to the real position (preferring the consider set) instead.
+
+Applied by scripts/fetch-mohex.sh.
+
+diff --git a/src/hex/Resistance.cpp b/src/hex/Resistance.cpp
+index 72be769..c6b7ff5 100644
+--- a/src/hex/Resistance.cpp
++++ b/src/hex/Resistance.cpp
+@@ -122,10 +122,23 @@ void Resistance::ComputeScores(HexColor color, const Groups& groups,
+     const HexPoint sink = HexPointUtil::colorEdge2(color);
+     const int n = static_cast<int>(groups.NumGroups(not_other) - 1);
+ 
++    // If the two edges are already one group -- which ICE fill-in inside the
++    // search can cause -- the sink's captain *is* the source, so the loop below
++    // never assigns pointToIndex[source] and the indexing later is undefined
++    // (it segfaults). The position is won for `color`: zero resistance, and the
++    // per-cell scores stay at infinity.
++    if (groups.CaptainOf(source) == groups.CaptainOf(sink))
++    {
++        m_resistance[color] = 0.0;
++        return;
++    }
++
+     // Compute index that does not contain the sink
+     int pointToIndex[BITSETSIZE];
+     HexPoint indexToPoint[BITSETSIZE];
+     {
++        for (int i = 0; i < BITSETSIZE; ++i)
++            pointToIndex[i] = -1;
+         int index = 0;
+         for (GroupIterator i(groups, not_other); i; ++i)
+         {
+diff --git a/src/mohex/MoHexPlayer.cpp b/src/mohex/MoHexPlayer.cpp
+index 40fd6f9..a70c279 100644
+--- a/src/mohex/MoHexPlayer.cpp
++++ b/src/mohex/MoHexPlayer.cpp
+@@ -185,7 +185,21 @@ HexPoint MoHexPlayer::Search(const HexState& state, const Game& game,
+     // move.
+     LogWarning() << "**** MoHexSearch returned empty sequence!\n"
+ 		 << "**** Returning random move!\n";
+-    return BoardUtil::RandomEmptyCell(brd.GetPosition());
++    // `brd` carries the ICE fill-in, and in a position proven won the fill-in
++    // can cover the whole board -- RandomEmptyCell then returns INVALID_POINT
++    // and the engine answers `genmove` with an illegal move. Fall back to the
++    // real position, preferring a cell from the consider set.
++    HexPoint fallback = BoardUtil::RandomEmptyCell(brd.GetPosition());
++    if (fallback == INVALID_POINT)
++    {
++        const StoneBoard& pos = state.Position();
++        bitset_t candidates = consider & pos.GetEmpty() & pos.Const().GetCells();
++        if (candidates.any())
++            fallback = static_cast<HexPoint>(BitsetUtil::FindSetBit(candidates));
++        else
++            fallback = BoardUtil::RandomEmptyCell(pos);
++    }
++    return fallback;
+ }
+ 
+ /** Does a 1-ply search.
+diff --git a/src/util/Misc.cpp b/src/util/Misc.cpp
+index 02cd8b6..e746461 100644
+--- a/src/util/Misc.cpp
++++ b/src/util/Misc.cpp
+@@ -35,9 +35,9 @@ void MiscUtil::FindProgramDir(int argc, char* argv[])
+     #endif
+ 
+     #if (defined (BOOST_FILESYSTEM_VERSION) && (BOOST_FILESYSTEM_VERSION == 3))
+-        programDir = path(argv[0]).branch_path();
++        programDir = path(argv[0]).parent_path();
+     #else
+-        programDir = path(argv[0], native).branch_path();
++        programDir = path(argv[0], native).parent_path();
+     #endif
+ }
+ 
+@@ -82,7 +82,7 @@ std::string MiscUtil::OpenFile(std::string name, std::ifstream& f)
+     #endif
+     {
+         path p = programDir / name;
+-        p.normalize();
++        p = p.lexically_normal();
+         #if (defined (BOOST_FILESYSTEM_VERSION) && (BOOST_FILESYSTEM_VERSION == 3))
+             programDirFile = p.string();
+         #else
+@@ -94,7 +94,7 @@ std::string MiscUtil::OpenFile(std::string name, std::ifstream& f)
+     }
+     {
+         path p = boost::filesystem::path(ABS_TOP_SRCDIR) / "share" / name;
+-        p.normalize();
++        p = p.lexically_normal();
+         #if (defined (BOOST_FILESYSTEM_VERSION) && (BOOST_FILESYSTEM_VERSION == 3))
+             absFile = p.string();
+         #else
+@@ -106,7 +106,7 @@ std::string MiscUtil::OpenFile(std::string name, std::ifstream& f)
+     }
+     {
+         path p = boost::filesystem::path(DATADIR) / name;
+-        p.normalize();
++        p = p.lexically_normal();
+         #if (defined (BOOST_FILESYSTEM_VERSION) && (BOOST_FILESYSTEM_VERSION == 3))
+             dataFile = p.string();
+         #else

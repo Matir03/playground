@@ -2,7 +2,8 @@
 
 Research playground for a custom MuZero variant. We validate the algorithm on a
 sequence of progressively richer 2-player abstract strategy games
-(Connect4 → 9×9 Go → Amazons → Arimaa) before applying it to the target game.
+(Connect4 → 9×9 Go → Amazons → Arimaa → Hex 13×13) before applying it to the
+target game.
 
 - Rust engines per game with shared core libs (MCTS, recording, server).
 - Python owns everything model-related: training, model server, orchestrator.
@@ -148,7 +149,7 @@ automatically on `cargo build` via [crates/protocol/build.rs](crates/protocol/bu
 
 ### Rust engines
 
-Each game has its own binary. All four speak the same `EngineService` on
+Each game has its own binary. All of them speak the same `EngineService` on
 gRPC + gRPC-Web. Default ports:
 
 | Game      | Binary            | Engine port | Expects model server at |
@@ -157,6 +158,7 @@ gRPC + gRPC-Web. Default ports:
 | Go 9×9    | `go9-engine`      | `7101`      | `http://127.0.0.1:7201` |
 | Amazons   | `amazons-engine`  | `7102`      | `http://127.0.0.1:7202` |
 | Arimaa    | `arimaa-engine`   | `7103`      | `http://127.0.0.1:7203` |
+| Hex 13×13 | `hex-engine`      | `7104`      | `http://127.0.0.1:7204` |
 
 ```bash
 # Build all engines.
@@ -184,6 +186,37 @@ grpcurl -plaintext 127.0.0.1:7100 playground.engine.EngineService/Health
 ```
 
 Full protocol surface is in [docs/protocols.md](docs/protocols.md).
+
+### Hex 13×13 and MoHex
+
+The Hex rules live in [crates/games/hex](crates/games/hex) (`hex-engine`).
+Black (First) connects top↔bottom, White (Second) left↔right — benzene's
+convention, so our board and MoHex's agree cell for cell (`a1`..`m13`). The
+swap rule is off by default; see `ALLOW_SWAP` in `src/game.rs` for what that
+costs and how to turn it on. No AZ net yet: `RequestMove` is answered by a
+placeholder, and the strength work comes next.
+
+**MoHex 2.0** (benzene) is the reference engine — the Hex equivalent of go9's
+GNU Go. Build it once; the script clones, patches the 2015 source for a modern
+toolchain (see [scripts/patches](scripts/patches)), pulls Boost + Berkeley DB
+into a micromamba env if the system lacks them, and symlinks the binary into
+`~/.local/bin`:
+
+```bash
+scripts/fetch-mohex.sh
+
+# Cross-check our rules against MoHex: random games, ply-by-ply agreement on
+# who has connected. This is the real test that the board geometry is right.
+cargo run --release -p hex-engine -- verify --games 40
+
+# Play MoHex (here against a random stand-in until the net lands).
+cargo run --release -p hex-engine -- match --games 4 --mohex-playouts 1000
+
+# Rules throughput — the floor for AZ self-play (~4.5M moves/s single-threaded).
+cargo run --release -p hex-engine -- bench --games 3000
+```
+
+`HEX_GTP_DEBUG=1` traces the GTP conversation and keeps MoHex's own search log.
 
 ### Python — model server
 

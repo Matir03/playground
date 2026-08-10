@@ -10,6 +10,7 @@ enum GameId {
   GAME_ID_GO9 = 2;
   GAME_ID_AMAZONS = 3;
   GAME_ID_ARIMAA = 4;
+  GAME_ID_HEX = 5;
 }
 
 enum Player {
