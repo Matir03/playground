@@ -1,8 +1,14 @@
 """Continuous Hex evaluator and gate, mirroring `c4_eval_loop.py`.
 
-Scores each new learner snapshot against **MoHex** — an absolute yardstick, not
-a chained self-play ELO that can drift upward against itself forever — and
-promotes the best-scoring net to `live/best.safetensors` + `live/best.onnx`.
+Promotes a new learner snapshot to `live/best.safetensors` + `live/best.onnx`
+when it beats the **current best net** head to head (AlphaGo Zero's 55% gate),
+and separately reports its score against **MoHex** as an absolute yardstick.
+
+Those are deliberately two different things. Gating on MoHex directly sounds
+tidier but has no resolution while the net is weak: a young net scores 0 of 8,
+the incumbent scored 0 of 8, nothing ever promotes, and the actor freezes on
+whatever it started with — worse than no gate. Beating the incumbent always
+discriminates; MoHex tells you whether the ladder is climbing anything real.
 
 The gate is the point. Without one, every snapshot immediately becomes the
 self-play generator, so a net that gets worse starts producing worse data and
@@ -63,6 +69,21 @@ def release_pause(live: str) -> None:
             pass
 
 
+def run_match(engine: str, cand: str, best: str, games: int, node_budget: int,
+              threads: int, cuda: bool, seed: int) -> float:
+    """Candidate vs incumbent; returns the candidate's score in [0,1]."""
+    cmd = [engine, "eval-match", "--a", cand, "--b", best, "--games", str(games),
+           "--node-budget", str(node_budget), "--threads", str(threads),
+           "--max-batch", str(max(8, games)), "--seed", str(seed)]
+    if cuda:
+        cmd.append("--cuda")
+    out = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    m = re.search(r"A_score\s+([\d.]+)", out.stdout)
+    if not m:
+        raise RuntimeError(f"no A_score in output:\n{out.stdout}\n{out.stderr}")
+    return float(m.group(1))
+
+
 def run_vs_mohex(engine: str, ckpt: str, games: int, sims: int, playouts: int,
                  mohex_bin: str, cuda: bool, seed: int) -> float:
     cmd = [engine, "vs-mohex", "--model", ckpt, "--games", str(games),
@@ -101,7 +122,13 @@ def main() -> None:
     ap.add_argument("--live", default="data/models/hex_az/live")
     ap.add_argument("--engine", default="target/release/hex-engine")
     ap.add_argument("--mohex-bin", default="mohex")
-    ap.add_argument("--games", type=int, default=8)
+    ap.add_argument("--games", type=int, default=24,
+                    help="games in the candidate-vs-champion gate match")
+    ap.add_argument("--promote-threshold", type=float, default=0.55,
+                    help="AGZ used 55%% over 400 games; with fewer games this is noisier")
+    ap.add_argument("--threads", type=int, default=8)
+    ap.add_argument("--mohex-games", type=int, default=8,
+                    help="games against MoHex, run only when a net promotes")
     ap.add_argument("--sims", type=int, default=400)
     ap.add_argument("--mohex-playouts", type=int, default=1000)
     ap.add_argument("--channels", type=int, default=64)
@@ -127,9 +154,9 @@ def main() -> None:
                  "scores": {}, "history": []}
 
     release_pause(live)  # never inherit a stale flag
-    print(f"hex evaluator: best gen {state['best_gen']} ({state['best_score']:.3f}), "
-          f"{args.games} games vs mohex@{args.mohex_playouts} every {args.every} gens",
-          flush=True)
+    print(f"hex evaluator: champion gen {state['best_gen']} (vs mohex {state['best_score']:.3f}); "
+          f"gate = {args.games} games vs champion at >={args.promote_threshold:.0%}, "
+          f"every {args.every} gens", flush=True)
 
     while True:
         gens = snapshots(snaps)
@@ -137,8 +164,19 @@ def main() -> None:
             gen, ck = gens[-1]
             parked = request_pause(live, args.pause_timeout)
             try:
-                sc = run_vs_mohex(args.engine, ck, args.games, args.sims,
-                                  args.mohex_playouts, args.mohex_bin, args.cuda, seed=gen)
+                if os.path.exists(best_ckpt):
+                    vs_best = run_match(args.engine, ck, best_ckpt, args.games,
+                                        args.sims, args.threads, args.cuda, seed=gen)
+                    promoted = vs_best >= args.promote_threshold
+                else:
+                    vs_best = 1.0  # nothing to beat yet
+                    promoted = True
+                # MoHex is the absolute yardstick, and it is expensive, so ask it
+                # only about nets that just earned the seat.
+                mohex = None
+                if promoted:
+                    mohex = run_vs_mohex(args.engine, ck, args.mohex_games, args.sims,
+                                         args.mohex_playouts, args.mohex_bin, args.cuda, seed=gen)
             except Exception as e:
                 release_pause(live)
                 print(f"gen{gen}: eval failed: {e}", flush=True)
@@ -148,25 +186,29 @@ def main() -> None:
                 continue
             release_pause(live)
 
-            promoted = sc > state["best_score"]
             if promoted:
                 shutil.copyfile(ck, best_ckpt)
                 try:
                     export_onnx(ck, best_onnx, args.channels, args.blocks)
                 except Exception as e:
                     print(f"gen{gen}: promoted but ONNX export failed: {e}", flush=True)
-                state["best_gen"], state["best_score"] = gen, sc
-            state["scores"][str(gen)] = sc
-            state["history"].append({"gen": gen, "score": sc, "promoted": promoted})
+                state["best_gen"] = gen
+                if mohex is not None:
+                    state["best_score"] = mohex
+            state["scores"][str(gen)] = {"vs_best": vs_best, "vs_mohex": mohex}
+            state["history"].append(
+                {"gen": gen, "vs_best": vs_best, "vs_mohex": mohex, "promoted": promoted}
+            )
             state["processed_through"] = gen
             tmp = scores_path + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(state, f, indent=2)
             os.replace(tmp, scores_path)
 
-            tag = "PROMOTED" if promoted else f"best stays gen{state['best_gen']} ({state['best_score']:.3f})"
+            tag = "PROMOTED" if promoted else f"champion stays gen{state['best_gen']}"
+            mh = f", vs mohex {mohex:.3f}" if mohex is not None else ""
             pk = "" if parked else " [pause timeout: ran with contention]"
-            print(f"gen{gen} vs mohex: {sc:.3f}  [{tag}]{pk}", flush=True)
+            print(f"gen{gen} vs champion: {vs_best:.3f}{mh}  [{tag}]{pk}", flush=True)
             if args.once:
                 return
         elif args.once:

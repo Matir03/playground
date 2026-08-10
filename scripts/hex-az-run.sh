@@ -45,7 +45,8 @@ GEN_EXAMPLES="${GEN_EXAMPLES:-100000}"
 
 # Gate. MoHex at 1000 playouts is a modest but real yardstick; 8 games keeps the
 # actor paused only briefly, and every 3rd generation keeps that rare.
-EVAL_GAMES="${EVAL_GAMES:-8}"
+EVAL_GAMES="${EVAL_GAMES:-24}"      # candidate vs champion (the gate)
+MOHEX_GAMES="${MOHEX_GAMES:-8}"    # absolute yardstick, only for nets that promote
 EVAL_SIMS="${EVAL_SIMS:-400}"
 MOHEX_PLAYOUTS="${MOHEX_PLAYOUTS:-1000}"
 EVAL_EVERY="${EVAL_EVERY:-3}"
@@ -84,7 +85,8 @@ start() {
   if [[ "${GATE:-1}" == "1" ]]; then
     supervise evaluator "$PYTHON $repo/python/hex_eval_loop.py --live $LIVE \
         --engine $ENGINE --mohex-bin ${MOHEX_BIN:-mohex} --cuda \
-        --games $EVAL_GAMES --sims $EVAL_SIMS --mohex-playouts $MOHEX_PLAYOUTS \
+        --games $EVAL_GAMES --mohex-games $MOHEX_GAMES --sims $EVAL_SIMS \
+        --mohex-playouts $MOHEX_PLAYOUTS \
         --every $EVAL_EVERY --channels $CHANNELS --blocks $BLOCKS" \
         PYTHONPATH="$repo/python/src"
   fi
