@@ -48,6 +48,7 @@ pub fn run_match(
         resign_threshold: 0.0,
         resign_consecutive: 0,
         resign_playout_frac: 0.0,
+            forced_playout_k: 0.0,
     };
     let t0 = Instant::now();
     let a_score =

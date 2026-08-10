@@ -239,6 +239,7 @@ async fn main() -> anyhow::Result<()> {
                 sims: 0, node_budget, c_puct, dir_alpha: 0.5, dir_eps: 0.0, temp_moves: 0,
                 explore_eps: 0.0, max_ply, settle_plies: 0, resign_threshold: 0.0,
                 resign_consecutive: 0, resign_playout_frac: 0.0,
+            forced_playout_k: 0.0,
             };
             tokio::task::spawn_blocking(move || {
                 selfplay::run_benchmark(&model, cuda, concurrency, threads, params, max_batch, seed,
@@ -255,6 +256,7 @@ async fn main() -> anyhow::Result<()> {
             let params = SearchParams {
                 sims: 0, node_budget, c_puct, dir_alpha, dir_eps, temp_moves, explore_eps: 0.0,
                 max_ply, settle_plies: 0, resign_threshold, resign_consecutive, resign_playout_frac,
+                forced_playout_k: 0.0,
             };
             tokio::task::spawn_blocking(move || {
                 selfplay::run_loop(&live, cuda, params, concurrency, chunk_secs, max_chunks, threads,

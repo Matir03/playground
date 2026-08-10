@@ -370,6 +370,58 @@ mod tests {
         }
     }
 
+    /// The cold-start failure this whole mechanism exists for: with a flat policy
+    /// and an uninformative value head, root Dirichlet noise decides which move
+    /// the search commits to — and that noise then *is* the policy target. With
+    /// forced playouts + pruning the noise is explored but subtracted back out,
+    /// so repeated searches of the same position agree far more often.
+    #[test]
+    fn pruning_takes_the_exploration_noise_out_of_the_target() {
+        let base = SearchParams {
+            sims: 0,
+            node_budget: 200,
+            c_puct: 0.6,
+            dir_alpha: 0.3,
+            dir_eps: 0.25,
+            temp_moves: 0,
+            explore_eps: 0.0,
+            max_ply: 0,
+            settle_plies: 0,
+            resign_threshold: 0.0,
+            resign_consecutive: 0,
+            resign_playout_frac: 0.0,
+            forced_playout_k: 0.0,
+        };
+        // How often do independent searches of the *same* opening agree?
+        let agreement = |k: f32| {
+            let params = SearchParams { forced_playout_k: k, ..base };
+            let (records, _) = batch_search::run_selfplay_moves::<Hex>(
+                &FlatPolicyNoisyValue, 32, params, 4, 16, 11, 25.0, 0.0,
+            );
+            let picks: Vec<usize> = records
+                .iter()
+                .filter_map(|r| r.moves.first())
+                .map(|mv| (0..mv.moves.len()).max_by_key(|&i| mv.visits[i]).unwrap())
+                .collect();
+            let mut counts = std::collections::HashMap::new();
+            for p in &picks {
+                *counts.entry(*p).or_insert(0usize) += 1;
+            }
+            let top = counts.values().copied().max().unwrap_or(0);
+            (picks.len(), counts.len(), top as f32 / picks.len().max(1) as f32)
+        };
+        let (n_off, distinct_off, top_off) = agreement(0.0);
+        let (n_on, distinct_on, top_on) = agreement(2.0);
+        println!(
+            "noise in target:  {n_off} games, {distinct_off} distinct openings, most common {top_off:.2}\n             noise pruned:     {n_on} games, {distinct_on} distinct openings, most common {top_on:.2}"
+        );
+        assert!(n_off > 8 && n_on > 8, "not enough games to compare");
+        assert!(
+            top_on >= top_off,
+            "pruning made the targets *less* consistent: {top_on:.2} vs {top_off:.2}"
+        );
+    }
+
     /// Stand-in for a barely-trained net: a flat policy and a value that varies
     /// with the position but means nothing (what the real value head looks like
     /// for the first few generations).
@@ -414,6 +466,7 @@ mod tests {
             resign_threshold: 0.0,
             resign_consecutive: 0,
             resign_playout_frac: 0.0,
+            forced_playout_k: 0.0,
         };
         let (records, _) =
             batch_search::run_selfplay_moves::<Hex>(&FlatPolicyNoisyValue, 2, params, 2, 2, 5, 30.0, 0.0);
@@ -493,6 +546,7 @@ mod tests {
             resign_threshold: 0.0,
             resign_consecutive: 0,
             resign_playout_frac: 0.0,
+            forced_playout_k: 0.0,
         };
         // Many games in flight against a small batch, so rows are mixed.
         let (records, _stats) =
@@ -540,6 +594,7 @@ mod tests {
             resign_threshold: 0.0,
             resign_consecutive: 0,
             resign_playout_frac: 0.0,
+            forced_playout_k: 0.0,
         };
         let (records, _stats) =
             batch_search::run_selfplay_moves::<Hex>(&Uniform, 8, params, 2, 8, 1, 20.0, 0.0);

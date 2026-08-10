@@ -103,6 +103,21 @@ pub struct SearchParams {
     /// safeguard, so a too-aggressive threshold can't silently corrupt training
     /// with false resignations. 0 = every game may resign.
     pub resign_playout_frac: f32,
+    /// KataGo-style **forced playouts + policy target pruning** (0 = off, 2.0 is
+    /// KataGo's k).
+    ///
+    /// Root Dirichlet noise exists to make the search *try* moves it wouldn't
+    /// otherwise. The problem is that the visit counts it produces are also the
+    /// policy training target, so the exploration noise is taught to the net as
+    /// if it were the search's judgement. On a wide board with an uninformative
+    /// value head that is most of the target: 374 searches of the same empty
+    /// Hex board picked 58 different first moves.
+    ///
+    /// With this on, each root child is *forced* to at least `sqrt(k · p · N)`
+    /// visits so the noise is genuinely explored — and those forced visits are
+    /// then subtracted back out when the target is written. The search sees the
+    /// noise; the training data doesn't.
+    pub forced_playout_k: f32,
 }
 
 /// One move's training-relevant record (policy target + the move actually played).
@@ -1018,6 +1033,18 @@ impl<M: MoveGame> MvSearch<M> {
         // with thousands of moves.
         let parent_q = if nd.total_n > 0 { nd.w_sum / nd.total_n as f32 } else { 0.0 };
         let fpu = crate::puct::fpu(parent_q, nd.visited_p);
+        // Forced playouts (root only): make sure a child the noise favours is
+        // actually tried, rather than dismissed after one bad rollout. The
+        // visits spent here are subtracted from the training target later, in
+        // `policy_counts_pruned` — that is the whole point of forcing them.
+        if node == 0 && self.params.forced_playout_k > 0.0 && nd.total_n > 0 {
+            let n = nd.total_n as f32;
+            for (a, e) in nd.entries.iter().enumerate() {
+                if (e.n as f32) < forced_playouts(self.params.forced_playout_k, e.p, n) {
+                    return a;
+                }
+            }
+        }
         let mut best = 0;
         let mut best_score = f32::NEG_INFINITY;
         for (a, e) in nd.entries.iter().enumerate() {
@@ -1143,9 +1170,48 @@ impl<M: MoveGame> MvSearch<M> {
         }
     }
 
-    /// Visit counts at the root (the policy target, parallel to `root_moves`).
+    /// Visit counts at the root — what the search actually did, and what the move
+    /// is chosen from.
     fn policy_counts(&self) -> Vec<u32> {
         self.arena[0].entries.iter().map(|e| e.n).collect()
+    }
+
+    /// The same counts with the forced (noise-driven) visits taken back out —
+    /// the *training* target. Every child but the most-visited one gives back up
+    /// to `sqrt(k · p · N)` visits, and a child left with a single visit is
+    /// dropped: one visit is indistinguishable from noise.
+    ///
+    /// Simpler than KataGo's rule, which stops subtracting when a child's PUCT
+    /// value would overtake the best child's; this can prune a little harder.
+    fn policy_counts_pruned(&self) -> Vec<u32> {
+        let mut counts = self.policy_counts();
+        let k = self.params.forced_playout_k;
+        let root = &self.arena[0];
+        if k <= 0.0 || root.total_n == 0 {
+            return counts;
+        }
+        let n = root.total_n as f32;
+        let best = counts
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, c)| *c)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        for (i, e) in root.entries.iter().enumerate() {
+            if i == best {
+                continue;
+            }
+            let give_back = forced_playouts(k, e.p, n) as u32;
+            counts[i] = counts[i].saturating_sub(give_back);
+            if counts[i] <= 1 {
+                counts[i] = 0;
+            }
+        }
+        // Never hand back an empty target.
+        if counts.iter().all(|&c| c == 0) {
+            counts[best] = self.policy_counts()[best].max(1);
+        }
+        counts
     }
 
     fn root_moves(&self) -> Vec<M::Move> {
@@ -1202,6 +1268,9 @@ impl<M: MoveGame> MvRunner<M> {
 
     fn complete_move(&mut self, params: &SearchParams) {
         let counts = self.search.policy_counts();
+        // The move is chosen from what the search actually did; the *target*
+        // records it with the forced exploration visits removed.
+        let target = self.search.policy_counts_pruned();
         let root_value = self.search.root_value();
         let sum: u32 = counts.iter().sum();
         let cur = self.states.last().unwrap();
@@ -1237,7 +1306,7 @@ impl<M: MoveGame> MvRunner<M> {
         }
 
         let next = M::apply(cur, &moves[played]);
-        self.moves.push(MvMoveRecord { moves, visits: counts, played, to_move });
+        self.moves.push(MvMoveRecord { moves, visits: target, played, to_move });
         self.states.push(next.clone());
 
         let capped = params.max_ply > 0 && self.states.len() as u32 - 1 >= params.max_ply;
@@ -1388,6 +1457,13 @@ fn mv_advance<M: MoveGame>(
 /// difference beyond run-to-run noise (holding more batches only starves the
 /// queue that fills them).
 const BATCH_PIPELINE_DEPTH: usize = 1;
+
+/// How many visits a root child is forced to receive before the search may judge
+/// it on its merits: `sqrt(k · p · N)` (KataGo).
+#[inline]
+fn forced_playouts(k: f32, prior: f32, root_visits: f32) -> f32 {
+    (k * prior * root_visits).max(0.0).sqrt()
+}
 
 /// One assembled batch: the games it belongs to, their planes padded to the fixed
 /// shape, and how long the gatherer blocked for the first leaf.

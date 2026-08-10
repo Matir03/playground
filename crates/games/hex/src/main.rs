@@ -129,6 +129,10 @@ enum Cmd {
         /// Sample from the visit counts for this many opening plies, then argmax.
         #[arg(long, default_value_t = 12)]
         temp_moves: u32,
+        /// KataGo forced playouts + policy target pruning (0 = off, 2.0 = KataGo's k):
+        /// explore the Dirichlet noise, then subtract it back out of the target.
+        #[arg(long, default_value_t = 2.0)]
+        forced_playout_k: f32,
         #[arg(long, default_value_t = 0)]
         seed: u64,
         /// Inference backend: `candle` (latest.safetensors) or `ort` (model.onnx).
@@ -348,9 +352,10 @@ async fn main() -> anyhow::Result<()> {
         Cmd::SelfPlay { addr, model_uri, .. } => serve(addr, &model_uri, &[], false).await?,
         Cmd::SelfplayLoop {
             live, cuda, concurrency, max_batch, chunk_secs, max_chunks, threads, node_budget,
-            c_puct, dir_alpha, dir_eps, temp_moves, seed, backend, ep, fp16,
+            c_puct, dir_alpha, dir_eps, temp_moves, forced_playout_k, seed, backend, ep, fp16,
         } => {
-            let params = search_params(node_budget, c_puct, dir_alpha, dir_eps, temp_moves);
+            let mut params = search_params(node_budget, c_puct, dir_alpha, dir_eps, temp_moves);
+            params.forced_playout_k = forced_playout_k;
             selfplay::run_loop(
                 &live, cuda, params, concurrency, chunk_secs, max_chunks,
                 threads.unwrap_or_else(default_threads), max_batch, seed,
@@ -463,6 +468,7 @@ fn search_params(
         resign_threshold: 0.0,
         resign_consecutive: 0,
         resign_playout_frac: 0.0,
+            forced_playout_k: 0.0,
     }
 }
 

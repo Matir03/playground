@@ -154,6 +154,7 @@ fn to_search_params(p: &Params) -> SearchParams {
         resign_threshold: p.resign_threshold,
         resign_consecutive: p.resign_consecutive,
         resign_playout_frac: p.resign_playout_frac,
+            forced_playout_k: 0.0,
     }
 }
 
