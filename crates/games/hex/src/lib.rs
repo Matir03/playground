@@ -1,10 +1,14 @@
 //! Hex 13×13: rules ([`game`]), the 169-bit board ([`bitboard`]) and the MoHex
 //! bridge ([`mohex`]).
 //!
-//! A library as well as a binary because the AZ pieces that come next (net,
-//! search, self-play, and any eval tooling) all need the rules and the
-//! symmetry/plane helpers.
+//! Plus the plain-AlphaZero stack built on them: the net ([`net`]), the PUCT
+//! search ([`mcts`]), self-play generation ([`selfplay`]) and the two ways to
+//! rate a checkpoint ([`eval`]).
 
 pub mod bitboard;
+pub mod eval;
 pub mod game;
+pub mod mcts;
 pub mod mohex;
+pub mod net;
+pub mod selfplay;

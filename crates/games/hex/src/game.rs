@@ -23,8 +23,9 @@ use crate::bitboard::{Bb, BOARD_MASK};
 
 pub const N: usize = 13;
 pub const NN: usize = N * N; // 169 cells
-/// Input planes for the AZ net: own stones, opponent stones, side-to-move.
-pub const PLANES: usize = 3;
+/// Input planes for the AZ net: own stones, opponent stones — in the *canonical*
+/// frame (see [`fill_planes_into`]), which is why no side-to-move plane is needed.
+pub const PLANES: usize = 2;
 
 /// Whether the swap (pie) rule is in force. When on, Second's *only* extra
 /// option is [`HexMove::Swap`] as the reply to First's opening move: First's
@@ -276,16 +277,42 @@ pub fn canonical(state: &HexState) -> HexState {
     if state.to_move == 1 { *state } else { transpose_swap(state) }
 }
 
-/// Write the `PLANES`×13×13 net input (own stones, opponent stones, side-to-move)
-/// into `out` (len 507). Single source of truth for self-play and training.
+/// The cell index `i` as the mover sees it — identity for Black, transposed for
+/// White. Converts between the real board and the canonical frame that
+/// [`fill_planes_into`] encodes and the policy head indexes.
+#[inline]
+pub fn canon_index(state: &HexState, i: usize) -> usize {
+    if state.to_move == 1 { i } else { transpose_index(i) }
+}
+
+/// Write the `PLANES`×13×13 net input into `out` (len 338). Single source of truth
+/// for self-play, training and interactive play.
+///
+/// The position is encoded **canonically**: plane 0 is the mover's stones, plane 1
+/// the opponent's, and when White is to move the board is transposed first, so the
+/// net always sees a position where *it* is the player connecting top↔bottom. That
+/// is [`transpose_swap`] applied for free, and it is why there is no side-to-move
+/// plane: the two colours are the same problem, and folding them together halves
+/// what the net has to learn. The policy head's index space is this same frame —
+/// map it back with [`canon_index`].
 pub fn fill_planes_into(state: &HexState, out: &mut [f32]) {
     debug_assert_eq!(out.len(), PLANES * NN);
+    out.fill(0.0);
     let (own, opp) = state.own_opp();
-    let side: f32 = if state.to_move == 1 { 1.0 } else { 0.0 };
-    for i in 0..NN {
-        out[i] = own.get(i) as u8 as f32;
-        out[NN + i] = opp.get(i) as u8 as f32;
-        out[2 * NN + i] = side;
+    if state.to_move == 1 {
+        for i in own.iter() {
+            out[i] = 1.0;
+        }
+        for i in opp.iter() {
+            out[NN + i] = 1.0;
+        }
+    } else {
+        for i in own.iter() {
+            out[transpose_index(i)] = 1.0;
+        }
+        for i in opp.iter() {
+            out[NN + transpose_index(i)] = 1.0;
+        }
     }
 }
 
@@ -370,16 +397,10 @@ impl Game for Hex {
     }
 
     fn to_features(state: &Self::State) -> Vec<u8> {
-        let (own, opp) = state.own_opp();
-        let mut out = Vec::with_capacity(PLANES * NN);
-        for bb in [own, opp] {
-            for i in 0..NN {
-                out.push(bb.get(i) as u8);
-            }
-        }
-        let side_plane: u8 = if state.to_move == 1 { 1 } else { 0 };
-        out.resize(PLANES * NN, side_plane);
-        out
+        // Same canonical layout as `fill_planes_into`, one byte per cell.
+        let mut planes = vec![0f32; PLANES * NN];
+        fill_planes_into(state, &mut planes);
+        planes.into_iter().map(|x| x as u8).collect()
     }
 
     fn encode_state(state: &Self::State) -> Vec<u8> {
@@ -660,10 +681,33 @@ mod tests {
         for (b, p) in bytes.iter().zip(&planes) {
             assert_eq!(*b as f32, *p);
         }
-        // White to move: own = white (empty), opp = black (one stone at g7).
+        // White to move: plane 0 (mine) empty, plane 1 (theirs) has the black stone
+        // — at its *transposed* cell, since the canonical frame flips the board.
         let (r, c) = parse_cell("g7").unwrap();
-        assert_eq!(planes[r * N + c], 0.0);
-        assert_eq!(planes[NN + r * N + c], 1.0);
-        assert_eq!(planes[2 * NN], 0.0);
+        assert_eq!(planes[..NN].iter().sum::<f32>(), 0.0);
+        assert_eq!(planes[NN + transpose_index(r * N + c)], 1.0);
+    }
+
+    #[test]
+    fn canonical_planes_make_the_two_colours_one_problem() {
+        // A position and its transpose+colour-swap are the same game with the roles
+        // exchanged, so the mover sees byte-identical planes in both.
+        let mut s = Hex::initial_state();
+        for cell in ["g7", "d4", "h7", "e4", "i7"] {
+            s = play(&s, cell);
+        }
+        let mirrored = transpose_swap(&s);
+        let mut a = vec![0f32; PLANES * NN];
+        let mut b = vec![0f32; PLANES * NN];
+        fill_planes_into(&s, &mut a);
+        fill_planes_into(&mirrored, &mut b);
+        assert_eq!(a, b);
+        // Plane 0 is always the mover's stones, seen as the vertical player.
+        assert_eq!(a[..NN].iter().sum::<f32>(), s.own_opp().0.count() as f32);
+        // And the index mapping round-trips: canonical → real → canonical.
+        for i in 0..NN {
+            assert_eq!(canon_index(&s, canon_index(&s, i)), i);
+            assert_eq!(canon_index(&mirrored, canon_index(&mirrored, i)), i);
+        }
     }
 }

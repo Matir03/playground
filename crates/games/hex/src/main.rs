@@ -1,17 +1,69 @@
-//! Hex 13×13 engine binary. See connect4-engine for subcommand semantics.
-//!
-//! Beyond `serve`/`self-play`, this exposes the MoHex bridge: `verify` checks our
-//! rules against MoHex over random games, `match` plays games against it.
+//! Hex 13×13 engine binary: AZ self-play training (`selfplay-loop`, `eval-match`,
+//! `selfplay-bench`, `vs-mohex`), the gRPC serve path, and the MoHex bridge
+//! (`verify` cross-checks the rules, `match` plays MoHex against a stand-in).
+//! See amazons-engine for the pattern the training subcommands follow.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Instant;
 
+use async_trait::async_trait;
 use clap::{Parser, Subcommand};
-use playground_core::Game;
+use playground_core::batch_search::SearchParams;
+use playground_core::{Game, LatentGameState, ModelClient, PolicyCandidate};
 use playground_model_client::RemoteModelClient;
 
-use hex_engine::game::Hex;
-use hex_engine::mohex;
+use hex_engine::game::{Hex, HexMove, HexState};
+use hex_engine::{eval, mohex, net, selfplay};
+
+/// A model the engine can serve: a remote Python model server (gRPC) or the AZ net
+/// embedded in-process via candle. `--model-local name=ckpt` is embedded, the
+/// default `--model-uri` is remote. Mirrors amazons-engine.
+enum HexModel {
+    Remote(RemoteModelClient<Hex>),
+    Local(net::LocalModel),
+}
+
+#[async_trait]
+impl ModelClient<Hex> for HexModel {
+    async fn encode(&self, state: &HexState) -> anyhow::Result<LatentGameState> {
+        match self {
+            Self::Remote(m) => m.encode(state).await,
+            Self::Local(m) => m.encode(state).await,
+        }
+    }
+    async fn eval(&self, lgs: &LatentGameState) -> anyhow::Result<f64> {
+        match self {
+            Self::Remote(m) => m.eval(lgs).await,
+            Self::Local(m) => m.eval(lgs).await,
+        }
+    }
+    async fn policy(&self, lgs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>> {
+        match self {
+            Self::Remote(m) => m.policy(lgs, top_b).await,
+            Self::Local(m) => m.policy(lgs, top_b).await,
+        }
+    }
+    async fn reify(
+        &self,
+        from_state: &HexState,
+        from_lgs: &LatentGameState,
+        to_lgs: &LatentGameState,
+        action_seed: Option<&[u8]>,
+        noise_scale: Option<f64>,
+    ) -> anyhow::Result<HexMove> {
+        match self {
+            Self::Remote(m) => m.reify(from_state, from_lgs, to_lgs, action_seed, noise_scale).await,
+            Self::Local(m) => m.reify(from_state, from_lgs, to_lgs, action_seed, noise_scale).await,
+        }
+    }
+    async fn model_version(&self) -> anyhow::Result<String> {
+        match self {
+            Self::Remote(m) => m.model_version().await,
+            Self::Local(m) => m.model_version().await,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "hex-engine", version)]
@@ -27,6 +79,13 @@ enum Cmd {
         addr: SocketAddr,
         #[arg(long, default_value = "http://127.0.0.1:7204")]
         model_uri: String,
+        /// Embedded AZ net(s), as `name=checkpoint.safetensors`. The UI's NN seat
+        /// selects by name; with none given only the remote model server is served.
+        #[arg(long = "model-local", value_name = "NAME=CHECKPOINT")]
+        models_local: Vec<String>,
+        /// Run the embedded net on the GPU (candle cuda). Needs the `cuda` feature.
+        #[arg(long)]
+        cuda: bool,
         /// Play MoHex for `RequestMove(player = EXTERNAL)` seats. Needs
         /// scripts/fetch-mohex.sh; without it those requests are refused.
         #[arg(long)]
@@ -37,6 +96,107 @@ enum Cmd {
         /// Default MoHex seconds per move (0 = budget by playouts only).
         #[arg(long, default_value_t = 0.0)]
         mohex_time: f64,
+    },
+    /// Continuous AZ self-play actor: hot-load live weights, append chunks to the
+    /// learner's replay buffer.
+    SelfplayLoop {
+        #[arg(long, default_value = "data/models/hex_az/live")]
+        live: String,
+        #[arg(long)]
+        cuda: bool,
+        /// Concurrent games kept in flight (overcommit ~3× max-batch).
+        #[arg(long, default_value_t = 512)]
+        concurrency: usize,
+        #[arg(long, default_value_t = 256)]
+        max_batch: usize,
+        /// Wall-clock seconds of self-play per buffer chunk.
+        #[arg(long, default_value_t = 60.0)]
+        chunk_secs: f64,
+        /// Replay-buffer window, in chunks.
+        #[arg(long, default_value_t = 40)]
+        max_chunks: usize,
+        #[arg(long)]
+        threads: Option<usize>,
+        #[arg(long, default_value_t = 400)]
+        node_budget: u32,
+        #[arg(long, default_value_t = 1.5)]
+        c_puct: f32,
+        /// Root Dirichlet noise (AZ exploration).
+        #[arg(long, default_value_t = 0.3)]
+        dir_alpha: f32,
+        #[arg(long, default_value_t = 0.25)]
+        dir_eps: f32,
+        /// Sample from the visit counts for this many opening plies, then argmax.
+        #[arg(long, default_value_t = 12)]
+        temp_moves: u32,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Self-play throughput benchmark (runs for `--secs` wall-clock).
+    SelfplayBench {
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        cuda: bool,
+        #[arg(long, default_value_t = 512)]
+        concurrency: usize,
+        #[arg(long, default_value_t = 20.0)]
+        secs: f64,
+        #[arg(long)]
+        threads: Option<usize>,
+        #[arg(long, default_value_t = 256)]
+        max_batch: usize,
+        #[arg(long, default_value_t = 400)]
+        node_budget: u32,
+        #[arg(long, default_value_t = 1.5)]
+        c_puct: f32,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Head-to-head between two checkpoints (relative strength / ELO).
+    EvalMatch {
+        #[arg(long)]
+        a: String,
+        #[arg(long)]
+        b: String,
+        #[arg(long)]
+        cuda: bool,
+        #[arg(long, default_value_t = 32)]
+        games: usize,
+        #[arg(long, default_value_t = 400)]
+        node_budget: u32,
+        #[arg(long, default_value_t = 1.5)]
+        c_puct: f32,
+        #[arg(long, default_value_t = 4)]
+        temp_moves: u32,
+        #[arg(long)]
+        threads: Option<usize>,
+        #[arg(long, default_value_t = 64)]
+        max_batch: usize,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Absolute strength: the net (with search) against MoHex.
+    VsMohex {
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        cuda: bool,
+        #[arg(long, default_value = "mohex")]
+        mohex_bin: String,
+        #[arg(long, default_value_t = 10)]
+        games: u32,
+        /// Net simulations per move.
+        #[arg(long, default_value_t = 400)]
+        sims: u32,
+        #[arg(long, default_value_t = 1.5)]
+        c_puct: f32,
+        #[arg(long, default_value_t = 1000)]
+        mohex_playouts: u32,
+        #[arg(long, default_value_t = 0.0)]
+        mohex_time: f64,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
     },
     SelfPlay {
         #[arg(long, default_value = "127.0.0.1:7104")]
@@ -71,6 +231,30 @@ enum Cmd {
         #[arg(long, default_value_t = 0.0)]
         mohex_time: f64,
     },
+    /// Print the net's raw value and top policy cells for a position (given as the
+    /// moves played from the empty board). Debug aid, and the Rust↔Python parity check.
+    NetEval {
+        #[arg(long)]
+        model: String,
+        /// Moves played from the empty board, e.g. `g7,d4,h7`.
+        #[arg(long, default_value = "")]
+        moves: String,
+        #[arg(long, default_value_t = 5)]
+        top: usize,
+    },
+    /// Raw forward throughput of the net (positions/s), with no search around it —
+    /// the ceiling `selfplay-bench` can approach, and how you tell a GPU-bound
+    /// actor from a CPU-bound one.
+    NetBench {
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        cuda: bool,
+        #[arg(long, default_value_t = 256)]
+        batch: usize,
+        #[arg(long, default_value_t = 50)]
+        iters: usize,
+    },
     /// Random-playout throughput of the rules (moves/s), the AZ self-play floor.
     Bench {
         #[arg(long, default_value_t = 2000)]
@@ -87,14 +271,44 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Serve { addr, model_uri, mohex_bin, mohex_playouts, mohex_time } => {
+        Cmd::Serve { addr, model_uri, models_local, cuda, mohex_bin, mohex_playouts, mohex_time } => {
             if let Some(bin) = &mohex_bin {
                 mohex::install(bin, mohex_playouts, mohex_time)?;
                 tracing::info!(bin, mohex_playouts, mohex_time, "mohex opponent ready");
             }
-            serve(addr, &model_uri).await?;
+            serve(addr, &model_uri, &models_local, cuda).await?;
         }
-        Cmd::SelfPlay { addr, model_uri, .. } => serve(addr, &model_uri).await?,
+        Cmd::SelfPlay { addr, model_uri, .. } => serve(addr, &model_uri, &[], false).await?,
+        Cmd::SelfplayLoop {
+            live, cuda, concurrency, max_batch, chunk_secs, max_chunks, threads, node_budget,
+            c_puct, dir_alpha, dir_eps, temp_moves, seed,
+        } => {
+            let params = search_params(node_budget, c_puct, dir_alpha, dir_eps, temp_moves);
+            selfplay::run_loop(
+                &live, cuda, params, concurrency, chunk_secs, max_chunks,
+                threads.unwrap_or_else(default_threads), max_batch, seed,
+            )?;
+        }
+        Cmd::SelfplayBench {
+            model, cuda, concurrency, secs, threads, max_batch, node_budget, c_puct, seed,
+        } => {
+            let params = search_params(node_budget, c_puct, 0.3, 0.25, 12);
+            selfplay::run_benchmark(
+                &model, cuda, concurrency, threads.unwrap_or_else(default_threads), params,
+                max_batch, seed, secs,
+            )?;
+        }
+        Cmd::EvalMatch { a, b, cuda, games, node_budget, c_puct, temp_moves, threads, max_batch, seed } => {
+            eval::run_match(
+                &a, &b, cuda, games, node_budget, c_puct, temp_moves,
+                threads.unwrap_or_else(default_threads), max_batch, seed,
+            )?;
+        }
+        Cmd::VsMohex { model, cuda, mohex_bin, games, sims, c_puct, mohex_playouts, mohex_time, seed } => {
+            eval::run_vs_mohex(
+                &model, cuda, &mohex_bin, games, sims, c_puct, mohex_playouts, mohex_time, seed,
+            )?;
+        }
         Cmd::Verify { mohex_bin, games, seed } => {
             mohex::verify_rules(&mohex_bin, games, seed)?;
         }
@@ -108,16 +322,126 @@ async fn main() -> anyhow::Result<()> {
                 moves[(rng >> 33) as usize % moves.len()]
             })?;
         }
+        Cmd::NetEval { model, moves, top } => net_eval(&model, &moves, top)?,
+        Cmd::NetBench { model, cuda, batch, iters } => net_bench(&model, cuda, batch, iters)?,
         Cmd::Bench { games } => bench(games),
         Cmd::Stdio => anyhow::bail!("stdio: implement when needed"),
     }
     Ok(())
 }
 
-async fn serve(addr: SocketAddr, model_uri: &str) -> anyhow::Result<()> {
-    let model = RemoteModelClient::<Hex>::connect(model_uri).await?;
-    let models = std::collections::HashMap::from([("nn".to_string(), model)]);
+async fn serve(
+    addr: SocketAddr,
+    model_uri: &str,
+    models_local: &[String],
+    cuda: bool,
+) -> anyhow::Result<()> {
+    let mut models: HashMap<String, HexModel> = HashMap::new();
+    if models_local.is_empty() {
+        let remote = RemoteModelClient::<Hex>::connect(model_uri).await?;
+        models.insert("nn".to_string(), HexModel::Remote(remote));
+    } else {
+        let device = net::pick_device(cuda)?;
+        for spec in models_local {
+            let (name, ckpt) = spec
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("--model-local wants NAME=CHECKPOINT, got {spec:?}"))?;
+            let m = net::LocalModel::load_on(ckpt, device.clone())?;
+            tracing::info!(name, ckpt, "loaded embedded AZ net");
+            models.insert(name.to_string(), HexModel::Local(m));
+        }
+    }
     playground_engine_server::run::<Hex, _>(addr, models).await
+}
+
+/// Search knobs for self-play. Hex always terminates within 169 plies, so the ply
+/// cap is a backstop and neither score-stability nor resignation applies (a
+/// resignation threshold would need calibrating against a trained net first).
+fn search_params(
+    node_budget: u32,
+    c_puct: f32,
+    dir_alpha: f32,
+    dir_eps: f32,
+    temp_moves: u32,
+) -> SearchParams {
+    SearchParams {
+        sims: 0,
+        node_budget,
+        c_puct,
+        dir_alpha,
+        dir_eps,
+        temp_moves,
+        explore_eps: 0.0,
+        max_ply: 200,
+        settle_plies: 0,
+        resign_threshold: 0.0,
+        resign_consecutive: 0,
+        resign_playout_frac: 0.0,
+    }
+}
+
+fn default_threads() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8)
+}
+
+/// Value + top policy cells for a position, as JSON. `moves` is a comma-separated
+/// list of cells played from the empty board.
+fn net_eval(model: &str, moves: &str, top: usize) -> anyhow::Result<()> {
+    let mut state = <Hex as Game>::initial_state();
+    for token in moves.split(',').filter(|t| !t.trim().is_empty()) {
+        let (r, c) = hex_engine::game::parse_cell(token)
+            .ok_or_else(|| anyhow::anyhow!("bad cell {token:?}"))?;
+        state = <Hex as Game>::apply(&state, &HexMove::Play { r: r as u8, c: c as u8 });
+    }
+    let m = net::LocalModel::load(model)?;
+    let (vals, logits) = m.value_policy_batch(&[&state])?;
+    // Report in board terms: the priors the search would actually use.
+    let (mut mvs, mut priors) = (Vec::new(), Vec::new());
+    <Hex as playground_core::batch_search::MoveGame>::expand(&state, &logits, &mut mvs, &mut priors);
+    let mut order: Vec<usize> = (0..mvs.len()).collect();
+    order.sort_by(|&a, &b| priors[b].total_cmp(&priors[a]));
+    let best: Vec<serde_json::Value> = order
+        .iter()
+        .take(top)
+        .map(|&i| match mvs[i] {
+            HexMove::Play { r, c } => serde_json::json!({
+                "cell": hex_engine::game::cell_name(r as usize, c as usize),
+                "prior": priors[i],
+            }),
+            HexMove::Swap => serde_json::json!({ "cell": "swap", "prior": priors[i] }),
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::json!({
+            "to_move": if state.to_move == 1 { "black" } else { "white" },
+            "value": vals[0],
+            "logit_sum": logits.iter().sum::<f32>(),
+            "top": best,
+        })
+    );
+    Ok(())
+}
+
+/// Time `iters` forwards of `batch` positions (after a warm-up).
+fn net_bench(model: &str, cuda: bool, batch: usize, iters: usize) -> anyhow::Result<()> {
+    use playground_core::batch_search::BatchModel;
+    let device = net::pick_device(cuda)?;
+    let m = net::LocalModel::load_on(model, device)?;
+    let planes = vec![0f32; batch * hex_engine::mcts::PLANES];
+    m.forward(&planes, batch)?; // warm-up (kernel load, allocator)
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        m.forward(&planes, batch)?;
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    println!(
+        "net-bench [{}]: batch {batch} × {iters} in {secs:.2}s — {:.1} forwards/s, {:.0} positions/s",
+        if cuda { "cuda" } else { "cpu" },
+        iters as f64 / secs,
+        (batch * iters) as f64 / secs,
+    );
+    Ok(())
 }
 
 /// Random playouts to completion, measuring rules throughput (legal-move

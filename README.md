@@ -226,6 +226,67 @@ cargo run --release -p hex-engine -- bench --games 3000
 
 `HEX_GTP_DEBUG=1` traces the GTP conversation and keeps MoHex's own search log.
 
+### Hex AlphaZero
+
+Plain AlphaZero — a direct policy/value net over real board states, PUCT search,
+self-play, train, repeat. No latent space, no reifier, no encoding: the
+MuZero-variant machinery the other games exercise is deliberately absent here,
+so Hex is the control experiment.
+
+* **Net** (`crates/games/hex/src/net.rs`, `python/src/playground/model_server/hex_net.py`)
+  — ResNet trunk, one policy logit per cell (169) and a scalar value. The two
+  files must stay in sync: they load the same `.safetensors`.
+* **Input** — 2 planes (mine, theirs) in the *canonical frame*: when White is to
+  move the board is transposed, so the net always sees itself as the player
+  connecting top↔bottom. Hex's transpose+colour-swap symmetry makes the colours
+  literally the same problem, which is why there is no side-to-move plane.
+  `game::canon_index` maps policy indices back to real cells.
+* **Search** — `MoveGame` on `core::batch_search`, the same GPU-saturating engine
+  amazons uses: hundreds of games in flight, their leaf evaluations coalesced
+  into one forward. Priors are a softmax over the legal cells only.
+* **Training example** — one per ply: canonical planes, the game outcome z from
+  that position's mover's point of view (±1 — Hex has no draws), and the MCTS
+  visit distribution. Dense, 169 floats.
+
+```bash
+# Terminal A — the actor. Writes chunks into <live>/buffer, hot-reloads weights.
+# (Needs a gen-0 net; the learner writes one on its first run.)
+source /tmp/cuda_env.sh   # this box: see the CUDA build notes
+cargo build --release -p hex-engine --features cuda
+./target/release/hex-engine selfplay-loop --live data/models/hex_az/live --cuda \
+    --concurrency 384 --max-batch 128 --node-budget 400
+
+# Terminal B — the learner. Trains a generation per burst of fresh self-play.
+PYTHONPATH=python/src python/.venv/bin/python python/hex_az_learner.py \
+    --live data/models/hex_az/live
+
+# Or let the orchestrator drive the cadence (learner + eval per generation):
+PYTHONPATH=python/src python/.venv/bin/python python/hex_train_cycle.py \
+    --live data/models/hex_az/live --cuda --period 900
+```
+
+Rating a checkpoint, two ways — relative (has it improved?) and absolute (is the
+whole run going anywhere?):
+
+```bash
+hex-engine eval-match --a <new.safetensors> --b <old.safetensors> --cuda --games 32
+hex-engine vs-mohex  --model <ckpt> --cuda --games 10 --sims 400 --mohex-playouts 1000
+```
+
+Two throughput probes, because "self-play is slow" has two very different causes:
+`net-bench` times the raw forward (the ceiling), `selfplay-bench` the whole
+search (what you actually get). On this box (laptop 4060, 64ch/6b) the candle
+forward tops out around **4.5k positions/s**, and self-play reaches ~3k nodes/s
+against it — i.e. GPU-forward-bound. The lever, if that matters, is the
+ORT/TensorRT backend amazons already has (`amazons/src/ort_net.rs`); it is not
+wired up for Hex yet.
+
+`hex-engine net-eval --model <ckpt> --moves g7,d4` prints the net's value and top
+priors for a position — the quickest way to see what a checkpoint believes.
+
+Play a trained net in the UI with
+`hex-engine serve --model-local nn=<ckpt> --cuda`.
+
 Interactive MoHex play goes through `RequestMove(player = EXTERNAL)`, a
 protocol-level seat for "the reference engine this game crate drives itself"
 (`Solver::choose_move_external`; the natural home for GNU Go in go9 too). The

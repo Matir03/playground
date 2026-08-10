@@ -14,7 +14,7 @@ before applying the algorithm to the primary target board game.
 | 2 | Go 9×9   | ~80 | Large | Standard RL benchmark; validates MCTS + policy/value at scale. |
 | 3 | Amazons  | ~1000+ | Large, high branching | First compound-move reifier (move queen + shoot arrow); rollout throughput. |
 | 4 | Arimaa   | ~17000 (per step × 4 steps) | Very large, compound moves | The real stress test for reification-based action decoding. |
-| 5 | Hex 13×13 | ~169 | Large, no draws | Pure connection game: trivial rules, deep strategy, and a strong reference engine (MoHex) to measure absolute strength against. |
+| 5 | Hex 13×13 | ~169 | Large, no draws | Pure connection game: trivial rules, deep strategy, and a strong reference engine (MoHex) to measure absolute strength against. Deliberately **plain AlphaZero** (direct policy/value, no latent space) — the control against which the variant's extra machinery is judged. |
 
 Connect 4 and Go validate the *training* and *plumbing*. Amazons and Arimaa
 validate the *reifier* and *KR-UCT progressive widening* approach — they have
