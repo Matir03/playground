@@ -9,6 +9,10 @@
 #   eval      every --eval-every cycles: candidate vs champion (the gate), and
 #             MoHex if it promotes; then exits
 #
+# (The evaluator's actor-pause handshake is vestigial here — nothing else is
+# running — so it is called with --pause-timeout 0 rather than waiting 90s for a
+# reply that can't come.)
+#
 # The alternative — actor and learner running continuously side by side — keeps
 # the GPU busier on paper but has them fighting for it, and on a thermally
 # capped laptop contention costs more than the idle time it saves. It also makes
@@ -128,7 +132,7 @@ while true; do
   if (( cycle % EVAL_EVERY == 0 )); then
     log "cycle $cycle: EVAL (gate: $EVAL_GAMES games vs champion)"
     $PYTHON "$repo/python/hex_eval_loop.py" --live "$LIVE" --engine "$ENGINE" \
-      --mohex-bin "$MOHEX_BIN" --cuda --once --every 0 \
+      --mohex-bin "$MOHEX_BIN" --cuda --once --every 0 --pause-timeout 0 \
       --games "$EVAL_GAMES" --mohex-games "$MOHEX_GAMES" --sims "$EVAL_SIMS" \
       --mohex-playouts "$MOHEX_PLAYOUTS" --channels "$CHANNELS" --blocks "$BLOCKS" \
       >> "$LOGS/evaluator.log" 2>&1 \
