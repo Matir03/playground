@@ -1,5 +1,5 @@
-"""13×13 Hex AlphaZero net — plain AZ: a ResNet trunk, one spatial policy head
-(169 logits, one per cell) and a scalar value head. No latent state, no reifier,
+"""13×13 Hex AlphaZero net — a ResNet trunk, one spatial policy head (169
+logits, one per cell), a scalar value head, and KataGo's ownership head. No latent state, no reifier,
 no encoding space.
 
 Input is 2 planes in the **canonical frame**: plane 0 the mover's stones, plane 1
@@ -56,6 +56,12 @@ class HexAZNet(nn.Module):
         # Policy: one logit per cell, index r*13+c (raw — the search does the
         # softmax over legal cells).
         self.pol_conv = nn.Conv2d(channels, 1, 3, padding=1)
+        # Ownership (KataGo's auxiliary target): per cell, who holds it when the
+        # game ends, in [-1, 1] from the mover's point of view. 169 supervised
+        # numbers per position instead of one ±1 outcome — the dense signal a
+        # value head needs while every opening still looks like a coin flip.
+        # Unused at inference; the Rust engine simply doesn't load it.
+        self.own_conv = nn.Conv2d(channels, 1, 3, padding=1)
         # Value.
         self.val_conv = nn.Conv2d(channels, 1, 1)
         self.val_bn = nn.BatchNorm2d(1)
@@ -68,14 +74,18 @@ class HexAZNet(nn.Module):
             x = blk(x)
         return x  # (B, C, N, N)
 
-    def forward(self, planes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """(B,2,13,13) -> (value (B,), policy_logits (B,169))."""
+    def forward(
+        self, planes: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(B,2,13,13) -> (value (B,), policy_logits (B,169), ownership (B,169))."""
         x = self._trunk(planes)
-        p = self.pol_conv(x).reshape(planes.shape[0], POLICY_DIM)
+        b = planes.shape[0]
+        p = self.pol_conv(x).reshape(b, POLICY_DIM)
+        o = torch.tanh(self.own_conv(x)).reshape(b, POLICY_DIM)
         v = F.relu(self.val_bn(self.val_conv(x))).flatten(1)
         v = F.relu(self.val_fc1(v))
         v = torch.tanh(self.val_fc2(v)).squeeze(-1)
-        return v, p
+        return v, p, o
 
 
 def arch_of(model: HexAZNet) -> dict:

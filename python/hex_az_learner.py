@@ -38,28 +38,41 @@ from playground.model_server.hex_net import (
 )
 
 PLANES = IN_PLANES * CELLS  # floats per encoded position
-_STRIDE = (PLANES + 1 + POLICY_DIM) * 4  # bytes per example
+_FLOATS = PLANES + 1 + POLICY_DIM + POLICY_DIM  # planes, value, policy, ownership
+_STRIDE = _FLOATS * 4
+_MAGIC = 0x58454831  # "HEX1"
+_VERSION = 2
+_FIELDS = ("planes", "value", "policy", "ownership")
 
 
 def read_examples(path: str) -> dict:
-    """Parse the actor's dense dump: count u64, then per example planes, value, policy."""
+    """Parse the actor's dump: magic u32, version u32, count u64, then per example
+    planes, value, policy, ownership — all f32 little-endian.
+
+    The header is checked rather than assumed: a chunk written by a different
+    build would otherwise be read as garbage with the right shape."""
     with open(path, "rb") as f:
         buf = f.read()
-    (count,) = struct.unpack_from("<Q", buf, 0)
-    expect = 8 + count * _STRIDE
+    magic, version = struct.unpack_from("<II", buf, 0)
+    if magic != _MAGIC:
+        raise ValueError(f"{path}: not a hex self-play chunk (magic {magic:#x})")
+    if version != _VERSION:
+        raise ValueError(f"{path}: chunk version {version}, this learner reads {_VERSION}")
+    (count,) = struct.unpack_from("<Q", buf, 8)
+    expect = 16 + count * _STRIDE
     if len(buf) != expect:
         raise ValueError(f"{path}: {len(buf)} bytes, expected {expect} for {count} examples")
-    raw = np.frombuffer(buf, dtype="<f4", count=count * (PLANES + 1 + POLICY_DIM), offset=8)
-    raw = raw.reshape(count, PLANES + 1 + POLICY_DIM)
+    raw = np.frombuffer(buf, dtype="<f4", count=count * _FLOATS, offset=16).reshape(count, _FLOATS)
     return {
         "planes": np.ascontiguousarray(raw[:, :PLANES]).reshape(count, IN_PLANES, N, N),
         "value": np.ascontiguousarray(raw[:, PLANES]),
-        "policy": np.ascontiguousarray(raw[:, PLANES + 1 :]),
+        "policy": np.ascontiguousarray(raw[:, PLANES + 1 : PLANES + 1 + POLICY_DIM]),
+        "ownership": np.ascontiguousarray(raw[:, PLANES + 1 + POLICY_DIM :]),
     }
 
 
 def merge(chunks: list[dict]) -> dict:
-    return {k: np.concatenate([c[k] for c in chunks]) for k in ("planes", "value", "policy")}
+    return {k: np.concatenate([c[k] for c in chunks]) for k in _FIELDS}
 
 
 def save_atomic(net: HexAZNet, path: str) -> None:
@@ -83,8 +96,8 @@ def export_onnx_atomic(net: HexAZNet, path: str) -> None:
     tmp = path + ".tmp"
     torch.onnx.export(
         net, torch.zeros(1, IN_PLANES, N, N, device=dev), tmp,
-        input_names=["planes"], output_names=["value", "policy"],
-        dynamic_axes={k: {0: "b"} for k in ("planes", "value", "policy")},
+        input_names=["planes"], output_names=["value", "policy", "ownership"],
+        dynamic_axes={k: {0: "b"} for k in ("planes", "value", "policy", "ownership")},
         opset_version=17, dynamo=False,
     )
     os.replace(tmp, path)
@@ -110,6 +123,8 @@ def main() -> None:
     # the learner is a fresh, short-lived process per generation.
     ap.add_argument("--exit-after-gens", type=int, default=0)
     ap.add_argument("--min-samples", type=int, default=4000)
+    ap.add_argument("--ownership-weight", type=float, default=0.15,
+                    help="weight on the auxiliary per-cell ownership loss")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -184,22 +199,28 @@ def main() -> None:
         nonlocal consumed
         n = big["planes"].shape[0]
         net.train()
-        acc = [0.0, 0.0]
+        acc = [0.0, 0.0, 0.0]
         for _ in range(k):
             b = rng.integers(0, n, size=args.batch_size)
             pl = torch.from_numpy(big["planes"][b]).to(device)
             tgt_z = torch.from_numpy(big["value"][b]).to(device)
             tgt_p = torch.from_numpy(big["policy"][b]).to(device)
-            v_pred, p_logits = net(pl)
+            tgt_o = torch.from_numpy(big["ownership"][b]).to(device)
+            v_pred, p_logits, o_pred = net(pl)
             loss_v = F.mse_loss(v_pred, tgt_z)
             loss_p = -(tgt_p * F.log_softmax(p_logits, dim=1)).sum(1).mean()
-            loss = loss_v + loss_p
+            # Ownership is 169 numbers per position against the value head's one,
+            # so it is weighted down to keep it an auxiliary signal rather than
+            # the objective. (KataGo scales its ownership loss similarly.)
+            loss_o = F.mse_loss(o_pred, tgt_o)
+            loss = loss_v + loss_p + args.ownership_weight * loss_o
             opt.zero_grad()
             loss.backward()
             opt.step()
             consumed += args.batch_size
             acc[0] += loss_v.item()
             acc[1] += loss_p.item()
+            acc[2] += loss_o.item()
         return acc
 
     existing = [
@@ -219,7 +240,7 @@ def main() -> None:
 
     BLOCK = 50
     steps_into_snap = 0
-    losses = [0.0, 0.0]
+    losses = [0.0, 0.0, 0.0]
     nblk = 0
     gens_this_run = 0
     while True:
@@ -243,7 +264,7 @@ def main() -> None:
 
         block = min(BLOCK, args.steps_per_snapshot - steps_into_snap)
         acc = train_block(big, block)
-        for i in range(2):
+        for i in range(3):
             losses[i] += acc[i]
         nblk += block
         steps_into_snap += block
@@ -266,11 +287,12 @@ def main() -> None:
                 f"snapshot gen{snap_gen}  samples {n}  chunks {len(cache)}  "
                 f"fresh {fresh} ({args.steps_per_snapshot * args.batch_size / max(1, fresh):.1f}x gen)  "
                 f"produced {produced}  consumed {consumed} ({consumed / max(1, produced):.1f}x)  "
-                f"loss v {losses[0] / max(1, nblk):.4f} p {losses[1] / max(1, nblk):.4f}",
+                f"loss v {losses[0] / max(1, nblk):.4f} p {losses[1] / max(1, nblk):.4f} "
+                f"o {losses[2] / max(1, nblk):.4f}",
                 flush=True,
             )
             steps_into_snap = 0
-            losses = [0.0, 0.0]
+            losses = [0.0, 0.0, 0.0]
             nblk = 0
             produced_at_gen_start = produced
             save_opt()

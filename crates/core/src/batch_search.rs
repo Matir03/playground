@@ -118,6 +118,15 @@ pub struct SearchParams {
     /// then subtracted back out when the target is written. The search sees the
     /// noise; the training data doesn't.
     pub forced_playout_k: f32,
+    /// KataGo's **playout cap randomization** (0 = off).
+    ///
+    /// Most moves get `fast_node_budget` visits and are played but *not*
+    /// recorded; a `full_search_prob` fraction get the full `node_budget` and
+    /// become training examples. Target quality and game throughput stop
+    /// competing for the same budget: the games advance cheaply, and the
+    /// positions you actually train on are searched properly.
+    pub full_search_prob: f32,
+    pub fast_node_budget: u32,
 }
 
 /// One move's training-relevant record (policy target + the move actually played).
@@ -934,6 +943,10 @@ pub struct MvMoveRecord<M: MoveGame> {
     pub visits: Vec<u32>,
     pub played: usize,
     pub to_move: u8,
+    /// False for a move played from a deliberately cheap search (playout cap
+    /// randomization) — it advanced the game but must not become a training
+    /// example.
+    pub for_training: bool,
 }
 
 /// A finished compound-move self-play game.
@@ -1235,6 +1248,8 @@ impl<M: MoveGame> MvSearch<M> {
 }
 
 struct MvRunner<M: MoveGame> {
+    /// Whether the search now in progress is a full (recorded) one.
+    full_search: bool,
     search: MvSearch<M>,
     states: Vec<M::State>,
     moves: Vec<MvMoveRecord<M>>,
@@ -1253,8 +1268,10 @@ impl<M: MoveGame> MvRunner<M> {
         let s0 = M::initial_state();
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let resign_enabled = rng.gen::<f32>() >= params.resign_playout_frac;
+        let full = roll_full_search(&params, &mut rng);
         Self {
-            search: MvSearch::new(s0.clone(), params),
+            search: MvSearch::new(s0.clone(), search_params_for(&params, full)),
+            full_search: full,
             states: vec![s0],
             moves: Vec::new(),
             rng,
@@ -1306,7 +1323,8 @@ impl<M: MoveGame> MvRunner<M> {
         }
 
         let next = M::apply(cur, &moves[played]);
-        self.moves.push(MvMoveRecord { moves, visits: target, played, to_move });
+        let for_training = self.full_search;
+        self.moves.push(MvMoveRecord { moves, visits: target, played, to_move, for_training });
         self.states.push(next.clone());
 
         let capped = params.max_ply > 0 && self.states.len() as u32 - 1 >= params.max_ply;
@@ -1314,7 +1332,8 @@ impl<M: MoveGame> MvRunner<M> {
         if over {
             self.finished = true;
         } else {
-            self.search = MvSearch::new(next, *params);
+            self.full_search = roll_full_search(params, &mut self.rng);
+            self.search = MvSearch::new(next, search_params_for(params, self.full_search));
         }
     }
 }
@@ -1457,6 +1476,31 @@ fn mv_advance<M: MoveGame>(
 /// difference beyond run-to-run noise (holding more batches only starves the
 /// queue that fills them).
 const BATCH_PIPELINE_DEPTH: usize = 1;
+
+/// Does the next move get the full search (and become a training example), or a
+/// cheap one that only advances the game? `full_search_prob <= 0` = always full.
+fn roll_full_search(params: &SearchParams, rng: &mut impl Rng) -> bool {
+    params.full_search_prob <= 0.0
+        || params.fast_node_budget == 0
+        || rng.gen::<f32>() < params.full_search_prob
+}
+
+/// The params a single search runs under: the cheap searches get the smaller
+/// budget, and no Dirichlet noise or forced playouts — nothing about them is
+/// recorded, so exploration there would only cost strength.
+fn search_params_for(params: &SearchParams, full: bool) -> SearchParams {
+    if full {
+        *params
+    } else {
+        SearchParams {
+            node_budget: params.fast_node_budget,
+            sims: 0,
+            dir_eps: 0.0,
+            forced_playout_k: 0.0,
+            ..*params
+        }
+    }
+}
 
 /// How many visits a root child is forced to receive before the search may judge
 /// it on its merits: `sqrt(k · p · N)` (KataGo).

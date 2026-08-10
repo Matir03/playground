@@ -186,6 +186,8 @@ fn to_search_params(p: &Params) -> SearchParams {
         resign_consecutive: 0,
         resign_playout_frac: 0.0,
             forced_playout_k: 0.0,
+            full_search_prob: 0.0,
+            fast_node_budget: 0,
     }
 }
 

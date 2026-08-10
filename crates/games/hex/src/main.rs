@@ -133,6 +133,13 @@ enum Cmd {
         /// explore the Dirichlet noise, then subtract it back out of the target.
         #[arg(long, default_value_t = 2.0)]
         forced_playout_k: f32,
+        /// Playout cap randomization: fraction of moves that get the full
+        /// `--node-budget` and become training examples (0 = every move does).
+        #[arg(long, default_value_t = 0.25)]
+        full_search_prob: f32,
+        /// Visits for the other moves — they advance the game but aren't recorded.
+        #[arg(long, default_value_t = 100)]
+        fast_node_budget: u32,
         #[arg(long, default_value_t = 0)]
         seed: u64,
         /// Inference backend: `candle` (latest.safetensors) or `ort` (model.onnx).
@@ -352,10 +359,13 @@ async fn main() -> anyhow::Result<()> {
         Cmd::SelfPlay { addr, model_uri, .. } => serve(addr, &model_uri, &[], false).await?,
         Cmd::SelfplayLoop {
             live, cuda, concurrency, max_batch, chunk_secs, max_chunks, threads, node_budget,
-            c_puct, dir_alpha, dir_eps, temp_moves, forced_playout_k, seed, backend, ep, fp16,
+            c_puct, dir_alpha, dir_eps, temp_moves, forced_playout_k, full_search_prob,
+            fast_node_budget, seed, backend, ep, fp16,
         } => {
             let mut params = search_params(node_budget, c_puct, dir_alpha, dir_eps, temp_moves);
             params.forced_playout_k = forced_playout_k;
+            params.full_search_prob = full_search_prob;
+            params.fast_node_budget = fast_node_budget;
             selfplay::run_loop(
                 &live, cuda, params, concurrency, chunk_secs, max_chunks,
                 threads.unwrap_or_else(default_threads), max_batch, seed,
@@ -469,6 +479,8 @@ fn search_params(
         resign_consecutive: 0,
         resign_playout_frac: 0.0,
             forced_playout_k: 0.0,
+            full_search_prob: 0.0,
+            fast_node_budget: 0,
     }
 }
 

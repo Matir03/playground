@@ -46,16 +46,28 @@ impl Backend {
         }
     }
 
-    /// The file whose mtime signals "the learner published new weights".
+    /// The file whose mtime signals "there are new weights to play from".
+    ///
+    /// `best.*` when the evaluator has promoted something, otherwise the
+    /// learner's latest. That indirection *is* the gate: the actor generates
+    /// data with a net that has proven itself against MoHex, so a snapshot that
+    /// got worse can't feed itself worse data (see `python/hex_eval_loop.py`).
     pub fn weights_path(self, live_dir: &str) -> String {
-        match self {
-            Backend::Candle => format!("{live_dir}/latest.safetensors"),
-            Backend::Ort { .. } => format!("{live_dir}/model.onnx"),
+        let (best, latest) = match self {
+            Backend::Candle => ("best.safetensors", "latest.safetensors"),
+            Backend::Ort { .. } => ("best.onnx", "model.onnx"),
+        };
+        let promoted = format!("{live_dir}/{best}");
+        if Path::new(&promoted).exists() {
+            promoted
+        } else {
+            format!("{live_dir}/{latest}")
         }
     }
 
     fn load(self, live_dir: &str, device: Option<candle_core::Device>) -> anyhow::Result<Arc<dyn BatchModel>> {
         let path = self.weights_path(live_dir);
+        tracing::debug!(%path, "loading self-play weights");
         match self {
             Backend::Candle => Ok(Arc::new(LocalModel::load_on(&path, device.unwrap())?)),
             Backend::Ort { ep, fp16 } => Ok(Arc::new(crate::ort_net::OrtModel::new(
@@ -87,6 +99,17 @@ pub struct Example {
     pub planes: Vec<f32>, // PLANES floats, canonical frame
     pub value: f32,       // game outcome z, side-to-move POV
     pub policy: Vec<f32>, // POLICY_DIM visit probabilities, canonical frame
+    /// Who ends up holding each cell when the game finishes: +1 this position's
+    /// mover, -1 the opponent, 0 still empty. Canonical frame, like everything else.
+    ///
+    /// This is KataGo's ownership target, and it exists because one ±1 outcome per
+    /// position is a starvation diet for a value head — especially in Hex, where a
+    /// weak net rightly sees every opening as a coin flip and therefore learns
+    /// nothing from the result. Final ownership is 169 supervised numbers per
+    /// position instead of one, it is available for free from the finished game,
+    /// and "which of us ends up holding this region" is exactly the structure a
+    /// connection game turns on.
+    pub ownership: Vec<f32>,
 }
 
 /// Turn finished games into examples. The winner is whoever was *not* to move in
@@ -104,6 +127,11 @@ pub fn examples_from_records(records: Vec<MvGameRecord<Hex>>) -> Vec<Example> {
             None // hit the ply cap, undecided
         };
         for (i, mv) in rec.moves.iter().enumerate() {
+            // Cheap searches (playout cap randomization) advanced the game but
+            // aren't worth training on.
+            if !mv.for_training {
+                continue;
+            }
             let total: u32 = mv.visits.iter().sum();
             if total == 0 {
                 continue;
@@ -131,16 +159,37 @@ pub fn examples_from_records(records: Vec<MvGameRecord<Hex>>) -> Vec<Example> {
             };
             let mut planes = vec![0f32; PLANES];
             fill_planes_into(state, &mut planes);
-            out.push(Example { planes, value: z, policy });
+            // Ownership is read off the finished board, from this mover's side.
+            let mut ownership = vec![0f32; POLICY_DIM];
+            for cell in 0..POLICY_DIM {
+                let owner = final_state.cell_at(cell);
+                if owner != 0 {
+                    ownership[canon_index(state, cell)] =
+                        if owner == mv.to_move { 1.0 } else { -1.0 };
+                }
+            }
+            out.push(Example { planes, value: z, policy, ownership });
         }
     }
     out
 }
 
-/// Binary dump read by `hex_az_learner.py`. Header: count u64. Per example:
-/// planes[PLANES f32], value f32, policy[POLICY_DIM f32]. All little-endian.
+/// Bytes per example in the dump: planes, value, policy, ownership.
+pub const EXAMPLE_FLOATS: usize = PLANES + 1 + POLICY_DIM + POLICY_DIM;
+
+/// Binary dump read by `hex_az_learner.py`. Header: magic u32, version u32,
+/// count u64. Per example: planes[PLANES f32], value f32, policy[POLICY_DIM f32],
+/// ownership[POLICY_DIM f32]. All little-endian.
+///
+/// The header exists so a learner never silently misreads a chunk written by a
+/// different build — the ownership target changed the layout once already.
+pub const DUMP_MAGIC: u32 = 0x5845_4831; // "HEX1" little-endian
+pub const DUMP_VERSION: u32 = 2;
+
 pub fn write_dump(out_path: &str, examples: &[Example]) -> anyhow::Result<()> {
-    let mut buf: Vec<u8> = Vec::with_capacity(8 + examples.len() * (PLANES + 1 + POLICY_DIM) * 4);
+    let mut buf: Vec<u8> = Vec::with_capacity(16 + examples.len() * EXAMPLE_FLOATS * 4);
+    buf.extend_from_slice(&DUMP_MAGIC.to_le_bytes());
+    buf.extend_from_slice(&DUMP_VERSION.to_le_bytes());
     buf.extend_from_slice(&(examples.len() as u64).to_le_bytes());
     for ex in examples {
         for &x in &ex.planes {
@@ -149,6 +198,9 @@ pub fn write_dump(out_path: &str, examples: &[Example]) -> anyhow::Result<()> {
         buf.extend_from_slice(&ex.value.to_le_bytes());
         for &p in &ex.policy {
             buf.extend_from_slice(&p.to_le_bytes());
+        }
+        for &o in &ex.ownership {
+            buf.extend_from_slice(&o.to_le_bytes());
         }
     }
     let mut f = std::io::BufWriter::new(std::fs::File::create(out_path)?);
@@ -212,6 +264,7 @@ pub fn run_loop(
     let make_model = || backend.load(live_dir, device.clone());
     let model: Mutex<Arc<dyn BatchModel>> = Mutex::new(make_model()?);
     let mut last_mtime = std::fs::metadata(&weights).and_then(|m| m.modified()).ok();
+    // `weights` is re-resolved per flush (see the on_flush closure).
     let mut seq = max_chunk_seq(&buffer).map(|s| s + 1).unwrap_or(0);
     eprintln!(
         "hex continuous actor [{}]: concurrency {concurrency}, flush {chunk_secs:.0}s, batch \
@@ -252,6 +305,22 @@ pub fn run_loop(
                 100.0 * black_wins as f64 / n_games as f64,
             );
         }
+        // The evaluator raises PAUSE so its match isn't fighting us for the GPU.
+        // Parking between chunks is coarse but costs nothing: in-flight games
+        // simply wait.
+        let pause = Path::new(live_dir).join("PAUSE");
+        if pause.exists() {
+            let parked = Path::new(live_dir).join("actor.paused");
+            let _ = std::fs::File::create(&parked);
+            eprintln!("  paused for evaluation");
+            while pause.exists() {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            let _ = std::fs::remove_file(&parked);
+            eprintln!("  resumed");
+        }
+        // Re-resolve the path each time: `best.*` may have appeared since.
+        let weights = backend.weights_path(live_dir);
         let mt = std::fs::metadata(&weights).and_then(|m| m.modified()).ok();
         if mt != last_mtime {
             match make_model() {
@@ -391,6 +460,8 @@ mod tests {
             resign_consecutive: 0,
             resign_playout_frac: 0.0,
             forced_playout_k: 0.0,
+            full_search_prob: 0.0,
+            fast_node_budget: 0,
         };
         // How often do independent searches of the *same* opening agree?
         let agreement = |k: f32| {
@@ -467,6 +538,8 @@ mod tests {
             resign_consecutive: 0,
             resign_playout_frac: 0.0,
             forced_playout_k: 0.0,
+            full_search_prob: 0.0,
+            fast_node_budget: 0,
         };
         let (records, _) =
             batch_search::run_selfplay_moves::<Hex>(&FlatPolicyNoisyValue, 2, params, 2, 2, 5, 30.0, 0.0);
@@ -547,6 +620,8 @@ mod tests {
             resign_consecutive: 0,
             resign_playout_frac: 0.0,
             forced_playout_k: 0.0,
+            full_search_prob: 0.0,
+            fast_node_budget: 0,
         };
         // Many games in flight against a small batch, so rows are mixed.
         let (records, _stats) =
@@ -595,6 +670,8 @@ mod tests {
             resign_consecutive: 0,
             resign_playout_frac: 0.0,
             forced_playout_k: 0.0,
+            full_search_prob: 0.0,
+            fast_node_budget: 0,
         };
         let (records, _stats) =
             batch_search::run_selfplay_moves::<Hex>(&Uniform, 8, params, 2, 8, 1, 20.0, 0.0);
@@ -646,12 +723,14 @@ mod tests {
                     visits: vec![10],
                     played: 0,
                     to_move: 1,
+                    for_training: true,
                 },
                 MvMoveRecord::<Hex> {
                     moves: vec![HexMove::Play { r: 0, c: 1 }],
                     visits: vec![10],
                     played: 0,
                     to_move: 2,
+                    for_training: true,
                 },
             ],
             resigned_by: None,
@@ -667,7 +746,15 @@ mod tests {
         for e in &ex {
             assert!((e.policy.iter().sum::<f32>() - 1.0).abs() < 1e-6);
             assert_eq!(e.planes.len(), PLANES);
+            assert_eq!(e.ownership.len(), POLICY_DIM);
         }
+        // Black owns a1 at the end and moved first, so from black's view it is +1
+        // and from white's (transposed) view it is -1.
+        assert_eq!(ex[0].ownership[0], 1.0);
+        assert_eq!(ex[1].ownership[crate::game::transpose_index(0)], -1.0);
+        // b1 is white's stone: -1 for black, +1 for white in its own frame.
+        assert_eq!(ex[0].ownership[1], -1.0);
+        assert_eq!(ex[1].ownership[crate::game::transpose_index(1)], 1.0);
     }
 
     #[test]
@@ -679,16 +766,20 @@ mod tests {
             planes: vec![0.5; PLANES],
             value: -1.0,
             policy: (0..POLICY_DIM).map(|i| i as f32).collect(),
+            ownership: vec![-1.0; POLICY_DIM],
         }];
         write_dump(path.to_str().unwrap(), &ex).unwrap();
 
         let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(u64::from_le_bytes(bytes[..8].try_into().unwrap()), 1);
-        assert_eq!(bytes.len(), 8 + (PLANES + 1 + POLICY_DIM) * 4);
-        let f = |off: usize| f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
-        assert_eq!(f(8), 0.5);
-        assert_eq!(f(8 + PLANES * 4), -1.0);
-        assert_eq!(f(8 + (PLANES + 1) * 4 + 4), 1.0);
+        assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), DUMP_MAGIC);
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), DUMP_VERSION);
+        assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), 1);
+        assert_eq!(bytes.len(), 16 + EXAMPLE_FLOATS * 4);
+        let f = |off: usize| f32::from_le_bytes(bytes[16 + off * 4..20 + off * 4].try_into().unwrap());
+        assert_eq!(f(0), 0.5, "planes");
+        assert_eq!(f(PLANES), -1.0, "value");
+        assert_eq!(f(PLANES + 2), 1.0, "policy[1]");
+        assert_eq!(f(PLANES + 1 + POLICY_DIM), -1.0, "ownership[0]");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
