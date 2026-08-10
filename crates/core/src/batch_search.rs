@@ -1257,12 +1257,17 @@ fn mv_scatter<M: MoveGame>(
     if n == 0 {
         return;
     }
+    // One move per runner (they're ~500 bytes each): drain straight into the
+    // chunk that gets sent, rather than building a combined Vec and splitting it.
     let chunk = n.div_ceil(n_workers.max(1));
-    let mut entries: Vec<(MvRunner<M>, f32, usize)> =
-        runners.into_iter().enumerate().map(|(i, r)| (r, vals[i], i)).collect();
-    while !entries.is_empty() {
-        let tail = entries.split_off(entries.len().saturating_sub(chunk));
-        let _ = work_tx.send(MvTask::Apply(tail, Arc::clone(&priors)));
+    let mut it = runners.into_iter().enumerate();
+    loop {
+        let mut entries: Vec<(MvRunner<M>, f32, usize)> = Vec::with_capacity(chunk);
+        entries.extend(it.by_ref().take(chunk).map(|(i, r)| (r, vals[i], i)));
+        if entries.is_empty() {
+            return;
+        }
+        let _ = work_tx.send(MvTask::Apply(entries, Arc::clone(&priors)));
     }
 }
 
@@ -1346,6 +1351,12 @@ fn mv_advance<M: MoveGame>(
     }
 }
 
+/// How many assembled batches may be queued ahead of the forward thread. One is
+/// enough to overlap gather with compute; depth 2 was measured and made no
+/// difference beyond run-to-run noise (holding more batches only starves the
+/// queue that fills them).
+const BATCH_PIPELINE_DEPTH: usize = 1;
+
 /// One assembled batch: the games it belongs to, their planes padded to the fixed
 /// shape, and how long the gatherer blocked for the first leaf.
 type GatheredBatch<M> = (Vec<MvRunner<M>>, Vec<f32>, f64);
@@ -1417,11 +1428,9 @@ fn mv_gpu_loop<M: MoveGame>(
     let mut win_batches = 0u64;
     let mut win_samples = 0u64;
     let mut win_t = Instant::now();
-    // Double-buffer: a gather thread assembles the next batch while this thread is
-    // inside `forward`, so the GPU doesn't sit idle through the collect. Bounded at
-    // one so the gatherer runs at most a batch ahead (leaves stay in the queue, where
-    // they can still join a fuller batch).
-    let (batch_tx, batch_rx) = crossbeam_channel::bounded::<GatheredBatch<M>>(1);
+    // Pipeline the gather: a separate thread assembles batches while this one is
+    // inside `forward`, so the GPU doesn't idle through the collect.
+    let (batch_tx, batch_rx) = crossbeam_channel::bounded::<GatheredBatch<M>>(BATCH_PIPELINE_DEPTH);
     std::thread::scope(|scope| {
         scope.spawn(move || {
             mv_gather_loop::<M>(eval_rx, batch_tx, batch_size, Some(deadline));
@@ -1597,7 +1606,8 @@ pub fn run_actor_continuous<M, F>(
     std::thread::scope(|scope| {
         // Gather thread: assembles the next batch while the forward thread is inside
         // `forward` (bounded at one batch ahead).
-        let (batch_tx, batch_rx) = crossbeam_channel::bounded::<GatheredBatch<M>>(1);
+        let (batch_tx, batch_rx) =
+            crossbeam_channel::bounded::<GatheredBatch<M>>(BATCH_PIPELINE_DEPTH);
         {
             let eval_rx = eval_rx.clone();
             scope.spawn(move || mv_gather_loop::<M>(eval_rx, batch_tx, batch_size, None));

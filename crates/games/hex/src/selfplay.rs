@@ -356,8 +356,73 @@ pub fn run_benchmark(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use playground_core::batch_search::MvMoveRecord;
+    use playground_core::batch_search::{MvMoveRecord, SearchParams};
     use playground_core::Game;
+
+    /// A stand-in net: every position is even, every move equally likely. Enough to
+    /// drive the real pipeline without a checkpoint.
+    struct Uniform;
+
+    impl BatchModel for Uniform {
+        fn forward(&self, _planes: &[f32], b: usize) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
+            Ok((vec![0.0; b], vec![0.0; b * POLICY_DIM]))
+        }
+    }
+
+    /// The value target of every example is `winner == states[i].to_move`, so a
+    /// record whose `states` and `moves` disagree about whose turn it is would
+    /// train the net on inverted outcomes — invisible in the loss, fatal to the
+    /// run. Check the alignment the engine actually produces.
+    #[test]
+    fn selfplay_records_line_up_states_with_movers() {
+        let params = SearchParams {
+            sims: 0,
+            node_budget: 4,
+            c_puct: 1.5,
+            dir_alpha: 0.3,
+            dir_eps: 0.0,
+            temp_moves: 0,
+            explore_eps: 0.0,
+            max_ply: 0,
+            settle_plies: 0,
+            resign_threshold: 0.0,
+            resign_consecutive: 0,
+            resign_playout_frac: 0.0,
+        };
+        let (records, _stats) =
+            batch_search::run_selfplay_moves::<Hex>(&Uniform, 8, params, 2, 8, 1, 20.0, 0.0);
+        assert!(!records.is_empty(), "no game finished in 20s");
+        for rec in &records {
+            assert_eq!(rec.states.len(), rec.moves.len() + 1, "one state per move, plus the last");
+            for (i, mv) in rec.moves.iter().enumerate() {
+                assert_eq!(
+                    rec.states[i].to_move, mv.to_move,
+                    "record {i}: the position and the move record disagree on the mover"
+                );
+                assert_eq!(rec.states[i].winner, 0, "a decided position was still searched");
+                // The move actually played must be one the search considered.
+                assert!(mv.moves.contains(&mv.moves[mv.played]));
+            }
+            let last = rec.states.last().unwrap();
+            assert_ne!(last.winner, 0, "a finished game ends decided (Hex has no draws)");
+            assert_eq!(last.winner, 3 - last.to_move, "the winner is whoever moved last");
+        }
+        // And the derived examples inherit that: the winner's positions score +1.
+        let winners: Vec<u8> = records.iter().map(|r| r.states.last().unwrap().winner).collect();
+        let plies: Vec<usize> = records.iter().map(|r| r.moves.len()).collect();
+        let examples = examples_from_records(records);
+        assert_eq!(examples.len(), plies.iter().sum::<usize>());
+        let mut k = 0;
+        for (g, n) in plies.iter().enumerate() {
+            for i in 0..*n {
+                // Mover at ply i is black when i is even; z is +1 iff that side won.
+                let mover = if i % 2 == 0 { 1 } else { 2 };
+                let want = if winners[g] == mover { 1.0 } else { -1.0 };
+                assert_eq!(examples[k].value, want, "game {g} ply {i}");
+                k += 1;
+            }
+        }
+    }
 
     #[test]
     fn examples_carry_canonical_targets_and_alternating_outcomes() {

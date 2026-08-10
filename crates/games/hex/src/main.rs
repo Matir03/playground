@@ -257,6 +257,13 @@ enum Cmd {
         moves: String,
         #[arg(long, default_value_t = 5)]
         top: usize,
+        /// Evaluate the transpose+colour-swapped position instead, mapping the
+        /// result back to real cells. Hex's symmetry makes this the *same*
+        /// position with the roles exchanged, so the output must match the
+        /// unmirrored one exactly — the end-to-end check that the canonical
+        /// frame (planes and policy indices) is wired up right for a live net.
+        #[arg(long)]
+        mirror: bool,
         /// Inference backend: `candle` (a .safetensors) or `ort` (a .onnx). Run it
         /// on both to check a backend (notably TensorRT fp16) still agrees.
         #[arg(long, default_value = "candle")]
@@ -265,6 +272,30 @@ enum Cmd {
         ep: String,
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         fp16: bool,
+    },
+    /// Play one self-play game with the net and print the moves — what the net
+    /// actually does, as opposed to what it scores.
+    PlayGame {
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        cuda: bool,
+        #[arg(long, default_value_t = 200)]
+        sims: u32,
+        #[arg(long, default_value_t = 1.5)]
+        c_puct: f32,
+        /// Sample from the visit counts for this many opening plies, then argmax.
+        #[arg(long, default_value_t = 0)]
+        temp_moves: u32,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        /// Print the final board.
+        #[arg(long)]
+        board: bool,
+        /// Also print the root visit distribution for each move — the policy target
+        /// self-play would record, so it can be compared against the actor's.
+        #[arg(long)]
+        verbose: bool,
     },
     /// Raw forward throughput of the net (positions/s), with no search around it —
     /// the ceiling `selfplay-bench` can approach, and how you tell a GPU-bound
@@ -365,8 +396,11 @@ async fn main() -> anyhow::Result<()> {
                 moves[(rng >> 33) as usize % moves.len()]
             })?;
         }
-        Cmd::NetEval { model, moves, top, backend, ep, fp16 } => {
-            net_eval(&model, &moves, top, parse_backend(&backend, &ep, fp16)?)?
+        Cmd::NetEval { model, moves, top, mirror, backend, ep, fp16 } => {
+            net_eval(&model, &moves, top, mirror, parse_backend(&backend, &ep, fp16)?)?
+        }
+        Cmd::PlayGame { model, cuda, sims, c_puct, temp_moves, seed, board, verbose } => {
+            play_game(&model, cuda, sims, c_puct, temp_moves, seed, board, verbose)?
         }
         Cmd::NetBench { model, cuda, batch, iters, backend, ep, fp16 } => {
             net_bench(&model, cuda, batch, iters, parse_backend(&backend, &ep, fp16)?)?
@@ -437,6 +471,7 @@ fn net_eval(
     model: &str,
     moves: &str,
     top: usize,
+    mirror: bool,
     backend: selfplay::Backend,
 ) -> anyhow::Result<()> {
     use playground_core::batch_search::BatchModel;
@@ -445,6 +480,15 @@ fn net_eval(
         let (r, c) = hex_engine::game::parse_cell(token)
             .ok_or_else(|| anyhow::anyhow!("bad cell {token:?}"))?;
         state = <Hex as Game>::apply(&state, &HexMove::Play { r: r as u8, c: c as u8 });
+    }
+    // In the mirrored frame every cell maps through the long diagonal, so map the
+    // reported moves back to make the two outputs directly comparable.
+    let unmap = |mv: HexMove| match (mirror, mv) {
+        (true, HexMove::Play { r, c }) => HexMove::Play { r: c, c: r },
+        (_, mv) => mv,
+    };
+    if mirror {
+        state = hex_engine::game::transpose_swap(&state);
     }
     let m: Box<dyn BatchModel> = match backend {
         selfplay::Backend::Candle => Box::new(net::LocalModel::load(model)?),
@@ -466,7 +510,7 @@ fn net_eval(
     let best: Vec<serde_json::Value> = order
         .iter()
         .take(top)
-        .map(|&i| match mvs[i] {
+        .map(|&i| match unmap(mvs[i]) {
             HexMove::Play { r, c } => serde_json::json!({
                 "cell": hex_engine::game::cell_name(r as usize, c as usize),
                 "prior": priors[i],
@@ -477,7 +521,8 @@ fn net_eval(
     println!(
         "{}",
         serde_json::json!({
-            "to_move": if state.to_move == 1 { "black" } else { "white" },
+            "to_move": if (state.to_move == 1) != mirror { "black" } else { "white" },
+            "mirrored": mirror,
             "value": vals[0],
             "logit_sum": logits.iter().sum::<f32>(),
             "top": best,
@@ -498,6 +543,73 @@ fn parse_backend(backend: &str, ep: &str, fp16: bool) -> anyhow::Result<selfplay
         },
         other => anyhow::bail!("unknown --backend {other:?} (use candle|ort)"),
     }
+}
+
+/// Play one game, net against itself, printing every move.
+fn play_game(
+    model: &str,
+    cuda: bool,
+    sims: u32,
+    c_puct: f32,
+    temp_moves: u32,
+    seed: u64,
+    show_board: bool,
+    verbose: bool,
+) -> anyhow::Result<()> {
+    use hex_engine::mcts::{self, Params};
+    use rand::SeedableRng;
+
+    let m = net::LocalModel::load_on(model, net::pick_device(cuda)?)?;
+    let params = Params { sims, c_puct, dir_alpha: 0.3, dir_eps: 0.0, temp_moves };
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+    let mut state = <Hex as Game>::initial_state();
+    let mut played: Vec<String> = Vec::new();
+    while state.winner == 0 {
+        let (moves, visits, value) = mcts::run_search(&m, &state, &params, &mut rng)?;
+        let mv = mcts::pick_move(&moves, &visits, state.ply as u32, temp_moves, &mut rng);
+        let name = match mv {
+            HexMove::Play { r, c } => hex_engine::game::cell_name(r as usize, c as usize),
+            HexMove::Swap => "swap".to_string(),
+        };
+        println!(
+            "{:>3}. {} {name:<4} v {:+.3}",
+            state.ply + 1,
+            if state.to_move == 1 { "B" } else { "W" },
+            value,
+        );
+        if verbose {
+            let total: u32 = visits.iter().sum();
+            let mut order: Vec<usize> = (0..visits.len()).collect();
+            order.sort_by_key(|&i| std::cmp::Reverse(visits[i]));
+            let top: Vec<String> = order
+                .iter()
+                .take(5)
+                .filter(|&&i| visits[i] > 0)
+                .map(|&i| match moves[i] {
+                    HexMove::Play { r, c } => format!(
+                        "{}:{}",
+                        hex_engine::game::cell_name(r as usize, c as usize),
+                        visits[i]
+                    ),
+                    HexMove::Swap => format!("swap:{}", visits[i]),
+                })
+                .collect();
+            println!("      root visits {total} over {} moves: {}", 
+                visits.iter().filter(|&&v| v > 0).count(), top.join(" "));
+        }
+        played.push(name);
+        state = <Hex as Game>::apply(&state, &mv);
+    }
+    if show_board {
+        print!("{}", hex_engine::game::render(&state));
+    }
+    println!(
+        "result: {} wins in {} plies   moves: {}",
+        if state.winner == 1 { "black" } else { "white" },
+        state.ply,
+        played.join(","),
+    );
+    Ok(())
 }
 
 /// Time `iters` forwards of `batch` positions (after a warm-up).
