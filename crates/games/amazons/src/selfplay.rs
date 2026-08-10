@@ -214,6 +214,7 @@ pub fn run_loop(
                 Err(e) => eprintln!("  weight reload failed: {e}"),
             }
         }
+        true // run until the process is stopped
     };
 
     batch_search::run_actor_continuous::<Amazons, _>(

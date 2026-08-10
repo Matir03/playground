@@ -148,6 +148,11 @@ enum Cmd {
         /// Visits for the other moves — they advance the game but aren't recorded.
         #[arg(long, default_value_t = 100)]
         fast_node_budget: u32,
+        /// Exit once this many training examples have been written (0 = run until
+        /// killed). The generate→train→eval cycle uses this so the phases never
+        /// share the GPU.
+        #[arg(long, default_value_t = 0)]
+        target_examples: u64,
         #[arg(long, default_value_t = 0)]
         seed: u64,
         /// Inference backend: `candle` (latest.safetensors) or `ort` (model.onnx).
@@ -368,7 +373,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::SelfplayLoop {
             live, cuda, concurrency, max_batch, chunk_secs, max_chunks, threads, node_budget,
             c_puct, dir_alpha, dir_eps, temp_moves, forced_playout_k, full_search_prob,
-            fast_node_budget, seed, backend, ep, fp16,
+            fast_node_budget, target_examples, seed, backend, ep, fp16,
         } => {
             let mut params = search_params(node_budget, c_puct, dir_alpha, dir_eps, temp_moves);
             params.forced_playout_k = forced_playout_k;
@@ -377,7 +382,7 @@ async fn main() -> anyhow::Result<()> {
             selfplay::run_loop(
                 &live, cuda, params, concurrency, chunk_secs, max_chunks,
                 threads.unwrap_or_else(default_threads), max_batch, seed,
-                parse_backend(&backend, &ep, fp16)?,
+                parse_backend(&backend, &ep, fp16)?, target_examples,
             )?;
         }
         Cmd::SelfplayBench {

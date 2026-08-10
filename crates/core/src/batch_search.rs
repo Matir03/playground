@@ -1721,12 +1721,15 @@ pub fn run_selfplay_moves<M: MoveGame>(
     (finished.into_inner().unwrap(), s)
 }
 
-/// Continuous self-play actor: keeps `concurrency` games in flight **forever** (refill
-/// on completion), and every `flush_secs` calls `on_flush(completed_games)` with the
+/// Continuous self-play actor: keeps `concurrency` games in flight (refill on
+/// completion), and every `flush_secs` calls `on_flush(completed_games)` with the
 /// games that finished since the last flush — in-flight games keep running across
 /// flushes (no tail, no discarded work). The GPU thread reads the model from `model`
 /// each batch, so the caller can hot-swap weights on a learner snapshot by replacing
-/// the `Arc` (e.g. inside `on_flush`). Never returns; the process is killed to stop.
+/// the `Arc` (e.g. inside `on_flush`).
+///
+/// Runs until `on_flush` returns `false`, which is how a caller stops after
+/// producing a target amount of data; return `true` to run forever.
 /// `report_secs` > 0 logs throughput periodically (0 = quiet).
 pub fn run_actor_continuous<M, F>(
     model: &Mutex<Arc<dyn BatchModel>>,
@@ -1740,7 +1743,7 @@ pub fn run_actor_continuous<M, F>(
     mut on_flush: F,
 ) where
     M: MoveGame,
-    F: FnMut(Vec<MvGameRecord<M>>),
+    F: FnMut(Vec<MvGameRecord<M>>) -> bool,
 {
     use std::sync::atomic::AtomicU64;
     let finished: Mutex<Vec<MvGameRecord<M>>> = Mutex::new(Vec::new());
@@ -1828,11 +1831,17 @@ pub fn run_actor_continuous<M, F>(
         drop(eval_tx);
         drop(eval_rx);
 
-        // This (caller) thread: flush completed games every `flush_secs`, forever.
+        // This (caller) thread: flush completed games every `flush_secs` until the
+        // caller says stop. The worker/GPU threads are inside `thread::scope`, so
+        // returning from here would block on them — hence the explicit exit: the
+        // games still in flight are unfinished work we are choosing to drop, and
+        // everything completed has already been written by `on_flush`.
         loop {
             std::thread::sleep(std::time::Duration::from_secs_f64(flush_secs));
             let games = std::mem::take(&mut *finished.lock().unwrap());
-            on_flush(games);
+            if !on_flush(games) {
+                std::process::exit(0);
+            }
         }
     });
 }

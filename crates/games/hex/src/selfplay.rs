@@ -250,6 +250,9 @@ pub fn run_loop(
     max_batch: usize,
     base_seed: u64,
     backend: Backend,
+    // Stop once this many examples have been written (0 = run until killed); the
+    // generate→train→eval cycle uses it so the phases never overlap.
+    target_examples: u64,
 ) -> anyhow::Result<()> {
     let buffer = Path::new(live_dir).join("buffer");
     std::fs::create_dir_all(&buffer)?;
@@ -274,7 +277,8 @@ pub fn run_loop(
         buffer.display(),
     );
 
-    let on_flush = |games: Vec<MvGameRecord<Hex>>| {
+    let mut produced: u64 = 0;
+    let on_flush = |games: Vec<MvGameRecord<Hex>>| -> bool {
         let n_games = games.len();
         if n_games == 0 {
             eprintln!("  flush: 0 games (ramp-up / games still in flight)");
@@ -300,6 +304,7 @@ pub fn run_loop(
             // "ex/game", not "plies/game": with playout cap randomization only a
             // fraction of plies are recorded, so the two stopped being the same
             // number.
+            produced += examples.len() as u64;
             eprintln!(
                 "  chunk {}: {n_games} games  {} ex  {:.0} ex/game  black won {:.0}%",
                 seq.saturating_sub(1),
@@ -335,6 +340,11 @@ pub fn run_loop(
                 Err(e) => eprintln!("  weight reload failed: {e}"),
             }
         }
+        if target_examples > 0 && produced >= target_examples {
+            eprintln!("  produced {produced} examples (target {target_examples}) — done");
+            return false;
+        }
+        true
     };
 
     batch_search::run_actor_continuous::<Hex, _>(
