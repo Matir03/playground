@@ -216,11 +216,22 @@ fn expand_node(model: &impl Evaluator, nodes: &mut [Node], idx: usize) -> anyhow
 
 fn select(node: &Node, c_puct: f32) -> usize {
     let sqrt_total = (node.total_n.max(1) as f32).sqrt();
+    // Unvisited children are scored against this node's own value, not a flat
+    // zero (see `playground_core::puct` for what that costs).
+    let (mut w_sum, mut visited_p) = (0.0f32, 0.0f32);
+    for a in 0..node.moves.len() {
+        if node.n[a] > 0 {
+            w_sum += node.w[a];
+            visited_p += node.priors[a];
+        }
+    }
+    let parent_q = if node.total_n > 0 { w_sum / node.total_n as f32 } else { 0.0 };
+    let fpu = playground_core::puct::fpu(parent_q, visited_p);
     let mut best = 0usize;
     let mut best_score = f32::NEG_INFINITY;
     for a in 0..node.moves.len() {
         let n = node.n[a];
-        let q = if n == 0 { 0.0 } else { node.w[a] / n as f32 };
+        let q = if n == 0 { fpu } else { node.w[a] / n as f32 };
         let u = c_puct * node.priors[a] * sqrt_total / (1.0 + n as f32);
         let score = q + u;
         if score > best_score {
@@ -342,8 +353,20 @@ mod tests {
         let mut rng = rand::rngs::StdRng::from_seed([3; 32]);
         let params = Params { sims: 400, dir_eps: 0.0, ..Default::default() };
         let (moves, visits, value) = run_search(&Favours(0, 0.0), &s, &params, &mut rng).unwrap();
-        let best = visits.iter().enumerate().max_by_key(|&(_, v)| *v).unwrap().0;
+        let mut order: Vec<usize> = (0..visits.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(visits[i]));
+        let best = order[0];
         assert_eq!(moves[best], HexMove::Play { r: 6, c: 6 }, "the winning cell");
-        assert!(value > 0.5, "a forced win should score near +1, got {value}");
+        // It must be preferred *decisively*, not just edged ahead. (The root's
+        // mean value stays modest: first-play urgency keeps the search widening
+        // instead of pouring every visit into the win, so the mean mixes in all
+        // the sampled alternatives — the win itself is worth +1.)
+        assert!(
+            visits[best] >= 3 * visits[order[1]],
+            "winning move got {} visits vs {} for the runner-up",
+            visits[best], visits[order[1]],
+        );
+        assert!(value > 0.0, "a forced win should score positive, got {value}");
+        assert_eq!(apply(&s, &moves[best]).winner, 1, "and it really ends the game");
     }
 }

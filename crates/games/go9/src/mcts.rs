@@ -152,7 +152,18 @@ fn random_legal(node: &Node, rng: &mut impl Rng) -> usize {
 
 /// PUCT action selection over the legal actions of `node`.
 fn select(node: &Node, c_puct: f32) -> usize {
-    let total: u32 = node.n.iter().sum();
+    // One pass for the totals, so an unvisited action can be scored against
+    // what this node is worth rather than a flat zero (see `core::puct`).
+    let (mut total, mut w_sum, mut visited_p) = (0u32, 0.0f32, 0.0f32);
+    for a in 0..ACTIONS {
+        if node.n[a] > 0 {
+            total += node.n[a];
+            w_sum += node.w[a];
+            visited_p += node.p[a];
+        }
+    }
+    let parent_q = if total > 0 { w_sum / total as f32 } else { 0.0 };
+    let fpu = playground_core::puct::fpu(parent_q, visited_p);
     let sqrt_total = ((total + 1) as f32).sqrt();
     let mut best = usize::MAX;
     let mut best_score = f32::NEG_INFINITY;
@@ -160,7 +171,7 @@ fn select(node: &Node, c_puct: f32) -> usize {
         if !node.legal[a] {
             continue;
         }
-        let q = if node.n[a] > 0 { node.w[a] / node.n[a] as f32 } else { 0.0 };
+        let q = if node.n[a] > 0 { node.w[a] / node.n[a] as f32 } else { fpu };
         let u = c_puct * node.p[a] * sqrt_total / (1 + node.n[a]) as f32;
         let score = q + u;
         if score > best_score {

@@ -374,6 +374,21 @@ fn kr_uct_select<G: Game>(tree: &[Node<G>], node_idx: usize, config: &SearchConf
 
     let sigma = config.kernel_bandwidth.max(1e-6);
     let total = node.visits as f64;
+    // Fallback for an action with no kernel-weighted visits to regress from:
+    // this node's own value rather than a flat 0 (see `crate::puct`). Normally
+    // the kernel supplies a neighbour's estimate and this never fires; it
+    // matters as σ → 0, where KR-UCT collapses to PUCT and the flat 0 becomes
+    // the same trap it is there. At a node's first selection every action hits
+    // this branch equally, so the choice is still the prior's — unchanged.
+    let visited_prior: f32 = node
+        .edges
+        .iter()
+        .enumerate()
+        .filter(|(b, _)| n[*b] > 0.0)
+        .map(|(_, e)| e.prior as f32)
+        .sum();
+    let parent_q = if node.visits > 0 { node.value_sum / node.visits as f64 } else { 0.0 };
+    let fpu = crate::puct::fpu(parent_q as f32, visited_prior) as f64;
     let mut best = None;
     let mut best_score = f64::NEG_INFINITY;
     for a in 0..m {
@@ -384,7 +399,7 @@ fn kr_uct_select<G: Game>(tree: &[Node<G>], node_idx: usize, config: &SearchConf
             w += k * n[b];
             num += k * n[b] * q[b];
         }
-        let q_kr = if w > 0.0 { num / w } else { 0.0 };
+        let q_kr = if w > 0.0 { num / w } else { fpu };
         let u = config.exploration_c * node.edges[a].prior * total.sqrt() / (1.0 + w);
         let score = q_kr + u;
         if score > best_score {

@@ -348,7 +348,20 @@ impl<G: BatchGame> GameSearch<G> {
 
     fn select(&self, node: usize) -> usize {
         let nd = &self.arena[node];
-        let total: u32 = nd.n.iter().sum();
+        // One pass for the node's totals, so unvisited children can be scored
+        // against what this node is actually worth (see `core::puct`).
+        let mut total = 0u32;
+        let mut w_sum = 0.0f32;
+        let mut visited_p = 0.0f32;
+        for a in 0..G::ACTIONS {
+            if nd.n[a] > 0 {
+                total += nd.n[a];
+                w_sum += nd.w[a];
+                visited_p += nd.p[a];
+            }
+        }
+        let parent_q = if total > 0 { w_sum / total as f32 } else { 0.0 };
+        let fpu = crate::puct::fpu(parent_q, visited_p);
         let sqrt_total = ((total + 1) as f32).sqrt();
         let c_puct = self.params.c_puct;
         let mut best = usize::MAX;
@@ -357,7 +370,7 @@ impl<G: BatchGame> GameSearch<G> {
             if !nd.legal[a] {
                 continue;
             }
-            let q = if nd.n[a] > 0 { nd.w[a] / nd.n[a] as f32 } else { 0.0 };
+            let q = if nd.n[a] > 0 { nd.w[a] / nd.n[a] as f32 } else { fpu };
             let u = c_puct * nd.p[a] * sqrt_total / (1 + nd.n[a]) as f32;
             let score = q + u;
             if score > best_score {
@@ -930,6 +943,10 @@ struct MvNode<M: MoveGame> {
     state: M::State,
     entries: Vec<MoveEntry<M>>,
     total_n: u32, // cached Σ n over entries, so `select` needn't re-sum each call
+    /// Cached Σ w and Σ p-of-visited, for the same reason: first-play urgency
+    /// needs both on every `select`.
+    w_sum: f32,
+    visited_p: f32,
     expanded: bool,
     terminal: bool,
     term_v: f32,
@@ -941,6 +958,8 @@ impl<M: MoveGame> MvNode<M> {
             state,
             entries: Vec::new(),
             total_n: 0,
+            w_sum: 0.0,
+            visited_p: 0.0,
             expanded: false,
             terminal: false,
             term_v: 0.0,
@@ -993,10 +1012,16 @@ impl<M: MoveGame> MvSearch<M> {
         let nd = &self.arena[node];
         let sqrt_total = ((nd.total_n + 1) as f32).sqrt();
         let c_puct = self.params.c_puct;
+        // Unvisited children are scored against this node's own value rather
+        // than a flat 0 (see `core::puct`). Both terms are maintained by
+        // `backup`, so this stays a single pass over the entries even for games
+        // with thousands of moves.
+        let parent_q = if nd.total_n > 0 { nd.w_sum / nd.total_n as f32 } else { 0.0 };
+        let fpu = crate::puct::fpu(parent_q, nd.visited_p);
         let mut best = 0;
         let mut best_score = f32::NEG_INFINITY;
         for (a, e) in nd.entries.iter().enumerate() {
-            let q = if e.n > 0 { e.w / e.n as f32 } else { 0.0 };
+            let q = if e.n > 0 { e.w / e.n as f32 } else { fpu };
             let u = c_puct * e.p * sqrt_total / (1 + e.n) as f32;
             let score = q + u;
             if score > best_score {
@@ -1072,6 +1097,8 @@ impl<M: MoveGame> MvSearch<M> {
                 nd.entries.push(MoveEntry { mv: *mv, p, n: 0, w: 0.0, child: -1 });
             }
             nd.total_n = 0;
+            nd.w_sum = 0.0;
+            nd.visited_p = 0.0;
             nd.expanded = true;
         }
         if node == 0 && self.params.dir_eps > 0.0 && !self.dirichlet_done {
@@ -1105,8 +1132,13 @@ impl<M: MoveGame> MvSearch<M> {
         for &(n, a) in self.pending_path.iter().rev() {
             v = -v;
             let nd = &mut self.arena[n];
-            nd.entries[a].n += 1;
-            nd.entries[a].w += v;
+            let e = &mut nd.entries[a];
+            if e.n == 0 {
+                nd.visited_p += e.p; // first visit: this child's prior is now "tried"
+            }
+            e.n += 1;
+            e.w += v;
+            nd.w_sum += v;
             nd.total_n += 1;
         }
     }

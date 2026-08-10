@@ -136,7 +136,18 @@ fn expand(arena: &mut Vec<Node>, idx: usize, eval: &impl Evaluator) -> anyhow::R
 
 /// PUCT child selection over the legal columns of `node`.
 fn select(node: &Node, c_puct: f32) -> usize {
-    let total: u32 = node.n.iter().sum();
+    // One pass for the totals, so an unvisited column can be scored against
+    // what this node is worth rather than a flat zero (see `core::puct`).
+    let (mut total, mut w_sum, mut visited_p) = (0u32, 0.0f32, 0.0f32);
+    for c in 0..C4_COLS {
+        if node.n[c] > 0 {
+            total += node.n[c];
+            w_sum += node.w[c];
+            visited_p += node.p[c];
+        }
+    }
+    let parent_q = if total > 0 { w_sum / total as f32 } else { 0.0 };
+    let fpu = playground_core::puct::fpu(parent_q, visited_p);
     let sqrt_total = ((total + 1) as f32).sqrt();
     let mut best = usize::MAX;
     let mut best_score = f32::NEG_INFINITY;
@@ -144,7 +155,7 @@ fn select(node: &Node, c_puct: f32) -> usize {
         if !node.legal[c] {
             continue;
         }
-        let q = if node.n[c] > 0 { node.w[c] / node.n[c] as f32 } else { 0.0 };
+        let q = if node.n[c] > 0 { node.w[c] / node.n[c] as f32 } else { fpu };
         let u = c_puct * node.p[c] * sqrt_total / (1 + node.n[c]) as f32;
         let score = q + u;
         if score > best_score {
