@@ -53,7 +53,17 @@ BATCH_SIZE="${BATCH_SIZE:-256}"
 
 # Eval / gate.
 EVAL_EVERY="${EVAL_EVERY:-3}"          # cycles between gate matches
-EVAL_GAMES="${EVAL_GAMES:-24}"         # candidate vs champion
+# 40 games at a 52% bar. The gate has two failure modes and they pull opposite
+# ways: promote a worse net and the run drifts down (the 2026-08-09 failure);
+# refuse a better one and the champion freezes, which caps the *data* — the
+# actor plays from best.*, so a stale champion means stale examples for every
+# generation after it. 24 games at 55% turned out to sit on the wrong side of
+# that: two candidates scored 0.458 and 0.542, both a coin flip from even, and
+# the champion sat for seven generations while the losses kept falling.
+# AGZ afforded 400-game matches; at this scale the honest choice is a lower bar
+# with more games. (SPRT would be the principled fix — play until decisive.)
+EVAL_GAMES="${EVAL_GAMES:-40}"         # candidate vs champion
+PROMOTE_THRESHOLD="${PROMOTE_THRESHOLD:-0.52}"
 MOHEX_GAMES="${MOHEX_GAMES:-8}"        # absolute yardstick, promoted nets only
 EVAL_SIMS="${EVAL_SIMS:-400}"
 # 100, not 1000: at 1000 MoHex wins every game against a young net and the
@@ -136,7 +146,8 @@ while true; do
     log "cycle $cycle: EVAL (gate: $EVAL_GAMES games vs champion)"
     $PYTHON "$repo/python/hex_eval_loop.py" --live "$LIVE" --engine "$ENGINE" \
       --mohex-bin "$MOHEX_BIN" --cuda --once --every 0 --pause-timeout 0 \
-      --games "$EVAL_GAMES" --mohex-games "$MOHEX_GAMES" --sims "$EVAL_SIMS" \
+      --games "$EVAL_GAMES" --promote-threshold "$PROMOTE_THRESHOLD" \
+      --mohex-games "$MOHEX_GAMES" --sims "$EVAL_SIMS" \
       --mohex-playouts "$MOHEX_PLAYOUTS" --channels "$CHANNELS" --blocks "$BLOCKS" \
       >> "$LOGS/evaluator.log" 2>&1 \
       || log "cycle $cycle: evaluator exited non-zero (continuing)"
