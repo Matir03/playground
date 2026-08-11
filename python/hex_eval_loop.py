@@ -91,17 +91,25 @@ def run_match(engine: str, cand: str, best: str, games: int, node_budget: int,
 
 
 def run_vs_mohex(engine: str, ckpt: str, games: int, sims: int, playouts: int,
-                 mohex_bin: str, cuda: bool, seed: int) -> float:
+                 mohex_bin: str, cuda: bool, seed: int) -> tuple[float, int]:
     cmd = [engine, "vs-mohex", "--model", ckpt, "--games", str(games),
            "--sims", str(sims), "--mohex-playouts", str(playouts),
            "--mohex-bin", mohex_bin, "--seed", str(seed)]
     if cuda:
         cmd.append("--cuda")
     out = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    m = re.search(r"net_vs_mohex\s+([\d.]+)", out.stdout)
+    # MoHex segfaults on some positions; the engine retries and voids what it
+    # cannot finish, so the score's denominator is the games that completed, not
+    # the games requested. Keep both -- 0.000 over 2 games and over 8 are very
+    # different readings. The per-game detail is on stderr, which is otherwise
+    # discarded.
+    for line in out.stderr.splitlines():
+        if "voided" in line or "mohex died" in line:
+            print(f"    {line.strip()}", flush=True)
+    m = re.search(r"net_vs_mohex\s+([\d.]+)\s+\((\d+) games", out.stdout)
     if not m:
         raise RuntimeError(f"no net_vs_mohex in output:\n{out.stdout}\n{out.stderr}")
-    return float(m.group(1))
+    return float(m.group(1)), int(m.group(2))
 
 
 def export_onnx(ckpt: str, out_path: str, channels: int, blocks: int) -> None:
@@ -202,11 +210,12 @@ def main() -> None:
                 # not cost the promotion: a missing binary once discarded a net
                 # that had already beaten the champion.
                 mohex = None
+                mohex_played = 0
                 if promoted:
                     try:
-                        mohex = run_vs_mohex(args.engine, ck, args.mohex_games, args.sims,
-                                             args.mohex_playouts, args.mohex_bin, args.cuda,
-                                             seed=gen)
+                        mohex, mohex_played = run_vs_mohex(
+                            args.engine, ck, args.mohex_games, args.sims,
+                            args.mohex_playouts, args.mohex_bin, args.cuda, seed=gen)
                     except Exception as e:
                         print(f"gen{gen}: promoted; mohex reading unavailable ({e})", flush=True)
             except Exception as e:
@@ -236,6 +245,7 @@ def main() -> None:
             entry = {
                 "gen": gen, "vs_best": vs_best, "vs_mohex": mohex, "promoted": promoted,
                 "mohex_playouts": args.mohex_playouts,
+                "mohex_games": mohex_played,  # completed, not requested
                 "loss_value": metrics.get("loss_value"),
                 "loss_policy": metrics.get("loss_policy"),
                 "loss_ownership": metrics.get("loss_ownership"),
@@ -249,7 +259,8 @@ def main() -> None:
             os.replace(tmp, scores_path)
 
             tag = "PROMOTED" if promoted else f"champion stays gen{state['best_gen']}"
-            mh = f", vs mohex@{args.mohex_playouts} {mohex:.3f}" if mohex is not None else ""
+            mh = (f", vs mohex@{args.mohex_playouts} {mohex:.3f}"
+                  f" ({mohex_played}/{args.mohex_games} games)") if mohex is not None else ""
             ls = ""
             if metrics:
                 ls = (f"  [loss v {metrics['loss_value']:.4f}"
