@@ -84,9 +84,14 @@ def run_match(engine: str, cand: str, best: str, games: int, node_budget: int,
     if cuda:
         cmd.append("--cuda")
     out = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    m = re.search(r"A_score\s+([\d.]+)", out.stdout)
+    # Log the match's own summary line (games played and elapsed). Without it the
+    # only record of a gate is its score, so there is no way to tell a real
+    # 40-game match from one that ended early -- the durations vary 150s..1250s
+    # and reconstructing why meant arithmetic rather than reading a log.
+    m = re.search(r"A_score\s+([\d.]+)\s*(\([^)]*\))?", out.stdout)
     if not m:
         raise RuntimeError(f"no A_score in output:\n{out.stdout}\n{out.stderr}")
+    print(f"    gate: A_score {m.group(1)} {m.group(2) or ''}".rstrip(), flush=True)
     return float(m.group(1))
 
 
