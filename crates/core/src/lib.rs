@@ -11,6 +11,7 @@ pub mod mcts;
 pub mod latent_mcts;
 pub mod puct;
 pub mod recording;
+pub mod trt_cache;
 pub mod solver;
 
 pub use game::{Game, Outcome, Player};

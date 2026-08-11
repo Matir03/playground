@@ -30,6 +30,11 @@ pub struct OrtModel {
 
 impl OrtModel {
     pub fn new(onnx_path: &str, ep: &str, fp16: bool, cache_dir: &str) -> anyhow::Result<Self> {
+        // Without this the actor's hot-reload is a no-op: TensorRT reuses the
+        // engine it built for the previous checkpoint, because it keys on the
+        // graph and every generation has the same architecture. See
+        // `playground_core::trt_cache`.
+        let cache_dir = &playground_core::trt_cache::content_keyed(cache_dir, onnx_path)?;
         let cuda = || {
             CUDA::default()
                 .with_device_id(0)
