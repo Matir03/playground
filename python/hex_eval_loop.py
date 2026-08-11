@@ -198,11 +198,17 @@ def main() -> None:
                     vs_best = 1.0  # nothing to beat yet
                     promoted = True
                 # MoHex is the absolute yardstick, and it is expensive, so ask it
-                # only about nets that just earned the seat.
+                # only about nets that just earned the seat. Its own failure must
+                # not cost the promotion: a missing binary once discarded a net
+                # that had already beaten the champion.
                 mohex = None
                 if promoted:
-                    mohex = run_vs_mohex(args.engine, ck, args.mohex_games, args.sims,
-                                         args.mohex_playouts, args.mohex_bin, args.cuda, seed=gen)
+                    try:
+                        mohex = run_vs_mohex(args.engine, ck, args.mohex_games, args.sims,
+                                             args.mohex_playouts, args.mohex_bin, args.cuda,
+                                             seed=gen)
+                    except Exception as e:
+                        print(f"gen{gen}: promoted; mohex reading unavailable ({e})", flush=True)
             except Exception as e:
                 release_pause(live)
                 print(f"gen{gen}: eval failed: {e}", flush=True)

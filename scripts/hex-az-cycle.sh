@@ -75,7 +75,9 @@ EVAL_SIMS="${EVAL_SIMS:-400}"
 # absolute column is 0.000 forever. Scores are comparable only within one
 # setting, so changing this restarts that series.
 MOHEX_PLAYOUTS="${MOHEX_PLAYOUTS:-100}"
-MOHEX_BIN="${MOHEX_BIN:-mohex}"
+# Resolve MoHex to a path: the cycle runs detached, without a login shell, so
+# ~/.local/bin isn't necessarily on PATH and a bare "mohex" fails to spawn.
+MOHEX_BIN="${MOHEX_BIN:-$(command -v mohex || echo "$HOME/.local/bin/mohex")}"
 
 case "${1:-run}" in
   stop)
