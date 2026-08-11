@@ -130,7 +130,11 @@ def main() -> None:
     ap.add_argument("--mohex-games", type=int, default=8,
                     help="games against MoHex, run only when a net promotes")
     ap.add_argument("--sims", type=int, default=400)
-    ap.add_argument("--mohex-playouts", type=int, default=1000)
+    # 100, not 1000: at 1000 playouts MoHex beats a young net every time and the
+    # column reads 0.000 forever, which is no measurement at all. A weaker
+    # yardstick gives a graded reading years earlier in the run. Scores are only
+    # comparable within one setting — note it when you change it.
+    ap.add_argument("--mohex-playouts", type=int, default=100)
     ap.add_argument("--channels", type=int, default=64)
     ap.add_argument("--blocks", type=int, default=6)
     ap.add_argument("--every", type=int, default=3, help="generations between evaluations")
@@ -195,10 +199,21 @@ def main() -> None:
                 state["best_gen"] = gen
                 if mohex is not None:
                     state["best_score"] = mohex
-            state["scores"][str(gen)] = {"vs_best": vs_best, "vs_mohex": mohex}
-            state["history"].append(
-                {"gen": gen, "vs_best": vs_best, "vs_mohex": mohex, "promoted": promoted}
-            )
+            # Carry the learner's losses for this generation into the record, so
+            # strength and what the net was fitting sit side by side.
+            try:
+                metrics = json.load(open(os.path.join(os.path.dirname(ck), "metrics.json")))
+            except Exception:
+                metrics = {}
+            entry = {
+                "gen": gen, "vs_best": vs_best, "vs_mohex": mohex, "promoted": promoted,
+                "mohex_playouts": args.mohex_playouts,
+                "loss_value": metrics.get("loss_value"),
+                "loss_policy": metrics.get("loss_policy"),
+                "loss_ownership": metrics.get("loss_ownership"),
+            }
+            state["scores"][str(gen)] = entry
+            state["history"].append(entry)
             state["processed_through"] = gen
             tmp = scores_path + ".tmp"
             with open(tmp, "w") as f:
@@ -206,9 +221,13 @@ def main() -> None:
             os.replace(tmp, scores_path)
 
             tag = "PROMOTED" if promoted else f"champion stays gen{state['best_gen']}"
-            mh = f", vs mohex {mohex:.3f}" if mohex is not None else ""
-            pk = "" if parked else " [pause timeout: ran with contention]"
-            print(f"gen{gen} vs champion: {vs_best:.3f}{mh}  [{tag}]{pk}", flush=True)
+            mh = f", vs mohex@{args.mohex_playouts} {mohex:.3f}" if mohex is not None else ""
+            ls = ""
+            if metrics:
+                ls = (f"  [loss v {metrics['loss_value']:.4f}"
+                      f" p {metrics['loss_policy']:.4f}"
+                      f" o {metrics['loss_ownership']:.4f}]")
+            print(f"gen{gen} vs champion: {vs_best:.3f}{mh}  [{tag}]{ls}", flush=True)
             if args.once:
                 return
         elif args.once:

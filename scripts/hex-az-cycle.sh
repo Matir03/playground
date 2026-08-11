@@ -56,7 +56,10 @@ EVAL_EVERY="${EVAL_EVERY:-3}"          # cycles between gate matches
 EVAL_GAMES="${EVAL_GAMES:-24}"         # candidate vs champion
 MOHEX_GAMES="${MOHEX_GAMES:-8}"        # absolute yardstick, promoted nets only
 EVAL_SIMS="${EVAL_SIMS:-400}"
-MOHEX_PLAYOUTS="${MOHEX_PLAYOUTS:-1000}"
+# 100, not 1000: at 1000 MoHex wins every game against a young net and the
+# absolute column is 0.000 forever. Scores are comparable only within one
+# setting, so changing this restarts that series.
+MOHEX_PLAYOUTS="${MOHEX_PLAYOUTS:-100}"
 MOHEX_BIN="${MOHEX_BIN:-mohex}"
 
 case "${1:-run}" in

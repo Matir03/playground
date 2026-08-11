@@ -282,6 +282,20 @@ def main() -> None:
             for path in (os.path.join(d, "config.json"), cfg_path):
                 with open(path, "w") as f:
                     json.dump({"arch": arch_of(net), "generation": snap_gen}, f)
+            # Losses next to the checkpoint, so the evaluator can record what the
+            # net was fitting at the moment it was measured — reading them back
+            # out of a log later is guesswork.
+            with open(os.path.join(d, "metrics.json"), "w") as f:
+                json.dump({
+                    "generation": snap_gen,
+                    "loss_value": losses[0] / max(1, nblk),
+                    "loss_policy": losses[1] / max(1, nblk),
+                    "loss_ownership": losses[2] / max(1, nblk),
+                    "samples": int(n),
+                    "chunks": len(cache),
+                    "fresh_examples": int(produced - produced_at_gen_start),
+                    "steps": args.steps_per_snapshot,
+                }, f, indent=2)
             fresh = produced - produced_at_gen_start
             print(
                 f"snapshot gen{snap_gen}  samples {n}  chunks {len(cache)}  "
