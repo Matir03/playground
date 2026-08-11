@@ -141,14 +141,19 @@ while true; do
     --fast-node-budget "$FAST_NODE_BUDGET" --full-search-prob "$FULL_SEARCH_PROB" \
     --c-puct "$C_PUCT" --chunk-secs "$CHUNK_SECS" --max-chunks "$MAX_CHUNKS" \
     --max-examples "$MAX_EXAMPLES" \
-    --target-examples "$TARGET_EXAMPLES" --seed "$cycle" >> "$LOGS/actor.log" 2>&1 \
-    || log "cycle $cycle: actor exited non-zero (continuing)"
+    --target-examples "$TARGET_EXAMPLES" --seed "$cycle" >> "$LOGS/actor.log" 2>&1
+  # The status matters: the actor writes its chunks before exiting, so a failure
+  # here is usually a teardown race (ORT/TRT static destructors) rather than lost
+  # work. Log the code so the two can be told apart -- 134 is abort().
+  rc=$?
+  (( rc == 0 )) || log "cycle $cycle: actor exited $rc (continuing)"
 
   log "cycle $cycle: TRAIN ($STEPS steps)"
   $PYTHON "$repo/python/hex_az_learner.py" --live "$LIVE" --channels "$CHANNELS" \
     --blocks "$BLOCKS" --steps-per-snapshot "$STEPS" --batch-size "$BATCH_SIZE" \
-    --gen-examples 0 --exit-after-gens 1 >> "$LOGS/learner.log" 2>&1 \
-    || log "cycle $cycle: learner exited non-zero (continuing)"
+    --gen-examples 0 --exit-after-gens 1 >> "$LOGS/learner.log" 2>&1
+  rc=$?
+  (( rc == 0 )) || log "cycle $cycle: learner exited $rc (continuing)"
 
   if (( cycle % EVAL_EVERY == 0 )); then
     log "cycle $cycle: EVAL (gate: $EVAL_GAMES games vs champion)"
@@ -157,7 +162,8 @@ while true; do
       --games "$EVAL_GAMES" --promote-threshold "$PROMOTE_THRESHOLD" \
       --mohex-games "$MOHEX_GAMES" --sims "$EVAL_SIMS" \
       --mohex-playouts "$MOHEX_PLAYOUTS" --channels "$CHANNELS" --blocks "$BLOCKS" \
-      >> "$LOGS/evaluator.log" 2>&1 \
-      || log "cycle $cycle: evaluator exited non-zero (continuing)"
+      >> "$LOGS/evaluator.log" 2>&1
+    rc=$?
+    (( rc == 0 )) || log "cycle $cycle: evaluator exited $rc (continuing)"
   fi
 done
