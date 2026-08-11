@@ -1,0 +1,51 @@
+66a87 config: MoHex v2.0.CMake Aug  9 2026.
+66a87 config: ============ InitializeSystem ============
+66a87 config: BenzeneProgram::InitRandom()
+66a87 config: Seed = 1786466686
+66a87 info: Prior Patterns:
+66a87 info: Global:
+66a87 info: Size            = 565 32648 
+66a87 info: TableEntries    = 65932 65910
+66a87 info: MirrorsAdded    = 0 0
+66a87 info: PrunableCount   = 30593 30629
+66a87 info: LargestGamma    = 5820.77
+66a87 info: SmallestGamma   = 6.6e-05
+66a87 info: Local:
+66a87 info: Size            = 550 5318 
+66a87 info: TableEntries    = 11602 11588
+66a87 info: MirrorsAdded    = 0 0
+66a87 info: PrunableCount   = 3659 3667
+66a87 info: LargestGamma    = 11281.8
+66a87 info: SmallestGamma   = 0.026235
+66a87 info: Playout Patterns:
+66a87 info: Global:
+66a87 info: Size            = 565 32648 
+66a87 info: TableEntries    = 70329 70329
+66a87 info: MirrorsAdded    = 4397 4419
+66a87 info: PrunableCount   = 30593 30629
+66a87 info: LargestGamma    = 5820.77
+66a87 info: SmallestGamma   = 6.6e-05
+66a87 info: Local:
+66a87 info: Size            = 550 5318 
+66a87 info: TableEntries    = 11602 11588
+66a87 info: MirrorsAdded    = 0 0
+66a87 info: PrunableCount   = 3659 3667
+66a87 info: LargestGamma    = 11281.8
+66a87 info: SmallestGamma   = 0.026235
+66a87 config: IcePatternSet: reading from '/home/matir/.local/src/benzene/share/ice-patterns.txt'.
+66a87 config: IcePatternSet: parsed 1136 patterns.
+66a87 config: VCS: reading captured set patterns from '/home/matir/.local/src/benzene/share/vc-captured-set.txt'.
+66a87 config: VCS:: parsed 1 patterns.
+66a87 config: VCS: reading captured set patterns from '/home/matir/.local/src/benzene/share/vc-captured-set.txt'.
+66a87 config: VCS:: parsed 1 patterns.
+66a87 config: IcePatternSet: reading from '/home/matir/.local/src/benzene/share/ice-patterns.txt'.
+66a87 config: IcePatternSet: parsed 1136 patterns.
+66a87 config: VCS: reading captured set patterns from '/home/matir/.local/src/benzene/share/vc-captured-set.txt'.
+66a87 config: VCS:: parsed 1 patterns.
+66a87 config: VCS: reading captured set patterns from '/home/matir/.local/src/benzene/share/vc-captured-set.txt'.
+66a87 config: VCS:: parsed 1 patterns.
+66a87 config: ============ BenzeneShutdown =============
+66a87 config: MoHexProgram:: ShutdownSystem()
+66a87 config: CommonProgram:: ShutdownSystem()
+66a87 config: BenzeneProgram:: ShutdownSystem()
+Flushing and closing this stream...

@@ -16,6 +16,9 @@ rand_chacha.workspace = true
 rand_distr.workspace = true
 bytes.workspace = true
 crossbeam-channel = "0.5"
+# For `_exit` on the actor's deliberate shutdown -- see `run_actor_continuous`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

@@ -1854,6 +1854,25 @@ pub fn run_actor_continuous<M, F>(
             let games = std::mem::take(&mut *finished.lock().unwrap());
             if !on_flush(games) {
                 stopping.store(true, std::sync::atomic::Ordering::Release);
+                // Leave by the syscall, not `process::exit`. `exit` runs the C++
+                // static destructors registered by onnxruntime/TensorRT, and they
+                // race the CUDA driver shutdown this same exit kicks off:
+                // "CUDA failure 4: driver shutting down", then SIGSEGV. That made
+                // every generation end in a 139 and left a real crash looking
+                // exactly like the routine one.
+                //
+                // Nothing is lost: everything we keep was written by `on_flush`
+                // above, and the games still in flight are already being dropped.
+                // Rust's stdout is line-buffered, but flush both streams anyway --
+                // `_exit` runs no atexit handlers.
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                let _ = std::io::stderr().flush();
+                #[cfg(unix)]
+                unsafe {
+                    libc::_exit(0)
+                };
+                #[cfg(not(unix))]
                 std::process::exit(0);
             }
         }
