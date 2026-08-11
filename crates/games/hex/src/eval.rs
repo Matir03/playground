@@ -32,13 +32,19 @@ pub fn run_match(
     threads: usize,
     max_batch: usize,
     base_seed: u64,
+    backend: crate::selfplay::Backend,
 ) -> anyhow::Result<f64> {
-    let device = crate::net::pick_device(cuda)?;
-    let a = LocalModel::load_on(ckpt_a, device.clone())?;
-    let b = LocalModel::load_on(ckpt_b, device)?;
+    // Matches are a big slice of a training cycle — a 40-game gate on candle
+    // took 40 minutes, because candle is latency-bound at these batch sizes
+    // (~1.3k nodes/s against TensorRT's ~100k). Both sides load through the
+    // same backend so neither gets an advantage from it.
+    let device = if backend.is_ort() { None } else { Some(crate::net::pick_device(cuda)?) };
+    let a = backend.load_file(ckpt_a, device.clone())?;
+    let b = backend.load_file(ckpt_b, device)?;
     eprintln!(
-        "hex eval-match: {games} games, {threads} threads, node-budget {node_budget}\n  \
+        "hex eval-match [{}]: {games} games, {threads} threads, node-budget {node_budget}\n  \
          A={ckpt_a}\n  B={ckpt_b}",
+        backend.label(),
     );
     let sp = SearchParams {
         sims: 0,
@@ -60,7 +66,7 @@ pub fn run_match(
     };
     let t0 = Instant::now();
     let a_score =
-        batch_search::run_eval_moves::<Hex>(&a, &b, games, sp, threads, max_batch, base_seed);
+        batch_search::run_eval_moves::<Hex>(&*a, &*b, games, sp, threads, max_batch, base_seed);
     println!("A_score {a_score:.4}  ({games} games, {:.1}s)", t0.elapsed().as_secs_f64());
     Ok(a_score)
 }

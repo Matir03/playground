@@ -79,8 +79,9 @@ impl Backend {
         }
     }
 
-    /// Same, for a checkpoint given directly (the bench takes a path, not a live dir).
-    fn load_file(self, path: &str, device: Option<candle_core::Device>) -> anyhow::Result<Arc<dyn BatchModel>> {
+    /// Same, for a checkpoint given directly (the bench and eval take a path,
+    /// not a live dir).
+    pub fn load_file(self, path: &str, device: Option<candle_core::Device>) -> anyhow::Result<Arc<dyn BatchModel>> {
         match self {
             Backend::Candle => Ok(Arc::new(LocalModel::load_on(path, device.unwrap())?)),
             Backend::Ort { ep, fp16 } => {

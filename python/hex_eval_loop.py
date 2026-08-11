@@ -70,11 +70,17 @@ def release_pause(live: str) -> None:
 
 
 def run_match(engine: str, cand: str, best: str, games: int, node_budget: int,
-              threads: int, cuda: bool, seed: int) -> float:
-    """Candidate vs incumbent; returns the candidate's score in [0,1]."""
+              threads: int, cuda: bool, seed: int, ort: bool = False) -> float:
+    """Candidate vs incumbent; returns the candidate's score in [0,1].
+
+    On the ORT/TensorRT backend a 40-game gate takes a couple of minutes rather
+    than the ~40 candle needs, which matters when the gate is a phase of every
+    third training cycle."""
     cmd = [engine, "eval-match", "--a", cand, "--b", best, "--games", str(games),
            "--node-budget", str(node_budget), "--threads", str(threads),
            "--max-batch", str(max(8, games)), "--seed", str(seed)]
+    if ort:
+        cmd += ["--backend", "ort", "--ep", "trt"]
     if cuda:
         cmd.append("--cuda")
     out = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -169,8 +175,24 @@ def main() -> None:
             parked = request_pause(live, args.pause_timeout)
             try:
                 if os.path.exists(best_ckpt):
-                    vs_best = run_match(args.engine, ck, best_ckpt, args.games,
-                                        args.sims, args.threads, args.cuda, seed=gen)
+                    # Match on ORT when both sides have an ONNX: export the
+                    # candidate (a second) to save ~35 minutes of match time.
+                    cand_onnx = os.path.join(live, "candidate.onnx")
+                    use_ort = os.path.exists(best_onnx)
+                    if use_ort:
+                        try:
+                            export_onnx(ck, cand_onnx, args.channels, args.blocks)
+                        except Exception as e:
+                            print(f"gen{gen}: candidate ONNX export failed, using candle: {e}",
+                                  flush=True)
+                            use_ort = False
+                    vs_best = run_match(
+                        args.engine,
+                        cand_onnx if use_ort else ck,
+                        best_onnx if use_ort else best_ckpt,
+                        args.games, args.sims, args.threads, args.cuda,
+                        seed=gen, ort=use_ort,
+                    )
                     promoted = vs_best >= args.promote_threshold
                 else:
                     vs_best = 1.0  # nothing to beat yet

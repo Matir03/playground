@@ -195,8 +195,10 @@ enum Cmd {
     },
     /// Head-to-head between two checkpoints (relative strength / ELO).
     EvalMatch {
+        /// Candidate: a .safetensors for `--backend candle`, a .onnx for `ort`.
         #[arg(long)]
         a: String,
+        /// Incumbent, same format as `--a`.
         #[arg(long)]
         b: String,
         #[arg(long)]
@@ -215,6 +217,13 @@ enum Cmd {
         max_batch: usize,
         #[arg(long, default_value_t = 0)]
         seed: u64,
+        /// Inference backend for both sides: `candle` (.safetensors) or `ort` (.onnx).
+        #[arg(long, default_value = "candle")]
+        backend: String,
+        #[arg(long, default_value = "trt")]
+        ep: String,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        fp16: bool,
     },
     /// Absolute strength: the net (with search) against MoHex.
     VsMohex {
@@ -405,10 +414,14 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(0);
             }
         }
-        Cmd::EvalMatch { a, b, cuda, games, node_budget, c_puct, temp_moves, threads, max_batch, seed } => {
+        Cmd::EvalMatch {
+            a, b, cuda, games, node_budget, c_puct, temp_moves, threads, max_batch, seed,
+            backend, ep, fp16,
+        } => {
             eval::run_match(
                 &a, &b, cuda, games, node_budget, c_puct, temp_moves,
                 threads.unwrap_or_else(default_threads), max_batch, seed,
+                parse_backend(&backend, &ep, fp16)?,
             )?;
         }
         Cmd::VsMohex { model, cuda, mohex_bin, games, sims, c_puct, mohex_playouts, mohex_time, seed } => {
