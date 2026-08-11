@@ -48,8 +48,31 @@ impl Drop for OrtModel {
     }
 }
 
+/// TensorRT names its cached engines after the *graph*, not the weights. Every
+/// checkpoint of ours has the same architecture, so they all collide: the first
+/// engine built for a given shape is silently reused for every later net loaded
+/// from the same cache directory.
+///
+/// That is not a subtle performance issue — it means a promoted net never
+/// actually plays. In this repo it went unnoticed for a 15-hour run: self-play
+/// kept using the engine built at startup while the champion advanced through
+/// five promotions, and gate matches "compared" two checkpoints that were both
+/// executing a third one's weights.
+///
+/// So the cache directory is keyed by the model's *content*. Same bytes reuse an
+/// engine; different bytes build their own.
+fn content_keyed_cache(cache_dir: &str, onnx_path: &str) -> anyhow::Result<String> {
+    use std::hash::{Hash, Hasher};
+    let bytes = std::fs::read(onnx_path)
+        .map_err(|e| anyhow::anyhow!("reading {onnx_path} to key its engine cache: {e}"))?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    Ok(format!("{cache_dir}/{:016x}", h.finish()))
+}
+
 impl OrtModel {
     pub fn new(onnx_path: &str, ep: &str, fp16: bool, cache_dir: &str) -> anyhow::Result<Self> {
+        let cache_dir = &content_keyed_cache(cache_dir, onnx_path)?;
         let cuda = || {
             CUDA::default()
                 .with_device_id(0)
