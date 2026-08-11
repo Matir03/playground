@@ -220,8 +220,27 @@ fn max_chunk_seq(buffer: &Path) -> Option<u64> {
     std::fs::read_dir(buffer).ok()?.filter_map(|e| e.ok()).filter_map(|e| chunk_seq(&e)).max()
 }
 
-/// Keep only the newest `keep` chunks — the replay buffer's sliding window.
-fn prune_buffer(buffer: &Path, keep: usize) {
+/// Number of examples in a chunk, from its header — cheap, no parsing of the body.
+fn chunk_examples(path: &Path) -> Option<u64> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut head = [0u8; 16];
+    f.read_exact(&mut head).ok()?;
+    if u32::from_le_bytes(head[0..4].try_into().ok()?) != DUMP_MAGIC {
+        return None;
+    }
+    Some(u64::from_le_bytes(head[8..16].try_into().ok()?))
+}
+
+/// The replay buffer's sliding window: keep the newest chunks up to `keep_chunks`
+/// **and** `keep_examples`, whichever binds first.
+///
+/// Counting only chunks is a trap, because a chunk is a *time* slice: when the GPU
+/// slowed 6x, 40 chunks stopped being 270k examples and became 63k, reuse went
+/// 0.6x -> 2.4x, and the net was yanked onto a narrow slice of recent play. The
+/// window that matters for training is measured in examples, so bound that
+/// directly and let the chunk count be a backstop.
+fn prune_buffer(buffer: &Path, keep_chunks: usize, keep_examples: u64) {
     let mut chunks: Vec<(u64, PathBuf)> = std::fs::read_dir(buffer)
         .into_iter()
         .flatten()
@@ -229,10 +248,24 @@ fn prune_buffer(buffer: &Path, keep: usize) {
         .filter_map(|e| chunk_seq(&e).map(|s| (s, e.path())))
         .collect();
     chunks.sort_unstable_by_key(|&(s, _)| s);
-    if chunks.len() > keep {
-        for (_, p) in &chunks[..chunks.len() - keep] {
-            let _ = std::fs::remove_file(p);
+
+    let mut drop_before = chunks.len().saturating_sub(keep_chunks);
+    if keep_examples > 0 {
+        // Walk newest-first, keeping chunks until the example budget is spent.
+        let mut total = 0u64;
+        let mut oldest_kept = chunks.len();
+        for (i, (_, p)) in chunks.iter().enumerate().rev() {
+            let n = chunk_examples(p).unwrap_or(0);
+            if total + n > keep_examples && total > 0 {
+                break;
+            }
+            total += n;
+            oldest_kept = i;
         }
+        drop_before = drop_before.max(oldest_kept);
+    }
+    for (_, p) in &chunks[..drop_before] {
+        let _ = std::fs::remove_file(p);
     }
 }
 
@@ -247,6 +280,8 @@ pub fn run_loop(
     concurrency: usize,
     chunk_secs: f64,
     max_chunks: usize,
+    // Replay-buffer window in examples (0 = bound by chunk count alone).
+    max_examples: u64,
     threads: usize,
     max_batch: usize,
     base_seed: u64,
@@ -272,7 +307,7 @@ pub fn run_loop(
     let mut seq = max_chunk_seq(&buffer).map(|s| s + 1).unwrap_or(0);
     eprintln!(
         "hex continuous actor [{}]: concurrency {concurrency}, flush {chunk_secs:.0}s, batch \
-         {max_batch}, {threads} threads, {} sims/move, buffer {} (keep {max_chunks})",
+         {max_batch}, {threads} threads, {} sims/move, buffer {} (keep {max_chunks} chunks / {max_examples} ex)",
         backend.label(),
         if params.node_budget > 0 { params.node_budget } else { params.sims },
         buffer.display(),
@@ -299,7 +334,7 @@ pub fn run_loop(
             if write_dump(tmp.to_str().unwrap(), &examples).is_ok()
                 && std::fs::rename(&tmp, &path).is_ok()
             {
-                prune_buffer(&buffer, max_chunks);
+                prune_buffer(&buffer, max_chunks, max_examples);
                 seq += 1;
             }
             // "ex/game", not "plies/game": with playout cap randomization only a

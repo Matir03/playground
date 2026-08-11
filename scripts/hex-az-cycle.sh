@@ -41,7 +41,12 @@ FAST_NODE_BUDGET="${FAST_NODE_BUDGET:-100}"
 FULL_SEARCH_PROB="${FULL_SEARCH_PROB:-0.25}"
 C_PUCT="${C_PUCT:-1.5}"
 CHUNK_SECS="${CHUNK_SECS:-60}"
-MAX_CHUNKS="${MAX_CHUNKS:-40}"
+# The buffer window that matters is examples, not chunks: a chunk is 60s of play,
+# so its size tracks GPU speed. When the GPU clamped to 210MHz, 40 chunks fell
+# from 270k examples to 63k, reuse went 0.6x -> 2.4x, and the value loss jumped
+# 0.09 -> 0.68. Chunk count is now just a backstop.
+MAX_CHUNKS="${MAX_CHUNKS:-200}"
+MAX_EXAMPLES="${MAX_EXAMPLES:-300000}"
 BACKEND="${BACKEND:-ort}"
 EP="${EP:-trt}"
 
@@ -133,6 +138,7 @@ while true; do
     --concurrency "$CONCURRENCY" --max-batch "$MAX_BATCH" --node-budget "$NODE_BUDGET" \
     --fast-node-budget "$FAST_NODE_BUDGET" --full-search-prob "$FULL_SEARCH_PROB" \
     --c-puct "$C_PUCT" --chunk-secs "$CHUNK_SECS" --max-chunks "$MAX_CHUNKS" \
+    --max-examples "$MAX_EXAMPLES" \
     --target-examples "$TARGET_EXAMPLES" --seed "$cycle" >> "$LOGS/actor.log" 2>&1 \
     || log "cycle $cycle: actor exited non-zero (continuing)"
 

@@ -120,9 +120,15 @@ enum Cmd {
         /// Wall-clock seconds of self-play per buffer chunk.
         #[arg(long, default_value_t = 60.0)]
         chunk_secs: f64,
-        /// Replay-buffer window, in chunks.
-        #[arg(long, default_value_t = 40)]
+        /// Replay-buffer window, in chunks (a backstop — see --max-examples).
+        #[arg(long, default_value_t = 200)]
         max_chunks: usize,
+        /// Replay-buffer window in *examples*, which is what training actually
+        /// cares about. A chunk is a time slice, so its size tracks GPU speed:
+        /// bounding by chunks alone let the buffer collapse 4x when the GPU
+        /// clocked down. 0 = chunk count only.
+        #[arg(long, default_value_t = 300_000)]
+        max_examples: u64,
         #[arg(long)]
         threads: Option<usize>,
         #[arg(long, default_value_t = 400)]
@@ -380,7 +386,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::SelfPlay { addr, model_uri, .. } => serve(addr, &model_uri, &[], false).await?,
         Cmd::SelfplayLoop {
-            live, cuda, concurrency, max_batch, chunk_secs, max_chunks, threads, node_budget,
+            live, cuda, concurrency, max_batch, chunk_secs, max_chunks, max_examples, threads, node_budget,
             c_puct, dir_alpha, dir_eps, temp_moves, forced_playout_k, full_search_prob,
             fast_node_budget, target_examples, seed, backend, ep, fp16,
         } => {
@@ -389,7 +395,7 @@ async fn main() -> anyhow::Result<()> {
             params.full_search_prob = full_search_prob;
             params.fast_node_budget = fast_node_budget;
             selfplay::run_loop(
-                &live, cuda, params, concurrency, chunk_secs, max_chunks,
+                &live, cuda, params, concurrency, chunk_secs, max_chunks, max_examples,
                 threads.unwrap_or_else(default_threads), max_batch, seed,
                 parse_backend(&backend, &ep, fp16)?, target_examples,
             )?;
