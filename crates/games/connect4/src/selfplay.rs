@@ -188,6 +188,7 @@ fn to_search_params(p: &Params) -> SearchParams {
             forced_playout_k: 0.0,
             full_search_prob: 0.0,
             fast_node_budget: 0,
+            random_opening_max: 0,
     }
 }
 

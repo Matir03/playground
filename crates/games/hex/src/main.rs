@@ -154,6 +154,12 @@ enum Cmd {
         /// Visits for the other moves — they advance the game but aren't recorded.
         #[arg(long, default_value_t = 100)]
         fast_node_budget: u32,
+        /// Random openings: each game plays N ~ U[0, this] uniformly random legal
+        /// moves before the search takes over, and none of them are trained on
+        /// (0 = off; 169 = the whole board). Keeps the training distribution
+        /// moving even while the champion generating the data is frozen.
+        #[arg(long, default_value_t = 0)]
+        random_opening_max: u32,
         /// Exit once this many training examples have been written (0 = run until
         /// killed). The generate→train→eval cycle uses this so the phases never
         /// share the GPU.
@@ -388,12 +394,13 @@ async fn main() -> anyhow::Result<()> {
         Cmd::SelfplayLoop {
             live, cuda, concurrency, max_batch, chunk_secs, max_chunks, max_examples, threads, node_budget,
             c_puct, dir_alpha, dir_eps, temp_moves, forced_playout_k, full_search_prob,
-            fast_node_budget, target_examples, seed, backend, ep, fp16,
+            fast_node_budget, random_opening_max, target_examples, seed, backend, ep, fp16,
         } => {
             let mut params = search_params(node_budget, c_puct, dir_alpha, dir_eps, temp_moves);
             params.forced_playout_k = forced_playout_k;
             params.full_search_prob = full_search_prob;
             params.fast_node_budget = fast_node_budget;
+            params.random_opening_max = random_opening_max;
             selfplay::run_loop(
                 &live, cuda, params, concurrency, chunk_secs, max_chunks, max_examples,
                 threads.unwrap_or_else(default_threads), max_batch, seed,
@@ -513,6 +520,7 @@ fn search_params(
             forced_playout_k: 0.0,
             full_search_prob: 0.0,
             fast_node_budget: 0,
+            random_opening_max: 0,
     }
 }
 

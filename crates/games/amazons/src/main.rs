@@ -242,6 +242,7 @@ async fn main() -> anyhow::Result<()> {
             forced_playout_k: 0.0,
             full_search_prob: 0.0,
             fast_node_budget: 0,
+            random_opening_max: 0,
             };
             tokio::task::spawn_blocking(move || {
                 selfplay::run_benchmark(&model, cuda, concurrency, threads, params, max_batch, seed,
@@ -261,6 +262,7 @@ async fn main() -> anyhow::Result<()> {
                 forced_playout_k: 0.0,
             full_search_prob: 0.0,
             fast_node_budget: 0,
+            random_opening_max: 0,
             };
             tokio::task::spawn_blocking(move || {
                 selfplay::run_loop(&live, cuda, params, concurrency, chunk_secs, max_chunks, threads,

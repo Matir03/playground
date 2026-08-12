@@ -511,6 +511,7 @@ mod tests {
             forced_playout_k: 0.0,
             full_search_prob: 0.0,
             fast_node_budget: 0,
+            random_opening_max: 0,
         };
         // How often do independent searches of the *same* opening agree?
         let agreement = |k: f32| {
@@ -545,6 +546,79 @@ mod tests {
     /// Stand-in for a barely-trained net: a flat policy and a value that varies
     /// with the position but means nothing (what the real value head looks like
     /// for the first few generations).
+    /// Random openings must diversify what the learner sees without ever
+    /// training on a randomly-played move.
+    #[test]
+    fn random_openings_diversify_training_positions() {
+        let base = SearchParams {
+            sims: 0,
+            node_budget: 40,
+            c_puct: 0.6,
+            dir_alpha: 0.3,
+            dir_eps: 0.25,
+            temp_moves: 0,
+            explore_eps: 0.0,
+            max_ply: 0,
+            settle_plies: 0,
+            resign_threshold: 0.0,
+            resign_consecutive: 0,
+            resign_playout_frac: 0.0,
+            forced_playout_k: 0.0,
+            full_search_prob: 0.0,
+            fast_node_budget: 0,
+            random_opening_max: 0,
+        };
+        // The ply of each game's first training example.
+        let first_training_plies = |params: SearchParams| -> Vec<usize> {
+            let (records, _) = batch_search::run_selfplay_moves::<Hex>(
+                &FlatPolicyNoisyValue, 24, params, 4, 16, 7, 20.0, 0.0,
+            );
+            records
+                .iter()
+                .filter_map(|r| {
+                    r.moves.iter().position(|m| m.for_training && m.visits.iter().sum::<u32>() > 0)
+                })
+                .collect()
+        };
+
+        // Off: every game is trained on from the empty board.
+        let off = first_training_plies(base);
+        assert!(!off.is_empty(), "expected some games");
+        assert!(off.iter().all(|&p| p == 0), "without random openings every game starts at ply 0");
+
+        // On: games start from many different positions.
+        let params = SearchParams { random_opening_max: 169, ..base };
+        let (records, _) = batch_search::run_selfplay_moves::<Hex>(
+            &FlatPolicyNoisyValue, 24, params, 4, 16, 7, 20.0, 0.0,
+        );
+        assert!(!records.is_empty(), "expected some games");
+
+        let mut distinct = std::collections::HashSet::new();
+        for r in &records {
+            let first = r
+                .moves
+                .iter()
+                .position(|m| m.for_training && m.visits.iter().sum::<u32>() > 0);
+            let Some(first) = first else { continue };
+            distinct.insert(first);
+            // Nothing before the first trained move may carry a policy target, and
+            // the position trained from must still be a live game.
+            for m in &r.moves[..first] {
+                assert!(!m.for_training || m.visits.iter().sum::<u32>() > 0);
+            }
+            assert_eq!(r.states[first].winner, 0, "trained on a finished position");
+            // The opening is a real prefix: every recorded move is legal at its state.
+            for (i, m) in r.moves.iter().enumerate().take(first) {
+                assert!(m.played < m.moves.len(), "move index outside the legal list");
+                assert_eq!(r.states[i].winner, 0, "opening continued past a finished game");
+            }
+        }
+        assert!(
+            distinct.len() > 1,
+            "random openings should spread the training positions, got {distinct:?}"
+        );
+    }
+
     struct FlatPolicyNoisyValue;
 
     impl BatchModel for FlatPolicyNoisyValue {
@@ -589,6 +663,7 @@ mod tests {
             forced_playout_k: 0.0,
             full_search_prob: 0.0,
             fast_node_budget: 0,
+            random_opening_max: 0,
         };
         let (records, _) =
             batch_search::run_selfplay_moves::<Hex>(&FlatPolicyNoisyValue, 2, params, 2, 2, 5, 30.0, 0.0);
@@ -671,6 +746,7 @@ mod tests {
             forced_playout_k: 0.0,
             full_search_prob: 0.0,
             fast_node_budget: 0,
+            random_opening_max: 0,
         };
         // Many games in flight against a small batch, so rows are mixed.
         let (records, _stats) =
@@ -721,6 +797,7 @@ mod tests {
             forced_playout_k: 0.0,
             full_search_prob: 0.0,
             fast_node_budget: 0,
+            random_opening_max: 0,
         };
         let (records, _stats) =
             batch_search::run_selfplay_moves::<Hex>(&Uniform, 8, params, 2, 8, 1, 20.0, 0.0);
