@@ -64,6 +64,7 @@ pub fn run_match(
             full_search_prob: 0.0,
             fast_node_budget: 0,
             random_opening_max: 0,
+            random_opening_decay: 1.0,
     };
     let t0 = Instant::now();
     let a_score =

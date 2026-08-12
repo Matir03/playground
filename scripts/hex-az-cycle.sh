@@ -45,6 +45,9 @@ C_PUCT="${C_PUCT:-1.5}"
 # frozen champion means a frozen training distribution -- which is how this run
 # stalled 18 generations at gen33. Evaluation is unaffected (gates start empty).
 RANDOM_OPENING_MAX="${RANDOM_OPENING_MAX:-169}"
+# Opening lengths decay 1% per ply rather than being uniform: short openings sit
+# nearer positions real games reach, and the tail still gets covered.
+RANDOM_OPENING_DECAY="${RANDOM_OPENING_DECAY:-1.01}"
 CHUNK_SECS="${CHUNK_SECS:-60}"
 # The buffer window that matters is examples, not chunks: a chunk is 60s of play,
 # so its size tracks GPU speed. When the GPU clamped to 210MHz, 40 chunks fell
@@ -145,6 +148,7 @@ while true; do
     --concurrency "$CONCURRENCY" --max-batch "$MAX_BATCH" --node-budget "$NODE_BUDGET" \
     --fast-node-budget "$FAST_NODE_BUDGET" --full-search-prob "$FULL_SEARCH_PROB" \
     --random-opening-max "$RANDOM_OPENING_MAX" \
+    --random-opening-decay "$RANDOM_OPENING_DECAY" \
     --c-puct "$C_PUCT" --chunk-secs "$CHUNK_SECS" --max-chunks "$MAX_CHUNKS" \
     --max-examples "$MAX_EXAMPLES" \
     --target-examples "$TARGET_EXAMPLES" --seed "$cycle" >> "$LOGS/actor.log" 2>&1

@@ -160,6 +160,11 @@ enum Cmd {
         /// moving even while the champion generating the data is frozen.
         #[arg(long, default_value_t = 0)]
         random_opening_max: u32,
+        /// Shape of the opening length: P(N=n) ∝ this^-n, truncated at
+        /// --random-opening-max (1.0 = uniform). 1.01 tilts toward short openings
+        /// while still reaching deep ones.
+        #[arg(long, default_value_t = 1.0)]
+        random_opening_decay: f32,
         /// Exit once this many training examples have been written (0 = run until
         /// killed). The generate→train→eval cycle uses this so the phases never
         /// share the GPU.
@@ -394,13 +399,15 @@ async fn main() -> anyhow::Result<()> {
         Cmd::SelfplayLoop {
             live, cuda, concurrency, max_batch, chunk_secs, max_chunks, max_examples, threads, node_budget,
             c_puct, dir_alpha, dir_eps, temp_moves, forced_playout_k, full_search_prob,
-            fast_node_budget, random_opening_max, target_examples, seed, backend, ep, fp16,
+            fast_node_budget, random_opening_max, random_opening_decay, target_examples, seed,
+            backend, ep, fp16,
         } => {
             let mut params = search_params(node_budget, c_puct, dir_alpha, dir_eps, temp_moves);
             params.forced_playout_k = forced_playout_k;
             params.full_search_prob = full_search_prob;
             params.fast_node_budget = fast_node_budget;
             params.random_opening_max = random_opening_max;
+            params.random_opening_decay = random_opening_decay;
             selfplay::run_loop(
                 &live, cuda, params, concurrency, chunk_secs, max_chunks, max_examples,
                 threads.unwrap_or_else(default_threads), max_batch, seed,
@@ -521,6 +528,7 @@ fn search_params(
             full_search_prob: 0.0,
             fast_node_budget: 0,
             random_opening_max: 0,
+            random_opening_decay: 1.0,
     }
 }
 

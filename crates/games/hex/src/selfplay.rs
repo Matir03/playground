@@ -512,6 +512,7 @@ mod tests {
             full_search_prob: 0.0,
             fast_node_budget: 0,
             random_opening_max: 0,
+            random_opening_decay: 1.0,
         };
         // How often do independent searches of the *same* opening agree?
         let agreement = |k: f32| {
@@ -567,6 +568,7 @@ mod tests {
             full_search_prob: 0.0,
             fast_node_budget: 0,
             random_opening_max: 0,
+            random_opening_decay: 1.0,
         };
         // The ply of each game's first training example.
         let first_training_plies = |params: SearchParams| -> Vec<usize> {
@@ -641,6 +643,7 @@ mod tests {
             full_search_prob: 0.0,
             fast_node_budget: 0,
             random_opening_max: 169,
+            random_opening_decay: 1.0,
         };
         let (records, _) = batch_search::run_selfplay_moves::<Hex>(
             &FlatPolicyNoisyValue, 24, params, 4, 16, 3, 20.0, 0.0,
@@ -675,6 +678,62 @@ mod tests {
             trainable,
             "examples must come only from searched, recorded moves ({openings} openings were played)"
         );
+    }
+
+    /// The opening length must actually follow P(n) ∝ decay^-n, and must still be
+    /// uniform when decay is 1.0 — the CDF inversion is easy to get subtly wrong.
+    #[test]
+    fn opening_length_follows_the_requested_decay() {
+        use rand::SeedableRng;
+        let base = SearchParams {
+            sims: 0,
+            node_budget: 1,
+            c_puct: 0.6,
+            dir_alpha: 0.3,
+            dir_eps: 0.0,
+            temp_moves: 0,
+            explore_eps: 0.0,
+            max_ply: 0,
+            settle_plies: 0,
+            resign_threshold: 0.0,
+            resign_consecutive: 0,
+            resign_playout_frac: 0.0,
+            forced_playout_k: 0.0,
+            full_search_prob: 0.0,
+            fast_node_budget: 0,
+            random_opening_max: 169,
+            random_opening_decay: 1.0,
+        };
+        let draw = |decay: f32| -> Vec<u32> {
+            let params = SearchParams { random_opening_decay: decay, ..base };
+            let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(11);
+            (0..20_000).map(|_| batch_search::sample_opening_len_for_test(&params, &mut rng)).collect()
+        };
+        let mean = |v: &[u32]| v.iter().map(|&x| x as f64).sum::<f64>() / v.len() as f64;
+        let in_range = |v: &[u32]| v.iter().all(|&x| x <= 169);
+
+        let uniform = draw(1.0);
+        assert!(in_range(&uniform));
+        assert!((mean(&uniform) - 84.5).abs() < 3.0, "decay 1.0 must stay uniform, mean {}", mean(&uniform));
+
+        let tilted = draw(1.01);
+        assert!(in_range(&tilted));
+        // Closed form for the truncated geometric: sum n r^n / sum r^n, r = 1/1.01.
+        let r = 1.0f64 / 1.01;
+        let (mut num, mut den) = (0.0, 0.0);
+        for n in 0..=169u32 {
+            let w = r.powi(n as i32);
+            num += n as f64 * w;
+            den += w;
+        }
+        let want = num / den;
+        assert!((mean(&tilted) - want).abs() < 3.0, "mean {}, expected {want}", mean(&tilted));
+        assert!(mean(&tilted) < mean(&uniform), "decay must shorten openings");
+
+        // Steeper decay shortens further, and the tail is still reachable.
+        let steep = draw(1.05);
+        assert!(mean(&steep) < mean(&tilted));
+        assert!(tilted.iter().any(|&n| n > 140), "the deep tail must still be sampled");
     }
 
     struct FlatPolicyNoisyValue;
@@ -722,6 +781,7 @@ mod tests {
             full_search_prob: 0.0,
             fast_node_budget: 0,
             random_opening_max: 0,
+            random_opening_decay: 1.0,
         };
         let (records, _) =
             batch_search::run_selfplay_moves::<Hex>(&FlatPolicyNoisyValue, 2, params, 2, 2, 5, 30.0, 0.0);
@@ -805,6 +865,7 @@ mod tests {
             full_search_prob: 0.0,
             fast_node_budget: 0,
             random_opening_max: 0,
+            random_opening_decay: 1.0,
         };
         // Many games in flight against a small batch, so rows are mixed.
         let (records, _stats) =
@@ -856,6 +917,7 @@ mod tests {
             full_search_prob: 0.0,
             fast_node_budget: 0,
             random_opening_max: 0,
+            random_opening_decay: 1.0,
         };
         let (records, _stats) =
             batch_search::run_selfplay_moves::<Hex>(&Uniform, 8, params, 2, 8, 1, 20.0, 0.0);

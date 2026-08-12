@@ -144,6 +144,14 @@ pub struct SearchParams {
     /// post-opening positions, but it does mean the realised distribution is not
     /// the nominal one.
     pub random_opening_max: u32,
+    /// Shape of the random-opening length: `P(N = n) ∝ random_opening_decay^-n`,
+    /// truncated to `0..=random_opening_max`. 1.0 = uniform.
+    ///
+    /// A per-ply decay tilts the openings toward short prefixes, which sit closer
+    /// to positions real games actually reach, while still reaching deep ones often
+    /// enough to keep the tail covered. At 1.01 over a 169-cell board the density
+    /// falls to 1.01^-169 ≈ 0.19 of its start, so it is a tilt rather than a cutoff.
+    pub random_opening_decay: f32,
 }
 
 /// One move's training-relevant record (policy target + the move actually played).
@@ -1497,7 +1505,26 @@ const BATCH_PIPELINE_DEPTH: usize = 1;
 
 /// Does the next move get the full search (and become a training example), or a
 /// cheap one that only advances the game? `full_search_prob <= 0` = always full.
-/// Play `N ~ U[0, random_opening_max]` uniformly random legal moves, returning the
+/// Draw an opening length from `P(n) ∝ decay^-n` on `0..=max` by inverting the CDF,
+/// so it costs one uniform draw regardless of `max`.
+pub fn sample_opening_len_for_test(params: &SearchParams, rng: &mut ChaCha8Rng) -> u32 {
+    sample_opening_len(params, rng)
+}
+
+fn sample_opening_len(params: &SearchParams, rng: &mut ChaCha8Rng) -> u32 {
+    let max = params.random_opening_max;
+    let r = 1.0f64 / params.random_opening_decay.max(f32::EPSILON) as f64;
+    if !(r.is_finite() && r > 0.0) || (r - 1.0).abs() < 1e-9 {
+        return rng.gen_range(0..=max); // uniform
+    }
+    // CDF(k) = (1 - r^(k+1)) / (1 - r^(max+1)); invert for k.
+    let span = 1.0 - r.powi(max as i32 + 1);
+    let u: f64 = rng.gen::<f64>();
+    let k = ((1.0 - u * span).ln() / r.ln() - 1.0).floor();
+    (k.max(0.0) as u32).min(max)
+}
+
+/// Play `N` uniformly random legal moves (`N` from [`sample_opening_len`]), returning the
 /// states and (non-training) move records. Resamples if the prefix finishes the
 /// game; falls back to the empty board if it keeps finishing.
 fn random_opening<M: MoveGame>(
@@ -1514,7 +1541,7 @@ fn random_opening<M: MoveGame>(
     let mut moves_buf = Vec::new();
     let mut prior_buf = Vec::new();
     for _ in 0..64 {
-        let n = rng.gen_range(0..=params.random_opening_max);
+        let n = sample_opening_len(params, rng);
         let mut states = vec![M::initial_state()];
         let mut recs: Vec<MvMoveRecord<M>> = Vec::new();
         for _ in 0..n {
