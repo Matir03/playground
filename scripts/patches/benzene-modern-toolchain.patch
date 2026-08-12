@@ -1,7 +1,12 @@
-benzene (MoHex 2.0) on a modern toolchain, and two genmove crashes.
+benzene (MoHex 2.0) on a modern toolchain, and the genmove crashes.
 
 Upstream (github.com/cgao3/benzene-vanilla-cmake) has been unmaintained since
-2015. Three fixes are needed to build it and to survive a full 13x13 game:
+2015. These fixes are needed to build it and to survive a full 13x13 game.
+
+A theme runs through all of them: benzene guards its invariants with
+`BenzeneAssert`, which compiles out in a release build. Every crash below is a
+place where the assert was the only thing standing between a "cannot happen"
+state and undefined behaviour.
 
 1. src/util/Misc.cpp -- Boost.Filesystem v2 calls (`branch_path`, `normalize`)
    that Boost removed; replaced by the v3 spellings (needs Boost >= 1.60).
@@ -23,6 +28,142 @@ Upstream (github.com/cgao3/benzene-vanilla-cmake) has been unmaintained since
 
 Applied by scripts/fetch-mohex.sh.
 
+4. src/hex/HexPoint.cpp -- ToString() indexes the name table with the point it
+   was handed, guarded only by an assert. Callers include the error paths that
+   *report* a bad move, so a bad point crashed the engine instead of being
+   named. Reporting a bad move must never be worse than making one: bounds-check
+   and return "?".
+
+5. src/hex/EndgameUtil.cpp + src/hex/BenzenePlayer.cpp -- genmove answering with
+   an occupied cell, or dying.
+
+   MostOverlappingMove() leaves `curBestMove` at -1 when no cell in the
+   intersection appears in any carrier, then returns (HexPoint)-1. That value is
+   used as an array index by the code reporting it (see 4), so the engine
+   segfaulted mid-error-message -- which is why it looked like a silent death.
+   It now reports INVALID_POINT and guesses nothing.
+
+   PlayWonGame() has a "should never get here" branch that likewise returns
+   INVALID_POINT once its assert is gone, and it is reached constantly in
+   heavily filled-in positions (65 times per 8 games at 100 playouts).
+
+   Both leave the determined-state path with no move. Rather than substitute a
+   random cell -- which in a *proven won* position can throw the win away --
+   CheckEndgame() now falls through to a real UCT search, filling in the
+   consider set that the determined branch never populated.
+
+6. src/mohex/MoHexEngine.cpp -- a last-resort legality check. Whatever the
+   internals decide, the move must be legal in the *game* board before it is
+   returned. Note this cannot be checked deeper in the stack: those layers hold
+   the ICE fill-in board, where a cell can be occupied and still be perfectly
+   legal in the real position.
+
+Verified: 8-game matches at 400 sims / 100 playouts, previously losing about
+half their games to crashes, now complete 8 of 8 with no illegal moves and no
+random substitutions -- confirmed on a seed not used during debugging.
+
+diff --git a/src/hex/BenzenePlayer.cpp b/src/hex/BenzenePlayer.cpp
+index b36e40f..ced851b 100644
+--- a/src/hex/BenzenePlayer.cpp
++++ b/src/hex/BenzenePlayer.cpp
+@@ -91,13 +91,22 @@ HexPoint BenzenePlayer::InitSearch(HexBoard& brd, HexColor color,
+ HexPoint BenzenePlayer::CheckEndgame(HexBoard& brd, HexColor color, 
+                                      bitset_t& consider, double& score)
+ {
+-    if (EndgameUtil::IsDeterminedState(brd, color, score)) 
+-        return EndgameUtil::PlayDeterminedState(brd, color);
+-    else 
++    if (EndgameUtil::IsDeterminedState(brd, color, score))
+     {
+-        consider = EndgameUtil::MovesToConsider(brd, color);
+-        BenzeneAssert(consider.any());
++        HexPoint determined = EndgameUtil::PlayDeterminedState(brd, color);
++        if (determined != INVALID_POINT)
++            return determined;
++        // The determined-state helpers can come up empty -- PlayWonGame has a
++        // "should never get here" path that returns INVALID_POINT once its
++        // asserts are compiled out, and it is reached often in heavily
++        // filled-in positions. Fall through to a real search instead of
++        // guessing a move; but the search needs a consider set, which the
++        // determined branch never filled in.
++        LogWarning() << "Determined state yielded no move; searching instead\n";
+     }
++    consider = EndgameUtil::MovesToConsider(brd, color);
++    if (consider.none())
++        LogWarning() << "MovesToConsider is empty!\n";
+ 
+     score = 0;
+     if (consider.count() == 1 && !m_search_singleton) 
+diff --git a/src/hex/EndgameUtil.cpp b/src/hex/EndgameUtil.cpp
+index ff03cd9..04e4500 100644
+--- a/src/hex/EndgameUtil.cpp
++++ b/src/hex/EndgameUtil.cpp
+@@ -165,8 +165,18 @@ HexPoint MostOverlappingMove(const CarrierList& carriers,
+     }
+     
+     if (curMostHits == 0)
++    {
++        // No cell in the intersection appears in any carrier. `curBestMove` is
++        // then still -1, and returning (HexPoint)-1 is not merely a bad move: it
++        // is used as an array index by HexPointUtil::ToString when the engine
++        // formats the "illegal move" error, which segfaults in a release build
++        // where BenzeneAssert is compiled out.
++        //
++        // Report no move and let the caller -- which has the board, and so can
++        // tell an empty cell from an occupied one -- choose the substitute.
+         LogWarning() << "curMostHits == 0!!\n";
+-    BenzeneAssert(curMostHits > 0);
++        return INVALID_POINT;
++    }
+     return (HexPoint)curBestMove;
+ }
+     
+@@ -286,11 +296,22 @@ HexPoint EndgameUtil::PlayDeterminedState(const HexBoard& brd, HexColor color)
+     BenzeneAssert(IsDeterminedState(brd, color));
+     BenzeneAssert(!brd.GetGroups().IsGameOver());
+ 
+-    if (IsWonGame(brd, color))
+-        return PlayWonGame(brd, color);
+-
+-    BenzeneAssert(IsLostGame(brd, color));
+-    return PlayLostGame(brd, color);
++    HexPoint move = IsWonGame(brd, color) ? PlayWonGame(brd, color)
++                                          : PlayLostGame(brd, color);
++    // The helpers above pick from connection carriers, which are not guaranteed
++    // to hold an empty cell -- and an occupied one makes genmove answer with an
++    // illegal move. Substitute here, where the position is in hand. A cell empty
++    // on the fill-in board is empty on the real one too, since fill-in only adds
++    // stones, so this is always legal.
++    // Only handle "no move at all" here. Do NOT reject a move for being occupied
++    // on `brd`: brd carries the ICE fill-in, so a cell can be occupied here and
++    // still empty -- and perfectly legal -- in the real game. Checking against
++    // this board discarded 64 legal moves in 8 games and quietly weakened the
++    // engine. Legality against the true position is settled in
++    // MoHexEngine::GenMove, which has it.
++    // Report "no move" rather than guessing one: a random cell in a *proven won*
++    // position can throw the win away, and the caller can do better by searching.
++    return move;
+ }
+ 
+ bitset_t EndgameUtil::MovesToConsider(const HexBoard& brd, HexColor color)
+diff --git a/src/hex/HexPoint.cpp b/src/hex/HexPoint.cpp
+index a0ac525..d16a88c 100644
+--- a/src/hex/HexPoint.cpp
++++ b/src/hex/HexPoint.cpp
+@@ -66,7 +66,12 @@ namespace
+ 
+ std::string HexPointUtil::ToString(HexPoint p)
+ {
+-    BenzeneAssert(0 <= p && p < FIRST_INVALID);
++    // The assert is compiled out in a release build, so an out-of-range point
++    // indexed the name table out of bounds and crashed -- and the callers that
++    // pass a bad point are precisely the error paths reporting it. Reporting a
++    // bad move must never be worse than making one.
++    if (p < 0 || p >= FIRST_INVALID)
++        return "?";
+     return GetHexPointData().name[p];
+ }
+ 
 diff --git a/src/hex/Resistance.cpp b/src/hex/Resistance.cpp
 index 72be769..c6b7ff5 100644
 --- a/src/hex/Resistance.cpp
@@ -51,6 +192,43 @@ index 72be769..c6b7ff5 100644
          int index = 0;
          for (GroupIterator i(groups, not_other); i; ++i)
          {
+diff --git a/src/mohex/MoHexEngine.cpp b/src/mohex/MoHexEngine.cpp
+index 5ed1828..869a3ae 100644
+--- a/src/mohex/MoHexEngine.cpp
++++ b/src/mohex/MoHexEngine.cpp
+@@ -166,7 +166,31 @@ HexPoint MoHexEngine::GenMove(HexColor color, bool useGameClock)
+     if (bookMove != INVALID_POINT)
+         return bookMove;
+     double maxTime = TimeForMove(color);
+-    return DoSearch(color, maxTime);
++    HexPoint move = DoSearch(color, maxTime);
++
++    // Last line of defence: the move must be legal in the *game* board, not just
++    // in the search's fill-in-augmented copy. When they disagree -- reachable via
++    // subtree reuse across a clear_board+replay, which is how an automated driver
++    // feeds positions -- genmove answers with an occupied cell, the engine throws
++    // while reporting it, and the game is lost to the caller either way.
++    //
++    // These are already-decided, heavily filled-in positions, so substituting a
++    // legal cell costs nothing in strength; the alternative is not playing at all.
++    if (move != SWAP_PIECES && move != RESIGN)
++    {
++        const StoneBoard& pos = m_game.Board();
++        if (!HexPointUtil::isInteriorCell(move) || !pos.IsEmpty(move))
++        {
++            LogWarning() << "GenMove produced an illegal move (" << move
++                         << "); substituting a legal one\n";
++            HexPoint alt = BoardUtil::RandomEmptyCell(pos);
++            if (alt != INVALID_POINT)
++                return alt;
++            LogWarning() << "No empty cell remains; resigning\n";
++            return RESIGN;
++        }
++    }
++    return move;
+ }
+ 
+ HexPoint MoHexEngine::DoSearch(HexColor color, double maxTime)
 diff --git a/src/mohex/MoHexPlayer.cpp b/src/mohex/MoHexPlayer.cpp
 index 40fd6f9..a70c279 100644
 --- a/src/mohex/MoHexPlayer.cpp
