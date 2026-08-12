@@ -619,6 +619,64 @@ mod tests {
         );
     }
 
+    /// Random-opening moves must contribute *nothing* to training — not a policy
+    /// target, not a value target, not an ownership target. All three live in one
+    /// `Example`, so the guarantee is that no example exists for those positions.
+    #[test]
+    fn random_openings_carry_no_targets_at_all() {
+        let params = SearchParams {
+            sims: 0,
+            node_budget: 40,
+            c_puct: 0.6,
+            dir_alpha: 0.3,
+            dir_eps: 0.25,
+            temp_moves: 0,
+            explore_eps: 0.0,
+            max_ply: 0,
+            settle_plies: 0,
+            resign_threshold: 0.0,
+            resign_consecutive: 0,
+            resign_playout_frac: 0.0,
+            forced_playout_k: 0.0,
+            full_search_prob: 0.0,
+            fast_node_budget: 0,
+            random_opening_max: 169,
+        };
+        let (records, _) = batch_search::run_selfplay_moves::<Hex>(
+            &FlatPolicyNoisyValue, 24, params, 4, 16, 3, 20.0, 0.0,
+        );
+        assert!(!records.is_empty(), "expected some games");
+
+        // An opening move is the only kind that runs no search at all, so it is
+        // exactly the zero-visit record.
+        let openings = records
+            .iter()
+            .flat_map(|r| &r.moves)
+            .filter(|m| m.visits.iter().sum::<u32>() == 0)
+            .count();
+        assert!(openings > 0, "no random openings were played; the test proves nothing");
+        for m in records.iter().flat_map(|r| &r.moves) {
+            if m.visits.iter().sum::<u32>() == 0 {
+                assert!(!m.for_training, "an unsearched opening move was marked for training");
+            }
+        }
+
+        // One example per searched, recorded move -- and not one more. If an
+        // opening position ever acquired a value or ownership target, it would
+        // have to show up as an extra example here.
+        let trainable = records
+            .iter()
+            .flat_map(|r| &r.moves)
+            .filter(|m| m.for_training && m.visits.iter().sum::<u32>() > 0)
+            .count();
+        let examples = examples_from_records(records);
+        assert_eq!(
+            examples.len(),
+            trainable,
+            "examples must come only from searched, recorded moves ({openings} openings were played)"
+        );
+    }
+
     struct FlatPolicyNoisyValue;
 
     impl BatchModel for FlatPolicyNoisyValue {

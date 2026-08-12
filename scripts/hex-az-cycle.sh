@@ -40,6 +40,11 @@ NODE_BUDGET="${NODE_BUDGET:-400}"
 FAST_NODE_BUDGET="${FAST_NODE_BUDGET:-100}"
 FULL_SEARCH_PROB="${FULL_SEARCH_PROB:-0.25}"
 C_PUCT="${C_PUCT:-1.5}"
+# Random openings: each game plays N ~ U[0, this] uniformly random legal moves that
+# are never trained on. Without it every game starts from the same position, so a
+# frozen champion means a frozen training distribution -- which is how this run
+# stalled 18 generations at gen33. Evaluation is unaffected (gates start empty).
+RANDOM_OPENING_MAX="${RANDOM_OPENING_MAX:-169}"
 CHUNK_SECS="${CHUNK_SECS:-60}"
 # The buffer window that matters is examples, not chunks: a chunk is 60s of play,
 # so its size tracks GPU speed. When the GPU clamped to 210MHz, 40 chunks fell
@@ -139,6 +144,7 @@ while true; do
   "$ENGINE" selfplay-loop --live "$LIVE" --backend "$BACKEND" --ep "$EP" \
     --concurrency "$CONCURRENCY" --max-batch "$MAX_BATCH" --node-budget "$NODE_BUDGET" \
     --fast-node-budget "$FAST_NODE_BUDGET" --full-search-prob "$FULL_SEARCH_PROB" \
+    --random-opening-max "$RANDOM_OPENING_MAX" \
     --c-puct "$C_PUCT" --chunk-secs "$CHUNK_SECS" --max-chunks "$MAX_CHUNKS" \
     --max-examples "$MAX_EXAMPLES" \
     --target-examples "$TARGET_EXAMPLES" --seed "$cycle" >> "$LOGS/actor.log" 2>&1
