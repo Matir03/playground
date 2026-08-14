@@ -79,13 +79,14 @@ EVAL_GAMES="${EVAL_GAMES:-40}"         # candidate vs champion
 PROMOTE_THRESHOLD="${PROMOTE_THRESHOLD:-0.52}"
 MOHEX_GAMES="${MOHEX_GAMES:-8}"        # absolute yardstick, promoted nets only
 EVAL_SIMS="${EVAL_SIMS:-400}"
+# Raised again 1000 -> 2000 at gen132 (0.875 at 1000, closing on the ceiling).
 # Raised 100 -> 1000 at gen102, when the net swept MoHex@100 8-0 and the column
 # stopped carrying information. 100 was itself a step down from 1000, chosen when
 # a young net lost every game; the run has now outgrown it. Measured at the
 # switch: gen102 scores 0.667 at 1000 playouts, so the new series has headroom in
 # both directions. Scores are comparable only within one setting -- the 100-
 # playout series (0.000 at gen3 ... 1.000 at gen102) ends here.
-MOHEX_PLAYOUTS="${MOHEX_PLAYOUTS:-1000}"
+MOHEX_PLAYOUTS="${MOHEX_PLAYOUTS:-2000}"
 # Resolve MoHex to a path: the cycle runs detached, without a login shell, so
 # ~/.local/bin isn't necessarily on PATH and a bare "mohex" fails to spawn.
 MOHEX_BIN="${MOHEX_BIN:-$(command -v mohex || echo "$HOME/.local/bin/mohex")}"
