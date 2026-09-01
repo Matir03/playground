@@ -85,6 +85,14 @@ pub struct SamplerConfig {
     /// Score candidates with the energy head. Off = uniform priors, which is the
     /// P1 configuration before `f` has been trained.
     pub use_energy: bool,
+    /// Pad every batched call up to this many positions, then discard the
+    /// padding. 0 leaves the batch at whatever the caller passed.
+    ///
+    /// TensorRT builds a separate engine per input shape, so a caller whose
+    /// batch shrinks — eval, where games finish at different plies — would set
+    /// it rebuilding mid-match. Self-play pads before it calls; padding here
+    /// gives every other caller the same guarantee.
+    pub pad_to: usize,
     pub seed: u64,
 }
 
@@ -98,6 +106,7 @@ impl Default for SamplerConfig {
             random_fraction: 0.25,
             temperature: 1.0,
             use_energy: true,
+            pad_to: 0,
             seed: 0,
         }
     }
@@ -640,10 +649,25 @@ impl MinionsModel {
         full: bool,
         batch_seq: u64,
     ) -> anyhow::Result<Vec<Expansion<MinionsTurns>>> {
-        let g = states.len();
-        if g == 0 {
+        let real = states.len();
+        if real == 0 {
             return Ok(Vec::new());
         }
+        // Widen to a fixed batch before touching the GPU, so the tensor shape
+        // does not follow the caller's live-game count.
+        let padded: Vec<MinionsState>;
+        let states: &[MinionsState] = if self.cfg.pad_to > real {
+            padded = states
+                .iter()
+                .cloned()
+                .chain(std::iter::repeat_with(|| states[real - 1].clone()))
+                .take(self.cfg.pad_to)
+                .collect();
+            &padded
+        } else {
+            states
+        };
+        let g = states.len();
         // Plan from the mover's point of view. Both seats play the same game
         // under a 180° rotation (`MinionsState::canonical`), so canonicalising
         // here lets one set of weights serve both instead of learning each
@@ -791,6 +815,9 @@ impl MinionsModel {
                 }
             }
         }
+        // Drop the padding: the caller asked about `real` positions and must not
+        // see the repeats that kept the tensor shape fixed.
+        out.truncate(real);
         Ok(out)
     }
 

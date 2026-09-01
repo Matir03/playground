@@ -178,6 +178,54 @@ pub fn settle_bids<R: rand::Rng + ?Sized>(a_bid: f64, b_bid: f64, rng: &mut R) -
 /// Per-seat rather than shared because the match that decides whether the kernel
 /// is worth adopting is flat-vs-KR **against the same checkpoint** — both seats
 /// load one net and differ only in how the search reads its candidates.
+/// One turn for many games at once.
+///
+/// The reason eval needed this: it used to play games strictly one at a time,
+/// so every search ran with a GPU batch of *one* while self-play batched 128.
+/// That was invisible at 100 simulations and became the dominant cost of the
+/// cycle at 800 — a single 40-game match was ~600k essentially unbatched
+/// expansions, around 25 minutes. Here the whole group advances together.
+fn pick_many(
+    seat: &Seat,
+    states: &[MinionsState],
+    plies: &[u32],
+    params: &SampledParams,
+) -> anyhow::Result<(Vec<TurnSpec>, playground_core::SearchStats)> {
+    let mut stats = playground_core::SearchStats::default();
+    match seat {
+        Seat::Net(m) => {
+            let results = playground_core::sampled_mcts::search_lockstep::<MinionsTurns, _>(
+                &**m,
+                states.to_vec(),
+                params,
+                plies,
+            )?;
+            let specs = results
+                .into_iter()
+                .map(|r| {
+                    stats.merge(&r.stats);
+                    r.candidates.get(r.chosen).map(|(s, _)| *s).unwrap_or_default()
+                })
+                .collect();
+            Ok((specs, stats))
+        }
+        Seat::Greedy => Ok((
+            states
+                .iter()
+                .map(|st| {
+                    TurnSpec::from_play(st, |s| {
+                        if Minions::outcome(s).is_terminal() {
+                            return None;
+                        }
+                        Some(Minions::choose_move(s).best_move)
+                    })
+                })
+                .collect(),
+            stats,
+        )),
+    }
+}
+
 /// `render` is `(path, count)`: write a full turn-by-turn transcript of the
 /// first `count` games to `path`.
 ///
@@ -226,12 +274,26 @@ pub fn run_match(
     let show = |b: Option<f64>| b.map_or("none".to_string(), |v| format!("{v:.3}"));
     eprintln!("bids: A {}  B {}", show(a_bid), show(b_bid));
 
-    for g in 0..games {
-        // Alternate which side's bid is treated as "A's" so a systematic error
-        // in one seat's valuation cannot hand it the good side every game.
-        let (bid, a_yellow) = {
-            let mut r = ChaCha8Rng::seed_from_u64(params.seed ^ (g as u64).wrapping_mul(0x51_7C_C1_B7));
-            match (a_bid, b_bid) {
+    // ── set every game up, then advance them all together ────────────────
+    struct Live {
+        g: u32,
+        state: MinionsState,
+        a_first: bool,
+        bid: i16,
+        done: bool,
+        /// Per-game transcript, buffered. Games advance in lockstep now, so
+        /// writing turns straight to the sink would interleave every game's
+        /// moves into an unreadable stream; each game's log is emitted whole
+        /// once the match ends.
+        log: String,
+    }
+    let mut live: Vec<Live> = (0..games)
+        .map(|g| {
+            // Alternate which side's bid is treated as "A's" so a systematic
+            // error in one seat's valuation cannot hand it the good side.
+            let mut r =
+                ChaCha8Rng::seed_from_u64(params.seed ^ (g as u64).wrapping_mul(0x51_7C_C1_B7));
+            let (bid, a_yellow) = match (a_bid, b_bid) {
                 (Some(x), Some(y)) => {
                     if g % 2 == 0 {
                         settle_bids(x, y, &mut r)
@@ -240,71 +302,118 @@ pub fn run_match(
                         (bd, !b_takes)
                     }
                 }
-                // Only one side can bid: its number stands unopposed, and the
+                // Only one side can bid: its number stands unopposed and the
                 // seats simply alternate. Letting the silent side "win" the
                 // auction would be the bug this replaced.
                 (Some(x), None) => (settle_bids(x, x, &mut r).0, g % 2 == 0),
                 (None, Some(y)) => (settle_bids(y, y, &mut r).0, g % 2 == 0),
                 (None, None) => (crate::game::START_MONEY_SECOND as i16, g % 2 == 0),
+            };
+            Live {
+                g,
+                state: MinionsState::with_bid(bid),
+                a_first: a_yellow,
+                bid,
+                done: false,
+                log: String::new(),
             }
-        };
-        // Yellow moves first.
-        let a_first = a_yellow;
-        let mut state = MinionsState::with_bid(bid);
-        let mut turn = 0u32;
-        let show = g < render_games;
-        if show {
-            if let Some(w) = sink.as_mut() {
-                writeln!(
-                    w,
-                    "\n===== game {} of {render_games}  |  A is {}  |  handicap {bid} =====",
-                    g + 1,
-                    if a_first { "yellow (moves first)" } else { "blue" }
-                )?;
-                writeln!(w, "{}", state.render())?;
+        })
+        .collect();
+
+    if sink.is_some() {
+        for l in live.iter_mut().filter(|l| l.g < render_games) {
+            use std::fmt::Write as _;
+            let _ = write!(
+                l.log,
+                "\n===== game {} of {render_games}  |  A is {}  |  handicap {} =====\n{}\n",
+                l.g + 1,
+                if l.a_first { "yellow (moves first)" } else { "blue" },
+                l.bid,
+                l.state.render()
+            );
+        }
+    }
+
+    let mut round = 0u32;
+    loop {
+        for l in live.iter_mut() {
+            if !l.done && Minions::outcome(&l.state).is_terminal() {
+                l.done = true;
             }
         }
-        while !Minions::outcome(&state).is_terminal() {
-            let a_to_move = (state.side == 0) == a_first;
-            let seat = if a_to_move { a } else { b };
+        if live.iter().all(|l| l.done) {
+            break;
+        }
+        // Both seats move in the same round: every live game is at the same
+        // side, so `a_first` alone decides which seat owns it this round.
+        for want_a in [true, false] {
+            let idxs: Vec<usize> = live
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| {
+                    !l.done && ((l.state.side == 0) == l.a_first) == want_a
+                })
+                .map(|(i, _)| i)
+                .collect();
+            if idxs.is_empty() {
+                continue;
+            }
+            let seat = if want_a { a } else { b };
+            let states: Vec<MinionsState> = idxs.iter().map(|&i| live[i].state.clone()).collect();
+            let plies: Vec<u32> = idxs.iter().map(|&i| live[i].state.turn as u32).collect();
             let mut p = *params;
-            p.seed = params.seed ^ ((g as u64) << 32) ^ turn as u64;
-            p.kernel_sigma = if a_to_move { sigma.0 } else { sigma.1 };
-            let (spec, st) = seat.pick(&state, &p, turn)?;
+            p.kernel_sigma = if want_a { sigma.0 } else { sigma.1 };
+            p.seed = params.seed ^ ((round as u64) << 32) ^ u64::from(want_a);
+            let (specs, st) = pick_many(seat, &states, &plies, &p)?;
             search_stats.merge(&st);
-            let prev_state = state.clone();
-            let next = realize(&state, &spec).next;
-            // A declaration that changes nothing would loop forever; end the
-            // turn regardless.
-            state = if Minions::encode_state(&next) == Minions::encode_state(&state) {
-                realize(&state, &TurnSpec::empty()).next
-            } else {
-                next
-            };
-            turn += 1;
-            if show {
-                if let Some(w) = sink.as_mut() {
+
+            for (&i, spec) in idxs.iter().zip(specs) {
+                let prev_state = live[i].state.clone();
+                let next = realize(&prev_state, &spec).next;
+                // A declaration that changes nothing would loop forever; end
+                // the turn regardless.
+                live[i].state = if Minions::encode_state(&next) == Minions::encode_state(&prev_state)
+                {
+                    realize(&prev_state, &TurnSpec::empty()).next
+                } else {
+                    next
+                };
+                if sink.is_some() && live[i].g < render_games {
+                    use std::fmt::Write as _;
                     let r = realize(&prev_state, &spec);
-                    let mover = if a_to_move { "A" } else { "B" };
-                    writeln!(
-                        w,
-                        "turn {} by {mover}  gold {:?}  net worth [{}, {}]  actions {}",
-                        state.turn,
-                        state.money,
-                        crate::game::net_worth(&state, 0),
-                        crate::game::net_worth(&state, 1),
+                    let mover = if want_a { "A" } else { "B" };
+                    let (nw0, nw1) = (
+                        crate::game::net_worth(&live[i].state, 0),
+                        crate::game::net_worth(&live[i].state, 1),
+                    );
+                    let (turn, money, board) =
+                        (live[i].state.turn, live[i].state.money, live[i].state.render());
+                    let _ = write!(
+                        live[i].log,
+                        "turn {turn} by {mover}  gold {money:?}  net worth [{nw0}, {nw1}]  \
+                         actions {}\n{board}\n",
                         r.actions.len()
-                    )?;
-                    writeln!(w, "{}", state.render())?;
+                    );
+                }
+                if Minions::outcome(&live[i].state).is_terminal() {
+                    live[i].done = true;
                 }
             }
         }
-        if show {
+        round += 1;
+    }
+
+    // ── score, once each game has finished ────────────────────────────────
+    for l in live.iter() {
+        let state = &l.state;
+        let a_first = l.a_first;
+        if l.g < render_games {
             if let Some(w) = sink.as_mut() {
+                write!(w, "{}", l.log)?;
                 writeln!(
                     w,
                     "outcome: {:?} after {} turns (cap {})",
-                    Minions::outcome(&state),
+                    Minions::outcome(state),
                     state.turn,
                     crate::game::MAX_TURNS
                 )?;
@@ -316,7 +425,9 @@ pub fn run_match(
             adj += 1;
         } else if (0..2u8).any(|sd| {
             !(0..crate::map::NUM_CELLS as u8).any(|c| {
-                state.piece_at(c).is_some_and(|(s2, u)| s2 == sd && matches!(u, crate::units::Unit::Necromancer))
+                state
+                    .piece_at(c)
+                    .is_some_and(|(s2, u)| s2 == sd && matches!(u, crate::units::Unit::Necromancer))
             })
         }) {
             necro += 1;
@@ -327,16 +438,15 @@ pub fn run_match(
         // Net-worth margin from A's seat, recorded whatever the verdict.
         //
         // Win/loss can be a *constant* here: the outcome at the turn cap is
-        // largely decided by seat (the second player's START_MONEY_SECOND
-        // compounds into a +6..+12 lead), and since `run_match` alternates seats
-        // a match then scores exactly 0.5 no matter how strong either side is —
-        // which is what pinned the promotion gate. Margin still separates them:
-        // a stronger net loses by less.
+        // largely decided by seat, and since the match alternates seats it then
+        // scores exactly 0.5 no matter how strong either side is — which is
+        // what pinned the promotion gate. Margin still separates them: a
+        // stronger net loses by less.
         let (a_side, b_side) = if a_first { (0u8, 1u8) } else { (1u8, 0u8) };
-        margin_sum += crate::game::net_worth(&state, a_side) as f64
-            - crate::game::net_worth(&state, b_side) as f64;
+        margin_sum += crate::game::net_worth(state, a_side) as f64
+            - crate::game::net_worth(state, b_side) as f64;
 
-        let a_won = match Minions::outcome(&state) {
+        let a_won = match Minions::outcome(state) {
             Outcome::FirstWins => a_first,
             Outcome::SecondWins => !a_first,
             _ => {

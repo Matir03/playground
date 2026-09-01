@@ -418,6 +418,11 @@ async fn main() -> anyhow::Result<()> {
                 // No random injection and no temperature at eval: we are
                 // measuring strength, not gathering diverse data.
                 random_fraction: 0.0,
+                // Every game advances together, so the live count falls as games
+                // finish. Padding to the full match width keeps one tensor shape
+                // for the whole match instead of letting TensorRT rebuild an
+                // engine each time a game ends.
+                pad_to: games as usize,
                 seed,
                 ..Default::default()
             };
