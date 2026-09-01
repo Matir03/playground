@@ -142,7 +142,10 @@ pub struct SampledParams {
     pub temp_moves: u32,
     /// Progressive widening for **non-root** nodes: how many of the generated
     /// candidates are selectable at `n` visits, `ceil(pw_beta * n^pw_alpha)`,
-    /// clamped to `[pw_init, k]`.
+    /// capped at `k`.
+    ///
+    /// There is deliberately no separate "initial count" knob: at `n = 1` the
+    /// schedule is `ceil(pw_beta)`, so `pw_beta` *is* the initial count.
     ///
     /// Measured motivation: 69% of expanded nodes receive exactly one visit and
     /// 91.6% of generated candidates are never tried, so spreading a node's
@@ -154,7 +157,6 @@ pub struct SampledParams {
     /// is the pre-existing behaviour.
     pub pw_alpha: f32,
     pub pw_beta: f32,
-    pub pw_init: usize,
     /// Candidates generated per model call. `0` keeps the old behaviour: a
     /// node's whole set is produced in one call.
     ///
@@ -189,7 +191,6 @@ impl Default for SampledParams {
             temp_moves: 8,
             pw_alpha: 0.5,
             pw_beta: 2.0,
-            pw_init: 4,
             pw_chunk: 0,
             kernel_sigma: 0.0,
             seed: 0,
@@ -444,7 +445,7 @@ fn visible<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool
     }
     let n = node.total_n.max(1) as f32;
     let target = (params.pw_beta * n.powf(params.pw_alpha)).ceil() as usize;
-    target.clamp(params.pw_init.min(m).max(1), m)
+    target.clamp(1, m)
 }
 
 /// How many candidates a node has *earned* — what `visible` would show it if it
@@ -457,9 +458,7 @@ fn earned<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool)
     }
     let n = node.total_n.max(1) as f32;
     let target = (params.pw_beta * n.powf(params.pw_alpha)).ceil() as usize;
-    // `pw_init` can exceed `k` on a small candidate budget, and `clamp` panics
-    // when its bounds cross.
-    target.clamp(params.pw_init.min(k).max(1), k)
+    target.clamp(1, k)
 }
 
 /// Select a child by PUCT, with root-only forced playouts.
@@ -1158,7 +1157,7 @@ mod tests {
     /// restricts the root.
     #[test]
     fn widening_limits_interior_nodes_but_not_the_root() {
-        let params = SampledParams { pw_alpha: 0.5, pw_beta: 2.0, pw_init: 4, ..Default::default() };
+        let params = SampledParams { pw_alpha: 0.5, pw_beta: 2.0, ..Default::default() };
         let mut node = new_node::<Count>(CountState { n: 21, side: 1 });
         node.entries = (0..12)
             .map(|i| Entry::<Count> { mv: i, p: 1.0 / 12.0, n: 0, w: 0.0, child: -1, explore: false })
@@ -1166,7 +1165,9 @@ mod tests {
 
         node.total_n = 1;
         assert_eq!(visible(&node, &params, true), 12, "the root always sees every candidate");
-        assert_eq!(visible(&node, &params, false), 4, "one visit -> pw_init only");
+        // At one visit the schedule is ceil(pw_beta) — the initial count is
+        // pw_beta itself, which is why there is no separate knob for it.
+        assert_eq!(visible(&node, &params, false), 2, "one visit -> ceil(pw_beta)");
         node.total_n = 16;
         assert_eq!(visible(&node, &params, false), 8, "ceil(2*sqrt(16)) = 8");
         node.total_n = 100;

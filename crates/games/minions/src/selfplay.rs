@@ -116,10 +116,10 @@ pub struct ActorConfig {
     pub sims: u32,
     /// KR-PUCT kernel bandwidth; 0 keeps the flat PUCT search (the default).
     pub kernel_sigma: f32,
-    /// Progressive widening at interior nodes; `pw_beta = 0` disables it.
+    /// Progressive widening at interior nodes; `pw_beta = 0` disables it, and
+    /// `ceil(pw_beta)` is the count a node starts with.
     pub pw_alpha: f32,
     pub pw_beta: f32,
-    pub pw_init: usize,
     /// Candidates per model call; 0 = a node's whole set in one call.
     pub pw_chunk: usize,
     pub fast_sims: u32,
@@ -170,7 +170,6 @@ impl Default for ActorConfig {
             kernel_sigma: 0.0,
             pw_alpha: 0.5,
             pw_beta: 2.0,
-            pw_init: 4,
             pw_chunk: 0,
             random_opening_max: 15,
             // Chosen so the truncated geometric on 0..=15 has mean 5 — a quarter
@@ -373,7 +372,6 @@ fn drive_pool_worker(
             temp_moves: cfg.temp_moves,
             pw_alpha: cfg.pw_alpha,
             pw_beta: cfg.pw_beta,
-            pw_init: cfg.pw_init,
             pw_chunk: cfg.pw_chunk,
             kernel_sigma: cfg.kernel_sigma,
             seed: seed ^ (turn as u64),
@@ -674,7 +672,6 @@ pub fn new_pool(model: &MinionsModel, cfg: &ActorConfig, n: usize, seed: u64) ->
                 temp_moves: cfg.temp_moves,
                 pw_alpha: cfg.pw_alpha,
             pw_beta: cfg.pw_beta,
-            pw_init: cfg.pw_init,
             pw_chunk: cfg.pw_chunk,
             kernel_sigma: cfg.kernel_sigma,
                 seed: seed ^ i as u64,
