@@ -120,7 +120,8 @@ pub struct ActorConfig {
     /// `ceil(pw_beta)` is the count a node starts with.
     pub pw_alpha: f32,
     pub pw_beta: f32,
-    /// Candidates per model call; 0 = a node's whole set in one call.
+    /// Candidates per model call. 1 matches the one-per-visit widening rate;
+    /// 0 disables chunking.
     pub pw_chunk: usize,
     pub fast_sims: u32,
     /// Probability a turn gets the full search — only full searches produce a
@@ -170,7 +171,7 @@ impl Default for ActorConfig {
             kernel_sigma: 0.0,
             pw_alpha: 0.5,
             pw_beta: 2.0,
-            pw_chunk: 0,
+            pw_chunk: 1,
             random_opening_max: 15,
             // Chosen so the truncated geometric on 0..=15 has mean 5 — a quarter
             // of `MAX_TURNS`, deep enough to reach genuinely mid-game positions

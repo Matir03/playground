@@ -163,7 +163,7 @@ enum Cmd {
         /// visited once and never look at a full candidate set; a node that
         /// earns visits asks for its next chunk, and that request batches
         /// alongside expansions because it is the same shape.
-        #[arg(long, default_value_t = 0)]
+        #[arg(long, default_value_t = 1)]
         pw_chunk: usize,
         /// Score candidates with the energy head (off = uniform priors).
         #[arg(long)]

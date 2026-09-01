@@ -157,16 +157,20 @@ pub struct SampledParams {
     /// is the pre-existing behaviour.
     pub pw_alpha: f32,
     pub pw_beta: f32,
-    /// Candidates generated per model call. `0` keeps the old behaviour: a
-    /// node's whole set is produced in one call.
+    /// Candidates generated per model call. `0` disables chunking and produces
+    /// a node's whole set at once.
     ///
-    /// With a chunk set, a wave is `max_batch` requests of `pw_chunk`
-    /// candidates each instead of `max_batch` requests of `k` — the same head
-    /// rows and the same tensor shape, but spread over more *nodes*. That is
-    /// the point: 69% of nodes are visited once and would otherwise pay for a
-    /// full candidate set they never look at. A node that earns visits asks for
-    /// its next chunk, and that request batches alongside expansions because it
-    /// is the same shape.
+    /// `1` is the natural setting, because widening reveals at most one new
+    /// candidate per visit: generating more than that produces candidates the
+    /// node may never be allowed to select, which is precisely the waste
+    /// chunking exists to remove (69% of nodes are visited exactly once, and
+    /// 91.6% of generated candidates are never tried).
+    ///
+    /// Generating one at a time is only affordable because a wave batches
+    /// across *nodes* — `max_batch` separate nodes asking for one candidate
+    /// each fills the same batch that one node asking for `max_batch` would.
+    /// That coupling matters: with a small chunk the wave must cover
+    /// proportionally more nodes, or the batch shrinks and the GPU starves.
     pub pw_chunk: usize,
     /// KR-PUCT kernel bandwidth over `SampledGame::move_distance`. Candidates
     /// within roughly this distance share visit counts and values, which is the
@@ -191,7 +195,7 @@ impl Default for SampledParams {
             temp_moves: 8,
             pw_alpha: 0.5,
             pw_beta: 2.0,
-            pw_chunk: 0,
+            pw_chunk: 1,
             kernel_sigma: 0.0,
             seed: 0,
         }
@@ -1021,11 +1025,19 @@ mod tests {
     /// what we want to test.
     struct Mock;
     impl SampledModel<Count> for Mock {
-        fn expand(&self, s: &CountState, k: usize) -> anyhow::Result<Expansion<Count>> {
-            let mut v: Vec<(u32, f32, bool)> =
-                (1..=3u32).filter(|m| *m <= s.n).map(|m| (m, 1.0, false)).collect();
-            v.truncate(k);
-            Ok((0.0, v))
+        /// Deliberately ignores `k` and proposes every legal move.
+        ///
+        /// A perfect proposer, so the tests using it isolate *search* behaviour
+        /// from what the sampler happened to draw. Truncating to `k` instead
+        /// would make it a prefix-returner, which cannot work one candidate at a
+        /// time — asked for one it would offer the same move forever and the
+        /// winning line would never be proposed at all. Real samplers are
+        /// stochastic; `Pool` is the fixture that models that.
+        fn expand(&self, s: &CountState, _k: usize) -> anyhow::Result<Expansion<Count>> {
+            Ok((
+                0.0,
+                (1..=3u32).filter(|m| *m <= s.n).map(|m| (m, 1.0, false)).collect(),
+            ))
         }
     }
 
@@ -1296,9 +1308,13 @@ mod tests {
                         .collect();
                     search.provide(0.0, cands);
                 }
-                // Chunked generation is off in this fixture, so this is
-                // unreachable; the arm keeps the match total.
-                Step::NeedWiden(_) => unreachable!("pw_chunk is 0 here"),
+                Step::NeedWiden(s) => {
+                    let cands: Vec<(u32, f32, bool)> = (1..=3u32)
+                        .filter(|m| *m <= s.n)
+                        .map(|m| (m, if m == 3 { 0.001 } else { 1.0 }, m == 3))
+                        .collect();
+                    search.provide_widen(cands);
+                }
                 Step::Done => break,
             }
         }
