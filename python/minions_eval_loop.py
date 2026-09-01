@@ -130,8 +130,17 @@ def run_diagnostic(args, live, scores, scores_path) -> None:
     games_dir = os.path.join(live, "games")
 
     # ...against the net from `lag` generations back.
-    past = os.path.join(live, "snapshots", f"gen{gen - args.lag:04d}", "checkpoint.safetensors")
-    if os.path.exists(past):
+    #
+    # Resolved by parsing each snapshot's own name rather than formatting the
+    # number: the directories are `gen110`, and a `:04d` guess produced
+    # `gen0110`, which silently skipped the comparison this eval exists for.
+    want = gen - args.lag
+    past = ""
+    for cand in snaps:
+        if int(re.search(r"gen(\d+)", cand).group(1)) == want:
+            past = os.path.join(cand, "checkpoint.safetensors")
+            break
+    if past and os.path.exists(past):
         score, margin = run_match(
             args.engine, ckpt, past, args.games, args.sims, args.candidates,
             args.t_steps, args.backend, args.ep, args.fp16, seed=gen,
@@ -143,7 +152,7 @@ def run_diagnostic(args, live, scores, scores_path) -> None:
         if _LAST_TURNS is not None:
             entry["lag_turns_win"], entry["lag_turns_loss"] = _LAST_TURNS
     else:
-        print(f"gen {gen}: no snapshot at gen{gen - args.lag:04d}, skipping the lag match")
+        print(f"gen {gen}: no snapshot at generation {want}, skipping the lag match")
 
     # ...and against greedy, the fixed external yardstick.
     try:
