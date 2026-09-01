@@ -443,9 +443,15 @@ fn visible<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool
     if is_root || params.pw_beta <= 0.0 {
         return m;
     }
-    let n = node.total_n.max(1) as f32;
+    let visits = node.total_n.max(1) as usize;
+    let n = visits as f32;
     let target = (params.pw_beta * n.powf(params.pw_alpha)).ceil() as usize;
-    target.clamp(1, m)
+    // Never reveal more than one new candidate per visit. In `n` visits a node
+    // can have tried at most `n` children, so an `n + 1`st is the most that can
+    // be put to use — and this makes the one-per-visit property structural
+    // rather than an accident of the default `pw_beta`/`pw_alpha`, whose
+    // schedule happens to grow slowly enough only because `beta * alpha == 1`.
+    target.min(visits + 1).clamp(1, m)
 }
 
 /// How many candidates a node has *earned* — what `visible` would show it if it
@@ -1176,6 +1182,38 @@ mod tests {
         let off = SampledParams { pw_beta: 0.0, ..params };
         node.total_n = 1;
         assert_eq!(visible(&node, &off, false), 12, "pw_beta = 0 disables widening");
+    }
+
+    /// Widening must never reveal more than one new candidate per visit, for
+    /// *any* schedule — not just the defaults, whose `beta * alpha == 1` makes
+    /// the property hold by accident.
+    #[test]
+    fn widening_never_adds_more_than_one_candidate_per_visit() {
+        for (beta, alpha) in [(2.0f32, 0.5f32), (4.0, 0.5), (8.0, 0.9), (1.0, 0.3)] {
+            let params = SampledParams { pw_alpha: alpha, pw_beta: beta, ..Default::default() };
+            let mut node = new_node::<Count>(CountState { n: 21, side: 1 });
+            node.entries = (0..64)
+                .map(|i| Entry::<Count> {
+                    mv: i,
+                    p: 1.0 / 64.0,
+                    n: 0,
+                    w: 0.0,
+                    child: -1,
+                    explore: false,
+                })
+                .collect();
+            let mut prev = 0usize;
+            for n in 1..=200u32 {
+                node.total_n = n;
+                let v = visible(&node, &params, false);
+                assert!(
+                    v <= prev + 1 || prev == 0,
+                    "beta={beta} alpha={alpha}: jumped {prev} -> {v} at n={n}"
+                );
+                assert!(v >= 1, "a node must always have something to select");
+                prev = v;
+            }
+        }
     }
 
     /// Chunked generation must reach the same root candidate set as one wide
