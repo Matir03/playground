@@ -888,6 +888,20 @@ impl<G: SampledGame> Search<G> {
     }
 }
 
+/// Candidates to request at a node's *first* visit.
+///
+/// Zero when chunking is on — the node only needs a value, and will ask for a
+/// candidate if something descends through it. With chunking off there is no
+/// widen path at all, so the whole set has to come up front or the node would
+/// never hold anything.
+pub fn expansion_k(params: &SampledParams) -> usize {
+    if params.pw_chunk > 0 {
+        0
+    } else {
+        params.k_candidates
+    }
+}
+
 /// Candidates to request per model call: the chunk when chunked generation is
 /// on, otherwise the node's whole set.
 pub fn chunk_k(params: &SampledParams) -> usize {
@@ -912,7 +926,7 @@ pub fn search<G: SampledGame, M: SampledModel<G>>(
         match s.step() {
             Step::NeedExpansion(state) => {
                 // Value only; candidates wait until something descends here.
-                let (v, cands) = model.expand(&state, 0)?;
+                let (v, cands) = model.expand(&state, expansion_k(params))?;
                 s.provide(v, cands);
             }
             Step::NeedWiden(state) => {
@@ -987,7 +1001,7 @@ pub fn search_lockstep<G: SampledGame, M: SampledModel<G>>(
         let exp_res = if exp.is_empty() {
             Vec::new()
         } else {
-            model.expand_batch(&exp, 0)?
+            model.expand_batch(&exp, expansion_k(params))?
         };
         let wid_res = if wid.is_empty() {
             Vec::new()
@@ -1333,6 +1347,31 @@ mod tests {
             }
         }
         assert!(saw_full_before_first_visit, "root was never fully populated before its sweep");
+    }
+
+    /// Chunking off must still leave nodes with candidates. With `pw_chunk = 0`
+    /// there is no widen path, so a value-only expansion would leave every node
+    /// permanently empty and the search would score everything on value alone.
+    #[test]
+    fn unchunked_expansion_still_yields_candidates() {
+        let params = SampledParams {
+            simulations: 30,
+            k_candidates: 3,
+            pw_chunk: 0,
+            k_forced: 0.0,
+            min_explore_visits: 0.0,
+            temp_moves: 0,
+            seed: 2,
+            ..Default::default()
+        };
+        assert_eq!(expansion_k(&params), 3, "unchunked expansion must ask for the whole set");
+        let r = search::<Count, _>(&Mock, CountState { n: 21, side: 1 }, &params, 0)
+            .expect("search");
+        assert!(!r.candidates.is_empty(), "root held no candidates with chunking off");
+        assert!(
+            r.candidates.iter().any(|(_, n)| *n > 0),
+            "no candidate was ever visited with chunking off"
+        );
     }
 
     /// Chunked generation must reach the same root candidate set as one wide

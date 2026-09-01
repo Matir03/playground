@@ -527,7 +527,8 @@ fn drive_pool_worker(
             while st.len() < max_batch {
                 st.push(st[n - 1].clone());
             }
-            let r = model.expand_batch_mode(&st, 0, want_full, *next_seed)?;
+            let exp_k = if cfg.pw_chunk > 0 { 0 } else { model.cfg.k_for(want_full) };
+            let r = model.expand_batch_mode(&st, exp_k, want_full, *next_seed)?;
             *next_seed = next_seed.wrapping_add(1);
             for (slot, (v, _)) in exp_idx.iter().zip(r) {
                 values[*slot] = v;
