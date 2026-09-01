@@ -425,6 +425,37 @@ fn drive_pool_worker(
         // since it lets a wave cover more nodes instead of over-serving few.
         let mut is_widen: Vec<bool> = Vec::with_capacity(max_batch);
         let mut scanned = 0usize;
+        // Each kind gets its own fixed width, and the two sum to `max_batch`.
+        // Padding both to the full width — which is what a single width forces —
+        // ran the trunk twice over `max_batch` rows and the diffusion head at
+        // 46% filler. Complementary widths keep both shapes fixed while halving
+        // the trunk rows per wave and taking the head padding to ~0.
+        // Batch-shape strategy, switchable at runtime so the two can be paired in
+        // one ABBA run rather than compared across rebuilds (this box drifts
+        // ~30% with heat, which is larger than either effect being measured).
+        //
+        // 0  = pad both calls to `max_batch`: one shape, but the head call runs
+        //      ~46% filler because the widen share of a wave varies.
+        // >0 = round each group up to this multiple: padding bounded by the
+        //      quantum, at the cost of an engine per shape.
+        //
+        // Measured ABBA (3 reversed pairs, cooldown gate): quantising to 16 is
+        // **+13.6% / +16.1% / +20.8%** over the single shape. The engine per
+        // shape is a one-time build that TensorRT caches; the head padding it
+        // removes is paid every wave. Unpaired runs said the opposite by a wide
+        // margin — this box drifts ~30% with heat, so do not trust a comparison
+        // that is not paired and cooled.
+        let shape_q: usize = std::env::var("MINIONS_SHAPE_Q")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16);
+        let width_for = |n: usize| {
+            if shape_q == 0 {
+                max_batch
+            } else {
+                ((n + shape_q - 1) / shape_q * shape_q).max(shape_q).min(max_batch)
+            }
+        };
         while ids.len() < max_batch && scanned < pool_size {
             let i = cursor % pool_size;
             cursor = cursor.wrapping_add(1);
@@ -493,14 +524,12 @@ fn drive_pool_worker(
         }
         gathered_either = true;
 
-        // Fixed-width batch: pad by repeating the last position, then discard.
+        // Each kind is padded to its own width below; padding the combined list
+        // here as well would only clone states nothing reads.
         let real = ids.len();
-        while states.len() < max_batch {
-            states.push(states[real - 1].clone());
-        }
         stats.batches += 1;
         stats.expansions += real as u64;
-        stats.padded += (max_batch - real) as u64;
+        stats.padded += (max_batch.saturating_sub(real)) as u64;
         // One `k` for the whole wave keeps the tensor shape fixed — the
         // constraint that killed an earlier overlap scheme, which set TensorRT
         // rebuilding an engine per shape and cost 97% of throughput.
@@ -519,12 +548,19 @@ fn drive_pool_worker(
         // ~70% of the loop. The extra trunk call costs ~5%.
         let exp_idx: Vec<usize> = (0..real).filter(|&i| !is_widen[i]).collect();
         let wid_idx: Vec<usize> = (0..real).filter(|&i| is_widen[i]).collect();
+        stats.req_expand += exp_idx.len() as u64;
+        stats.req_widen += wid_idx.len() as u64;
+        if !wid_idx.is_empty() {
+            stats.head_real += wid_idx.len() as u64;
+            stats.head_run += width_for(wid_idx.len()) as u64;
+        }
 
         let mut values = vec![0.0f32; real];
         if !exp_idx.is_empty() {
             let mut st: Vec<MinionsState> = exp_idx.iter().map(|&i| states[i].clone()).collect();
             let n = st.len();
-            while st.len() < max_batch {
+            let w = width_for(n);
+            while st.len() < w {
                 st.push(st[n - 1].clone());
             }
             let exp_k = if cfg.pw_chunk > 0 { 0 } else { model.cfg.k_for(want_full) };
@@ -539,7 +575,8 @@ fn drive_pool_worker(
         if !wid_idx.is_empty() {
             let mut st: Vec<MinionsState> = wid_idx.iter().map(|&i| states[i].clone()).collect();
             let n = st.len();
-            while st.len() < max_batch {
+            let w = width_for(n);
+            while st.len() < w {
                 st.push(st[n - 1].clone());
             }
             let r = model.expand_batch_mode(&st, k_call, want_full, *next_seed)?;
@@ -581,6 +618,17 @@ pub struct PoolStats {
     pub expansions: u64,
     /// Padding rows — wasted work, traded for a fixed TensorRT input shape.
     pub padded: u64,
+    /// Requests that only wanted a value (a node's first visit) versus those
+    /// that wanted a candidate. The split decides how much of each wave's
+    /// generative-head work is padding: the head call is padded to `max_batch`,
+    /// so a wave that is mostly expansions runs the diffusion head almost
+    /// entirely on filler.
+    pub req_expand: u64,
+    pub req_widen: u64,
+    /// Head rows actually wanted, and head rows run. The gap is the padding
+    /// waste in the most expensive phase.
+    pub head_real: u64,
+    pub head_run: u64,
     pub turns: u64,
     pub games: u64,
 }
@@ -597,6 +645,30 @@ impl PoolStats {
         self.explore_promoted += o.explore_promoted;
         self.explore_mass += o.explore_mass;
         self.explore_nodes += o.explore_nodes;
+        self.req_expand += o.req_expand;
+        self.req_widen += o.req_widen;
+        self.head_real += o.head_real;
+        self.head_run += o.head_run;
+    }
+
+    /// Where each wave's requests went, and how much of the generative-head
+    /// work was filler. `head` padding is the expensive kind: the diffusion and
+    /// energy heads are the bulk of the loop.
+    pub fn split_report(&self) -> String {
+        let reqs = (self.req_expand + self.req_widen).max(1);
+        let head_waste = if self.head_run == 0 {
+            0.0
+        } else {
+            100.0 * (1.0 - self.head_real as f64 / self.head_run as f64)
+        };
+        format!(
+            "requests: {:.0}% value-only, {:.0}% candidate  |  head rows {} of {} run ({:.0}% padding)",
+            100.0 * self.req_expand as f64 / reqs as f64,
+            100.0 * self.req_widen as f64 / reqs as f64,
+            self.head_real,
+            self.head_run,
+            head_waste
+        )
     }
 
     pub fn report(&self, secs: f64) -> String {
@@ -1089,6 +1161,7 @@ pub fn run_loop(
             model.phases.report_wall(t0.elapsed().as_secs_f64(), cfg.workers)
         );
         println!("  {}", stats.explore_report());
+        println!("  {}", stats.split_report());
         if !examples.is_empty() {
             let path = write_chunk(&buffer, chunk_index, &examples)?;
             chunk_index += 1;
