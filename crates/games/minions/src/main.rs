@@ -154,6 +154,17 @@ enum Cmd {
         /// against the same net.
         #[arg(long, default_value_t = 0.0)]
         kernel_sigma: f32,
+        /// Candidates generated per model call. 0 (default) produces a node's
+        /// whole set in one call.
+        ///
+        /// With a chunk, a wave becomes `max_batch` requests of this size
+        /// instead of `max_batch` requests of `--candidates` — identical tensor
+        /// shape and head rows, spread over more *nodes*. 69% of nodes are
+        /// visited once and never look at a full candidate set; a node that
+        /// earns visits asks for its next chunk, and that request batches
+        /// alongside expansions because it is the same shape.
+        #[arg(long, default_value_t = 0)]
+        pw_chunk: usize,
         /// Score candidates with the energy head (off = uniform priors).
         #[arg(long)]
         no_energy: bool,
@@ -366,14 +377,14 @@ async fn main() -> anyhow::Result<()> {
             full_search_prob,
             candidates, candidates_fast, t_steps, t_steps_fast, random_fraction,
             random_opening_max, random_opening_decay, min_explore_visits, workers, no_energy,
-            kernel_sigma,
+            kernel_sigma, pw_chunk,
             chunk_secs, max_examples,
             max_chunks, target_examples, seed,
         } => {
             let kind = minions_engine::net::BackendKind::parse(&backend, &ep, fp16, cuda)?;
             let actor = minions_engine::selfplay::ActorConfig {
                 sims, fast_sims, full_search_prob, backend: kind, min_explore_visits, workers,
-                random_opening_max, random_opening_decay, kernel_sigma,
+                random_opening_max, random_opening_decay, kernel_sigma, pw_chunk,
                 ..Default::default()
             };
             let sampler = minions_engine::sampler::SamplerConfig {

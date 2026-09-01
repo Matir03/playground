@@ -120,6 +120,8 @@ pub struct ActorConfig {
     pub pw_alpha: f32,
     pub pw_beta: f32,
     pub pw_init: usize,
+    /// Candidates per model call; 0 = a node's whole set in one call.
+    pub pw_chunk: usize,
     pub fast_sims: u32,
     /// Probability a turn gets the full search — only full searches produce a
     /// policy target (KataGo's playout-cap randomization).
@@ -169,6 +171,7 @@ impl Default for ActorConfig {
             pw_alpha: 0.5,
             pw_beta: 2.0,
             pw_init: 4,
+            pw_chunk: 0,
             random_opening_max: 15,
             // Chosen so the truncated geometric on 0..=15 has mean 5 — a quarter
             // of `MAX_TURNS`, deep enough to reach genuinely mid-game positions
@@ -371,6 +374,7 @@ fn drive_pool_worker(
             pw_alpha: cfg.pw_alpha,
             pw_beta: cfg.pw_beta,
             pw_init: cfg.pw_init,
+            pw_chunk: cfg.pw_chunk,
             kernel_sigma: cfg.kernel_sigma,
             seed: seed ^ (turn as u64),
         };
@@ -416,6 +420,11 @@ fn drive_pool_worker(
         // pool from where we left off so no slot is starved.
         let mut ids: Vec<usize> = Vec::with_capacity(max_batch);
         let mut states: Vec<MinionsState> = Vec::with_capacity(max_batch);
+        // Parallel to `ids`: whether this request is a widen (more candidates
+        // for a node that earned them) rather than a first expansion. Both are
+        // the same shape, so they share one batch — which is the whole point,
+        // since it lets a wave cover more nodes instead of over-serving few.
+        let mut is_widen: Vec<bool> = Vec::with_capacity(max_batch);
         let mut scanned = 0usize;
         while ids.len() < max_batch && scanned < pool_size {
             let i = cursor % pool_size;
@@ -431,6 +440,13 @@ fn drive_pool_worker(
                     Step::NeedExpansion(st) => {
                         ids.push(i);
                         states.push(st);
+                        is_widen.push(false);
+                        break;
+                    }
+                    Step::NeedWiden(st) => {
+                        ids.push(i);
+                        states.push(st);
+                        is_widen.push(true);
                         break;
                     }
                     Step::Done => {
@@ -486,12 +502,23 @@ fn drive_pool_worker(
         stats.batches += 1;
         stats.expansions += real as u64;
         stats.padded += (max_batch - real) as u64;
-        let mut results =
-            model.expand_batch_mode(&states, model.cfg.k_for(want_full), want_full, *next_seed)?;
+        // One `k` for the whole wave keeps the tensor shape fixed — the
+        // constraint that killed an earlier overlap scheme, which set TensorRT
+        // rebuilding an engine per shape and cost 97% of throughput.
+        let k_call = if cfg.pw_chunk > 0 {
+            cfg.pw_chunk.min(model.cfg.k_for(want_full).max(1))
+        } else {
+            model.cfg.k_for(want_full)
+        };
+        let mut results = model.expand_batch_mode(&states, k_call, want_full, *next_seed)?;
         *next_seed = next_seed.wrapping_add(1);
         results.truncate(real);
-        for (i, (v, cands)) in ids.into_iter().zip(results) {
-            slots[i].search.provide(v, cands);
+        for ((i, widen), (v, cands)) in ids.into_iter().zip(is_widen).zip(results) {
+            if widen {
+                slots[i].search.provide_widen(cands);
+            } else {
+                slots[i].search.provide(v, cands);
+            }
         }
         // The next kind is chosen from supply at the top of the loop.
     }
@@ -648,6 +675,7 @@ pub fn new_pool(model: &MinionsModel, cfg: &ActorConfig, n: usize, seed: u64) ->
                 pw_alpha: cfg.pw_alpha,
             pw_beta: cfg.pw_beta,
             pw_init: cfg.pw_init,
+            pw_chunk: cfg.pw_chunk,
             kernel_sigma: cfg.kernel_sigma,
                 seed: seed ^ i as u64,
             };

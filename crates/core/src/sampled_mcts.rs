@@ -90,6 +90,10 @@ pub type Expansion<G> = (f32, Vec<(<G as SampledGame>::Move, f32, bool)>);
 
 /// What a resumable search is waiting for.
 pub enum Step<G: SampledGame> {
+    /// An expanded node has earned more candidates than it holds. Same shape as
+    /// an expansion request, so it rides the same batch; the value that comes
+    /// back is ignored.
+    NeedWiden(G::State),
     /// The search reached an unexpanded node and needs its value and candidates.
     /// Feed them back with [`Search::provide`].
     NeedExpansion(G::State),
@@ -151,6 +155,17 @@ pub struct SampledParams {
     pub pw_alpha: f32,
     pub pw_beta: f32,
     pub pw_init: usize,
+    /// Candidates generated per model call. `0` keeps the old behaviour: a
+    /// node's whole set is produced in one call.
+    ///
+    /// With a chunk set, a wave is `max_batch` requests of `pw_chunk`
+    /// candidates each instead of `max_batch` requests of `k` — the same head
+    /// rows and the same tensor shape, but spread over more *nodes*. That is
+    /// the point: 69% of nodes are visited once and would otherwise pay for a
+    /// full candidate set they never look at. A node that earns visits asks for
+    /// its next chunk, and that request batches alongside expansions because it
+    /// is the same shape.
+    pub pw_chunk: usize,
     /// KR-PUCT kernel bandwidth over `SampledGame::move_distance`. Candidates
     /// within roughly this distance share visit counts and values, which is the
     /// point: with ~16 visits per root child, per-candidate value estimates are
@@ -175,6 +190,7 @@ impl Default for SampledParams {
             pw_alpha: 0.5,
             pw_beta: 2.0,
             pw_init: 4,
+            pw_chunk: 0,
             kernel_sigma: 0.0,
             seed: 0,
         }
@@ -215,6 +231,11 @@ struct Entry<G: SampledGame> {
 struct Node<G: SampledGame> {
     state: G::State,
     entries: Vec<Entry<G>>,
+    /// Set when a widen chunk produced nothing new. The sampler can saturate —
+    /// every proposal merging into a candidate already held — and without this
+    /// the node would keep asking for candidates it can never get, spinning the
+    /// search forever. Caught by `chunked_generation_reaches_the_same_root_set`.
+    widen_exhausted: bool,
     /// Row-major `k x k` kernel matrix over `entries`, empty when the kernel is
     /// disabled. Built once at expansion: the distances depend only on the
     /// candidates and the state, neither of which changes afterwards, so paying
@@ -382,6 +403,7 @@ fn new_node<G: SampledGame>(state: G::State) -> Node<G> {
     Node {
         state,
         entries: Vec::new(),
+        widen_exhausted: false,
         kern: Vec::new(),
         total_n: 0,
         w_sum: 0.0,
@@ -423,6 +445,21 @@ fn visible<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool
     let n = node.total_n.max(1) as f32;
     let target = (params.pw_beta * n.powf(params.pw_alpha)).ceil() as usize;
     target.clamp(params.pw_init.min(m).max(1), m)
+}
+
+/// How many candidates a node has *earned* — what `visible` would show it if it
+/// held the full set. The root earns all of them immediately: its visit
+/// distribution is the training target, so every candidate needs its chance.
+fn earned<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool) -> usize {
+    let k = params.k_candidates.max(1);
+    if is_root || params.pw_beta <= 0.0 {
+        return k;
+    }
+    let n = node.total_n.max(1) as f32;
+    let target = (params.pw_beta * n.powf(params.pw_alpha)).ceil() as usize;
+    // `pw_init` can exceed `k` on a small candidate budget, and `clamp` panics
+    // when its bounds cross.
+    target.clamp(params.pw_init.min(k).max(1), k)
 }
 
 /// Select a child by PUCT, with root-only forced playouts.
@@ -545,6 +582,8 @@ pub struct Search<G: SampledGame> {
     path: Vec<(usize, usize)>,
     /// Node awaiting expansion, if `step` returned `NeedExpansion`.
     pending: Option<usize>,
+    /// Node awaiting more candidates, if `step` returned `NeedWiden`.
+    pending_widen: Option<usize>,
 }
 
 impl<G: SampledGame> Search<G> {
@@ -560,6 +599,7 @@ impl<G: SampledGame> Search<G> {
             nodes: 0,
             path: Vec::new(),
             pending: None,
+            pending_widen: None,
         }
     }
 
@@ -579,6 +619,22 @@ impl<G: SampledGame> Search<G> {
                 }
                 if self.tree[cur].entries.is_empty() {
                     break 0.0; // model proposed nothing; score on value alone
+                }
+                // Ask for the next chunk before selecting, if this node has
+                // earned more candidates than it holds. The simulation is
+                // abandoned rather than paused: nothing has been backed up yet,
+                // so re-descending from the root afterwards costs only the
+                // descent, and it keeps `path` from holding indices into a node
+                // whose entries are about to be re-sorted.
+                if self.params.pw_chunk > 0 && !self.tree[cur].widen_exhausted {
+                    let held = self.tree[cur].entries.len();
+                    if held < earned(&self.tree[cur], &self.params, cur == 0)
+                        && held < self.params.k_candidates.max(1)
+                    {
+                        self.pending_widen = Some(cur);
+                        self.path.clear();
+                        return Step::NeedWiden(self.tree[cur].state.clone());
+                    }
                 }
                 let pick = select(&self.tree[cur], &self.params, cur == 0);
                 self.path.push((cur, pick));
@@ -686,6 +742,59 @@ impl<G: SampledGame> Search<G> {
         }
     }
 
+    /// Append a chunk of candidates to a node that earned them.
+    ///
+    /// Merges against the candidates already there — the sampler is stochastic
+    /// and re-proposes, so without merging a node would accumulate duplicates
+    /// that fragment exactly the visits they should concentrate. Priors are
+    /// renormalised over the grown set and the kernel matrix rebuilt.
+    pub fn provide_widen(&mut self, candidates: Vec<(G::Move, f32, bool)>) {
+        let cur = self.pending_widen.take().expect("provide_widen without a pending widen");
+        let mut seen: std::collections::HashMap<u128, usize> = Default::default();
+        for (i, e) in self.tree[cur].entries.iter().enumerate() {
+            seen.insert(G::state_key(&G::apply(&self.tree[cur].state, &e.mv)), i);
+        }
+        let k_max = self.params.k_candidates.max(1);
+        let before = self.tree[cur].entries.len();
+        for (mv, p, explore) in candidates {
+            if self.tree[cur].entries.len() >= k_max {
+                break;
+            }
+            let key = G::state_key(&G::apply(&self.tree[cur].state, &mv));
+            match seen.get(&key) {
+                Some(&i) => {
+                    self.tree[cur].entries[i].p += p.max(0.0);
+                    self.tree[cur].entries[i].explore |= explore;
+                }
+                None => {
+                    seen.insert(key, self.tree[cur].entries.len());
+                    self.tree[cur].entries.push(Entry {
+                        mv,
+                        p: p.max(0.0),
+                        n: 0,
+                        w: 0.0,
+                        child: -1,
+                        explore,
+                    });
+                }
+            }
+        }
+        if self.tree[cur].entries.len() == before {
+            self.tree[cur].widen_exhausted = true;
+        }
+        // Sorting is safe here because a widen abandons its simulation, so no
+        // `path` entry indexes into this node.
+        self.tree[cur].entries.sort_by(|a, b| b.p.total_cmp(&a.p));
+        let sum: f32 = self.tree[cur].entries.iter().map(|e| e.p).sum();
+        if sum > 0.0 {
+            self.tree[cur].entries.iter_mut().for_each(|e| e.p /= sum);
+        } else {
+            let u = 1.0 / self.tree[cur].entries.len().max(1) as f32;
+            self.tree[cur].entries.iter_mut().for_each(|e| e.p = u);
+        }
+        self.build_kernel(cur);
+    }
+
     /// Precompute the node's kernel matrix. A no-op when the kernel is off, so
     /// the disabled path allocates nothing and costs nothing.
     fn build_kernel(&mut self, node: usize) {
@@ -763,6 +872,16 @@ impl<G: SampledGame> Search<G> {
     }
 }
 
+/// Candidates to request per model call: the chunk when chunked generation is
+/// on, otherwise the node's whole set.
+pub fn chunk_k(params: &SampledParams) -> usize {
+    if params.pw_chunk > 0 {
+        params.pw_chunk.min(params.k_candidates.max(1))
+    } else {
+        params.k_candidates
+    }
+}
+
 /// Run one search to completion against `model`. The single-game path — used by
 /// eval, the interactive engine and the tests; self-play drives many
 /// [`Search`]es in lockstep instead, so its forwards are batched.
@@ -776,8 +895,13 @@ pub fn search<G: SampledGame, M: SampledModel<G>>(
     loop {
         match s.step() {
             Step::NeedExpansion(state) => {
-                let (v, cands) = model.expand(&state, params.k_candidates)?;
+                let (v, cands) = model.expand(&state, chunk_k(params))?;
                 s.provide(v, cands);
+            }
+            Step::NeedWiden(state) => {
+                // Same call, same shape; only the candidates are wanted.
+                let (_, cands) = model.expand(&state, chunk_k(params))?;
+                s.provide_widen(cands);
             }
             Step::Done => return Ok(s.finish()),
         }
@@ -806,6 +930,7 @@ pub fn search_lockstep<G: SampledGame, M: SampledModel<G>>(
     loop {
         // Collect this round's pending expansions.
         let mut want: Vec<usize> = Vec::with_capacity(searches.len());
+        let mut widen: Vec<bool> = Vec::with_capacity(searches.len());
         let mut states: Vec<G::State> = Vec::with_capacity(searches.len());
         for (i, s) in searches.iter_mut().enumerate() {
             if done[i] {
@@ -814,6 +939,12 @@ pub fn search_lockstep<G: SampledGame, M: SampledModel<G>>(
             match s.step() {
                 Step::NeedExpansion(st) => {
                     want.push(i);
+                    widen.push(false);
+                    states.push(st);
+                }
+                Step::NeedWiden(st) => {
+                    want.push(i);
+                    widen.push(true);
                     states.push(st);
                 }
                 Step::Done => done[i] = true,
@@ -822,15 +953,19 @@ pub fn search_lockstep<G: SampledGame, M: SampledModel<G>>(
         if want.is_empty() {
             break;
         }
-        let results = model.expand_batch(&states, params.k_candidates)?;
+        let results = model.expand_batch(&states, chunk_k(params))?;
         anyhow::ensure!(
             results.len() == want.len(),
             "expand_batch returned {} results for {} states",
             results.len(),
             want.len()
         );
-        for (i, (v, cands)) in want.into_iter().zip(results) {
-            searches[i].provide(v, cands);
+        for ((i, is_widen), (v, cands)) in want.into_iter().zip(widen).zip(results) {
+            if is_widen {
+                searches[i].provide_widen(cands);
+            } else {
+                searches[i].provide(v, cands);
+            }
         }
     }
     Ok(searches.into_iter().map(|s| s.finish()).collect())
@@ -1042,6 +1177,56 @@ mod tests {
         assert_eq!(visible(&node, &off, false), 12, "pw_beta = 0 disables widening");
     }
 
+    /// Chunked generation must reach the same root candidate set as one wide
+    /// call — it changes *how many calls* a node needs, never what it ends up
+    /// holding. The root is the case that matters: its set is the training
+    /// target, so a chunk that quietly truncated it would corrupt training.
+    #[test]
+    fn chunked_generation_reaches_the_same_root_set() {
+        /// A stochastic sampler: successive calls return *different* draws from
+        /// the same pool, which is what makes chunked generation able to
+        /// accumulate a full set. A model that returned the same candidates
+        /// every call would saturate instead — the `widen_exhausted` path.
+        struct Pool {
+            cursor: std::sync::atomic::AtomicUsize,
+        }
+        impl SampledModel<Count> for Pool {
+            fn expand(&self, s: &CountState, k: usize) -> anyhow::Result<Expansion<Count>> {
+                let start = self.cursor.fetch_add(k.max(1), std::sync::atomic::Ordering::Relaxed);
+                let moves: Vec<u32> = (1..=3u32).filter(|m| *m <= s.n).collect();
+                let cands: Vec<(u32, f32, bool)> = (0..k.max(1))
+                    .map(|i| moves[(start + i) % moves.len()])
+                    .map(|m| (m, 1.0 / m as f32, false))
+                    .collect();
+                Ok((0.0, cands))
+            }
+        }
+        let base = SampledParams {
+            simulations: 40,
+            k_candidates: 3,
+            k_forced: 0.0,
+            min_explore_visits: 0.0,
+            temp_moves: 0,
+            seed: 11,
+            ..Default::default()
+        };
+        let pool = Pool { cursor: std::sync::atomic::AtomicUsize::new(0) };
+        let whole = search::<Count, _>(&pool, CountState { n: 21, side: 1 }, &base, 0)
+            .expect("unchunked");
+
+        let chunked_params = SampledParams { pw_chunk: 1, ..base };
+        let chunked = search::<Count, _>(&pool, CountState { n: 21, side: 1 }, &chunked_params, 0)
+            .expect("chunked");
+
+        let mut a: Vec<u32> = whole.candidates.iter().map(|(m, _)| *m).collect();
+        let mut b: Vec<u32> = chunked.candidates.iter().map(|(m, _)| *m).collect();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b, "chunked generation must reach the same root candidates");
+        let sum: f32 = chunked.priors.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "priors must stay normalised, got {sum}");
+    }
+
     /// An explore candidate must be *tried* even when its prior is negligible.
     ///
     /// KataGo's floor is `sqrt(k·P·N)` and only applies to candidates already
@@ -1072,6 +1257,9 @@ mod tests {
                         .collect();
                     search.provide(0.0, cands);
                 }
+                // Chunked generation is off in this fixture, so this is
+                // unreachable; the arm keeps the match total.
+                Step::NeedWiden(_) => unreachable!("pw_chunk is 0 here"),
                 Step::Done => break,
             }
         }
