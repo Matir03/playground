@@ -123,6 +123,8 @@ pub struct ActorConfig {
     /// Candidates per model call. 1 matches the one-per-visit widening rate;
     /// 0 disables chunking.
     pub pw_chunk: usize,
+    /// Resume a paused descent after a widen rather than re-descending.
+    pub pw_resume: bool,
     pub fast_sims: u32,
     /// Probability a turn gets the full search — only full searches produce a
     /// policy target (KataGo's playout-cap randomization).
@@ -172,6 +174,14 @@ impl Default for ActorConfig {
             pw_alpha: 0.5,
             pw_beta: 2.0,
             pw_chunk: 1,
+            // Env-switchable so both arms run from one binary in a paired
+            // benchmark; comparing across rebuilds separates the arms in time,
+            // which is exactly what this box's thermal drift punishes.
+            pw_resume: std::env::var("MINIONS_WIDEN_RESUME")
+                .ok()
+                .and_then(|v| v.parse::<u8>().ok())
+                .map(|v| v != 0)
+                .unwrap_or(false),
             random_opening_max: 15,
             // Chosen so the truncated geometric on 0..=15 has mean 5 — a quarter
             // of `MAX_TURNS`, deep enough to reach genuinely mid-game positions
@@ -374,6 +384,7 @@ fn drive_pool_worker(
             pw_alpha: cfg.pw_alpha,
             pw_beta: cfg.pw_beta,
             pw_chunk: cfg.pw_chunk,
+            pw_resume: cfg.pw_resume,
             kernel_sigma: cfg.kernel_sigma,
             seed: seed ^ (turn as u64),
         };
@@ -782,6 +793,7 @@ pub fn new_pool(model: &MinionsModel, cfg: &ActorConfig, n: usize, seed: u64) ->
                 pw_alpha: cfg.pw_alpha,
             pw_beta: cfg.pw_beta,
             pw_chunk: cfg.pw_chunk,
+            pw_resume: cfg.pw_resume,
             kernel_sigma: cfg.kernel_sigma,
                 seed: seed ^ i as u64,
             };

@@ -31,8 +31,17 @@ TARGET_EXAMPLES="${TARGET_EXAMPLES:-80000}"
 #
 # CONCURRENCY tracks MAX_BATCH: `pick_mode` only guarantees zero padding while
 # the pool holds >= 2 * MAX_BATCH slots, and padding is discarded GPU work.
-CONCURRENCY="${CONCURRENCY:-1024}"
-MAX_BATCH="${MAX_BATCH:-128}"
+# `pick_mode` guarantees zero padding only while each worker owns
+# `2 * MAX_BATCH` slots, so concurrency has to scale with the batch:
+# 2 * 768 * 4 workers = 6144.
+#
+# Measured ABBA against 128, both reps agreeing in sign: 192 +16/+20%,
+# 256 +37/+45%, 384 +15/+19% and 512 +29/+30% over 256, 768 +44/+40% over 256.
+# At 1024 and 1536 the reps disagree in sign, so 768 is the plateau. Note the
+# old note in memory had 256 at -5%; that was true of a different inner loop,
+# and re-measuring after changing the loop is the whole point.
+CONCURRENCY="${CONCURRENCY:-6144}"
+MAX_BATCH="${MAX_BATCH:-768}"
 # Pool workers, each owning a disjoint slice of the pool so one worker's CPU
 # phases (commit, realize, playout) overlap another's GPU work. Measured on the
 # 7x7 net, ABBA pairs on a quiet machine: 1 -> 2 is +17.5% (3/3), 2 -> 4 a

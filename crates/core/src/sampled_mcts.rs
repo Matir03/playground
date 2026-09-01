@@ -177,6 +177,23 @@ pub struct SampledParams {
     /// That coupling matters: with a small chunk the wave must cover
     /// proportionally more nodes, or the batch shrinks and the GPU starves.
     pub pw_chunk: usize,
+    /// Resume the descent where it paused after a widen, instead of discarding
+    /// it and re-descending from the root.
+    ///
+    /// The widen decision depends only on the node's own visit and held counts,
+    /// never on the candidate that comes back — so nothing about the answer
+    /// invalidates the path taken to get there. Discarding it throws away a
+    /// descent per widen and leaves the new candidate unselected until some
+    /// later simulation happens to arrive at the same node.
+    ///
+    /// **Measured to be worth nothing** (ABBA at batch 768: -4.6% / -0.3% /
+    /// +0.0%, never positive), so it defaults off. The reasoning was right and
+    /// the conclusion still wrong: the discarded descent is CPU work, and CPU is
+    /// ~4-6% of the loop once the generative heads stop dominating, so there is
+    /// nothing left to reclaim. It also does not reduce generation — the same
+    /// widens happen either way; resuming only changes when the candidate is
+    /// first selectable.
+    pub pw_resume: bool,
     /// KR-PUCT kernel bandwidth over `SampledGame::move_distance`. Candidates
     /// within roughly this distance share visit counts and values, which is the
     /// point: with ~16 visits per root child, per-candidate value estimates are
@@ -201,6 +218,7 @@ impl Default for SampledParams {
             pw_alpha: 0.5,
             pw_beta: 2.0,
             pw_chunk: 1,
+            pw_resume: false,
             kernel_sigma: 0.0,
             seed: 0,
         }
@@ -598,6 +616,8 @@ pub struct Search<G: SampledGame> {
     pending: Option<usize>,
     /// Node awaiting more candidates, if `step` returned `NeedWiden`.
     pending_widen: Option<usize>,
+    /// Where to pick the descent back up after a widen, with `path` intact.
+    resume_at: Option<usize>,
 }
 
 impl<G: SampledGame> Search<G> {
@@ -614,6 +634,7 @@ impl<G: SampledGame> Search<G> {
             path: Vec::new(),
             pending: None,
             pending_widen: None,
+            resume_at: None,
         }
     }
 
@@ -621,8 +642,13 @@ impl<G: SampledGame> Search<G> {
     pub fn step(&mut self) -> Step<G> {
         debug_assert!(self.pending.is_none(), "step called with an expansion outstanding");
         while self.sims_left > 0 {
-            self.path.clear();
-            let mut cur = 0usize;
+            let mut cur = match self.resume_at.take() {
+                Some(node) => node,
+                None => {
+                    self.path.clear();
+                    0
+                }
+            };
             let value = loop {
                 if self.tree[cur].terminal {
                     break self.tree[cur].term_v;
@@ -643,7 +669,15 @@ impl<G: SampledGame> Search<G> {
                         && held < self.params.k_candidates.max(1)
                     {
                         self.pending_widen = Some(cur);
-                        self.path.clear();
+                        if self.params.pw_resume {
+                            // Keep `path`; the descent continues at `cur` when
+                            // the candidate arrives. Sorting this node's entries
+                            // in `provide_widen` stays safe because `cur`'s own
+                            // edge is not in `path` yet — only its ancestors'.
+                            self.resume_at = Some(cur);
+                        } else {
+                            self.path.clear();
+                        }
                         return Step::NeedWiden(self.tree[cur].state.clone());
                     }
                 }
@@ -1347,6 +1381,41 @@ mod tests {
             }
         }
         assert!(saw_full_before_first_visit, "root was never fully populated before its sweep");
+    }
+
+    /// Resuming a paused descent must not corrupt the tree: visits still sum
+    /// correctly through the root, and the search still finds the winning line.
+    ///
+    /// The risk is `path`. A widen keeps it and `provide_widen` re-sorts the
+    /// node's entries, so if the paused node's own edge were already in `path`,
+    /// the sort would silently repoint it at a different move.
+    #[test]
+    fn resuming_after_a_widen_keeps_the_tree_consistent() {
+        for resume in [false, true] {
+            let params = SampledParams {
+                simulations: 120,
+                k_candidates: 3,
+                pw_chunk: 1,
+                pw_resume: resume,
+                k_forced: 0.0,
+                min_explore_visits: 0.0,
+                temp_moves: 0,
+                seed: 9,
+                ..Default::default()
+            };
+            let r = search::<Count, _>(&Mock, CountState { n: 5, side: 1 }, &params, 0)
+                .expect("search");
+            let total: u32 = r.candidates.iter().map(|(_, n)| *n).sum();
+            assert!(
+                total <= params.simulations,
+                "resume={resume}: root visits {total} exceed the simulation budget"
+            );
+            assert!(total > 0, "resume={resume}: no visits recorded at all");
+            assert_eq!(
+                r.candidates[r.chosen].0, 1,
+                "resume={resume}: should leave a multiple of four"
+            );
+        }
     }
 
     /// Chunking off must still leave nodes with candidates. With `pw_chunk = 0`
