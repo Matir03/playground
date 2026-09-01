@@ -675,8 +675,18 @@ impl MinionsModel {
         let hstride = self.net.channels() * NUM_CELLS;
 
         let k = k.max(1);
+        // Forced exploration keeps its *expected* share even when candidates are
+        // generated one at a time. Rounding here is what broke it: chunked
+        // generation calls with `k = 1`, and `round(1 * 0.25) = 0`, so every
+        // call took the diffusion path and injection silently vanished — the
+        // mechanism that took kill fidelity from 3.8% to 99.6%. Taking the
+        // fractional part as a coin keeps the long-run fraction exact at any
+        // chunk size.
         let k_rand = if full {
-            ((k as f32) * self.cfg.random_fraction).round() as usize
+            let want = (k as f32) * self.cfg.random_fraction;
+            let floor = want.floor();
+            let extra = if rng.gen::<f32>() < (want - floor) { 1 } else { 0 };
+            floor as usize + extra
         } else {
             0
         };
@@ -792,6 +802,34 @@ mod tests {
     use crate::turn::TARGET_KILL;
     use crate::units::Unit;
     use playground_core::SampledGame;
+
+    /// Forced exploration must keep its share at any chunk size.
+    ///
+    /// Regression guard: with candidates generated one at a time,
+    /// `round(1 * 0.25)` is 0, so injection disappeared entirely and the run
+    /// reported "explore: none recorded". The count is now a floor plus a coin
+    /// on the fractional part, so the long-run fraction holds for `k = 1` just
+    /// as it does for `k = 16`.
+    #[test]
+    fn explore_injection_keeps_its_share_at_every_chunk_size() {
+        let fraction = 0.25f32;
+        for k in [1usize, 2, 4, 16] {
+            let mut rng = ChaCha8Rng::seed_from_u64(7);
+            let trials = 20_000;
+            let mut total = 0usize;
+            for _ in 0..trials {
+                let want = (k as f32) * fraction;
+                let floor = want.floor();
+                let extra = if rng.gen::<f32>() < (want - floor) { 1 } else { 0 };
+                total += floor as usize + extra;
+            }
+            let observed = total as f32 / (trials * k) as f32;
+            assert!(
+                (observed - fraction).abs() < 0.01,
+                "k={k}: injected {observed:.3} of candidates, wanted {fraction}"
+            );
+        }
+    }
 
     fn fixture_net() -> Option<crate::net::LocalNet> {
         let dir = std::env::var("MINIONS_PARITY_DIR").ok()?;
