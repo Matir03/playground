@@ -1228,6 +1228,76 @@ mod tests {
         }
     }
 
+    /// The root is not widened: it must be fully populated, and then every
+    /// candidate visited once, before any candidate gets a second visit.
+    ///
+    /// Its visit distribution is the training target, so a candidate that never
+    /// got a look would be trained against as if search had rejected it.
+    #[test]
+    fn the_root_is_fully_populated_and_swept_before_any_second_visit() {
+        struct Rot {
+            cursor: std::sync::atomic::AtomicUsize,
+        }
+        impl SampledModel<Count> for Rot {
+            fn expand(&self, _s: &CountState, k: usize) -> anyhow::Result<Expansion<Count>> {
+                let start = self.cursor.fetch_add(k.max(1), std::sync::atomic::Ordering::Relaxed);
+                Ok((
+                    0.0,
+                    (0..k.max(1))
+                        .map(|i| ((start + i) % 8 + 1) as u32)
+                        .map(|m| (m, 1.0, false))
+                        .collect(),
+                ))
+            }
+        }
+        let k = 8usize;
+        let params = SampledParams {
+            simulations: 200,
+            k_candidates: k,
+            pw_chunk: 1,
+            k_forced: 0.0,
+            min_explore_visits: 0.0,
+            temp_moves: 0,
+            seed: 4,
+            ..Default::default()
+        };
+        let model = Rot { cursor: std::sync::atomic::AtomicUsize::new(0) };
+        let mut search = Search::<Count>::new(CountState { n: 40, side: 1 }, &params, 0);
+        let mut saw_full_before_first_visit = false;
+        loop {
+            // Observe the root between steps.
+            let root = &search.tree[0];
+            if root.expanded {
+                let held = root.entries.len();
+                let max_n = root.entries.iter().map(|e| e.n).max().unwrap_or(0);
+                let min_n = root.entries.iter().map(|e| e.n).min().unwrap_or(0);
+                if max_n == 0 && held == k {
+                    saw_full_before_first_visit = true;
+                }
+                assert!(
+                    max_n == 0 || held == k,
+                    "root took a visit while holding {held} of {k} candidates"
+                );
+                assert!(
+                    max_n < 2 || min_n >= 1,
+                    "a root candidate reached {max_n} visits while another still had {min_n}"
+                );
+            }
+            match search.step() {
+                Step::NeedExpansion(st) => {
+                    let (v, c) = model.expand(&st, chunk_k(&params)).unwrap();
+                    search.provide(v, c);
+                }
+                Step::NeedWiden(st) => {
+                    let (_, c) = model.expand(&st, chunk_k(&params)).unwrap();
+                    search.provide_widen(c);
+                }
+                Step::Done => break,
+            }
+        }
+        assert!(saw_full_before_first_visit, "root was never fully populated before its sweep");
+    }
+
     /// Chunked generation must reach the same root candidate set as one wide
     /// call — it changes *how many calls* a node needs, never what it ends up
     /// holding. The root is the case that matters: its set is the training
