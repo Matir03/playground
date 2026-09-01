@@ -1138,10 +1138,27 @@ pub fn run_loop(
         std::thread::sleep(Duration::from_secs(5));
     }
 
+    // Continue from the highest index present, not the file *count*.
+    //
+    // Counting is wrong whenever pruning has removed chunks from the middle or
+    // front of the range: with `chunk_000047..077` surviving, a count of 32
+    // restarts numbering at 32, and since `prune_buffer` treats the sort order
+    // as age, every freshly written chunk sorts *before* the survivors and is
+    // deleted as though it were the oldest data in the buffer. Self-play then
+    // runs continuously while the learner trains on a frozen set — losses keep
+    // falling because it is overfitting, so nothing looks wrong.
     let mut chunk_index = std::fs::read_dir(&buffer)?
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|x| x == "bin"))
-        .count();
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "bin"))
+        .filter_map(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.strip_prefix("chunk_"))
+                .and_then(|s| s.parse::<usize>().ok())
+        })
+        .max()
+        .map_or(0, |m| m + 1);
     let mut last_mtime = None;
     let mut model =
         MinionsModel::new(crate::net::load_backend(live, &cfg.backend, &cache_dir)?, sampler);
@@ -1466,6 +1483,42 @@ mod tests {
     }
 
     #[test]
+    /// The chunk counter must continue past the highest surviving index, not
+    /// restart at the file count.
+    ///
+    /// Regression guard: pruning leaves gaps, so a count-based index collides
+    /// with survivors and — because `prune_buffer` reads sort order as age —
+    /// every new chunk is deleted as the "oldest" the moment it is written.
+    #[test]
+    fn chunk_index_resumes_past_the_highest_surviving_chunk() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("minions_idx_{}_{uniq}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        assert!(dir.is_dir(), "temp dir {dir:?} was not created");
+        // A buffer that has been pruned: a gap at the front, survivors at 47-49.
+        for i in [47usize, 48, 49] {
+            std::fs::write(dir.join(format!("chunk_{i:06}.bin")), b"x").expect("write");
+        }
+        let next = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "bin"))
+            .filter_map(|p| {
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| s.strip_prefix("chunk_"))
+                    .and_then(|s| s.parse::<usize>().ok())
+            })
+            .max()
+            .map_or(0, |m| m + 1);
+        assert_eq!(next, 50, "must continue past 49, not restart at the count (3)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn chunk_round_trips_through_the_header() {
         let dir = std::env::temp_dir().join(format!("minions_chunk_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

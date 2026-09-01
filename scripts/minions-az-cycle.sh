@@ -92,10 +92,11 @@ STEPS="${STEPS:-600}"
 MIN_SAMPLES="${MIN_SAMPLES:-$TARGET_EXAMPLES}"
 BATCH="${BATCH:-128}"
 # Diagnostics only now — nothing gates on them, so they run rarely.
-EVAL_EVERY="${EVAL_EVERY:-10}"
+EVAL_EVERY="${EVAL_EVERY:-5}"
 # Compare the newest net against the one this many generations back. One
-# generation apart is inside the noise of a 40-game match; ten is not.
-EVAL_LAG="${EVAL_LAG:-10}"
+# generation apart is inside the noise of a 40-game match; five gives the
+# comparison enough separation while keeping the diagnostic frequent.
+EVAL_LAG="${EVAL_LAG:-5}"
 # GFlowNet trajectory-balance weight for the sampler. TB settles around 7-9
 # while the other losses sit at 0.5-3, so 1.0 would swamp them.
 TB_WEIGHT="${TB_WEIGHT:-0.3}"
