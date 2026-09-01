@@ -91,7 +91,11 @@ STEPS="${STEPS:-600}"
 # generate phase was never going to produce.
 MIN_SAMPLES="${MIN_SAMPLES:-$TARGET_EXAMPLES}"
 BATCH="${BATCH:-128}"
-EVAL_EVERY="${EVAL_EVERY:-3}"
+# Diagnostics only now — nothing gates on them, so they run rarely.
+EVAL_EVERY="${EVAL_EVERY:-10}"
+# Compare the newest net against the one this many generations back. One
+# generation apart is inside the noise of a 40-game match; ten is not.
+EVAL_LAG="${EVAL_LAG:-10}"
 # GFlowNet trajectory-balance weight for the sampler. TB settles around 7-9
 # while the other losses sit at 0.5-3, so 1.0 would swamp them.
 TB_WEIGHT="${TB_WEIGHT:-0.3}"
@@ -187,12 +191,35 @@ while true; do
   # <live>/watchdog.jsonl and warns, so the trend is on the record either way.
   "$PYTHON" "$repo/python/minions_watchdog.py" --live "$LIVE" || true
 
+  # Auto-promote: the newest net always becomes the one self-play uses.
+  #
+  # The promotion gate cost 29% of wall clock to answer a question a 40-game
+  # match could not answer well anyway — adjacent generations scored 0.300 and
+  # 0.033 against the same opponent, so the gate was mostly sampling noise, and
+  # it rejected generations that later turned out fine. Modern AlphaZero-style
+  # runs do not gate; they trust the learner and watch the diagnostics.
+  echo "== cycle $gen: promote =="
+  "$PYTHON" - <<PROMOTE_EOF
+import json, os, shutil
+from safetensors.torch import load_file
+from playground.model_server.minions_net import build_model, export_onnx_atomic
+live = "$LIVE"
+latest = os.path.join(live, "latest.safetensors")
+shutil.copyfile(latest, os.path.join(live, "best.safetensors.tmp"))
+os.replace(os.path.join(live, "best.safetensors.tmp"), os.path.join(live, "best.safetensors"))
+cfg = json.load(open(os.path.join(live, "config.json")))
+net = build_model(cfg["arch"])
+net.load_state_dict(load_file(latest))
+export_onnx_atomic(net, os.path.join(live, "best"))
+print("promoted latest -> best")
+PROMOTE_EOF
+
   if (( gen % EVAL_EVERY == 0 )); then
-    echo "== cycle $gen: eval =="
+    echo "== cycle $gen: eval (diagnostic) =="
     "$PYTHON" "$repo/python/minions_eval_loop.py" --live "$LIVE" \
       --engine "$ENGINE" --games "$EVAL_GAMES" --candidates "$EVAL_CANDIDATES" \
       --sims "$EVAL_SIMS" --greedy-games "$GREEDY_GAMES" \
-      --t-steps "$T_STEPS" --promote-threshold "$PROMOTE" --once \
+      --t-steps "$T_STEPS" --lag "$EVAL_LAG" --once \
       --backend "$BACKEND" --ep "$EP" $FP16_FLAG || {
         # Never let evaluation kill the run. The script is `set -e`, so a bad
         # eval used to take the whole cycle down with it — an unattended run

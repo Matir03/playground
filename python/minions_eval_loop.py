@@ -106,6 +106,69 @@ def run_match(engine, a, b, games, sims, candidates, t_steps, backend, ep, fp16,
     return float(m.group(1)), margin
 
 
+def run_diagnostic(args, live, scores, scores_path) -> None:
+    """Measure the newest net without gating anything on the result.
+
+    With every generation auto-promoted there is no champion to defend, so a
+    match against the *previous champion* would compare two nets one generation
+    apart — well inside the noise of a 40-game match. Comparing against the net
+    from `--lag` generations back gives the comparison enough separation to say
+    something, and greedy stays as the fixed external yardstick.
+    """
+    snaps = sorted(glob.glob(os.path.join(live, "snapshots", "gen*")),
+                   key=lambda p: int(re.search(r"gen(\d+)", p).group(1)))
+    if not snaps:
+        print("no snapshots to evaluate")
+        return
+    gen = int(re.search(r"gen(\d+)", snaps[-1]).group(1))
+    ckpt = os.path.join(snaps[-1], "checkpoint.safetensors")
+    if not os.path.exists(ckpt):
+        print(f"gen {gen}: no checkpoint")
+        return
+
+    entry = {"gen": gen, "diagnostic": True}
+    games_dir = os.path.join(live, "games")
+
+    # ...against the net from `lag` generations back.
+    past = os.path.join(live, "snapshots", f"gen{gen - args.lag:04d}", "checkpoint.safetensors")
+    if os.path.exists(past):
+        score, margin = run_match(
+            args.engine, ckpt, past, args.games, args.sims, args.candidates,
+            args.t_steps, args.backend, args.ep, args.fp16, seed=gen,
+            render_file=os.path.join(games_dir, f"gen_{gen:04d}_vs_lag{args.lag}.txt"),
+            render_games=args.render_games)
+        entry[f"vs_gen_minus_{args.lag}"] = score
+        if margin is not None:
+            entry[f"vs_gen_minus_{args.lag}_margin"] = round(margin, 3)
+        if _LAST_TURNS is not None:
+            entry["lag_turns_win"], entry["lag_turns_loss"] = _LAST_TURNS
+    else:
+        print(f"gen {gen}: no snapshot at gen{gen - args.lag:04d}, skipping the lag match")
+
+    # ...and against greedy, the fixed external yardstick.
+    try:
+        g, gm = run_match(
+            args.engine, ckpt, None, args.greedy_games, args.sims, args.candidates,
+            args.t_steps, args.backend, args.ep, args.fp16, seed=1000 + gen,
+            render_file=os.path.join(games_dir, f"gen_{gen:04d}_vs_greedy.txt"),
+            render_games=args.render_games)
+        entry["vs_greedy"] = g
+        if gm is not None:
+            entry["vs_greedy_margin"] = round(gm, 3)
+        if _LAST_TURNS is not None:
+            entry["greedy_turns_win"], entry["greedy_turns_loss"] = _LAST_TURNS
+    except Exception as exc:  # noqa: BLE001
+        entry["vs_greedy_error"] = str(exc)[:200]
+
+    metrics = os.path.join(snaps[-1], "metrics.json")
+    if os.path.exists(metrics):
+        entry.update({k: v for k, v in json.load(open(metrics)).items() if k != "generation"})
+    scores["history"].append(entry)
+    scores["processed_through"] = gen
+    json.dump(scores, open(scores_path, "w"), indent=2)
+    print(f"gen {gen}: {entry}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", required=True)
@@ -122,6 +185,10 @@ def main():
     ap.add_argument("--backend", default="candle", choices=["candle", "ort"])
     ap.add_argument("--ep", default="trt", choices=["trt", "cuda"])
     ap.add_argument("--fp16", action="store_true")
+    ap.add_argument("--lag", type=int, default=0,
+                    help="diagnostic mode: skip promotion entirely and measure the "
+                         "newest net against the one from LAG generations back, "
+                         "plus greedy. 0 keeps the promotion-gated ladder.")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--period", type=int, default=120)
     args = ap.parse_args()
@@ -132,6 +199,10 @@ def main():
         "best_gen": 0, "best_score": 0.0, "processed_through": 0, "history": []
     }
     best = os.path.join(live, "best.safetensors")
+
+    if args.lag > 0:
+        run_diagnostic(args, live, scores, scores_path)
+        return
 
     while True:
         snaps = sorted(glob.glob(os.path.join(live, "snapshots", "gen*")))
