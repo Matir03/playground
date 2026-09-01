@@ -509,14 +509,49 @@ fn drive_pool_worker(
         } else {
             model.cfg.k_for(want_full)
         };
-        let mut results = model.expand_batch_mode(&states, k_call, want_full, *next_seed)?;
-        *next_seed = next_seed.wrapping_add(1);
-        results.truncate(real);
-        for ((i, widen), (v, cands)) in ids.into_iter().zip(is_widen).zip(results) {
+        // Two calls, split by what each request actually needs. Both are padded
+        // to `max_batch`, so both keep a fixed tensor shape and TensorRT builds
+        // one engine apiece.
+        //
+        // The split is the point: an expansion needs only a value, so it runs
+        // the trunk and stops. Only widens — nodes that something is actually
+        // descending through — pay for the diffusion and energy heads, which are
+        // ~70% of the loop. The extra trunk call costs ~5%.
+        let exp_idx: Vec<usize> = (0..real).filter(|&i| !is_widen[i]).collect();
+        let wid_idx: Vec<usize> = (0..real).filter(|&i| is_widen[i]).collect();
+
+        let mut values = vec![0.0f32; real];
+        if !exp_idx.is_empty() {
+            let mut st: Vec<MinionsState> = exp_idx.iter().map(|&i| states[i].clone()).collect();
+            let n = st.len();
+            while st.len() < max_batch {
+                st.push(st[n - 1].clone());
+            }
+            let r = model.expand_batch_mode(&st, 0, want_full, *next_seed)?;
+            *next_seed = next_seed.wrapping_add(1);
+            for (slot, (v, _)) in exp_idx.iter().zip(r) {
+                values[*slot] = v;
+            }
+        }
+        let mut cands_for: Vec<Option<Vec<(crate::turn::TurnSpec, f32, bool)>>> =
+            (0..real).map(|_| None).collect();
+        if !wid_idx.is_empty() {
+            let mut st: Vec<MinionsState> = wid_idx.iter().map(|&i| states[i].clone()).collect();
+            let n = st.len();
+            while st.len() < max_batch {
+                st.push(st[n - 1].clone());
+            }
+            let r = model.expand_batch_mode(&st, k_call, want_full, *next_seed)?;
+            *next_seed = next_seed.wrapping_add(1);
+            for (slot, (_, c)) in wid_idx.iter().zip(r) {
+                cands_for[*slot] = Some(c);
+            }
+        }
+        for (n, (i, widen)) in ids.into_iter().zip(is_widen).enumerate() {
             if widen {
-                slots[i].search.provide_widen(cands);
+                slots[i].search.provide_widen(cands_for[n].take().unwrap_or_default());
             } else {
-                slots[i].search.provide(v, cands);
+                slots[i].search.provide(values[n], Vec::new());
             }
         }
         // The next kind is chosen from supply at the top of the loop.

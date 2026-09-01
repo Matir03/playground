@@ -698,6 +698,16 @@ impl MinionsModel {
         let values = tr.value;
         let hstride = self.net.channels() * NUM_CELLS;
 
+        // `k == 0` is a value-only expansion: run the trunk, skip the heads.
+        //
+        // A node's first visit needs a value and nothing else — it will not
+        // choose a move until something descends through it, and 77% of nodes
+        // never are. Generating a candidate there was the whole of the residual
+        // waste after chunking (43.4% of candidates, one per frontier node).
+        if k == 0 {
+            let out = (0..real).map(|gi| (values.get(gi).copied().unwrap_or(0.0), Vec::new()));
+            return Ok(out.collect());
+        }
         let k = k.max(1);
         // Forced exploration keeps its *expected* share even when candidates are
         // generated one at a time. Rounding here is what broke it: chunked

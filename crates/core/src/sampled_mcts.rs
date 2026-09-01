@@ -103,6 +103,11 @@ pub enum Step<G: SampledGame> {
 
 pub trait SampledModel<G: SampledGame>: Send + Sync {
     /// Value for the side to move in `[-1, 1]`, and up to `k` distinct candidate
+    /// `k == 0` means **value only**: return the value and an empty candidate
+    /// list, skipping candidate generation entirely. A node's first visit needs
+    /// nothing else — it will not choose a move until something descends
+    /// through it, and most nodes never are.
+    ///
     /// moves with priors. Priors need not be normalised; the search normalises
     /// over whatever comes back. Returning an empty candidate list is treated as
     /// a pass-less dead end and the node is scored on value alone.
@@ -626,9 +631,6 @@ impl<G: SampledGame> Search<G> {
                     self.pending = Some(cur);
                     return Step::NeedExpansion(self.tree[cur].state.clone());
                 }
-                if self.tree[cur].entries.is_empty() {
-                    break 0.0; // model proposed nothing; score on value alone
-                }
                 // Ask for the next chunk before selecting, if this node has
                 // earned more candidates than it holds. The simulation is
                 // abandoned rather than paused: nothing has been backed up yet,
@@ -644,6 +646,11 @@ impl<G: SampledGame> Search<G> {
                         self.path.clear();
                         return Step::NeedWiden(self.tree[cur].state.clone());
                     }
+                }
+                if self.tree[cur].entries.is_empty() {
+                    // Genuinely nothing to play: either the model proposed
+                    // nothing, or widening is exhausted. Score on value alone.
+                    break 0.0;
                 }
                 let pick = select(&self.tree[cur], &self.params, cur == 0);
                 self.path.push((cur, pick));
@@ -904,7 +911,8 @@ pub fn search<G: SampledGame, M: SampledModel<G>>(
     loop {
         match s.step() {
             Step::NeedExpansion(state) => {
-                let (v, cands) = model.expand(&state, chunk_k(params))?;
+                // Value only; candidates wait until something descends here.
+                let (v, cands) = model.expand(&state, 0)?;
                 s.provide(v, cands);
             }
             Step::NeedWiden(state) => {
@@ -962,17 +970,46 @@ pub fn search_lockstep<G: SampledGame, M: SampledModel<G>>(
         if want.is_empty() {
             break;
         }
-        let results = model.expand_batch(&states, chunk_k(params))?;
+        // Split by need: expansions want a value (`k = 0`, trunk only), widens
+        // want a candidate. Only widens pay for the generative heads.
+        let exp: Vec<G::State> = states
+            .iter()
+            .zip(&widen)
+            .filter(|(_, w)| !**w)
+            .map(|(s, _)| s.clone())
+            .collect();
+        let wid: Vec<G::State> = states
+            .iter()
+            .zip(&widen)
+            .filter(|(_, w)| **w)
+            .map(|(s, _)| s.clone())
+            .collect();
+        let exp_res = if exp.is_empty() {
+            Vec::new()
+        } else {
+            model.expand_batch(&exp, 0)?
+        };
+        let wid_res = if wid.is_empty() {
+            Vec::new()
+        } else {
+            model.expand_batch(&wid, chunk_k(params))?
+        };
         anyhow::ensure!(
-            results.len() == want.len(),
-            "expand_batch returned {} results for {} states",
-            results.len(),
-            want.len()
+            exp_res.len() == exp.len() && wid_res.len() == wid.len(),
+            "expand_batch returned {}/{} results for {}/{} states",
+            exp_res.len(),
+            wid_res.len(),
+            exp.len(),
+            wid.len()
         );
-        for ((i, is_widen), (v, cands)) in want.into_iter().zip(widen).zip(results) {
+        let mut exp_out = exp_res.into_iter();
+        let mut wid_out = wid_res.into_iter();
+        for (i, is_widen) in want.into_iter().zip(widen) {
             if is_widen {
+                let (_, cands) = wid_out.next().expect("one widen result per widen request");
                 searches[i].provide_widen(cands);
             } else {
+                let (v, cands) = exp_out.next().expect("one value per expansion request");
                 searches[i].provide(v, cands);
             }
         }
