@@ -3,7 +3,8 @@
 Research playground for a custom MuZero variant. We validate the algorithm on a
 sequence of progressively richer 2-player abstract strategy games
 (Connect4 → 9×9 Go → Amazons → Arimaa → Hex 13×13) before applying it to the
-target game.
+target game — a simplified cut of which now lives here too, as
+[Minions](#minions-simplified).
 
 - Rust engines per game with shared core libs (MCTS, recording, server).
 - Python owns everything model-related: training, model server, orchestrator.
@@ -159,6 +160,7 @@ gRPC + gRPC-Web. Default ports:
 | Amazons   | `amazons-engine`  | `7102`      | `http://127.0.0.1:7202` |
 | Arimaa    | `arimaa-engine`   | `7103`      | `http://127.0.0.1:7203` |
 | Hex 13×13 | `hex-engine`      | `7104`      | `http://127.0.0.1:7204` |
+| Minions   | `minions-engine`  | `7105`      | `http://127.0.0.1:7205` |
 
 ```bash
 # Build all engines.
@@ -186,6 +188,93 @@ grpcurl -plaintext 127.0.0.1:7100 playground.engine.EngineService/Health
 ```
 
 Full protocol surface is in [docs/protocols.md](docs/protocols.md).
+
+### Minions (simplified)
+
+A cut-down version of [Matir03/minions](https://github.com/Matir03/minions),
+the target game, in [crates/games/minions](crates/games/minions)
+(`minions-engine`). What survives is the board fight; what is gone is
+everything above it:
+
+- **one 10×10 hex board**, all land, with the ten graveyards kept;
+- **one board point**, so taking the board wins the game outright and board
+  points need no representation;
+- **no generaling** — no techline, no spells. The five buyable units are
+  unlocked from move one;
+- **first four techline units** — `skeleton`, `serpent`, `warg`, `ghost` —
+  plus the always-acquired `zombie` and the basic necromancer.
+
+Unit stats, the attack/spawn phase split, within-turn damage, `lumbering` /
+`flying` / `persistent`, unsummon bounces, rebates, and income of
+`graveyards + 3` are all as in the full game. A turn is a *sequence* of actions
+ending in "end turn", the way an Arimaa turn is a sequence of steps, so the
+engine is asked for one action at a time. The full scope of the
+simplification is in the module docs of `crates/games/minions/src/game.rs`.
+
+Two ways to win, both from the full game: kill the enemy necromancer, or hold
+8 of the 10 graveyards at the end of your opponent's turn. Games hitting the
+40-turn cap (20 apiece) are decided on **net worth** — gold plus every unit you
+own at cost, on the board and in reinforcements — with exact ties drawn. Buying
+is therefore par, and the only way to gain is to take material your opponent
+does not take back. It scored raw gold until self-play found the hoarding
+equilibrium that predicts; see `adjudicate` in `src/game.rs`.
+
+The web UI has a playable board with a human or the greedy heuristic
+(`src/solver.rs`) on either side:
+
+```bash
+cargo run --release -p minions-engine -- serve --addr 127.0.0.1:7105
+cd web && npm run dev        # then pick "Minions (simplified)"
+
+# Or watch the heuristic play itself in the terminal.
+cargo run --release -p minions-engine -- greedy-game --games 1
+```
+
+#### Sampled AlphaZero over whole turns
+
+The action is a **whole turn** — ~10^15–10^25 legal turns — so the legal set is
+never enumerated. A turn is *declared* as three board-shaped fields
+([`TurnSpec`](crates/games/minions/src/turn.rs)): where each unit goes (one of
+the 37 hexes within distance 3), what happens to each enemy (stay / kill /
+unsummon), and what is spawned where. `realize` compiles a declaration into a
+legal atomic sequence by a fixed point — moves and attacks interleave, because an
+enemy may have to die before a friendly can path through its hex.
+
+Candidates come from an **any-order masked diffusion** over the ~80 live
+variables, not a per-cell factored policy: with ~25 units the product of
+marginals has almost no mass on the joint, and rescoring cannot repair a support
+failure. `T` is a dial — `T=1` is mean-field, `T=n` is exact autoregressive and
+yields a proper density for effective-sample-size diagnostics. A slice of every
+candidate set is drawn uniformly at random regardless of the net, and forced /
+injected visits are subtracted from the training target so exploration is never
+taught as if search had chosen it.
+
+```bash
+# One serial generate -> train -> eval cycle, repeated.
+scripts/minions-az-cycle.sh
+
+# Or the phases individually.
+minions-engine selfplay-loop --live data/models/minions/live --target-examples 20000
+PYTHONPATH=python/src python/.venv/bin/python python/minions_az_learner.py \
+    --live data/models/minions/live --exit-after-gens 1
+PYTHONPATH=python/src python/.venv/bin/python python/minions_eval_loop.py \
+    --live data/models/minions/live --once
+
+# Realizer soak: legality under adversarial declarations, plus fidelity,
+# throughput, and greedy-vs-exact attack assignment.
+minions-engine soak --threads 6 --secs 600
+```
+
+The net (`minions_net.py`, mirrored in `src/net.rs`) is one trunk with four
+heads: value, graveyard-ownership aux, the diffusion sampler, and an energy head
+`f(s, a)` scoring a whole declaration — the policy of record, since only priors
+*relative to a candidate set* are ever needed. Parity between the two
+implementations is pinned by a fixture:
+
+```bash
+python python/minions_parity_fixture.py --out data/minions_parity
+MINIONS_PARITY_DIR=$PWD/data/minions_parity cargo test -p minions-engine parity
+```
 
 ### Hex 13×13 and MoHex
 

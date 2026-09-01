@@ -37,6 +37,7 @@ web/
       go9/
       amazons/
       arimaa/
+      minions/
     pages/
       play/           # interactive play surface
       runs/           # orchestrator dashboards

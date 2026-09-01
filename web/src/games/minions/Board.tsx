@@ -1,15 +1,17 @@
 /**
- * Simplified Minions on one 10×10 hex board. Each seat is a human or the
+ * Simplified Minions on one 7×7 hex board. Each seat is a human or the
  * engine's greedy built-in mover; the Rust engine owns the rules and validates
  * every move, so everything computed here is highlighting only.
  *
  * Wire format (must match crates/games/minions/src/game.rs):
- *   GameState.payload = 223 bytes
- *     [0,100)   cells   — 0 empty, else 1 + unit + 6*side
- *     [100,200) pstate  — bit0 moved, bit1 attacked, bit2 exhausted, bits3-5 damage
- *     [200,204) money   — 2 × u16 LE
- *     [204,214) reinforcements — side0[5] then side1[5], zombie..ghost
- *     214 side · 215 phase · [216,218) turn u16 LE · [218,222) ply u32 LE · 222 winner
+ *   GameState.payload = 133 bytes (N=7)
+ *     [0,CELLS)        cells   — 0 empty, else 1 + unit + 6*side
+ *     [CELLS,2*CELLS)  pstate  — bit0 moved, bit1 attacked, bit2 exhausted, bits3-5 damage
+ *     [98,102) money   — 2 × u16 LE
+ *     [102,112) reinforcements — side0[5] then side1[5], zombie..ghost
+ *     [112,124) nw_hist — 6 × i16 LE (net-worth diff, oldest first)
+ *     124 side · 125 phase · [126,128) turn u16 LE · [128,132) ply u32 LE · 132 winner
+ *   (offsets shown for N=7; the constants below derive them from `CELLS`)
  *   Move.payload = [0,from,to] move · [1,from,to] attack · [2,unit] buy
  *                  [3,unit,at] spawn · [4] end phase
  *
@@ -44,7 +46,7 @@ import {
 
 // ── Rules mirror ──────────────────────────────────────────────────────────────
 
-const N = 10;
+const N = 7;
 const CELLS = N * N;
 const PHASE_ATTACK = 0;
 
@@ -73,14 +75,16 @@ const NEIGHBORS: number[][] = Array.from({ length: CELLS }, (_, i) => {
 
 /** Must match map::GRAVEYARD_XY. */
 const GRAVEYARD_XY: [number, number][] = [
-  [4, 4], [5, 5], [2, 6], [7, 3], [6, 2], [3, 7], [0, 4], [9, 5], [4, 0], [5, 9],
+  [1, 4], [5, 2],
+  [4, 1], [2, 5],
+  [0, 3], [6, 3],
 ];
 const IS_GRAVEYARD = (() => {
   const m = new Array<boolean>(CELLS).fill(false);
   for (const [x, y] of GRAVEYARD_XY) m[cellIdx(x, y)] = true;
   return m;
 })();
-const GRAVEYARDS_TO_WIN = 8;
+const GRAVEYARDS_TO_WIN = 4;
 
 interface UnitDef {
   name: string;
@@ -122,20 +126,30 @@ interface Decoded {
   winner: number;
 }
 
+// Offsets are derived from the board size rather than written out, so resizing
+// the board cannot leave the UI silently reading the wrong bytes. Field order
+// must match `Minions::encode_state` in crates/games/minions/src/game.rs:
+// cells, pstate, money, reinforcements, nw_hist, side, phase, turn, ply, winner.
+const ADJ_WINDOW = 6;  // must match game::ADJ_WINDOW
+const O_MONEY = 2 * CELLS;
+const O_REINF = O_MONEY + 4;
+const O_NW_HIST = O_REINF + 10;
+const O_SIDE = O_NW_HIST + 2 * ADJ_WINDOW;
+
 function decode(p: Uint8Array): Decoded {
   const dv = new DataView(p.buffer, p.byteOffset, p.byteLength);
   return {
-    cells: p.subarray(0, 100),
-    pstate: p.subarray(100, 200),
-    money: [dv.getUint16(200, true), dv.getUint16(202, true)],
+    cells: p.subarray(0, CELLS),
+    pstate: p.subarray(CELLS, 2 * CELLS),
+    money: [dv.getUint16(O_MONEY, true), dv.getUint16(O_MONEY + 2, true)],
     reinforcements: [
-      Array.from(p.subarray(204, 209)),
-      Array.from(p.subarray(209, 214)),
+      Array.from(p.subarray(O_REINF, O_REINF + 5)),
+      Array.from(p.subarray(O_REINF + 5, O_REINF + 10)),
     ],
-    side: p[214],
-    phase: p[215],
-    turn: dv.getUint16(216, true),
-    winner: p[222],
+    side: p[O_SIDE],
+    phase: p[O_SIDE + 1],
+    turn: dv.getUint16(O_SIDE + 2, true),
+    winner: p[O_SIDE + 8],
   };
 }
 
@@ -222,16 +236,47 @@ function graveyardsHeld(d: Decoded, side: number): number {
 
 // ── Presentation ──────────────────────────────────────────────────────────────
 
-type Seat = "human" | "solver";
-const SEAT_LABELS: Record<Seat, string> = { human: "Human", solver: "Greedy bot" };
+type Seat = "human" | "solver" | "net";
+const SEAT_LABELS: Record<Seat, string> = {
+  human: "Human",
+  solver: "Greedy bot",
+  net: "Trained net",
+};
+// The net is a *turn*-level policy, so it goes through EXTERNAL (the engine
+// drives it in-process from local weights) rather than NN, which is the model
+// server's per-move interface and cannot express a whole-turn action.
+const SEAT_PLAYER: Record<"solver" | "net", EnginePlayer> = {
+  solver: EnginePlayer.SOLVER,
+  net: EnginePlayer.EXTERNAL,
+};
 
 const SIDE_NAME = ["Yellow (first)", "Blue (second)"];
 const SIDE_FILL = ["#e0a72c", "#3f74d8"];
 const SIDE_INK = ["#4a3506", "#ffffff"];
 
+/**
+ * A side's net worth: gold plus every unit it owns at cost, on the board and in
+ * reinforcements. Mirrors `net_worth` in crates/games/minions/src/game.rs — the
+ * cap is adjudicated on this, so the UI has to explain the result in the same
+ * terms the engine decided it in.
+ */
+function netWorth(d: Decoded, side: number): number {
+  let total = d.money[side];
+  for (const c of d.cells) {
+    if (c !== 0 && pieceSide(c) === side) total += UNITS[pieceUnit(c)].cost;
+  }
+  // Reinforcement slots follow BUYABLE: zombie, skeleton, serpent, warg, ghost,
+  // i.e. unit indices 1..5.
+  d.reinforcements[side].forEach((n, slot) => {
+    total += n * UNITS[slot + 1].cost;
+  });
+  return total;
+}
+
 /** Which of the three endings this was, read back off the final position. */
 function endReason(d: Decoded, o: Outcome): string {
-  if (o === Outcome.DRAW) return `turn ${d.turn} cap reached with gold level at $${d.money[0]}`;
+  if (o === Outcome.DRAW)
+    return `turn ${d.turn} cap reached with net worth level at $${netWorth(d, 0)}`;
   const loser = o === Outcome.FIRST_WINS ? 1 : 0;
   const necroAlive = Array.from(d.cells).some(
     (c) => c !== 0 && pieceSide(c) === loser && pieceUnit(c) === 0,
@@ -239,16 +284,16 @@ function endReason(d: Decoded, o: Outcome): string {
   const winner = 1 - loser;
   if (!necroAlive) return `${SIDE_NAME[loser]}'s necromancer was destroyed`;
   if (graveyardsHeld(d, winner) >= GRAVEYARDS_TO_WIN) {
-    return `${SIDE_NAME[winner]} held ${graveyardsHeld(d, winner)} of the 10 graveyards at the end of ${SIDE_NAME[loser]}'s turn`;
+    return `${SIDE_NAME[winner]} held ${graveyardsHeld(d, winner)} of the 6 graveyards at the end of ${SIDE_NAME[loser]}'s turn`;
   }
-  return `turn ${d.turn} cap reached — ${SIDE_NAME[winner]} ahead on gold, $${d.money[winner]} to $${d.money[loser]}`;
+  return `turn ${d.turn} cap reached — ${SIDE_NAME[winner]} ahead on net worth, $${netWorth(d, winner)} to $${netWorth(d, loser)}`;
 }
 
 function outcomeLabel(o: Outcome): string {
   switch (o) {
     case Outcome.FIRST_WINS: return "Yellow takes the board";
     case Outcome.SECOND_WINS: return "Blue takes the board";
-    case Outcome.DRAW: return "Draw — level on gold at the cap";
+    case Outcome.DRAW: return "Draw — level on net worth at the cap";
     default: return "";
   }
 }
@@ -339,7 +384,8 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
   useEffect(() => {
     if (!handle || !state) return;
     if (state.outcome !== Outcome.IN_PROGRESS) return;
-    if (seatToMove(state) !== "solver") return;
+    const mover = seatToMove(state);
+    if (mover === "human") return;
 
     const tag = `${handle.handleId}:${state.ply}`;
     if (engineTurnRef.current === tag) return;
@@ -357,8 +403,10 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
             for await (const prog of client.requestMove(
               create(RequestMoveRequestSchema, {
                 handle,
-                player: EnginePlayer.SOLVER,
-                budget: create(SearchBudgetSchema, { maxMillis: 1000 }),
+                player: SEAT_PLAYER[mover],
+                budget: create(SearchBudgetSchema, {
+                  maxMillis: mover === "net" ? 20000 : 1000,
+                }),
               }),
               { signal: AbortSignal.timeout(30000) },
             )) {

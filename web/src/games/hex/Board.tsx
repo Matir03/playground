@@ -2,6 +2,9 @@
  * Hex 13×13 play surface. The Rust engine owns the rules (connection detection,
  * legality, terminal state); each seat is a human or one of its movers:
  *
+ *   - "AlphaZero net" (EnginePlayer.NN) — the trained net, served in-process
+ *     from a checkpoint the engine was started with (`--model-local nn=...`).
+ *     "Seconds/move" becomes its search budget.
  *   - "Placeholder" (EnginePlayer.SOLVER) — centre, then the first empty cell.
  *     Not a player; it just makes the seat answerable with nothing configured.
  *   - "MoHex 2.0" (EnginePlayer.EXTERNAL) — the reference Hex engine, driven
@@ -9,7 +12,6 @@
  *     `--mohex-bin`; otherwise the request fails and the error shows below the
  *     board. "Seconds/move" becomes MoHex's per-move time budget.
  *
- * There is no Hex net yet — that seat arrives with the AZ run.
  *
  * Wire format (must match crates/games/hex/src/game.rs):
  *   GameState.payload = 169 cell bytes (row-major; 0 empty, 1 black, 2 white),
@@ -49,10 +51,11 @@ import {
 const N = 13;
 
 type Cell = 0 | 1 | 2;
-type Seat = "human" | "engine" | "mohex";
+type Seat = "human" | "net" | "engine" | "mohex";
 
 const SEAT_LABELS: Record<Seat, string> = {
   human: "Human",
+  net: "AlphaZero net",
   engine: "Placeholder",
   mohex: "MoHex 2.0",
 };
@@ -60,9 +63,14 @@ const SEAT_LABELS: Record<Seat, string> = {
 // MoHex only answers if the engine was started with `--mohex-bin`; otherwise
 // the RPC fails with a failed-precondition that we surface as-is.
 const SEAT_PLAYER: Record<Exclude<Seat, "human">, EnginePlayer> = {
+  net: EnginePlayer.NN,
   engine: EnginePlayer.SOLVER,
   mohex: EnginePlayer.EXTERNAL,
 };
+
+// The name the engine was started with (`--model-local nn=...`). Only the NN
+// seat carries one; the others ignore it.
+const SEAT_MODEL: Partial<Record<Seat, string>> = { net: "nn" };
 
 const BLACK = "#1f2937";
 const WHITE = "#f8fafc";
@@ -231,6 +239,7 @@ export function HexBoard({ client }: { client: Client<typeof EngineService> }) {
               create(RequestMoveRequestSchema, {
                 handle,
                 player: SEAT_PLAYER[seat],
+                model: SEAT_MODEL[seat] ?? "",
                 budget: create(SearchBudgetSchema, {
                   maxMillis: Math.max(1, Math.round(seconds * 1000)),
                 }),

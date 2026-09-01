@@ -2,7 +2,7 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
 // The Rust engines speak gRPC-Web. We proxy them under same-origin paths
-// (/c4, /go9, /a, /hex) so the whole setup runs behind a single origin with no CORS. The
+// (/c4, /go9, /a, /hex, /mi) so the whole setup runs behind a single origin with no CORS. The
 // frontend uses these relative paths as its engine base URLs (see App.tsx).
 // Local-only: bound to localhost (not exposed publicly).
 export default defineConfig({
@@ -30,6 +30,11 @@ export default defineConfig({
         target: "http://127.0.0.1:7104",
         changeOrigin: true,
         rewrite: (p) => p.replace(/^\/hex/, ""),
+      },
+      "/mi": {
+        target: "http://127.0.0.1:7105",
+        changeOrigin: true,
+        rewrite: (p) => p.replace(/^\/mi/, ""),
       },
     },
   },

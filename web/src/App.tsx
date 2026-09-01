@@ -4,6 +4,7 @@ import { Connect4Board } from "./games/connect4/Board";
 import { Go9Board } from "./games/go9/Board";
 import { AmazonsBoard } from "./games/amazons/Board";
 import { HexBoard } from "./games/hex/Board";
+import { MinionsBoard } from "./games/minions/Board";
 
 // Engines are reached under same-origin proxy paths (see vite.config.ts), so the
 // whole app works behind one origin without CORS.
@@ -28,6 +29,11 @@ const GAMES = [
     blurb: "Black connects top↕bottom, White left↔right; first to link their two edges wins, and there are no draws. The engine seat plays the placeholder mover for now — there is no Hex net yet. Swap rule off.",
     start: "hex-engine serve --addr 127.0.0.1:7104",
   },
+  {
+    id: "minions", label: "Minions (simplified)", engineUrl: "/mi", playable: true,
+    blurb: "One 7×7 hex board from Matir03/minions, with the first four techline units permanently unlocked and no generaling. Kill the enemy necromancer, hold 4 of the 6 graveyards at the end of their turn, or be ahead on net worth at the 20-turn cap. A turn is an attack phase then a spawn phase — the engine seat plays a greedy heuristic, not a net.",
+    start: "minions-engine serve --addr 127.0.0.1:7105",
+  },
   { id: "arimaa", label: "Arimaa", engineUrl: "/ar", playable: false, blurb: "", start: "" },
 ] as const;
 
@@ -44,6 +50,7 @@ const clients: Partial<Record<GameId, ReturnType<typeof engineClientFor>>> = {
   go9: engineClientFor("/go9"),
   amazons: engineClientFor("/a"),
   hex: engineClientFor("/hex"),
+  minions: engineClientFor("/mi"),
 };
 
 export function App() {
@@ -154,6 +161,8 @@ function GameView({
         <AmazonsBoard client={client} />
       ) : game.id === "hex" ? (
         <HexBoard client={client} />
+      ) : game.id === "minions" ? (
+        <MinionsBoard client={client} />
       ) : (
         <Go9Board client={client} />
       )}

@@ -11,11 +11,12 @@ enum GameId {
   GAME_ID_AMAZONS = 3;
   GAME_ID_ARIMAA = 4;
   GAME_ID_HEX = 5;
+  GAME_ID_MINIONS = 6;
 }
 
 enum Player {
   PLAYER_UNSPECIFIED = 0;
-  PLAYER_FIRST = 1;   // e.g. Yellow in Connect 4, Black in Go, White in Amazons, Gold in Arimaa
+  PLAYER_FIRST = 1;   // e.g. Yellow in Connect 4, Black in Go, White in Amazons, Gold in Arimaa, Yellow in Minions
   PLAYER_SECOND = 2;
 }
 
