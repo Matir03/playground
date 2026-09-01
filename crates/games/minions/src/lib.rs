@@ -11,13 +11,20 @@
 //! and what is spawned where, and [`realize`] compiles that into a legal
 //! sequence of [`MinionsMove`]s. [`bitboard`] is the `u128` hex board it uses.
 
+pub mod assign;
 pub mod bitboard;
+pub mod eval;
 pub mod game;
 pub mod map;
+pub mod net;
+pub mod net_seat;
+pub mod ort_net;
+pub mod sampler;
+pub mod selfplay;
 pub mod solver;
 pub mod turn;
 pub mod units;
 
 pub use game::{Minions, MinionsMove, MinionsState};
-pub use turn::{realize, Realized, TurnSpec};
+pub use turn::{realize, MinionsTurns, Realized, TurnSpec};
 pub use units::Unit;

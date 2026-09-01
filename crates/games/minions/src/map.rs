@@ -1,40 +1,45 @@
-//! The single 10×10 hex board.
+//! The single 7×7 hex board.
 //!
-//! Geometry is the reference implementation's: a rhombus of hexes addressed by
-//! `(x, y)` with `x` running `a`..`j` and `y` running `0`..`9`, cell index
-//! `i = y*10 + x`, and the six neighbour offsets
+//! Geometry is the reference implementation's, scaled down: a rhombus of hexes
+//! addressed by `(x, y)` with `x` running `a`..`g` and `y` running `0`..`6`,
+//! cell index `i = y*7 + x`, and the six neighbour offsets
 //! `W(-1,0) NW(-1,+1) NE(0,+1) E(+1,0) SE(+1,-1) SW(0,-1)`. Hex distance is
 //! `max(|dx|, |dy|, |dx+dy|)`.
 //!
 //! **Simplification: the map is all land.** The full game's water tiles and
 //! native terrain (flood / earthquake / whirlwind / firestorm) are gone, so
 //! `flying` only ever means "moves through enemy units". What is kept is the
-//! ten graveyards, because they drive both income and the second way to win.
+//! graveyards, because they drive both income and the second way to win.
 //!
-//! The layout is symmetric under the 180° rotation `(x,y) → (9-x, 9-y)`, which
+//! The layout is symmetric under the 180° rotation `(x,y) → (6-x, 6-y)`, which
 //! maps each side's setup onto the other's, and no two graveyards are adjacent
-//! — both invariants the full game requires of its maps.
+//! — both invariants the full game requires of its maps. A 7×7 board keeps the
+//! whole action space intact (max speed is 3 and 37 hexes lie within distance 3
+//! of a cell, so the per-cell move head is unchanged) while cutting the cells
+//! from 100 to 49.
 
-pub const N: usize = 10;
+pub const N: usize = 7;
 pub const NUM_CELLS: usize = N * N;
 
 /// Graveyards a side must occupy at the end of its opponent's turn to take the
-/// board that way. Same threshold as the full game.
-pub const GRAVEYARDS_TO_WIN: u32 = 8;
+/// board that way. Four of six, keeping the full game's "clear majority, not
+/// all" shape.
+pub const GRAVEYARDS_TO_WIN: u32 = 4;
 
-/// The ten graveyards, as `(x, y)`. Five rotation-symmetric pairs: two near
-/// each side's home, one pair either side of the centre, and two contested
-/// pairs on the long diagonal's flanks.
-pub const GRAVEYARD_XY: [(u8, u8); 10] = [
-    (4, 4), (5, 5),
-    (2, 6), (7, 3),
-    (6, 2), (3, 7),
-    (0, 4), (9, 5),
-    (4, 0), (5, 9),
+/// The six graveyards, as `(x, y)`: three rotation-symmetric pairs, none
+/// adjacent to another (minimum pairwise hex distance 2) and none on a starting
+/// cell. Two flank the centre diagonal, two sit on the short flanks, and one
+/// pair holds the board's opposite edges.
+pub const GRAVEYARD_XY: [(u8, u8); 6] = [
+    (1, 4), (5, 2),
+    (4, 1), (2, 5),
+    (0, 3), (6, 3),
 ];
 
-/// Necromancer start cells: `c2` for the first player, `h7` for the second.
-pub const NECRO_START: [u8; 2] = [idx(2, 2), idx(7, 7)];
+/// Necromancer start cells: `b1` for the first player, `f5` for the second —
+/// each a full hex in from its corner, so all six neighbours exist for the
+/// opening zombies.
+pub const NECRO_START: [u8; 2] = [idx(1, 1), idx(5, 5)];
 
 #[inline]
 pub const fn idx(x: u8, y: u8) -> u8 {
@@ -110,7 +115,7 @@ pub fn start_zombies(side: usize) -> [u8; 6] {
 }
 
 /// `a0`-style name for a cell, matching the reference implementation's
-/// notation (column letter `a`..`j`, then row digit `0`..`9`).
+/// notation (column letter `a`..`g`, then row digit `0`..`6`).
 pub fn cell_name(i: u8) -> String {
     format!("{}{}", (b'a' + (i % N as u8)) as char, i / N as u8)
 }
@@ -149,16 +154,24 @@ mod tests {
 
     #[test]
     fn interior_cells_have_six_neighbours() {
-        let interior = idx(5, 5);
+        let interior = idx(3, 3);
         assert_eq!(NEIGHBORS[interior as usize].iter().filter(|&&n| n != NO_CELL).count(), 6);
     }
 
     #[test]
     fn graveyards_are_symmetric_and_non_adjacent() {
         let gys: Vec<u8> = GRAVEYARD_XY.iter().map(|&(x, y)| idx(x, y)).collect();
-        assert_eq!(gys.len(), 10);
+        assert_eq!(gys.len(), GRAVEYARD_XY.len());
+        assert!(
+            GRAVEYARDS_TO_WIN as usize * 2 > GRAVEYARD_XY.len(),
+            "the win threshold must be a strict majority of the graveyards"
+        );
+        let last = N as u8 - 1;
         for &(x, y) in &GRAVEYARD_XY {
-            assert!(GRAVEYARD_XY.contains(&(9 - x, 9 - y)), "{x},{y} has no rotation partner");
+            assert!(
+                GRAVEYARD_XY.contains(&(last - x, last - y)),
+                "{x},{y} has no rotation partner"
+            );
         }
         for (i, &a) in gys.iter().enumerate() {
             for &b in &gys[i + 1..] {
@@ -180,10 +193,58 @@ mod tests {
 
     #[test]
     fn cell_names_round_trip() {
-        assert_eq!(cell_name(NECRO_START[0]), "c2");
-        assert_eq!(cell_name(NECRO_START[1]), "h7");
+        assert_eq!(cell_name(NECRO_START[0]), "b1");
+        assert_eq!(cell_name(NECRO_START[1]), "f5");
         for i in 0..NUM_CELLS as u8 {
             assert_eq!(parse_cell(&cell_name(i)), Some(i));
         }
+    }
+}
+
+/// 180° rotation about the board centre, which on this rhombus is exactly index
+/// reversal: `(x, y) -> (N-1-x, N-1-y)` and `y*N+x -> NUM_CELLS-1-(y*N+x)`.
+///
+/// This is a genuine automorphism of the position, not an approximation, and it
+/// is what lets the net see one point of view instead of two:
+///   - the six hex directions are closed under negation, so adjacency survives;
+///   - the graveyards map onto each other — (1,4)<->(5,2), (4,1)<->(2,5),
+///     (0,3)<->(6,3);
+///   - the necromancer starts swap — (1,1)<->(5,5).
+/// Each of those is asserted in `rotation_is_an_automorphism` below.
+#[inline]
+pub const fn rot(i: usize) -> usize {
+    NUM_CELLS - 1 - i
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+
+    #[test]
+    fn rotation_is_an_automorphism() {
+        // Self-inverse.
+        for i in 0..NUM_CELLS {
+            assert_eq!(rot(rot(i)), i);
+        }
+        // Adjacency is preserved: the rotated neighbours of a cell are exactly
+        // the neighbours of the rotated cell.
+        for i in 0..NUM_CELLS {
+            let mut a: Vec<u8> = NEIGHBORS[i]
+                .iter()
+                .filter(|&&n| n != NO_CELL)
+                .map(|&n| rot(n as usize) as u8)
+                .collect();
+            let mut b: Vec<u8> =
+                NEIGHBORS[rot(i)].iter().filter(|&&n| n != NO_CELL).copied().collect();
+            a.sort_unstable();
+            b.sort_unstable();
+            assert_eq!(a, b, "adjacency broken at cell {i}");
+        }
+        // The graveyards are setwise invariant.
+        for i in 0..NUM_CELLS {
+            assert_eq!(IS_GRAVEYARD[i], IS_GRAVEYARD[rot(i)], "graveyards asymmetric at {i}");
+        }
+        // The two necromancers start on rotated squares.
+        assert_eq!(rot(NECRO_START[0] as usize), NECRO_START[1] as usize);
     }
 }

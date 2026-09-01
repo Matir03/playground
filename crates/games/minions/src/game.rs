@@ -58,32 +58,93 @@ pub use crate::map::GRAVEYARDS_TO_WIN;
 /// Money the second player starts with, compensating for moving second. The
 /// full game's `START_MONEY_PER_BOARD`, for our one board.
 pub const START_MONEY_SECOND: u16 = 6;
+
+/// Range of starting-money handicaps drawn during self-play, as *blue's*
+/// (second player's) advantage in gold. Negative gives the money to yellow.
+///
+/// A fixed handicap makes the seat, not the play, decide a game at the turn cap:
+/// with `START_MONEY_SECOND` alone the second player finished ahead by +6..+12
+/// net worth in every measured game, so a match that alternates seats scores
+/// exactly 0.5 whatever the players' strengths and nothing is ever promoted.
+///
+/// Randomising it does two jobs. It breaks that determinism in the training
+/// distribution, and it forces the value head to *price* the handicap — which is
+/// what the bidding phase then binary-searches over to find the compensation
+/// that makes a game even.
+pub const BID_MIN: i16 = -5;
+pub const BID_MAX: i16 = 10;
 /// Flat part of end-of-turn income: `+2` per board, `+1` soul for the basic
 /// necromancer.
 pub const BASE_INCOME: u16 = 3;
 /// Turns (counting each side's separately, so this is 20 apiece) after which the
 /// game is decided by [`adjudicate`] instead of being played out.
-pub const MAX_TURNS: u16 = 40;
+/// 20 side-turns — ten apiece — on the 7x7 board.
+pub const MAX_TURNS: u16 = 20;
+
+/// Turns averaged when adjudicating at the cap.
+///
+/// Adjudicating on the single final position hands the result to whoever the
+/// clock happens to stop on: a side that has just banked income and not yet been
+/// answered looks ahead by a full turn's worth of gold. Averaging the net-worth
+/// difference over the last six turns — three apiece — cancels that, and also
+/// smooths a one-off trade that happens to land on the boundary.
+pub const ADJ_WINDOW: usize = 6;
 
 /// Feature planes produced by [`Game::to_features`].
-pub const PLANES: usize = 31;
+pub const PLANES: usize = 26;
 
-/// Who wins a game that hits [`MAX_TURNS`]: **more gold wins**, exact ties draw.
+/// A side's **net worth**: gold, plus the cost of every unit it owns, whether on
+/// the board or waiting in reinforcements.
 ///
-/// Deliberately the single place this rule lives, because it is load-bearing and
-/// suspect. Most games hit the cap (the greedy heuristic finishes around turn 33),
-/// so this is the de-facto objective rather than a tiebreak — and gold is *spent*
-/// on units, so scoring raw gold rewards hoarding over developing. The degenerate
-/// line: with both sides passing and no graveyards contested, income is
-/// [`BASE_INCOME`] a turn each, so after 20 turns apiece the first player holds 60
-/// and the second 66 from [`START_MONEY_SECOND`] — "pass forever" wins for the
-/// second player.
+/// Units are valued at [`UnitStats::cost`], not `rebate`, and that choice is the
+/// whole point: paying `cost` gold for a unit worth `cost` leaves net worth
+/// exactly unchanged, so buying and spawning is a **no-op** under this measure.
+/// Valuing at `rebate` (which is strictly lower — a skeleton costs 4 and rebates
+/// 2) would still tax every purchase and leave a weaker version of the same
+/// hoarding incentive.
 ///
-/// If the self-play spend-rate watchdog shows that happening, the spend-neutral
-/// fix is one line here: add the rebate value of units on the board (liquidation
-/// value), so converting gold into units costs nothing.
+/// Reinforcements count at full value because an unsummoned unit is not lost:
+/// it returns to its owner's pool and can be respawned for free. Unsummoning
+/// therefore costs its victim tempo but not material, while a **kill** removes
+/// the unit outright. That asymmetry is real and this scoring preserves it.
+pub fn net_worth(state: &MinionsState, side: u8) -> u32 {
+    let mut total = state.money[side as usize] as u32;
+    for &c in state.cells.iter() {
+        if c != 0 && cell_side(c) == side {
+            total += cell_unit(c).stats().cost as u32;
+        }
+    }
+    for (slot, &n) in state.reinforcements[side as usize].iter().enumerate() {
+        total += n as u32 * BUYABLE[slot].stats().cost as u32;
+    }
+    total
+}
+
+/// Who wins a game that hits [`MAX_TURNS`]: **higher net worth wins**, exact ties
+/// draw.
+///
+/// Deliberately the single place this rule lives, because it is load-bearing.
+/// Most games hit the cap (the greedy heuristic finishes around turn 33), so this
+/// is the de-facto objective rather than a tiebreak.
+///
+/// It scored **raw gold** until 2026-08-26, and self-play found the hole exactly
+/// as predicted: gold is *spent* on units, so hoarding beat developing. Three
+/// generations of the watchdog, monotonic throughout — mean gold 7.7 -> 18.5 ->
+/// 25.1, units on board 16.9 -> 14.1 -> 12.4, and corr(gold, units) +0.47 ->
+/// -0.11 -> -0.23. The degenerate line is concrete: with both sides passing,
+/// income is [`BASE_INCOME`] a turn each, so after 20 turns apiece the first
+/// player holds 60 and the second 66 from [`START_MONEY_SECOND`], and "pass
+/// forever" simply wins for the second player.
+///
+/// Scoring [`net_worth`] removes the incentive at its root rather than penalising
+/// the symptom: converting gold into units is value-neutral, so the only way to
+/// gain is to take material the opponent does not take back.
 pub fn adjudicate(state: &MinionsState) -> u8 {
-    match state.money[0].cmp(&state.money[1]) {
+    // Mean over the window rather than the final position: see [`ADJ_WINDOW`].
+    // Summed as i32 and compared against zero, so no division and no rounding
+    // decides a close game.
+    let total: i32 = state.nw_hist.iter().map(|&v| v as i32).sum();
+    match total.cmp(&0) {
         std::cmp::Ordering::Greater => 1, // first wins
         std::cmp::Ordering::Less => 2,    // second wins
         std::cmp::Ordering::Equal => 3,   // draw
@@ -150,10 +211,80 @@ pub struct MinionsState {
     /// Turns completed. Turn 0 is the first player's opening turn, which has no
     /// spawn phase.
     pub turn: u16,
+    /// Net-worth difference (first minus second) at the end of each of the last
+    /// [`ADJ_WINDOW`] turns, oldest first. Kept in the state because
+    /// [`adjudicate`] needs history and `Game::outcome` is stateless.
+    pub nw_hist: [i16; ADJ_WINDOW],
     /// Monotonic count of *actions*, not turns — this is `Game::ply`.
     pub ply: u32,
     /// 0 = in progress, 1 = first wins, 2 = second wins, 3 = draw.
     pub winner: u8,
+}
+
+impl MinionsState {
+    /// The position seen from the mover's side: rotated 180° and colour-swapped,
+    /// so the side to move is always side 0 starting from the bottom-left.
+    ///
+    /// The two seats play the *same game* under this involution (see
+    /// [`crate::map::rot`]), but with absolute cell indices the net had to learn
+    /// both orientations separately — halving the value of every example and
+    /// handing the value head a seat signal to shortcut on. Canonicalising here
+    /// means one point of view for both seats.
+    ///
+    /// Cheap: the rotation is index reversal, so this is a reverse plus a colour
+    /// flip. Self-inverse, which `canonical_round_trips` checks.
+    pub fn canonical(&self) -> Self {
+        if self.side == 0 { self.clone() } else { self.rotated() }
+    }
+
+    /// The position rotated 180° with the two seats swapped.
+    ///
+    /// Unconditional, and a true involution — `rotated().rotated()` is the
+    /// identity. [`Self::canonical`] applies it only when it is side 1 to move,
+    /// which makes *that* idempotent rather than self-inverse.
+    pub fn rotated(&self) -> Self {
+        let mut out = self.clone();
+        for i in 0..NUM_CELLS {
+            let j = crate::map::rot(i);
+            let c = self.cells[i];
+            // Flip the owner so the mover's pieces are always side 0.
+            out.cells[j] = if c == 0 { 0 } else { encode_cell(1 - cell_side(c), cell_unit(c)) };
+            out.pstate[j] = self.pstate[i];
+        }
+        out.money.swap(0, 1);
+        out.reinforcements.swap(0, 1);
+        out.side = 1 - self.side;
+        // `nw_hist` is first-minus-second, so swapping the seats negates it.
+        for v in out.nw_hist.iter_mut() {
+            *v = -*v;
+        }
+        out.winner = match self.winner {
+            1 => 2,
+            2 => 1,
+            w => w,
+        };
+        out
+    }
+
+    /// Opening position with a starting-money handicap, as *blue's* (second
+    /// player's) advantage in gold. Negative gives the money to yellow instead.
+    ///
+    /// This is the quantity the bidding phase settles: both sides name the
+    /// compensation they think makes the game even, and the average becomes the
+    /// real handicap. Self-play draws it from `BID_MIN..=BID_MAX` so the value
+    /// head learns to price it rather than seeing one fixed number.
+    pub fn with_bid(bid: i16) -> Self {
+        let mut s = Self::default();
+        s.money = if bid >= 0 {
+            [0, bid as u16]
+        } else {
+            [(-bid) as u16, 0]
+        };
+        // The window is primed from the position, so it has to be re-primed
+        // after the balance changes or adjudication would use the default one.
+        s.prime_nw_hist();
+        s
+    }
 }
 
 impl Default for MinionsState {
@@ -165,21 +296,35 @@ impl Default for MinionsState {
                 cells[z as usize] = encode_cell(side as u8, Unit::Zombie);
             }
         }
-        Self {
+        let mut me = Self {
             cells,
             pstate: [0; NUM_CELLS],
             money: [0, START_MONEY_SECOND],
             reinforcements: [[0; BUYABLE.len()]; 2],
+            nw_hist: [0; ADJ_WINDOW],
             side: 0,
             phase: PHASE_ATTACK,
             turn: 0,
             ply: 0,
             winner: 0,
-        }
+        };
+        me.prime_nw_hist();
+        me
     }
 }
 
 impl MinionsState {
+    /// Fill the adjudication window with the current balance.
+    ///
+    /// Used for the opening position, where there is no history yet. Without it
+    /// a fresh state would adjudicate as a draw regardless of the balance. States
+    /// rebuilt from the wire format carry their real history instead.
+    pub fn prime_nw_hist(&mut self) {
+        let diff = net_worth(self, 0) as i32 - net_worth(self, 1) as i32;
+        let v = diff.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        self.nw_hist = [v; ADJ_WINDOW];
+    }
+
     #[inline]
     pub fn piece_at(&self, i: u8) -> Option<(u8, Unit)> {
         let c = self.cells[i as usize];
@@ -199,13 +344,19 @@ impl MinionsState {
     }
 
     /// Empty cells adjacent to one of `side`'s spawners (necromancer, zombie).
-    /// A unit spawned this turn is a spawner immediately, as in the full game.
+    ///
+    /// A unit spawned **this turn** does not count: spawn chaining is explicitly
+    /// illegal, so a freshly placed zombie cannot open further cells until next
+    /// turn. Spawned units carry `EXHAUSTED`, which is exactly that predicate.
     pub fn spawn_cells(&self, side: u8) -> Vec<u8> {
         let mut seen = [false; NUM_CELLS];
         let mut out = Vec::new();
         for (i, &c) in self.cells.iter().enumerate() {
             if c == 0 || cell_side(c) != side || !cell_unit(c).stats().spawn {
                 continue;
+            }
+            if self.pstate[i] & EXHAUSTED != 0 {
+                continue; // spawned this turn — cannot chain
             }
             for &n in &NEIGHBORS[i] {
                 if n != NO_CELL && self.cells[n as usize] == 0 && !seen[n as usize] {
@@ -227,14 +378,24 @@ impl MinionsState {
         let stats = unit.stats();
         let flying = stats.flying;
 
+        // Stack buffers, not `Vec`s. This is the hot path of the forced-
+        // exploration playout: `random_playout` calls `legal_moves` once per
+        // action and 85% of that is here, so the old version's five allocations
+        // per call (`frontier`, `out`, and a fresh `next` on every BFS step)
+        // came to roughly 600 allocations per playout. A frontier can never
+        // exceed the board.
         let mut steps = [u8::MAX; NUM_CELLS];
         steps[from as usize] = 0;
-        let mut frontier = vec![from];
-        let mut out = Vec::new();
+        let mut frontier = [0u8; NUM_CELLS];
+        let mut next = [0u8; NUM_CELLS];
+        frontier[0] = from;
+        let mut n_front = 1usize;
+        // Speed-1 units (most of them) reach at most their six neighbours.
+        let mut out = Vec::with_capacity(if stats.speed <= 1 { 8 } else { 40 });
 
         for step in 1..=stats.speed {
-            let mut next = Vec::new();
-            for &cur in &frontier {
+            let mut n_next = 0usize;
+            for &cur in &frontier[..n_front] {
                 for &n in &NEIGHBORS[cur as usize] {
                     if n == NO_CELL || steps[n as usize] != u8::MAX {
                         continue;
@@ -248,11 +409,13 @@ impl MinionsState {
                     if occ == 0 {
                         out.push(n);
                     }
-                    next.push(n);
+                    next[n_next] = n;
+                    n_next += 1;
                 }
             }
-            frontier = next;
-            if frontier.is_empty() {
+            frontier[..n_next].copy_from_slice(&next[..n_next]);
+            n_front = n_next;
+            if n_front == 0 {
                 break;
             }
         }
@@ -294,12 +457,16 @@ impl MinionsState {
             return Vec::new();
         }
         let range = unit.stats().range as u32;
-        (0..NUM_CELLS as u8)
-            .filter(|&i| {
-                let c = self.cells[i as usize];
-                c != 0 && cell_side(c) != side && dist(from, i) <= range
-            })
-            .collect()
+        // `collect` from a filter has no useful size hint, so it reallocated as
+        // it grew; a unit rarely has more than a handful of targets in range.
+        let mut out = Vec::with_capacity(8);
+        for i in 0..NUM_CELLS as u8 {
+            let c = self.cells[i as usize];
+            if c != 0 && cell_side(c) != side && dist(from, i) <= range {
+                out.push(i);
+            }
+        }
+        out
     }
 
     /// Debug render: `y` descending so the second player is at the top, rows
@@ -428,6 +595,12 @@ impl Minions {
             state.winner = (1 - state.side) + 1;
         }
 
+        // Record this turn's balance before the cap is tested, so the window
+        // includes the turn that just finished.
+        let diff = net_worth(state, 0) as i32 - net_worth(state, 1) as i32;
+        state.nw_hist.rotate_left(1);
+        state.nw_hist[ADJ_WINDOW - 1] = diff.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+
         state.turn += 1;
         if state.winner == 0 && state.turn >= MAX_TURNS {
             state.winner = adjudicate(state);
@@ -468,7 +641,9 @@ impl Game for Minions {
             return Vec::new();
         }
         let side = state.side;
-        let mut out = Vec::new();
+        // Sized to a typical mid-game branching factor (~30-50 moves) so the
+        // per-action enumeration in `random_playout` stops reallocating.
+        let mut out = Vec::with_capacity(64);
 
         if state.phase == PHASE_ATTACK {
             for i in 0..NUM_CELLS as u8 {
@@ -565,13 +740,21 @@ impl Game for Minions {
                 plane(&mut |i| (state.cells[i] == want) as u8, &mut out);
             }
         }
-        plane(&mut |i| damage_of(state.pstate[i]), &mut out);
-        plane(&mut |i| (state.pstate[i] & MOVED != 0) as u8, &mut out);
-        plane(&mut |i| (state.pstate[i] & ATTACKED != 0) as u8, &mut out);
-        plane(&mut |i| (state.pstate[i] & EXHAUSTED != 0) as u8, &mut out);
+        // No per-piece turn-state planes (damage / moved / attacked / exhausted)
+        // and no phase plane. The action space is a whole turn, so the only
+        // positions the net ever sees are turn boundaries — and `end_turn`
+        // clears every `pstate`, leaving all five constant. Asserted over real
+        // games by `turn_boundary_states_have_no_piece_state`.
+        //
+        // No `side` plane either: the sampler canonicalises to the mover's frame
+        // (`MinionsState::canonical`), so it would be a constant 0 — and while
+        // the frame was absolute it was a direct seat signal for the value head
+        // to shortcut on instead of reading the position.
+        //
+        // The graveyard mask stays. It is constant across *examples* but varies
+        // across *cells*, and the trunk is fully convolutional — this plane is
+        // the only thing telling it which six cells decide the game.
         plane(&mut |i| IS_GRAVEYARD[i] as u8, &mut out);
-        plane(&mut |_| state.side, &mut out);
-        plane(&mut |_| (state.phase == PHASE_SPAWN) as u8, &mut out);
         for side in [me, 1 - me] {
             let m = state.money[side as usize].min(255) as u8;
             plane(&mut |_| m, &mut out);
@@ -582,6 +765,14 @@ impl Game for Minions {
                 plane(&mut |_| n, &mut out);
             }
         }
+        // Turns remaining before the cap forces adjudication. Raw count, like
+        // money and reinforcements — the net sees 0..=MAX_TURNS, not a fraction.
+        //
+        // Appended **last** on purpose: every earlier plane index keeps its
+        // meaning, so the watchdog's hardcoded offsets and any older reasoning
+        // about the layout stay correct.
+        let left = MAX_TURNS.saturating_sub(state.turn).min(255) as u8;
+        plane(&mut |_| left, &mut out);
         debug_assert_eq!(out.len(), PLANES * NUM_CELLS);
         out
     }
@@ -595,6 +786,12 @@ impl Game for Minions {
         }
         for side in state.reinforcements {
             out.extend_from_slice(&side);
+        }
+        // Adjudication history travels with the state: priming it from the
+        // position instead would fabricate a past the game did not have, and a
+        // state near the cap would decode to the wrong result.
+        for v in state.nw_hist {
+            out.extend_from_slice(&v.to_le_bytes());
         }
         out.push(state.side);
         out.push(state.phase);
@@ -614,6 +811,7 @@ impl Game for Minions {
             pstate: [0; NUM_CELLS],
             money: [0; 2],
             reinforcements: [[0; BUYABLE.len()]; 2],
+            nw_hist: [0; ADJ_WINDOW],
             side: 0,
             phase: PHASE_ATTACK,
             turn: 0,
@@ -633,6 +831,10 @@ impl Game for Minions {
             side.copy_from_slice(&bytes[o..o + BUYABLE.len()]);
             o += BUYABLE.len();
         }
+        for v in s.nw_hist.iter_mut() {
+            *v = i16::from_le_bytes([bytes[o], bytes[o + 1]]);
+            o += 2;
+        }
         s.side = bytes[o];
         s.phase = bytes[o + 1];
         s.turn = u16::from_le_bytes([bytes[o + 2], bytes[o + 3]]);
@@ -647,6 +849,7 @@ impl Game for Minions {
         if s.side > 1 || s.phase > PHASE_SPAWN || s.winner > 3 {
             anyhow::bail!("minions state: bad side/phase/winner byte");
         }
+
         Ok(s)
     }
 
@@ -678,11 +881,23 @@ pub const STATE_BYTES: usize = NUM_CELLS   // cells
     + NUM_CELLS                            // pstate
     + 4                                    // money
     + 2 * BUYABLE.len()                    // reinforcements
+    + 2 * ADJ_WINDOW                       // nw_hist
     + 1 + 1 + 2 + 4 + 1; // side, phase, turn, ply, winner
 
 impl Solver for Minions {
     fn choose_move(state: &Self::State) -> SearchOutcome<Self::Move> {
         crate::solver::greedy_move(state)
+    }
+
+    /// The trained net, playing a whole turn per search — see
+    /// [`crate::net_seat`]. Returns `None` unless `serve --net-dir` configured
+    /// one, so asking to play the net without weights is a clear failure rather
+    /// than a silent fallback to the greedy heuristic.
+    fn choose_move_external(
+        state: &Self::State,
+        budget: playground_core::SolverBudget,
+    ) -> Option<anyhow::Result<SearchOutcome<Self::Move>>> {
+        crate::net_seat::choose(state, budget)
     }
 }
 
@@ -742,21 +957,24 @@ mod tests {
     #[test]
     fn a_position_always_has_a_legal_move() {
         let mut s = Minions::initial_state();
-        for _ in 0..40 {
+        // Up to the cap: past it the game is over and having no moves is correct.
+        while !Minions::outcome(&s).is_terminal() {
             let moves = Minions::legal_moves(&s);
-            assert!(!moves.is_empty());
+            assert!(!moves.is_empty(), "no legal move at turn {}", s.turn);
             s = Minions::apply(&s, &MinionsMove::EndPhase);
         }
+        assert_eq!(s.turn, MAX_TURNS, "passing should run to the cap");
     }
 
     #[test]
     fn zombies_are_lumbering() {
         let mut s = Minions::initial_state();
         // Put an enemy zombie next to one of ours, then move ours and try to attack.
-        let from = idx(2, 3);
-        let target = idx(2, 5);
+        let from = idx(0, 4);
+        let target = idx(0, 6);
+        s.cells[from as usize] = encode_cell(0, Unit::Zombie);
         s.cells[target as usize] = encode_cell(1, Unit::Zombie);
-        let dest = idx(2, 4);
+        let dest = idx(0, 5);
         assert!(s.move_targets(from).contains(&dest));
         let moved = Minions::apply(&s, &MinionsMove::Move { from, to: dest });
         assert!(
@@ -771,11 +989,11 @@ mod tests {
     #[test]
     fn enemies_block_a_path_but_friends_do_not() {
         let mut s = Minions::initial_state();
-        // c2..j9 is open ground. From f2 the only two-step route to f4 runs
-        // through f3, so whatever sits on f3 decides whether f4 is reachable.
-        let from = idx(5, 2);
-        let corridor = idx(5, 3);
-        let behind = idx(5, 4);
+        // From d0 the only two-step route to d2 runs through d1, so whatever
+        // sits on d1 decides whether d2 is reachable.
+        let from = idx(3, 0);
+        let corridor = idx(3, 1);
+        let behind = idx(3, 2);
         s.cells[from as usize] = encode_cell(0, Unit::Serpent); // speed 2, grounded
         assert!(s.move_targets(from).contains(&behind));
 
@@ -956,15 +1174,95 @@ mod tests {
     }
 
     #[test]
-    fn stalling_to_the_cap_is_adjudicated_on_gold() {
+    /// Buying and spawning must not move net worth. This is the property the
+    /// whole rule rests on: gold converts into units at par, so the only way to
+    /// gain is to take material the opponent does not take back. Valuing units
+    /// at `rebate` instead of `cost` would break it (a skeleton costs 4, rebates
+    /// 2) and leave a weaker form of the hoarding incentive.
+    #[test]
+    fn buying_and_spawning_leave_net_worth_unchanged() {
+        // Accounting test: it drives `apply` directly rather than going through
+        // legal-move generation, because the point is the bookkeeping, not when
+        // the moves happen to be legal.
+        let mut s = Minions::initial_state();
+        s.money[0] = 20; // the opening bank is under a skeleton's price
+        let before = net_worth(&s, 0);
+
+        let bought = Minions::apply(&s, &MinionsMove::Buy(Unit::Skeleton));
+        assert_eq!(bought.money[0], s.money[0] - Unit::Skeleton.stats().cost,
+                   "buying must actually cost gold");
+        assert_eq!(net_worth(&bought, 0), before, "gold -> reinforcements is not par");
+
+        // ...and the reinforcement converting to a unit on the board is also par.
+        let at = (0..NUM_CELLS).find(|&i| bought.cells[i] == 0).expect("an empty cell") as u8;
+        let spawned = Minions::apply(&bought, &MinionsMove::Spawn { unit: Unit::Skeleton, at });
+        assert_eq!(net_worth(&spawned, 0), before, "reinforcements -> board is not par");
+    }
+
+    /// The behaviour that changed: material beats a bank balance.
+    #[test]
+    fn adjudication_counts_units_not_just_gold() {
+        let mut s = after_opening();
+        // Second player is richer in raw gold but has spent nothing; first player
+        // converted gold into a skeleton on the board. Under the old gold rule the
+        // hoarder won; under net worth the position is what counts.
+        // Both sides open symmetrically, so their starting material cancels and
+        // only the gold and the added unit move the comparison.
+        s.money = [0, 4];
+        assert_eq!(net_worth(&s, 0) + 4, net_worth(&s, 1), "setup: second is 4 ahead");
+        let cell = (0..NUM_CELLS).find(|&i| s.cells[i] == 0).expect("an empty cell");
+        s.cells[cell] = encode_cell(0, Unit::Skeleton);
+        s.prime_nw_hist();
+        assert!(s.money[1] > s.money[0], "second player must be ahead on raw gold");
+        assert_eq!(adjudicate(&s), 3, "a skeleton exactly offsets 4 gold");
+
+        // One more zombie of material and the first player is simply ahead.
+        let cell2 = (0..NUM_CELLS).find(|&i| s.cells[i] == 0).expect("another empty cell");
+        s.cells[cell2] = encode_cell(0, Unit::Zombie);
+        s.prime_nw_hist();
+        assert_eq!(adjudicate(&s), 1);
+    }
+
+    /// Unsummoning costs its victim tempo, not material: the unit returns to the
+    /// owner's pool and can be respawned for free, so net worth is unchanged. A
+    /// kill removes it outright. The scoring must keep those distinct.
+    #[test]
+    fn unsummon_preserves_net_worth_but_a_kill_does_not() {
+        let mut s = after_opening();
+        let cell = (0..NUM_CELLS).find(|&i| s.cells[i] == 0).expect("an empty cell");
+        s.cells[cell] = encode_cell(0, Unit::Skeleton);
+        let with_unit = net_worth(&s, 0);
+
+        // Unsummon: board -> reinforcements.
+        let mut unsummoned = s.clone();
+        unsummoned.cells[cell] = 0;
+        let slot = BUYABLE.iter().position(|u| *u == Unit::Skeleton).unwrap();
+        unsummoned.reinforcements[0][slot] += 1;
+        assert_eq!(net_worth(&unsummoned, 0), with_unit, "unsummon must not cost material");
+
+        // Killed: gone entirely.
+        let mut killed = s.clone();
+        killed.cells[cell] = 0;
+        assert_eq!(
+            net_worth(&killed, 0),
+            with_unit - Unit::Skeleton.stats().cost as u32,
+            "a kill must cost the unit's full value"
+        );
+    }
+
+    #[test]
+    fn stalling_to_the_cap_is_adjudicated_on_net_worth() {
         let mut s = Minions::initial_state();
         while Minions::outcome(&s) == Outcome::InProgress {
             s = Minions::apply(&s, &MinionsMove::EndPhase);
         }
         assert_eq!(s.turn, MAX_TURNS);
-        // Both sides pass, so neither takes a graveyard and both bank BASE_INCOME
-        // a turn — the second player wins on its START_MONEY_SECOND head start.
-        // This is the hoarding equilibrium `adjudicate` documents.
+        // Both sides pass, so neither takes a graveyard, neither spends, and both
+        // bank BASE_INCOME a turn — the second player wins on its
+        // START_MONEY_SECOND head start. Net worth reduces to gold here precisely
+        // because nothing was bought, which is what makes "pass forever" still a
+        // *win* for the second player rather than a draw: net worth removes the
+        // incentive to hoard over developing, it does not erase the head start.
         assert!(s.money[1] > s.money[0]);
         assert_eq!(Minions::outcome(&s), Outcome::SecondWins);
     }
@@ -972,12 +1270,59 @@ mod tests {
     #[test]
     fn adjudication_follows_gold_and_draws_exact_ties() {
         let mut s = after_opening();
+        // Adjudication averages the window, so each position has to be given a
+        // history — `prime_nw_hist` states "this balance has held".
         s.money = [11, 4];
+        s.prime_nw_hist();
         assert_eq!(adjudicate(&s), 1);
         s.money = [4, 11];
+        s.prime_nw_hist();
         assert_eq!(adjudicate(&s), 2);
         s.money = [7, 7];
+        s.prime_nw_hist();
         assert_eq!(adjudicate(&s), 3);
+    }
+
+    /// The window is the point: a lead that only exists on the final turn — the
+    /// side to move having just banked income the opponent has not answered —
+    /// must not decide the game.
+    #[test]
+    /// A bid is a signed handicap: positive gives blue (second) the money,
+    /// negative gives it to yellow (first), and it must reach adjudication.
+    #[test]
+    fn a_bid_hands_the_starting_money_to_the_named_side() {
+        let even = MinionsState::with_bid(0);
+        assert_eq!(even.money, [0, 0]);
+        assert_eq!(adjudicate(&even), 3, "no handicap, identical armies: a draw");
+
+        let blue = MinionsState::with_bid(7);
+        assert_eq!(blue.money, [0, 7]);
+        assert_eq!(adjudicate(&blue), 2, "blue's handicap must win the tiebreak");
+
+        let yellow = MinionsState::with_bid(-4);
+        assert_eq!(yellow.money, [4, 0]);
+        assert_eq!(adjudicate(&yellow), 1, "a negative bid pays yellow instead");
+
+        // The adjudication window is primed from the position, so a handicap
+        // applied after construction has to be reflected in it — otherwise the
+        // average is taken over a balance the game never had.
+        assert!(blue.nw_hist.iter().all(|&v| v < 0), "window must see blue ahead");
+        assert!(yellow.nw_hist.iter().all(|&v| v > 0), "window must see yellow ahead");
+    }
+
+    fn adjudication_averages_away_a_last_turn_swing() {
+        let mut s = after_opening();
+        s.money = [0, 0];
+        s.prime_nw_hist();
+        // Level throughout, then first player banks a turn's income at the buzzer.
+        s.nw_hist[ADJ_WINDOW - 1] = 4;
+        assert_eq!(adjudicate(&s), 1, "a +4 blip against five level turns still wins?");
+
+        // Against a sustained deficit, the same blip must not flip the result.
+        for v in s.nw_hist.iter_mut().take(ADJ_WINDOW - 1) {
+            *v = -2;
+        }
+        assert_eq!(adjudicate(&s), 2, "sustained -2 x5 must outweigh a +4 final turn");
     }
 
     #[test]
@@ -1045,4 +1390,99 @@ mod tests {
         }
         assert!(Minions::outcome(&s).is_terminal());
     }
+}
+
+#[cfg(test)]
+mod move_targets_bench {
+    use super::*;
+    use rand::SeedableRng;
+
+    /// `move_targets` exactly as it was before the stack-buffer rewrite, so the
+    /// speedup is a paired A/B in one binary rather than a before/after across
+    /// two builds. Delete once the change is settled.
+    fn legacy_move_targets(st: &MinionsState, from: u8) -> Vec<u8> {
+        let Some((side, unit)) = st.piece_at(from) else {
+            return Vec::new();
+        };
+        let stats = unit.stats();
+        let flying = stats.flying;
+        let mut steps = [u8::MAX; NUM_CELLS];
+        steps[from as usize] = 0;
+        let mut frontier = vec![from];
+        let mut out = Vec::new();
+        for step in 1..=stats.speed {
+            let mut next = Vec::new();
+            for &cur in &frontier {
+                for &n in &NEIGHBORS[cur as usize] {
+                    if n == NO_CELL || steps[n as usize] != u8::MAX {
+                        continue;
+                    }
+                    let occ = st.cells[n as usize];
+                    if occ != 0 && !flying && cell_side(occ) != side {
+                        continue;
+                    }
+                    steps[n as usize] = step;
+                    if occ == 0 {
+                        out.push(n);
+                    }
+                    next.push(n);
+                }
+            }
+            frontier = next;
+            if frontier.is_empty() {
+                break;
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    #[test]
+    #[ignore = "timing measurement; run with --ignored --nocapture"]
+    fn move_targets_paired_ab() {
+        let mut st = MinionsState::default();
+        let mut prng = rand_chacha::ChaCha8Rng::seed_from_u64(11);
+        for _ in 0..12 {
+            if Minions::outcome(&st).is_terminal() {
+                break;
+            }
+            let spec = crate::turn::TurnSpec::random_playout(&st, &mut prng);
+            st = crate::turn::realize(&st, &spec).next;
+        }
+        let own: Vec<u8> = (0..NUM_CELLS as u8)
+            .filter(|&i| st.piece_at(i).map(|(s, _)| s == st.side).unwrap_or(false))
+            .collect();
+        // Identical output is the precondition for the timing to mean anything.
+        for &i in &own {
+            assert_eq!(st.move_targets(i), legacy_move_targets(&st, i), "cell {i}");
+        }
+        let reps = 20000;
+        let run = |legacy: bool| -> f64 {
+            let t0 = std::time::Instant::now();
+            for _ in 0..reps {
+                for &i in &own {
+                    let v = if legacy { legacy_move_targets(&st, i) } else { st.move_targets(i) };
+                    std::hint::black_box(v.len());
+                }
+            }
+            t0.elapsed().as_secs_f64() * 1e9 / (reps as f64 * own.len() as f64)
+        };
+        run(true);
+        run(false);
+        let (mut la, mut nu) = (0.0, 0.0);
+        for _ in 0..4 {
+            la += run(true);
+            nu += run(false);
+            nu += run(false);
+            la += run(true);
+        }
+        println!(
+            "move_targets  legacy {:.0} ns   new {:.0} ns   {:+.1}%   ({} own units)",
+            la / 8.0,
+            nu / 8.0,
+            (la - nu) / la * 100.0,
+            own.len()
+        );
+    }
+
 }

@@ -1568,6 +1568,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
+name = "minions-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "candle-core",
+ "candle-nn",
+ "clap",
+ "ort",
+ "playground-core",
+ "playground-engine-server",
+ "playground-model-client",
+ "playground-protocol",
+ "rand 0.8.6",
+ "rand_chacha 0.3.1",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

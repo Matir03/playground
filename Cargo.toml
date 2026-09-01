@@ -10,6 +10,7 @@ members = [
     "crates/games/amazons",
     "crates/games/arimaa",
     "crates/games/hex",
+    "crates/games/minions",
 ]
 
 [workspace.package]

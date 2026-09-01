@@ -1,16 +1,16 @@
-//! 100-cell hex bitboards in a single `u128`.
+//! Hex bitboards in a single `u128`, one bit per cell.
 //!
-//! The board is exactly 100 cells, so a `u128` holds one bit per hex with 28 to
-//! spare — the same trick as the reference engine's
+//! `NUM_CELLS` must stay ≤ 128; at 7×7 that is 49 bits with 79 to spare — the
+//! same trick as the reference engine's
 //! `spooky/src/core/board/bitboards.rs`, which this is a direct port of: same
-//! 10×10 rhombus, same six directions, same `i = y*10 + x` indexing, so the
-//! shift/mask constants transfer unchanged.
+//! rhombus, same six directions, same `i = y*N + x` indexing. The shifts are
+//! derived from `N` rather than hardcoded, so the board can be resized.
 //!
 //! A dilation is six shift-and-mask ORs. Each direction's mask is the set of
 //! *destination* cells that direction can legally reach, which is what stops a
 //! shift from wrapping around a row edge: stepping W from `x = 0` would land on
-//! `x = 9` of the row below, and that cell is not a valid W destination (W
-//! destinations are `x ≤ 8`), so the mask drops it.
+//! `x = N-1` of the row below, and that cell is not a valid W destination (W
+//! destinations are `x ≤ N-2`), so the mask drops it.
 
 use crate::map::{N, NUM_CELLS};
 
@@ -46,7 +46,9 @@ const fn dest_mask(dx: i32, dy: i32) -> Bb {
 }
 
 // Directions in the same order as `map::NEIGHBORS`: W NW NE E SE SW.
-// Index shifts are `dy*10 + dx`: -1, +9, +10, +1, -9, -10.
+// Index shifts are `dy*N + dx`: -1, +(N-1), +N, +1, -(N-1), -N.
+const S_ROW: u32 = N as u32;
+const S_DIAG: u32 = N as u32 - 1;
 const M_W: Bb = dest_mask(-1, 0);
 const M_NW: Bb = dest_mask(-1, 1);
 const M_NE: Bb = dest_mask(0, 1);
@@ -58,11 +60,11 @@ const M_SW: Bb = dest_mask(0, -1);
 #[inline]
 pub const fn dilate(b: Bb) -> Bb {
     ((b >> 1) & M_W)
-        | ((b << 9) & M_NW)
-        | ((b << 10) & M_NE)
+        | ((b << S_DIAG) & M_NW)
+        | ((b << S_ROW) & M_NE)
         | ((b << 1) & M_E)
-        | ((b >> 9) & M_SE)
-        | ((b >> 10) & M_SW)
+        | ((b >> S_DIAG) & M_SE)
+        | ((b >> S_ROW) & M_SW)
 }
 
 /// Cells reachable from `from` in at most `speed` steps, moving only through
@@ -137,8 +139,13 @@ mod tests {
                 assert!(has(r, c), "speed {speed} should reach {c}");
             }
         }
-        // 37 hexes within distance 3 — the size of the move head.
-        assert_eq!(cells(reachable(bit(start), 3, FULL)).count(), 37);
+        // The distance-3 ball is 37 hexes in open space; on a board this small
+        // it is clipped by the rim, so compare against the geometry rather than
+        // the constant — the move head still has 37 slots, most of them
+        // off-board from any given cell.
+        let ball = (0..NUM_CELLS as u8).filter(|&c| dist(start, c) <= 3).count();
+        assert_eq!(cells(reachable(bit(start), 3, FULL)).count(), ball);
+        assert!(ball <= 37, "the ball cannot exceed the move head's 37 offsets");
     }
 
     #[test]
