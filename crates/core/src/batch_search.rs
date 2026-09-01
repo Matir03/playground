@@ -1512,15 +1512,30 @@ pub fn sample_opening_len_for_test(params: &SearchParams, rng: &mut ChaCha8Rng) 
 }
 
 fn sample_opening_len(params: &SearchParams, rng: &mut ChaCha8Rng) -> u32 {
-    let max = params.random_opening_max;
-    let r = 1.0f64 / params.random_opening_decay.max(f32::EPSILON) as f64;
+    sample_geometric_len(params.random_opening_max, params.random_opening_decay, rng)
+}
+
+/// Draw `n` from a truncated geometric on `0..=max` with `P(n) ∝ decay^-n`.
+/// `decay = 1` is uniform.
+///
+/// Shared so every game samples openings the same way — and so the off-by-one
+/// below is fixed in one place. It used to `floor(x) - 1`, which is the inverse
+/// for a *continuous* CDF; the discrete inverse needs the smallest `k` whose
+/// `CDF(k) >= u`, i.e. `ceil(x) - 1`. The difference is not cosmetic: at
+/// `max = 8, decay = 1.15` the old form put 0.34 of the mass on length 0 against
+/// a true 0.18, and drew length `max` **never** — the deepest opening, the one
+/// doing the most work to move the training distribution, could not occur. It
+/// survived because the only test checked the *mean* over a 0..169 range, where
+/// a one-step shift hides inside the tolerance.
+pub fn sample_geometric_len(max: u32, decay: f32, rng: &mut ChaCha8Rng) -> u32 {
+    let r = 1.0f64 / decay.max(f32::EPSILON) as f64;
     if !(r.is_finite() && r > 0.0) || (r - 1.0).abs() < 1e-9 {
         return rng.gen_range(0..=max); // uniform
     }
     // CDF(k) = (1 - r^(k+1)) / (1 - r^(max+1)); invert for k.
     let span = 1.0 - r.powi(max as i32 + 1);
     let u: f64 = rng.gen::<f64>();
-    let k = ((1.0 - u * span).ln() / r.ln() - 1.0).floor();
+    let k = ((1.0 - u * span).ln() / r.ln()).ceil() - 1.0;
     (k.max(0.0) as u32).min(max)
 }
 
@@ -2181,4 +2196,49 @@ pub fn run_eval_moves<M: MoveGame>(
     });
 
     score_x2.load(Ordering::Acquire) as f64 / (2.0 * n_games as f64)
+}
+
+#[cfg(test)]
+mod opening_len_tests {
+    use super::sample_geometric_len;
+    use rand::SeedableRng;
+
+    /// Pin the *shape*, not just the mean.
+    ///
+    /// The previous inverse was off by one and the only test compared means over
+    /// a 0..169 range, where a one-step shift sits inside the tolerance. This
+    /// checks the two things that actually broke: the mass at 0, and whether the
+    /// deepest opening is reachable at all.
+    #[test]
+    fn geometric_length_matches_its_pmf() {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7);
+        let (max, decay) = (8u32, 1.15f32);
+        let n = 200_000;
+        let mut counts = vec![0u32; max as usize + 1];
+        for _ in 0..n {
+            counts[sample_geometric_len(max, decay, &mut rng) as usize] += 1;
+        }
+        let r = 1.0f64 / decay as f64;
+        let z: f64 = (0..=max).map(|k| r.powi(k as i32)).sum();
+        for k in 0..=max as usize {
+            let want = r.powi(k as i32) / z;
+            let got = counts[k] as f64 / n as f64;
+            assert!(
+                (got - want).abs() < 0.01,
+                "length {k}: sampled {got:.4}, geometric {want:.4} (counts {counts:?})"
+            );
+        }
+        assert!(counts[max as usize] > 0, "the deepest opening must be reachable");
+    }
+
+    #[test]
+    fn decay_one_is_uniform() {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(8);
+        let mut counts = vec![0u32; 9];
+        for _ in 0..90_000 {
+            counts[sample_geometric_len(8, 1.0, &mut rng) as usize] += 1;
+        }
+        let (lo, hi) = (*counts.iter().min().unwrap(), *counts.iter().max().unwrap());
+        assert!(hi - lo < 1500, "decay 1.0 must be uniform: {counts:?}");
+    }
 }
