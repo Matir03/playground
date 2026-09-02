@@ -91,8 +91,9 @@ STEPS="${STEPS:-600}"
 # generate phase was never going to produce.
 MIN_SAMPLES="${MIN_SAMPLES:-$TARGET_EXAMPLES}"
 BATCH="${BATCH:-128}"
-# Diagnostics only now — nothing gates on them, so they run rarely.
-EVAL_EVERY="${EVAL_EVERY:-5}"
+# The champion match runs every generation and gates promotion; only the greedy
+# yardstick is periodic.
+GREEDY_EVERY="${GREEDY_EVERY:-5}"
 # Compare the newest net against the one this many generations back. One
 # generation apart is inside the noise of a 40-game match; five gives the
 # comparison enough separation while keeping the diagnostic frequent.
@@ -192,41 +193,34 @@ while true; do
   # <live>/watchdog.jsonl and warns, so the trend is on the record either way.
   "$PYTHON" "$repo/python/minions_watchdog.py" --live "$LIVE" || true
 
-  # Auto-promote: the newest net always becomes the one self-play uses.
+  # Promotion is gated on a match against the reigning champion, every
+  # generation. Auto-promotion was tried and abandoned: with nothing gating the
+  # ladder, forty generations of falling losses produced a net that lost 180
+  # straight games to greedy, because every generation entered self-play
+  # regardless of whether it was actually stronger than the one before it.
   #
-  # The promotion gate cost 29% of wall clock to answer a question a 40-game
-  # match could not answer well anyway — adjacent generations scored 0.300 and
-  # 0.033 against the same opponent, so the gate was mostly sampling noise, and
-  # it rejected generations that later turned out fine. Modern AlphaZero-style
-  # runs do not gate; they trust the learner and watch the diagnostics.
-  echo "== cycle $gen: promote =="
-  "$PYTHON" - <<PROMOTE_EOF
-import json, os, shutil
-from safetensors.torch import load_file
-from playground.model_server.minions_net import build_model, export_onnx_atomic
-live = "$LIVE"
-latest = os.path.join(live, "latest.safetensors")
-shutil.copyfile(latest, os.path.join(live, "best.safetensors.tmp"))
-os.replace(os.path.join(live, "best.safetensors.tmp"), os.path.join(live, "best.safetensors"))
-cfg = json.load(open(os.path.join(live, "config.json")))
-net = build_model(cfg["arch"])
-net.load_state_dict(load_file(latest))
-export_onnx_atomic(net, os.path.join(live, "best"))
-print("promoted latest -> best")
-PROMOTE_EOF
-
-  if (( gen % EVAL_EVERY == 0 )); then
-    echo "== cycle $gen: eval (diagnostic) =="
-    "$PYTHON" "$repo/python/minions_eval_loop.py" --live "$LIVE" \
-      --engine "$ENGINE" --games "$EVAL_GAMES" --candidates "$EVAL_CANDIDATES" \
-      --sims "$EVAL_SIMS" --greedy-games "$GREEDY_GAMES" \
-      --t-steps "$T_STEPS" --lag "$EVAL_LAG" --once \
-      --backend "$BACKEND" --ep "$EP" $FP16_FLAG || {
-        # Never let evaluation kill the run. The script is `set -e`, so a bad
-        # eval used to take the whole cycle down with it — an unattended run
-        # died at cycle 3 that way, losing the night. Eval only decides
-        # promotion; self-play and training are unaffected by skipping one.
-        echo "WARNING: cycle $gen eval failed; continuing without promotion" >&2
-      }
+  # The gate's known weakness stands — a 40-game match is noisy, and it will
+  # sometimes reject a generation that was fine. That is the trade being made
+  # deliberately: a rejected good generation costs one cycle, an accepted bad
+  # one poisons the buffer that trains all its successors.
+  echo "== cycle $gen: eval vs champion (gates promotion) =="
+  # Greedy is a slow external yardstick, not a rung on the ladder, and its
+  # 30-game reading carries about +/-0.09 — so it runs every GREEDY_EVERY
+  # generations and is skipped (0 games) otherwise.
+  g_games=0
+  if (( gen % GREEDY_EVERY == 0 )); then
+    g_games="$GREEDY_GAMES"
+    echo "== cycle $gen: also measuring vs greedy =="
   fi
+  "$PYTHON" "$repo/python/minions_eval_loop.py" --live "$LIVE" \
+    --engine "$ENGINE" --games "$EVAL_GAMES" --candidates "$EVAL_CANDIDATES" \
+    --sims "$EVAL_SIMS" --greedy-games "$g_games" \
+    --t-steps "$T_STEPS" --promote-threshold "$PROMOTE" --once \
+    --backend "$BACKEND" --ep "$EP" $FP16_FLAG || {
+      # Never let evaluation kill the run. The script is `set -e`, so a bad
+      # eval used to take the whole cycle down with it — an unattended run
+      # died at cycle 3 that way, losing the night. A skipped eval means the
+      # champion simply stands for another generation.
+      echo "WARNING: cycle $gen eval failed; champion unchanged" >&2
+    }
 done

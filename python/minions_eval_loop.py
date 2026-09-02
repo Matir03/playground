@@ -275,20 +275,27 @@ def main():
             # Absolute yardstick against the greedy heuristic. Tracking only —
             # it never gates promotion, so a weak early net still climbs its own
             # ladder while this records how far off the external bar it is.
-            try:
-                g, gm = run_match(args.engine, ckpt, None, args.greedy_games, args.sims,
-                                  args.candidates, args.t_steps, args.backend, args.ep,
-                                  args.fp16, seed=1000 + gen,
-                                  render_file=os.path.join(
-                                      live, "games", f"gen_{gen:04d}_vs_greedy.txt"),
-                                  render_games=args.render_games)
-                entry["vs_greedy"] = g
-                if gm is not None:
-                    entry["vs_greedy_margin"] = round(gm, 3)
-                if _LAST_TURNS is not None:
-                    entry["greedy_turns_win"], entry["greedy_turns_loss"] = _LAST_TURNS
-            except Exception as exc:  # noqa: BLE001
-                entry["vs_greedy_error"] = str(exc)[:200]
+            #
+            # `--greedy-games 0` skips it. The champion gate has to run every
+            # generation to decide promotion, but greedy is a slow external
+            # yardstick whose 30-game reading is worth ±0.09; running it every
+            # generation costs time without making the number mean more, so the
+            # cycle asks for it periodically and passes 0 otherwise.
+            if args.greedy_games > 0:
+              try:
+                  g, gm = run_match(args.engine, ckpt, None, args.greedy_games, args.sims,
+                                    args.candidates, args.t_steps, args.backend, args.ep,
+                                    args.fp16, seed=1000 + gen,
+                                    render_file=os.path.join(
+                                        live, "games", f"gen_{gen:04d}_vs_greedy.txt"),
+                                    render_games=args.render_games)
+                  entry["vs_greedy"] = g
+                  if gm is not None:
+                      entry["vs_greedy_margin"] = round(gm, 3)
+                  if _LAST_TURNS is not None:
+                      entry["greedy_turns_win"], entry["greedy_turns_loss"] = _LAST_TURNS
+              except Exception as exc:  # noqa: BLE001
+                  entry["vs_greedy_error"] = str(exc)[:200]
 
             entry["promoted"] = promoted
             metrics = os.path.join(snap, "metrics.json")
