@@ -496,7 +496,8 @@ def _slot_log_probs(logits, spec, step_mask, device):
 
 
 def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux=0.15,
-                tb_weight=0.0, t_steps=4, move_smoothing=0.0, tb_candidates=1):
+                tb_weight=0.0, t_steps=4, move_smoothing=0.0, tb_candidates=1,
+                tb_data=None):
     """One generation of updates.
 
     With ``tb_weight > 0`` this runs the two-phase schedule: every step first
@@ -634,12 +635,44 @@ def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux
                 comm_all = live_f.astype(bool)
                 edecl = torch.from_numpy(energy_planes(spec, comm_all)).to(device)
                 reward = net.energy_head(hh2, edecl)
-            h2 = net.trunk(planes)
-            hh2 = net.head_features(h2)
-            # Same restriction: TB replays a recorded turn, so it needs a real
-            # policy target behind it.
-            tb_live = live_f * full_rows[:, None, None]
-            if tb_candidates > 1:
+            if tb_data is not None:
+                # Draw from the dedicated TB buffer: every root the actor saw,
+                # fast searches included, with every turn the sampler drew —
+                # including the ones search rejected, which are the off-support
+                # turns TB exists to cover and which the policy record discards.
+                ti = rng.integers(0, len(tb_data["n_cands"]), size=bs)
+                tb_planes = torch.from_numpy(
+                    tb_data["planes"][ti].astype(np.float32)
+                ).to(device).view(bs, IN_PLANES, N, N)
+                tlive = tb_data["live"][ti]
+                tb_live = np.stack(
+                    [(tlive & C_MOVE) > 0, (tlive & C_TARGET) > 0, (tlive & C_SPAWN) > 0],
+                    axis=2,
+                )
+                ncand = np.maximum(tb_data["n_cands"][ti].astype(np.int64), 1)
+                pick = (rng.random(bs) * ncand).astype(np.int64)
+                tb_spec = tb_data["spec"][ti, pick]
+                with torch.no_grad():
+                    ht = net.head_features(net.trunk(tb_planes))
+                    edecl_t = torch.from_numpy(
+                        energy_planes(tb_spec, tb_live.astype(bool))
+                    ).to(device)
+                    reward = net.energy_head(ht, edecl_t)
+                h2 = net.trunk(tb_planes)
+                hh2 = net.head_features(h2)
+                spec_for_tb = tb_spec
+            else:
+                h2 = net.trunk(planes)
+                hh2 = net.head_features(h2)
+                # Fallback: replay a recorded turn, which needs a real policy
+                # target behind it.
+                tb_live = live_f * full_rows[:, None, None]
+                spec_for_tb = spec
+            if tb_data is not None:
+                loss_tb = trajectory_balance_loss(
+                    net, h2, hh2, spec_for_tb, tb_live, reward, t_steps, rng, device
+                )
+            elif tb_candidates > 1:
                 # Expand to several stored candidates per position. Each is a
                 # realized turn the search actually looked at, so the frozen
                 # energy head scores them in-distribution; more of them per
@@ -699,6 +732,10 @@ def main():
                          "Mass kept on the true label at a central cell: 0.99 at "
                          "sigma 0.25, 0.79 at 0.40, 0.55 at 0.50, 0.16 at 1.00 - so "
                          "0.4-0.5 is the useful band and 1.0 is far too flat.")
+    ap.add_argument("--tb-sample", type=int, default=200_000,
+                    help="TB records to load per generation, drawn as whole chunks "
+                         "at random from the pool. Bounds RAM without bounding "
+                         "which positions TB eventually sees.")
     ap.add_argument("--tb-candidates", type=int, default=1,
                     help="stored candidates per position to run trajectory balance "
                          "over. 1 replays only the best-visited turn, which is what "
@@ -786,12 +823,24 @@ def main():
 
         batch = buf.merged()
         t0 = time.time()
+        # A fresh random slice of the TB pool each generation: the buffer holds
+        # millions of positions and loading it whole would cost more RAM than
+        # the trainer has, but a different subset each time still covers it.
+        tb_data = (
+            load_tb_sample(os.path.join(live, "tb_buffer"), args.tb_sample, rng)
+            if args.tb_weight > 0.0
+            else None
+        )
+        if tb_data is not None:
+            print(f"  tb buffer: {len(tb_data['n_cands'])} records, "
+                  f"{tb_data['n_cands'].mean():.1f} candidates each")
         lv, hent, ld, le, la, hdecl, ltb = train_block(
             net, opt, batch, args.steps, args.batch, device, rng,
             args.w_diff, args.w_energy, args.aux_weight,
             tb_weight=args.tb_weight, t_steps=args.t_steps,
             move_smoothing=args.move_smoothing,
             tb_candidates=args.tb_candidates,
+            tb_data=tb_data,
         )
         generation += 1
         gens_done += 1
