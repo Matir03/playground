@@ -276,15 +276,31 @@ def main():
             # it never gates promotion, so a weak early net still climbs its own
             # ladder while this records how far off the external bar it is.
             #
+            # It measures the *champion*, not this candidate. The champion is the
+            # net self-play actually runs on and the one the run's strength is
+            # claimed for; a candidate the gate just rejected never plays a game
+            # outside this eval, so scoring it against greedy would report a
+            # number for a net that does not exist in the ladder. When the
+            # candidate was promoted the two are the same net; when it was
+            # rejected they are not, and the champion is the one that matters.
+            #
             # `--greedy-games 0` skips it. The champion gate has to run every
             # generation to decide promotion, but greedy is a slow external
             # yardstick whose 30-game reading is worth ±0.09; running it every
             # generation costs time without making the number mean more, so the
             # cycle asks for it periodically and passes 0 otherwise.
-            if args.greedy_games > 0:
+            if args.greedy_games > 0 and os.path.exists(best):
+              champ_gen = scores.get("best_gen", gen)
+              entry["greedy_gen"] = champ_gen
               try:
-                  g, gm = run_match(args.engine, ckpt, None, args.greedy_games, args.sims,
+                  g, gm = run_match(args.engine, best, None, args.greedy_games, args.sims,
                                     args.candidates, args.t_steps, args.backend, args.ep,
+                                    # Seeded by the measuring generation, not the
+                                    # champion's: a champion that survives several
+                                    # gates gets re-measured, and reusing its own
+                                    # seed would replay the identical 30 games and
+                                    # add nothing. Fresh seeds make the repeats
+                                    # independent samples that can be pooled.
                                     args.fp16, seed=1000 + gen,
                                     render_file=os.path.join(
                                         live, "games", f"gen_{gen:04d}_vs_greedy.txt"),
