@@ -281,6 +281,30 @@ def energy_planes(spec: np.ndarray, committed: np.ndarray) -> np.ndarray:
     return np.concatenate([d[:, :2], d[:, 3:]], axis=1)
 
 
+def sample_tb_specs(batch: dict, idx: np.ndarray, k: int):
+    """Up to `k` stored candidates per position, for trajectory balance.
+
+    TB replays *recorded* turns, and until now it replayed exactly one per
+    position — so the sampler was being fit to `exp f` on a single turn that
+    search had already favoured. The record already holds up to `TOP_K`
+    realized candidates per position at no extra cost, and realized is what
+    matters: the energy head is trained and evaluated on realized specs
+    (`sampler.rs` realizes before scoring), so freshly sampled declarations
+    would be out of distribution for the reward.
+
+    Returns `(specs, rows)` where `rows` indexes back into `idx`, so callers can
+    line up planes and live masks with the expanded candidate set.
+    """
+    n = batch["n_cands"][idx].astype(np.int64)
+    specs, rows = [], []
+    for r, cnt in enumerate(n):
+        take = int(min(max(cnt, 1), k))
+        for c in range(take):
+            specs.append(batch["spec"][idx[r], c])
+            rows.append(r)
+    return np.stack(specs), np.asarray(rows, dtype=np.int64)
+
+
 def sample_target_spec(batch: dict, idx: np.ndarray, rng: np.random.Generator):
     """Pick one candidate per example, proportional to its pruned visit share."""
     probs = batch["prob"][idx].astype(np.float64)
@@ -403,7 +427,7 @@ def _slot_log_probs(logits, spec, step_mask, device):
 
 
 def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux=0.15,
-                tb_weight=0.0, t_steps=4, move_smoothing=0.0):
+                tb_weight=0.0, t_steps=4, move_smoothing=0.0, tb_candidates=1):
     """One generation of updates.
 
     With ``tb_weight > 0`` this runs the two-phase schedule: every step first
@@ -546,9 +570,24 @@ def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux
             # Same restriction: TB replays a recorded turn, so it needs a real
             # policy target behind it.
             tb_live = live_f * full_rows[:, None, None]
-            loss_tb = trajectory_balance_loss(
-                net, h2, hh2, spec, tb_live, reward, t_steps, rng, device
-            )
+            if tb_candidates > 1:
+                # Expand to several stored candidates per position. Each is a
+                # realized turn the search actually looked at, so the frozen
+                # energy head scores them in-distribution; more of them per
+                # position simply gives TB more of the support it is meant to
+                # cover than the single best-visited turn does.
+                tb_spec, tb_rows = sample_tb_specs(batch, idx, tb_candidates)
+                rows_t = torch.from_numpy(tb_rows).to(device)
+                h2e, hh2e = h2[rows_t], hh2[rows_t]
+                reward_e = reward[rows_t] if reward.dim() == 1 else reward[rows_t].squeeze(-1)
+                loss_tb = trajectory_balance_loss(
+                    net, h2e, hh2e, tb_spec, tb_live[tb_rows], reward_e,
+                    t_steps, rng, device
+                )
+            else:
+                loss_tb = trajectory_balance_loss(
+                    net, h2, hh2, spec, tb_live, reward, t_steps, rng, device
+                )
             opt.zero_grad(set_to_none=True)
             (tb_weight * loss_tb).backward()
             opt.step()
@@ -591,6 +630,10 @@ def main():
                          "Mass kept on the true label at a central cell: 0.99 at "
                          "sigma 0.25, 0.79 at 0.40, 0.55 at 0.50, 0.16 at 1.00 - so "
                          "0.4-0.5 is the useful band and 1.0 is far too flat.")
+    ap.add_argument("--tb-candidates", type=int, default=1,
+                    help="stored candidates per position to run trajectory balance "
+                         "over. 1 replays only the best-visited turn, which is what "
+                         "TB was meant to avoid; up to TOP_K are available free.")
     ap.add_argument("--tb-weight", type=float, default=0.0,
                     help="weight on the GFlowNet trajectory-balance loss for the "
                          "sampler; 0 keeps the masked-CE-only behaviour")
@@ -679,6 +722,7 @@ def main():
             args.w_diff, args.w_energy, args.aux_weight,
             tb_weight=args.tb_weight, t_steps=args.t_steps,
             move_smoothing=args.move_smoothing,
+            tb_candidates=args.tb_candidates,
         )
         generation += 1
         gens_done += 1
