@@ -37,7 +37,7 @@ use crate::sampler::{MinionsModel, SamplerConfig};
 use crate::turn::{MinionsTurns, TurnSpec};
 
 pub const MAGIC: u32 = 0x4d_49_4e_33; // "MIN3"
-pub const VERSION: u32 = 7;
+pub const VERSION: u32 = 8;
 /// Horizon for the necromancer-survival target, in side-turns.
 pub const NECRO_HORIZON: usize = 10;
 /// Buyable unit classes (zombie, skeleton, serpent, warg, ghost).
@@ -50,7 +50,15 @@ pub const N_BUYABLE: usize = 5;
 /// and gave no visits is a real training signal — "this one is bad" — and
 /// keeping only the survivors meant the head never saw a negative example and
 /// had to extrapolate everywhere off its own favoured support.
-pub const TOP_K: usize = 16;
+///
+/// A **bound**, not a target: `n_cands` records how many slots are really used
+/// and the rest are zeroed. Sized well above any `--candidates` anyone is
+/// likely to run, because the alternative is silently dropping candidates.
+/// Forced-exploration candidates are drawn *within* the budget rather than on
+/// top of it (`sampler.rs`: `k_diff = k - k_rand`), so the true root cap is
+/// `--candidates` itself. `record_drops` counts anything that exceeds this, so
+/// the day it is too small the run says so instead of quietly truncating.
+pub const TOP_K: usize = 32;
 pub const SPEC_BYTES: usize = 3 * NUM_CELLS;
 pub const PLANE_BYTES: usize = crate::game::PLANES * NUM_CELLS;
 /// Auxiliary "rest of the game" targets, all in the canonical frame — index 0 is
@@ -702,6 +710,10 @@ pub struct PoolStats {
     /// waste in the most expensive phase.
     pub head_real: u64,
     pub head_run: u64,
+    /// Candidates a record could not hold. Should be zero: `TOP_K` is sized
+    /// above any plausible `--candidates`. Non-zero means the record is
+    /// silently dropping turns the energy head would otherwise learn from.
+    pub record_drops: u64,
     pub turns: u64,
     pub games: u64,
 }
@@ -722,6 +734,7 @@ impl PoolStats {
         self.req_widen += o.req_widen;
         self.head_real += o.head_real;
         self.head_run += o.head_run;
+        self.record_drops += o.record_drops;
     }
 
     /// Where each wave's requests went, and how much of the generative-head
@@ -734,8 +747,13 @@ impl PoolStats {
         } else {
             100.0 * (1.0 - self.head_real as f64 / self.head_run as f64)
         };
+        let drops = if self.record_drops > 0 {
+            format!("  |  DROPPED {} candidates (raise TOP_K)", self.record_drops)
+        } else {
+            String::new()
+        };
         format!(
-            "requests: {:.0}% value-only, {:.0}% candidate  |  head rows {} of {} run ({:.0}% padding)",
+            "requests: {:.0}% value-only, {:.0}% candidate  |  head rows {} of {} run ({:.0}% padding){drops}",
             100.0 * self.req_expand as f64 / reqs as f64,
             100.0 * self.req_widen as f64 / reqs as f64,
             self.head_real,
@@ -990,6 +1008,9 @@ fn advance_turn(
             }
         }
 
+        if result.candidates.len() > TOP_K {
+            stats.record_drops += (result.candidates.len() - TOP_K) as u64;
+        }
         policy = scored;
     }
 

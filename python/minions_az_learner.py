@@ -44,7 +44,7 @@ from playground.model_server.minions_net import (
 
 # ── record layout — must match crates/games/minions/src/selfplay.rs ────────────
 MAGIC = 0x4D494E33
-VERSION = 7  # must match selfplay::VERSION in Rust
+VERSION = 8  # must match selfplay::VERSION in Rust
 # v4 records are identical except that they predate the trailing "turns left"
 # feature plane, so they are one plane short. They are still usable: the plane is
 # appended last, and the stem weights that read it start at zero (see
@@ -58,9 +58,9 @@ VERSION = 7  # must match selfplay::VERSION in Rust
 # with zeros, which the energy loss already masks off via `n_cands`. They age
 # out of the sliding window within ~5 generations, so no buffer wipe is needed
 # for the widening — and a wipe was measured to cost ~10 generations.
-COMPAT_VERSIONS = {VERSION: IN_PLANES, 6: IN_PLANES}
-COMPAT_TOP_K = {VERSION: 16, 6: 8}
-TOP_K = 16
+COMPAT_VERSIONS = {VERSION: IN_PLANES, 7: IN_PLANES, 6: IN_PLANES}
+COMPAT_TOP_K = {VERSION: 32, 7: 16, 6: 8}
+TOP_K = 32
 SPEC_BYTES = 3 * CELLS
 PLANE_BYTES = IN_PLANES * CELLS
 CAND_BYTES = SPEC_BYTES + 4
