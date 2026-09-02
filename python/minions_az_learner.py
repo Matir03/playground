@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import argparse
 import glob
-import struct
 import json
 import math
 import os
@@ -44,7 +43,7 @@ from playground.model_server.minions_net import (
 
 # ── record layout — must match crates/games/minions/src/selfplay.rs ────────────
 MAGIC = 0x4D494E33
-VERSION = 8  # must match selfplay::VERSION in Rust
+VERSION = 6  # must match selfplay::VERSION in Rust
 # v4 records are identical except that they predate the trailing "turns left"
 # feature plane, so they are one plane short. They are still usable: the plane is
 # appended last, and the stem weights that read it start at zero (see
@@ -53,14 +52,8 @@ VERSION = 8  # must match selfplay::VERSION in Rust
 # window within ~10 generations.
 # v5 and earlier predate `is_full` and the turns-left plane; they are not
 # read back, since the stride differs in two places now.
-# v6 is identical except that it stored only the visit-ranked top 8 candidates.
-# Those chunks stay readable: their candidate slots are padded out to `TOP_K`
-# with zeros, which the energy loss already masks off via `n_cands`. They age
-# out of the sliding window within ~5 generations, so no buffer wipe is needed
-# for the widening — and a wipe was measured to cost ~10 generations.
-COMPAT_VERSIONS = {VERSION: IN_PLANES, 7: IN_PLANES, 6: IN_PLANES}
-COMPAT_TOP_K = {VERSION: 32, 7: 16, 6: 8}
-TOP_K = 32
+COMPAT_VERSIONS = {VERSION: IN_PLANES}
+TOP_K = 8
 SPEC_BYTES = 3 * CELLS
 PLANE_BYTES = IN_PLANES * CELLS
 CAND_BYTES = SPEC_BYTES + 4
@@ -185,16 +178,10 @@ def read_chunk(path: str) -> dict | None:
         )
         return None
     body = raw[16:]
-    # Older versions differ in the plane count and in how many candidate slots
-    # they stored; both shift every offset after them.
+    # Older versions differ only in the plane count, which shifts every offset.
     n_planes = COMPAT_VERSIONS[int(version)]
-    rec_top_k = COMPAT_TOP_K[int(version)]
     plane_bytes = n_planes * CELLS
-    stride = (
-        EXAMPLE_BYTES
-        - (PLANE_BYTES - plane_bytes)
-        - (TOP_K - rec_top_k) * CAND_BYTES
-    )
+    stride = EXAMPLE_BYTES - (PLANE_BYTES - plane_bytes)
     if body.size != count * stride:
         raise ValueError(
             f"{path}: expected {count * stride} body bytes for v{version}, got {body.size}"
@@ -204,15 +191,7 @@ def read_chunk(path: str) -> dict | None:
         # Pad the missing trailing plane(s) with zeros and re-align the rest.
         pad = np.zeros((count, PLANE_BYTES - plane_bytes), dtype=np.uint8)
         rec = np.concatenate([rec[:, :plane_bytes], pad, rec[:, plane_bytes:]], axis=1)
-    # Offsets after the candidate block depend on this record's own slot count.
-    o_cands = O_CANDS
-    o_hex = o_cands + rec_top_k * CAND_BYTES
-    o_necro = o_hex + HEX_BYTES
-    o_isfull = o_necro + NECRO_BYTES
-    cands = rec[:, o_cands:o_hex].reshape(count, rec_top_k, CAND_BYTES)
-    if rec_top_k < TOP_K:
-        pad = np.zeros((count, TOP_K - rec_top_k, CAND_BYTES), dtype=np.uint8)
-        cands = np.concatenate([cands, pad], axis=1)
+    cands = rec[:, O_CANDS:O_HEX].reshape(count, TOP_K, CAND_BYTES)
     return {
         "planes": rec[:, O_PLANES:O_TOMOVE].copy(),
         "value": rec[:, O_VALUE:O_VALUE + 4].copy().view("<f4").reshape(count),
@@ -222,13 +201,13 @@ def read_chunk(path: str) -> dict | None:
         "prob": cands[:, :, SPEC_BYTES:].copy().reshape(-1, 4).view("<f4").reshape(count, TOP_K),
         # Fractions stored as bytes; rescaled once here rather than per step.
         "hex_control": (
-            rec[:, o_hex:o_hex + HEX_BYTES].astype(np.float32) / 255.0
+            rec[:, O_HEX:O_HEX + HEX_BYTES].astype(np.float32) / 255.0
         ).reshape(count, 2, CELLS),
-        "necro_safety": rec[:, o_necro:o_necro + NECRO_BYTES]
+        "necro_safety": rec[:, O_NECRO:O_NECRO + NECRO_BYTES]
         .astype(np.float32)
         .reshape(count, 2, NECRO_HORIZON),
         # Playout-cap randomization: only full searches carry a policy target.
-        "is_full": rec[:, o_isfull].copy(),
+        "is_full": rec[:, O_ISFULL].copy(),
     }
 
 
@@ -300,74 +279,6 @@ def energy_planes(spec: np.ndarray, committed: np.ndarray) -> np.ndarray:
     just a liveness mask the trunk features already carry."""
     d = decl_planes(spec, committed)
     return np.concatenate([d[:, :2], d[:, 3:]], axis=1)
-
-
-TB_MAGIC = 0x4D544231
-TB_VERSION = 1
-TB_TOP_K = 16  # must match selfplay::TB_TOP_K
-TB_RECORD_BYTES = PLANE_BYTES + CELLS + 1 + TB_TOP_K * SPEC_BYTES
-
-
-def read_tb_chunk(path: str) -> dict | None:
-    """Parse one trajectory-balance chunk.
-
-    Layout mirrors ``selfplay::TbRecord::encode``:
-    ``planes | live | n_cands | TB_TOP_K * spec``. There are no visits and no
-    value — TB scores each turn with the frozen energy head at training time,
-    so the record only says which position and which turns the sampler drew.
-    """
-    with open(path, "rb") as fh:
-        blob = fh.read()
-    if len(blob) < 16:
-        return None
-    magic, version, count = struct.unpack("<IIQ", blob[:16])
-    if magic != TB_MAGIC:
-        raise ValueError(f"{path}: bad magic {magic:#x}")
-    if version != TB_VERSION:
-        print(f"skipping {path}: tb version {version}, want {TB_VERSION}")
-        return None
-    body = blob[16:]
-    if len(body) != count * TB_RECORD_BYTES:
-        raise ValueError(f"{path}: {len(body)} bytes for {count} records")
-    rec = np.frombuffer(body, dtype=np.uint8).reshape(count, TB_RECORD_BYTES)
-    o_live = PLANE_BYTES
-    o_n = o_live + CELLS
-    o_spec = o_n + 1
-    return {
-        "planes": rec[:, :PLANE_BYTES].copy(),
-        "live": rec[:, o_live:o_n].copy(),
-        "n_cands": rec[:, o_n].copy(),
-        "spec": rec[:, o_spec:].copy().reshape(count, TB_TOP_K, SPEC_BYTES),
-    }
-
-
-def load_tb_sample(tb_dir: str, want: int, rng: np.random.Generator) -> dict | None:
-    """Load a random subset of TB chunks totalling roughly ``want`` records.
-
-    The buffer holds millions of positions; loading it whole would cost more RAM
-    than the trainer has. Drawing a fresh random set of chunks each generation
-    gives TB varied positions across the whole pool without ever holding it.
-    """
-    paths = sorted(glob.glob(os.path.join(tb_dir, "tb_*.bin")))
-    if not paths:
-        return None
-    rng.shuffle(paths)
-    parts, total = [], 0
-    for p in paths:
-        try:
-            d = read_tb_chunk(p)
-        except (ValueError, OSError) as exc:
-            print(f"skipping {p}: {exc}")
-            continue
-        if d is None:
-            continue
-        parts.append(d)
-        total += len(d["n_cands"])
-        if total >= want:
-            break
-    if not parts:
-        return None
-    return {k: np.concatenate([p[k] for p in parts]) for k in parts[0]}
 
 
 def sample_tb_specs(batch: dict, idx: np.ndarray, k: int):
@@ -516,8 +427,7 @@ def _slot_log_probs(logits, spec, step_mask, device):
 
 
 def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux=0.15,
-                tb_weight=0.0, t_steps=4, move_smoothing=0.0, tb_candidates=1,
-                tb_data=None):
+                tb_weight=0.0, t_steps=4, move_smoothing=0.0, tb_candidates=1):
     """One generation of updates.
 
     With ``tb_weight > 0`` this runs the two-phase schedule: every step first
@@ -655,44 +565,12 @@ def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux
                 comm_all = live_f.astype(bool)
                 edecl = torch.from_numpy(energy_planes(spec, comm_all)).to(device)
                 reward = net.energy_head(hh2, edecl)
-            if tb_data is not None:
-                # Draw from the dedicated TB buffer: every root the actor saw,
-                # fast searches included, with every turn the sampler drew —
-                # including the ones search rejected, which are the off-support
-                # turns TB exists to cover and which the policy record discards.
-                ti = rng.integers(0, len(tb_data["n_cands"]), size=bs)
-                tb_planes = torch.from_numpy(
-                    tb_data["planes"][ti].astype(np.float32)
-                ).to(device).view(bs, IN_PLANES, N, N)
-                tlive = tb_data["live"][ti]
-                tb_live = np.stack(
-                    [(tlive & C_MOVE) > 0, (tlive & C_TARGET) > 0, (tlive & C_SPAWN) > 0],
-                    axis=2,
-                )
-                ncand = np.maximum(tb_data["n_cands"][ti].astype(np.int64), 1)
-                pick = (rng.random(bs) * ncand).astype(np.int64)
-                tb_spec = tb_data["spec"][ti, pick]
-                with torch.no_grad():
-                    ht = net.head_features(net.trunk(tb_planes))
-                    edecl_t = torch.from_numpy(
-                        energy_planes(tb_spec, tb_live.astype(bool))
-                    ).to(device)
-                    reward = net.energy_head(ht, edecl_t)
-                h2 = net.trunk(tb_planes)
-                hh2 = net.head_features(h2)
-                spec_for_tb = tb_spec
-            else:
-                h2 = net.trunk(planes)
-                hh2 = net.head_features(h2)
-                # Fallback: replay a recorded turn, which needs a real policy
-                # target behind it.
-                tb_live = live_f * full_rows[:, None, None]
-                spec_for_tb = spec
-            if tb_data is not None:
-                loss_tb = trajectory_balance_loss(
-                    net, h2, hh2, spec_for_tb, tb_live, reward, t_steps, rng, device
-                )
-            elif tb_candidates > 1:
+            h2 = net.trunk(planes)
+            hh2 = net.head_features(h2)
+            # Same restriction: TB replays a recorded turn, so it needs a real
+            # policy target behind it.
+            tb_live = live_f * full_rows[:, None, None]
+            if tb_candidates > 1:
                 # Expand to several stored candidates per position. Each is a
                 # realized turn the search actually looked at, so the frozen
                 # energy head scores them in-distribution; more of them per
@@ -752,10 +630,6 @@ def main():
                          "Mass kept on the true label at a central cell: 0.99 at "
                          "sigma 0.25, 0.79 at 0.40, 0.55 at 0.50, 0.16 at 1.00 - so "
                          "0.4-0.5 is the useful band and 1.0 is far too flat.")
-    ap.add_argument("--tb-sample", type=int, default=200_000,
-                    help="TB records to load per generation, drawn as whole chunks "
-                         "at random from the pool. Bounds RAM without bounding "
-                         "which positions TB eventually sees.")
     ap.add_argument("--tb-candidates", type=int, default=1,
                     help="stored candidates per position to run trajectory balance "
                          "over. 1 replays only the best-visited turn, which is what "
@@ -843,24 +717,12 @@ def main():
 
         batch = buf.merged()
         t0 = time.time()
-        # A fresh random slice of the TB pool each generation: the buffer holds
-        # millions of positions and loading it whole would cost more RAM than
-        # the trainer has, but a different subset each time still covers it.
-        tb_data = (
-            load_tb_sample(os.path.join(live, "tb_buffer"), args.tb_sample, rng)
-            if args.tb_weight > 0.0
-            else None
-        )
-        if tb_data is not None:
-            print(f"  tb buffer: {len(tb_data['n_cands'])} records, "
-                  f"{tb_data['n_cands'].mean():.1f} candidates each")
         lv, hent, ld, le, la, hdecl, ltb = train_block(
             net, opt, batch, args.steps, args.batch, device, rng,
             args.w_diff, args.w_energy, args.aux_weight,
             tb_weight=args.tb_weight, t_steps=args.t_steps,
             move_smoothing=args.move_smoothing,
             tb_candidates=args.tb_candidates,
-            tb_data=tb_data,
         )
         generation += 1
         gens_done += 1
