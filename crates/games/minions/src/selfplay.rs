@@ -57,6 +57,23 @@ pub const PLANE_BYTES: usize = crate::game::PLANES * NUM_CELLS;
 pub const HEX_CONTROL_BYTES: usize = 2 * NUM_CELLS;
 pub const NECRO_SAFETY_BYTES: usize = 2 * NECRO_HORIZON;
 
+/// Candidate slots stored per **trajectory-balance** record.
+///
+/// Sized to the full-search candidate budget so nothing the sampler drew is
+/// discarded. This is the point of the TB buffer: the policy target keeps only
+/// the visit-ranked `TOP_K`, so the turns search looked at and rejected — the
+/// ones that are off the sampler's own favoured support — never reached
+/// training. Those are exactly the turns trajectory balance needs.
+pub const TB_TOP_K: usize = 16;
+/// `planes | live | n_cands | specs`. No visit counts and no value: TB scores
+/// each turn with the frozen energy head at training time, so the record only
+/// has to say *which position* and *which turns were drawn*.
+pub const TB_RECORD_BYTES: usize = PLANE_BYTES + NUM_CELLS + 1 + TB_TOP_K * SPEC_BYTES;
+/// Magic and version for the TB stream, kept separate from the policy record so
+/// the two formats can move independently.
+pub const TB_MAGIC: u32 = 0x4D544231;
+pub const TB_VERSION: u32 = 1;
+
 pub const EXAMPLE_BYTES: usize = PLANE_BYTES
     + 1
     + 4
@@ -66,6 +83,34 @@ pub const EXAMPLE_BYTES: usize = PLANE_BYTES
     + HEX_CONTROL_BYTES
     + NECRO_SAFETY_BYTES
     + 1; // is_full
+
+/// One position and every turn the sampler drew at it, for trajectory balance.
+///
+/// Recorded for **fast searches too**. The policy record skips them because a
+/// 100-simulation visit count is a poor policy target, but TB does not use
+/// visits at all — it matches the sampler's path probability against the energy
+/// head's score — so a fast root is exactly as useful as a full one, and there
+/// are three of them for every full one.
+pub struct TbRecord {
+    pub planes: Vec<u8>,
+    pub live: Vec<u8>,
+    pub specs: Vec<TurnSpec>,
+}
+
+impl TbRecord {
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.planes);
+        out.extend_from_slice(&self.live);
+        let n = self.specs.len().min(TB_TOP_K);
+        out.push(n as u8);
+        for i in 0..TB_TOP_K {
+            match self.specs.get(i) {
+                Some(spec) => out.extend_from_slice(&spec.to_bytes()),
+                None => out.extend(std::iter::repeat_n(0u8, SPEC_BYTES)),
+            }
+        }
+    }
+}
 
 pub struct Example {
     pub planes: Vec<u8>,
@@ -125,6 +170,9 @@ pub struct ActorConfig {
     pub pw_chunk: usize,
     /// Resume a paused descent after a widen rather than re-descending.
     pub pw_resume: bool,
+    /// Retention cap for the trajectory-balance buffer, in records. 0 disables
+    /// TB recording entirely.
+    pub tb_max_records: usize,
     pub fast_sims: u32,
     /// Probability a turn gets the full search — only full searches produce a
     /// policy target (KataGo's playout-cap randomization).
@@ -174,6 +222,7 @@ impl Default for ActorConfig {
             pw_alpha: 0.5,
             pw_beta: 2.0,
             pw_chunk: 1,
+            tb_max_records: 2_000_000,
             // Env-switchable so both arms run from one binary in a paired
             // benchmark; comparing across rebuilds separates the arms in time,
             // which is exactly what this box's thermal drift punishes.
@@ -257,6 +306,9 @@ pub struct Slot {
     /// Whether the running search is a full one (and so yields a policy target).
     full: bool,
     pending: Vec<Pending>,
+    /// Trajectory-balance records banked from this slot, one per root search —
+    /// fast searches included, since TB uses no visit counts.
+    tb: Vec<TbRecord>,
     /// End-of-turn summary for every turn played so far, including the fast
     /// searches that record no example — the auxiliary targets average over the
     /// whole remaining game, not just the recorded positions.
@@ -514,6 +566,10 @@ fn drive_pool_worker(
                                 search,
                                 full,
                                 pending: Vec::new(),
+                                // Carried across the game boundary: TB records
+                                // are per-position and outlive the game they
+                                // came from, and the run loop drains them.
+                                tb: std::mem::take(&mut slots[i].tb),
                                 trace: Vec::new(),
                                 turn: opening,
                                 rng,
@@ -805,6 +861,7 @@ pub fn new_pool(model: &MinionsModel, cfg: &ActorConfig, n: usize, seed: u64) ->
                 search,
                 full,
                 pending: Vec::new(),
+            tb: Vec::new(),
                 trace: Vec::new(),
                 turn: opening,
                 rng,
@@ -826,6 +883,8 @@ fn advance_turn(
     start_search: StartSearch,
     stats: &mut PoolStats,
 ) -> bool {
+    let tb_planes = Minions::to_features(&slot.state);
+    let tb_live = live_bytes(&slot.state);
     let finished = std::mem::replace(
         &mut slot.search,
         Search::new(slot.state.clone(), &SampledParams { simulations: 0, ..Default::default() }, 0),
@@ -834,6 +893,15 @@ fn advance_turn(
     if result.candidates.is_empty() {
         return false;
     }
+    // Every root, full or fast, with *every* turn the sampler drew — not just
+    // the visit-ranked survivors the policy target keeps. The turns search
+    // rejected are the ones off the sampler's favoured support, which is what
+    // trajectory balance exists to cover.
+    slot.tb.push(TbRecord {
+        planes: tb_planes,
+        live: tb_live,
+        specs: result.candidates.iter().take(TB_TOP_K).map(|(s, _)| *s).collect(),
+    });
     // Empty for a fast search: no policy target, but the position is still
     // recorded for its value and auxiliary targets.
     let mut policy: Vec<(TurnSpec, f32)> = Vec::new();
@@ -1050,6 +1118,54 @@ fn examples_from(
         .collect()
 }
 
+/// Same container shape as the policy chunks, its own magic and version so the
+/// two record formats can change independently.
+fn write_tb_chunk(dir: &Path, index: usize, records: &[TbRecord]) -> anyhow::Result<PathBuf> {
+    let mut buf = Vec::with_capacity(16 + records.len() * TB_RECORD_BYTES);
+    buf.extend_from_slice(&TB_MAGIC.to_le_bytes());
+    buf.extend_from_slice(&TB_VERSION.to_le_bytes());
+    buf.extend_from_slice(&(records.len() as u64).to_le_bytes());
+    for r in records {
+        r.encode(&mut buf);
+    }
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!("tb_{index:06}.bin"));
+    let tmp = path.with_extension("bin.tmp");
+    std::fs::write(&tmp, &buf)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(path)
+}
+
+/// Drop the oldest TB chunks past the retention cap.
+///
+/// Resumes numbering from the highest index elsewhere, for the reason recorded
+/// in `run_loop`: counting files restarts numbering below the survivors and the
+/// pruner then deletes the newest data as though it were the oldest.
+fn prune_tb_buffer(dir: &Path, max_records: usize) -> anyhow::Result<()> {
+    let mut chunks: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "bin"))
+            .collect(),
+        Err(_) => return Ok(()),
+    };
+    chunks.sort();
+    let count_of = |p: &Path| -> usize {
+        std::fs::metadata(p)
+            .map(|m| (m.len().saturating_sub(16)) as usize / TB_RECORD_BYTES)
+            .unwrap_or(0)
+    };
+    let mut total: usize = chunks.iter().map(|p| count_of(p)).sum();
+    for p in &chunks {
+        if total <= max_records {
+            break;
+        }
+        total -= count_of(p);
+        let _ = std::fs::remove_file(p);
+    }
+    Ok(())
+}
+
 fn write_chunk(dir: &Path, index: usize, examples: &[Example]) -> anyhow::Result<PathBuf> {
     let mut buf = Vec::with_capacity(16 + examples.len() * EXAMPLE_BYTES);
     buf.extend_from_slice(&MAGIC.to_le_bytes());
@@ -1159,6 +1275,22 @@ pub fn run_loop(
         })
         .max()
         .map_or(0, |m| m + 1);
+    // Same rule as `chunk_index`: resume past the highest surviving index.
+    let mut tb_index = std::fs::read_dir(live.join("tb_buffer"))
+        .ok()
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter_map(|p| {
+                    p.file_stem()
+                        .and_then(|s| s.to_str())
+                        .and_then(|s| s.strip_prefix("tb_"))
+                        .and_then(|s| s.parse::<usize>().ok())
+                })
+                .max()
+                .map_or(0, |m| m + 1)
+        })
+        .unwrap_or(0);
     let mut last_mtime = None;
     let mut model =
         MinionsModel::new(crate::net::load_backend(live, &cfg.backend, &cache_dir)?, sampler);
@@ -1184,6 +1316,20 @@ pub fn run_loop(
         let t0 = Instant::now();
         let examples =
             drive_pool(&model, &cfg, &mut pool, max_batch, &mut pool_seed, deadline, &mut stats)?;
+        // Drain the trajectory-balance records the slots banked this window.
+        let tb_records: Vec<TbRecord> =
+            pool.iter_mut().flat_map(|s| std::mem::take(&mut s.tb)).collect();
+        if !tb_records.is_empty() && cfg.tb_max_records > 0 {
+            let tb_dir = live.join("tb_buffer");
+            let path = write_tb_chunk(&tb_dir, tb_index, &tb_records)?;
+            tb_index += 1;
+            println!(
+                "  wrote {} ({} tb records)",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                tb_records.len()
+            );
+            prune_tb_buffer(&tb_dir, cfg.tb_max_records)?;
+        }
         println!("  {}", stats.report(t0.elapsed().as_secs_f64()));
         println!(
             "  {}",
@@ -1490,6 +1636,40 @@ mod tests {
     /// with survivors and — because `prune_buffer` reads sort order as age —
     /// every new chunk is deleted as the "oldest" the moment it is written.
     #[test]
+    /// A TB record must survive the round trip byte-for-byte, and the header
+    /// must say how many records follow — the learner reads this format with a
+    /// hand-written parser in Python, so a silent layout drift shows up as
+    /// garbage targets rather than an error.
+    #[test]
+    fn tb_record_round_trips_through_the_chunk_header() {
+        let st = MinionsState::default();
+        use rand::SeedableRng;
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(5);
+        let specs: Vec<TurnSpec> =
+            (0..3).map(|_| crate::turn::TurnSpec::random_playout(&st, &mut rng)).collect();
+        let rec = TbRecord {
+            planes: Minions::to_features(&st),
+            live: live_bytes(&st),
+            specs: specs.clone(),
+        };
+        let mut buf = Vec::new();
+        rec.encode(&mut buf);
+        assert_eq!(buf.len(), TB_RECORD_BYTES, "record must be exactly TB_RECORD_BYTES");
+
+        assert_eq!(&buf[..PLANE_BYTES], &rec.planes[..], "planes must lead the record");
+        let live_at = PLANE_BYTES;
+        assert_eq!(&buf[live_at..live_at + NUM_CELLS], &rec.live[..], "live mask follows planes");
+        let n_at = live_at + NUM_CELLS;
+        assert_eq!(buf[n_at] as usize, specs.len(), "count must match the specs written");
+        for (i, spec) in specs.iter().enumerate() {
+            let at = n_at + 1 + i * SPEC_BYTES;
+            assert_eq!(&buf[at..at + SPEC_BYTES], &spec.to_bytes()[..], "spec {i} round trip");
+        }
+        // Unused slots are zeroed, not left as whatever was in the buffer.
+        let tail = n_at + 1 + specs.len() * SPEC_BYTES;
+        assert!(buf[tail..].iter().all(|&b| b == 0), "unused candidate slots must be zeroed");
+    }
+
     fn chunk_index_resumes_past_the_highest_surviving_chunk() {
         let uniq = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

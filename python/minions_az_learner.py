@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import struct
 import json
 import math
 import os
@@ -279,6 +280,74 @@ def energy_planes(spec: np.ndarray, committed: np.ndarray) -> np.ndarray:
     just a liveness mask the trunk features already carry."""
     d = decl_planes(spec, committed)
     return np.concatenate([d[:, :2], d[:, 3:]], axis=1)
+
+
+TB_MAGIC = 0x4D544231
+TB_VERSION = 1
+TB_TOP_K = 16  # must match selfplay::TB_TOP_K
+TB_RECORD_BYTES = PLANE_BYTES + CELLS + 1 + TB_TOP_K * SPEC_BYTES
+
+
+def read_tb_chunk(path: str) -> dict | None:
+    """Parse one trajectory-balance chunk.
+
+    Layout mirrors ``selfplay::TbRecord::encode``:
+    ``planes | live | n_cands | TB_TOP_K * spec``. There are no visits and no
+    value — TB scores each turn with the frozen energy head at training time,
+    so the record only says which position and which turns the sampler drew.
+    """
+    with open(path, "rb") as fh:
+        blob = fh.read()
+    if len(blob) < 16:
+        return None
+    magic, version, count = struct.unpack("<IIQ", blob[:16])
+    if magic != TB_MAGIC:
+        raise ValueError(f"{path}: bad magic {magic:#x}")
+    if version != TB_VERSION:
+        print(f"skipping {path}: tb version {version}, want {TB_VERSION}")
+        return None
+    body = blob[16:]
+    if len(body) != count * TB_RECORD_BYTES:
+        raise ValueError(f"{path}: {len(body)} bytes for {count} records")
+    rec = np.frombuffer(body, dtype=np.uint8).reshape(count, TB_RECORD_BYTES)
+    o_live = PLANE_BYTES
+    o_n = o_live + CELLS
+    o_spec = o_n + 1
+    return {
+        "planes": rec[:, :PLANE_BYTES].copy(),
+        "live": rec[:, o_live:o_n].copy(),
+        "n_cands": rec[:, o_n].copy(),
+        "spec": rec[:, o_spec:].copy().reshape(count, TB_TOP_K, SPEC_BYTES),
+    }
+
+
+def load_tb_sample(tb_dir: str, want: int, rng: np.random.Generator) -> dict | None:
+    """Load a random subset of TB chunks totalling roughly ``want`` records.
+
+    The buffer holds millions of positions; loading it whole would cost more RAM
+    than the trainer has. Drawing a fresh random set of chunks each generation
+    gives TB varied positions across the whole pool without ever holding it.
+    """
+    paths = sorted(glob.glob(os.path.join(tb_dir, "tb_*.bin")))
+    if not paths:
+        return None
+    rng.shuffle(paths)
+    parts, total = [], 0
+    for p in paths:
+        try:
+            d = read_tb_chunk(p)
+        except (ValueError, OSError) as exc:
+            print(f"skipping {p}: {exc}")
+            continue
+        if d is None:
+            continue
+        parts.append(d)
+        total += len(d["n_cands"])
+        if total >= want:
+            break
+    if not parts:
+        return None
+    return {k: np.concatenate([p[k] for p in parts]) for k in parts[0]}
 
 
 def sample_tb_specs(batch: dict, idx: np.ndarray, k: int):

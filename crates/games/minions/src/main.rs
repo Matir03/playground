@@ -165,6 +165,11 @@ enum Cmd {
         /// alongside expansions because it is the same shape.
         #[arg(long, default_value_t = 1)]
         pw_chunk: usize,
+        /// Retention cap for the trajectory-balance buffer, in records; 0 turns
+        /// TB recording off. Every root — fast searches included — contributes
+        /// one record with every turn the sampler drew.
+        #[arg(long, default_value_t = 2_000_000)]
+        tb_max_records: usize,
         /// Score candidates with the energy head (off = uniform priors).
         #[arg(long)]
         no_energy: bool,
@@ -377,7 +382,7 @@ async fn main() -> anyhow::Result<()> {
             full_search_prob,
             candidates, candidates_fast, t_steps, t_steps_fast, random_fraction,
             random_opening_max, random_opening_decay, min_explore_visits, workers, no_energy,
-            kernel_sigma, pw_chunk,
+            kernel_sigma, pw_chunk, tb_max_records,
             chunk_secs, max_examples,
             max_chunks, target_examples, seed,
         } => {
@@ -385,6 +390,7 @@ async fn main() -> anyhow::Result<()> {
             let actor = minions_engine::selfplay::ActorConfig {
                 sims, fast_sims, full_search_prob, backend: kind, min_explore_visits, workers,
                 random_opening_max, random_opening_decay, kernel_sigma, pw_chunk,
+                tb_max_records,
                 ..Default::default()
             };
             let sampler = minions_engine::sampler::SamplerConfig {
