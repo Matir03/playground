@@ -952,6 +952,18 @@ fn advance_turn(
         // trained by cross-entropy over exactly the stored set, so a rejected
         // turn teaches "search looked at this and did not want it". Storing
         // only survivors left the head with no negative examples at all.
+        // Append the turns search declined, as zero-mass negatives — but only
+        // the ones it declined *on its own*.
+        //
+        // A forced-exploration candidate is in the set because we put it there,
+        // and its visits were bought rather than earned. If it never attracted
+        // an organic visit, "search rejected this" is not a claim the data
+        // supports: search was never asked. Storing it as a negative would
+        // teach the energy head to suppress the very probes that exist to keep
+        // the sampler's support wide. So an explore candidate is stored only if
+        // it earned visits beyond its forced ones — and then it carries real
+        // mass anyway. A candidate the *sampler* proposed and search passed over
+        // is a fair negative, and is kept at zero.
         if scored.len() < TOP_K {
             let kept: std::collections::HashSet<u128> = scored
                 .iter()
@@ -959,9 +971,14 @@ fn advance_turn(
                     <MinionsTurns as playground_core::SampledGame>::state_key(&crate::turn::realize(&slot.state, s).next)
                 })
                 .collect();
-            for (spec, _) in result.candidates.iter() {
+            for (i, (spec, visits)) in result.candidates.iter().enumerate() {
                 if scored.len() >= TOP_K {
                     break;
+                }
+                let is_explore = result.explore.get(i).copied().unwrap_or(false);
+                let forced = result.forced.get(i).copied().unwrap_or(0);
+                if is_explore && *visits <= forced {
+                    continue; // bought, not earned — no claim either way
                 }
                 let key = <MinionsTurns as playground_core::SampledGame>::state_key(&crate::turn::realize(&slot.state, spec).next);
                 if !kept.contains(&key) {

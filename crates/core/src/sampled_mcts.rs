@@ -29,10 +29,12 @@
 //!   prior goes to zero.
 //!
 //! Both would bias the training target, so
-//! [`SampledSearchResult::policy_target_with`] subtracts them back out: each child is pruned to the visit count plain PUCT
-//! would have chosen on its own merits. A candidate that was *forced* into the
-//! tree and then earned organic visits survives on merit; one that didn't,
-//! vanishes. Value targets deliberately keep every visit — a random candidate is
+//! [`SampledSearchResult::policy_target_with`] gates on them: a child whose
+//! visits were all bought by a floor drops out entirely, and a child that
+//! earned even one visit on its own merits keeps its *whole* count — the forced
+//! visits looked at that move too, and their results came back. A candidate
+//! that was *forced* into the tree and then earned organic visits survives on
+//! merit; one that didn't, vanishes. Value targets deliberately keep every visit — a random candidate is
 //! cheap value data even when it is worthless policy data.
 
 use crate::puct;
@@ -140,8 +142,9 @@ pub struct SampledParams {
     /// Visits guaranteed to every *explore*-origin root candidate, regardless of
     /// its prior — the part KataGo's prior-scaled floor cannot provide, since
     /// that floor is proportional to `P(a)` and skips candidates never tried.
-    /// Like forced playouts, these are subtracted before the training target is
-    /// formed. 0 disables it.
+    /// Like forced playouts, these are counted and gate the training target:
+    /// a candidate that earned nothing beyond them contributes nothing.
+    /// 0 disables it.
     pub min_explore_visits: f32,
     /// Plies sampled proportional to visits before switching to argmax.
     pub temp_moves: u32,
@@ -228,16 +231,20 @@ impl Default for SampledParams {
 /// Visits per candidate below which policy-target pruning erases almost the
 /// whole candidate set.
 ///
-/// Pruning subtracts a forced-playout floor of `sqrt(k·p·N)` from every
-/// non-best child and drops whatever is left at one visit or fewer. With
-/// uniform priors `p = 1/K` and `x = N/K` visits per candidate, a candidate
-/// survives only when `x − 1 > sqrt(k·x)`, i.e. `x² − (2+k)x + 1 > 0`. For the
-/// default `k_forced = 2` that is `x > 3.73`.
+/// The historical rule this solves: pruning subtracted a forced-playout floor
+/// of `sqrt(k·p·N)` from every non-best child and dropped whatever was left at
+/// one visit or fewer. With uniform priors `p = 1/K` and `x = N/K` visits per
+/// candidate, a candidate survived only when `x − 1 > sqrt(k·x)`, i.e.
+/// `x² − (2+k)x + 1 > 0`. For the default `k_forced = 2` that is `x > 3.73`.
 ///
 /// This matters because falling below it is *silent*: search still works, the
 /// value and sampler heads still train, but every recorded node has a single
 /// candidate — and a softmax over one element has zero gradient, so the energy
 /// head (the policy of record) quietly learns nothing at all.
+/// Approximate only, since the target now gates on *counted* forced visits
+/// rather than this estimate, and so prunes strictly less. Retained for the
+/// startup warning, where the question is the rough one of whether
+/// `--sims / --candidates` leaves anything to learn from.
 pub fn min_visits_per_candidate(k_forced: f32) -> f32 {
     if k_forced <= 0.0 {
         return 0.0;
@@ -254,6 +261,12 @@ struct Entry<G: SampledGame> {
     child: i32,
     /// Drawn by forced exploration rather than proposed by the model.
     explore: bool,
+    /// Visits this entry received *because* a floor demanded them, counted as
+    /// they happen. The target compares against this exact number instead of
+    /// the prior-proportional estimate `sqrt(k*p*N)`, which over-subtracted
+    /// from high-prior candidates — the floor grows with the prior, so the
+    /// moves the policy rates highest were the most likely to be zeroed.
+    forced_n: u32,
 }
 
 struct Node<G: SampledGame> {
@@ -342,11 +355,14 @@ pub struct SampledSearchResult<G: SampledGame> {
     /// The normalised priors the search actually selected on, parallel to
     /// `candidates`. Returned rather than recomputed because the sampler is
     /// stochastic — asking it again would yield different candidates, and the
-    /// pruning below has to subtract the forced visits *these* priors earned.
+    /// search selected against *these*.
     pub priors: Vec<f32>,
     /// Which candidates came from forced exploration, parallel to `candidates`.
-    /// Their guaranteed visits are subtracted before the training target forms.
     pub explore: Vec<bool>,
+    /// Visits each root candidate received because a floor demanded them,
+    /// parallel to `candidates`. Counted as they happened rather than estimated,
+    /// so the target knows exactly what forced exploration bought.
+    pub forced: Vec<u32>,
     /// Index into `candidates` of the move to play.
     pub chosen: usize,
     /// Candidate-budget accounting over the whole tree, not just the root.
@@ -357,24 +373,23 @@ pub struct SampledSearchResult<G: SampledGame> {
 }
 
 impl<G: SampledGame> SampledSearchResult<G> {
-    /// Visit counts with forced and injected exploration subtracted, normalised.
+    /// Visit counts with forced-only candidates dropped, normalised.
     ///
-    /// KataGo's policy-target pruning: give back `sqrt(k · P · N)` from every
-    /// non-best child, drop any child left with one visit or fewer, and never
-    /// prune the most-visited child. Without this, every forced visit and every
-    /// randomly injected candidate would be taught to the policy as if the
-    /// search had chosen it.
+    /// KataGo's policy-target pruning in the exact-count form: drop any child
+    /// whose visits were all bought by a floor, keep the full count of any that
+    /// earned one on merit, and never prune the most-visited child. Without
+    /// this, every forced visit and every randomly injected candidate would be
+    /// taught to the policy as if the search had chosen it.
     pub fn policy_target(&self, k_forced: f32) -> Vec<f32> {
         self.policy_target_with(&SampledParams { k_forced, ..Default::default() })
     }
 
-    /// As [`Self::policy_target`], but subtracting the *same* floor the search
-    /// granted — including the guaranteed visits explore candidates received.
+    /// As [`Self::policy_target`]; the `params` are accepted for symmetry with
+    /// the search and for the `min_explore_visits` warning path.
     ///
-    /// These must agree. If the search floors an explore candidate at `m` visits
-    /// and the target only subtracts KataGo's prior-scaled floor, the difference
-    /// is pure injected noise taught to the policy as if it were search's
-    /// judgement — the opposite of what forced exploration is for.
+    /// Search and target must agree about what was bought. They cannot drift
+    /// here, because the target reads the counts the search recorded as it
+    /// granted them rather than reconstructing a floor from the priors.
     pub fn policy_target_with(&self, params: &SampledParams) -> Vec<f32> {
         let k_forced = params.k_forced;
         let priors = &self.priors;
@@ -395,21 +410,24 @@ impl<G: SampledGame> SampledSearchResult<G> {
         // has a real value estimate. That visit is the search *asking*, not the
         // search *choosing*, so it must not appear in the training target — the
         // same reason forced playouts and injected explore visits are stripped.
-        const SEEDED: f32 = 1.0;
+        // Forced visits decide *whether* a candidate counts, not how much.
+        //
+        // A candidate that never attracted a visit search chose for itself has
+        // shown nothing, and drops out. But once it has earned even one, the
+        // forced visits are evidence about it too — they were spent looking at
+        // this move and the results came back — so its full visit count is what
+        // search actually concluded. Subtracting them there would understate a
+        // candidate precisely because we had insisted on examining it.
+        //
+        // The count is exact, taken as the visits happened. The old estimate
+        // `max(sqrt(k*p*N), min_explore)` grew with the prior, so it
+        // over-subtracted from the candidates the policy rated highest and
+        // zeroed them — and a zeroed candidate stored as a negative teaches the
+        // energy head to suppress the moves it currently likes.
+        let _ = k_forced;
         for (i, c) in counts.iter_mut().enumerate() {
-            if i == best {
-                *c = (*c - SEEDED).max(0.0);
-                continue;
-            }
-            let p = priors.get(i).copied().unwrap_or(0.0);
-            let ex = self.explore.get(i).copied().unwrap_or(false);
-            let forced = if k_forced > 0.0 || params.min_explore_visits > 0.0 {
-                explore_floor(ex, p, total as f32, params).max(SEEDED)
-            } else {
-                SEEDED
-            };
-            *c = (*c - forced).max(0.0);
-            if *c <= 1.0 {
+            let forced = self.forced.get(i).copied().unwrap_or(0) as f32;
+            if i != best && *c <= forced {
                 *c = 0.0;
             }
         }
@@ -444,9 +462,8 @@ fn new_node<G: SampledGame>(state: G::State) -> Node<G> {
 
 /// The visit floor a root candidate is entitled to before PUCT may starve it.
 ///
-/// Shared by selection and by [`SampledSearchResult::policy_target`] so the two
-/// cannot drift: the target subtracts exactly what the search added, and forced
-/// visits leave no trace in what the policy trains on.
+/// Used by selection; the training target no longer recomputes it, reading the
+/// per-entry forced counts instead, so the two cannot drift.
 fn explore_floor(explore: bool, p: f32, total: f32, params: &SampledParams) -> f32 {
     let katago = if params.k_forced > 0.0 {
         (params.k_forced * p * total).max(0.0).sqrt()
@@ -495,7 +512,9 @@ fn earned<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool)
 }
 
 /// Select a child by PUCT, with root-only forced playouts.
-fn select<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool) -> usize {
+/// Returns `(index, forced)` — `forced` when a floor demanded this visit
+/// rather than PUCT choosing it, so the target can subtract exactly those.
+fn select<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool) -> (usize, bool) {
     let n = visible(node, params, is_root);
     debug_assert!(n > 0);
     let total = node.total_n.max(1) as f32;
@@ -506,7 +525,8 @@ fn select<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool)
     // `policy_target_with` subtracts it back out of the training target.
     if is_root {
         if let Some(i) = node.entries.iter().position(|e| e.n == 0) {
-            return i;
+            // The sweep visit is seeded, not chosen: it counts as forced.
+            return (i, true);
         }
     }
 
@@ -534,7 +554,7 @@ fn select<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool)
             }
         }
         if forced_pick != usize::MAX {
-            return forced_pick;
+            return (forced_pick, true);
         }
     }
 
@@ -575,7 +595,7 @@ fn select<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool)
                 best = i;
             }
         }
-        return best;
+        return (best, false);
     }
 
     let sqrt_total = total.sqrt();
@@ -592,7 +612,7 @@ fn select<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool)
             best = i;
         }
     }
-    best
+    (best, false)
 }
 
 /// A resumable search: it runs until it needs an expansion, hands the position
@@ -686,7 +706,10 @@ impl<G: SampledGame> Search<G> {
                     // nothing, or widening is exhausted. Score on value alone.
                     break 0.0;
                 }
-                let pick = select(&self.tree[cur], &self.params, cur == 0);
+                let (pick, forced) = select(&self.tree[cur], &self.params, cur == 0);
+                if forced {
+                    self.tree[cur].entries[pick].forced_n += 1;
+                }
                 self.path.push((cur, pick));
                 let child = self.tree[cur].entries[pick].child;
                 if child >= 0 {
@@ -733,6 +756,7 @@ impl<G: SampledGame> Search<G> {
                         w: 0.0,
                         child: -1,
                         explore,
+                        forced_n: 0,
                     });
                 }
             }
@@ -825,6 +849,7 @@ impl<G: SampledGame> Search<G> {
                         w: 0.0,
                         child: -1,
                         explore,
+                        forced_n: 0,
                     });
                 }
             }
@@ -888,6 +913,7 @@ impl<G: SampledGame> Search<G> {
             root.entries.iter().map(|e| (e.mv.clone(), e.n)).collect();
         let priors: Vec<f32> = root.entries.iter().map(|e| e.p).collect();
         let explore: Vec<bool> = root.entries.iter().map(|e| e.explore).collect();
+        let forced: Vec<u32> = root.entries.iter().map(|e| e.forced_n).collect();
         let value =
             if root.total_n > 0 { root.w_sum as f64 / root.total_n as f64 } else { 0.0 };
 
@@ -918,7 +944,7 @@ impl<G: SampledGame> Search<G> {
                 .map(|(i, _)| i)
                 .unwrap_or(0)
         };
-        SampledSearchResult { candidates, priors, explore, chosen, value, nodes: self.nodes, stats }
+        SampledSearchResult { candidates, priors, explore, forced, chosen, value, nodes: self.nodes, stats }
     }
 }
 
@@ -1263,7 +1289,7 @@ mod tests {
         let params = SampledParams { pw_alpha: 0.5, pw_beta: 2.0, ..Default::default() };
         let mut node = new_node::<Count>(CountState { n: 21, side: 1 });
         node.entries = (0..12)
-            .map(|i| Entry::<Count> { mv: i, p: 1.0 / 12.0, n: 0, w: 0.0, child: -1, explore: false })
+            .map(|i| Entry::<Count> { mv: i, p: 1.0 / 12.0, n: 0, w: 0.0, child: -1, explore: false, forced_n: 0 })
             .collect();
 
         node.total_n = 1;
@@ -1297,6 +1323,7 @@ mod tests {
                     w: 0.0,
                     child: -1,
                     explore: false,
+                    forced_n: 0,
                 })
                 .collect();
             let mut prev = 0usize;
@@ -1551,14 +1578,16 @@ mod tests {
     /// ...and those guaranteed visits must not reach the training target.
     ///
     /// This is the half that makes forced exploration safe. If the search grants
-    /// an explore candidate `m` visits and the target does not subtract them, the
-    /// policy is taught that injected noise was search's judgement — strictly
-    /// worse than not exploring at all.
+    /// an explore candidate `m` visits and the target counts them as evidence
+    /// on their own, the policy is taught that injected noise was search's
+    /// judgement — strictly worse than not exploring at all.
     #[test]
     fn guaranteed_explore_visits_are_pruned_from_the_target() {
         let params = SampledParams { k_forced: 0.0, min_explore_visits: 4.0, ..Default::default() };
-        // The explore candidate earned exactly its floor and nothing more.
+        // The explore candidate earned exactly its floor and nothing more: all
+        // four of its visits were demanded, none chosen.
         let r = SampledSearchResult::<Count> {
+            forced: vec![1, 1, 4],
             stats: SearchStats::default(),
             candidates: vec![(1, 40), (2, 20), (3, 4)],
             priors: vec![0.5, 0.4, 0.1],
@@ -1571,8 +1600,10 @@ mod tests {
         assert_eq!(t[2], 0.0, "a candidate that only ever got its floor must not survive");
         assert!((t.iter().sum::<f32>() - 1.0).abs() < 1e-5, "target must stay normalised");
 
-        // Earning well beyond the floor, it survives on merit.
+        // Earning well beyond the floor, it survives on merit: four visits were
+        // demanded, the other twenty-one were chosen.
         let r2 = SampledSearchResult::<Count> {
+            forced: vec![1, 1, 4],
             stats: SearchStats::default(),
             candidates: vec![(1, 40), (2, 20), (3, 25)],
             priors: vec![0.5, 0.4, 0.1],
@@ -1663,9 +1694,12 @@ mod tests {
 
     #[test]
     fn policy_target_prunes_forced_visits_away() {
-        // A candidate with a tiny prior that only ever got its forced visits
-        // must not appear in the training target.
+        // A candidate that only ever got its forced visits must not appear in
+        // the training target. `forced` now carries the visits a floor actually
+        // demanded, counted as they happened, so the fixture states them rather
+        // than relying on the old prior-proportional estimate.
         let r = SampledSearchResult::<Count> {
+            forced: vec![1, 3, 4],
             stats: SearchStats::default(),
             candidates: vec![(1, 93), (2, 3), (3, 4)],
             priors: vec![0.9, 0.05, 0.05],
@@ -1679,6 +1713,8 @@ mod tests {
         assert!(t[0] > 0.9, "the earned child should dominate: {t:?}");
         assert_eq!(t[1], 0.0, "forced-only visits must be pruned: {t:?}");
         assert_eq!(t[2], 0.0, "forced-only visits must be pruned: {t:?}");
+        // The winner keeps its whole count rather than a floor-adjusted one.
+        assert!(t[0] > 0.99, "an earned candidate keeps its full visits: {t:?}");
     }
 
     #[test]
@@ -1687,6 +1723,7 @@ mod tests {
         // forced floor — it survives on merit. This is how an injected random
         // candidate gets promoted.
         let r = SampledSearchResult::<Count> {
+            forced: vec![],
             stats: SearchStats::default(),
             candidates: vec![(1, 55), (2, 45)],
             priors: vec![0.95, 0.05],
@@ -1700,33 +1737,41 @@ mod tests {
     }
 
     #[test]
-    fn pruning_survival_matches_the_stated_threshold() {
-        // Uniform priors and uniform visits, swept across visits-per-candidate.
-        // Below the threshold the target collapses to a single candidate, which
-        // starves the energy head; above it, several survive.
-        let k_forced = 2.0f32;
-        let thresh = min_visits_per_candidate(k_forced);
-        assert!((thresh - 3.732).abs() < 1e-2, "threshold was {thresh}");
-        let survivors = |x: u32, k: usize| -> usize {
+    fn forced_visits_gate_a_candidate_but_are_not_subtracted() {
+        // Survival is now exact: a candidate keeps mass when the visits it was
+        // *not* forced into exceed one. The old rule subtracted an estimate,
+        // `max(sqrt(k*p*N), min_explore)`, which grew with the prior and so
+        // over-subtracted from precisely the candidates the policy rated
+        // highest — the reason `min_visits_per_candidate` no longer predicts
+        // this and is kept only as a startup warning.
+        let survivors = |visits: u32, forced: u32, k: usize| -> usize {
             let r = SampledSearchResult::<Count> {
-            stats: SearchStats::default(),
-                candidates: (0..k).map(|i| (i as u32, x)).collect(),
+                forced: vec![forced; k],
+                stats: SearchStats::default(),
+                candidates: (0..k).map(|i| (i as u32, visits)).collect(),
                 priors: vec![1.0 / k as f32; k],
-            explore: vec![false; 8],
+                explore: vec![false; k],
                 chosen: 0,
                 value: 0.0,
                 nodes: 0,
             };
-            r.policy_target(k_forced).iter().filter(|&&p| p > 0.0).count()
+            r.policy_target(2.0).iter().filter(|&&p| p > 0.0).count()
         };
-        assert_eq!(survivors(3, 8), 1, "below threshold: everything pruned to one");
-        assert!(survivors(8, 8) > 1, "well above threshold: candidates survive");
-        assert!(survivors(16, 8) > 4, "further above: most survive");
+        // Every visit was forced: nothing earned anything, so the target falls
+        // back to the single best child rather than returning all zeros.
+        assert_eq!(survivors(4, 4, 8), 1, "forced-only visits leave nothing to learn from");
+        // A single earned visit is enough to count, and then the *whole* visit
+        // count stands — the forced visits looked at this move too.
+        assert_eq!(survivors(5, 4, 8), 8, "one earned visit puts a candidate back in");
+        // Survival does not depend on the prior any more: the same forced count
+        // is used however the policy rated the move.
+        assert_eq!(survivors(6, 1, 8), 8, "survival does not depend on the prior");
     }
 
     #[test]
     fn policy_target_never_returns_all_zeros() {
         let r = SampledSearchResult::<Count> {
+            forced: vec![],
             stats: SearchStats::default(),
             candidates: vec![(1, 1), (2, 1)],
             priors: vec![0.5, 0.5],
