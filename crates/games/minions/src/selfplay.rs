@@ -37,14 +37,20 @@ use crate::sampler::{MinionsModel, SamplerConfig};
 use crate::turn::{MinionsTurns, TurnSpec};
 
 pub const MAGIC: u32 = 0x4d_49_4e_33; // "MIN3"
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 /// Horizon for the necromancer-survival target, in side-turns.
 pub const NECRO_HORIZON: usize = 10;
 /// Buyable unit classes (zombie, skeleton, serpent, warg, ghost).
 pub const N_BUYABLE: usize = 5;
-/// Candidate slots stored per example. Policy-target pruning usually leaves far
-/// fewer than this with any mass.
-pub const TOP_K: usize = 8;
+/// Candidate slots stored per example.
+///
+/// Sized to the full-search candidate budget so the *rejected* turns are stored
+/// too, not just the ones pruning left with mass. The energy head is trained by
+/// cross-entropy over exactly the stored set, so a turn that search looked at
+/// and gave no visits is a real training signal — "this one is bad" — and
+/// keeping only the survivors meant the head never saw a negative example and
+/// had to extrapolate everywhere off its own favoured support.
+pub const TOP_K: usize = 16;
 pub const SPEC_BYTES: usize = 3 * NUM_CELLS;
 pub const PLANE_BYTES: usize = crate::game::PLANES * NUM_CELLS;
 /// Auxiliary "rest of the game" targets, all in the canonical frame — index 0 is
@@ -923,6 +929,28 @@ fn advance_turn(
             .collect();
         scored.sort_by(|a, b| b.1.total_cmp(&a.1));
         scored.truncate(TOP_K);
+        // Then append the turns pruning rejected, up to the slot budget. They
+        // carry zero target mass, which is the signal: the energy head is
+        // trained by cross-entropy over exactly the stored set, so a rejected
+        // turn teaches "search looked at this and did not want it". Storing
+        // only survivors left the head with no negative examples at all.
+        if scored.len() < TOP_K {
+            let kept: std::collections::HashSet<u128> = scored
+                .iter()
+                .map(|(s, _)| {
+                    <MinionsTurns as playground_core::SampledGame>::state_key(&crate::turn::realize(&slot.state, s).next)
+                })
+                .collect();
+            for (spec, _) in result.candidates.iter() {
+                if scored.len() >= TOP_K {
+                    break;
+                }
+                let key = <MinionsTurns as playground_core::SampledGame>::state_key(&crate::turn::realize(&slot.state, spec).next);
+                if !kept.contains(&key) {
+                    scored.push((*spec, 0.0));
+                }
+            }
+        }
         // Renormalise over the candidates that survived truncation.
         //
         // `policy_target` normalises across *all* candidates, so keeping only
@@ -1551,8 +1579,13 @@ mod tests {
     #[test]
     fn truncated_policy_target_is_renormalised() {
         // A search target over more candidates than we can store, with real
-        // mass in the tail that truncation will drop.
-        let full: Vec<f32> = vec![0.30, 0.20, 0.12, 0.10, 0.08, 0.07, 0.05, 0.04, 0.03, 0.01];
+        // mass in the tail that truncation will drop. Built from `TOP_K` rather
+        // than hard-coded, so widening the slot budget cannot silently turn this
+        // into a test where nothing is truncated at all.
+        let n = TOP_K + 6;
+        let raw: Vec<f32> = (0..n).map(|i| 1.0 / (i as f32 + 1.0)).collect();
+        let z: f32 = raw.iter().sum();
+        let full: Vec<f32> = raw.iter().map(|p| p / z).collect();
         assert!((full.iter().sum::<f32>() - 1.0).abs() < 1e-6, "test fixture must be a distribution");
 
         let mut scored: Vec<f32> = full.clone();

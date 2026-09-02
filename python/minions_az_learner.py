@@ -44,7 +44,7 @@ from playground.model_server.minions_net import (
 
 # ── record layout — must match crates/games/minions/src/selfplay.rs ────────────
 MAGIC = 0x4D494E33
-VERSION = 6  # must match selfplay::VERSION in Rust
+VERSION = 7  # must match selfplay::VERSION in Rust
 # v4 records are identical except that they predate the trailing "turns left"
 # feature plane, so they are one plane short. They are still usable: the plane is
 # appended last, and the stem weights that read it start at zero (see
@@ -53,8 +53,14 @@ VERSION = 6  # must match selfplay::VERSION in Rust
 # window within ~10 generations.
 # v5 and earlier predate `is_full` and the turns-left plane; they are not
 # read back, since the stride differs in two places now.
-COMPAT_VERSIONS = {VERSION: IN_PLANES}
-TOP_K = 8
+# v6 is identical except that it stored only the visit-ranked top 8 candidates.
+# Those chunks stay readable: their candidate slots are padded out to `TOP_K`
+# with zeros, which the energy loss already masks off via `n_cands`. They age
+# out of the sliding window within ~5 generations, so no buffer wipe is needed
+# for the widening — and a wipe was measured to cost ~10 generations.
+COMPAT_VERSIONS = {VERSION: IN_PLANES, 6: IN_PLANES}
+COMPAT_TOP_K = {VERSION: 16, 6: 8}
+TOP_K = 16
 SPEC_BYTES = 3 * CELLS
 PLANE_BYTES = IN_PLANES * CELLS
 CAND_BYTES = SPEC_BYTES + 4
@@ -179,10 +185,16 @@ def read_chunk(path: str) -> dict | None:
         )
         return None
     body = raw[16:]
-    # Older versions differ only in the plane count, which shifts every offset.
+    # Older versions differ in the plane count and in how many candidate slots
+    # they stored; both shift every offset after them.
     n_planes = COMPAT_VERSIONS[int(version)]
+    rec_top_k = COMPAT_TOP_K[int(version)]
     plane_bytes = n_planes * CELLS
-    stride = EXAMPLE_BYTES - (PLANE_BYTES - plane_bytes)
+    stride = (
+        EXAMPLE_BYTES
+        - (PLANE_BYTES - plane_bytes)
+        - (TOP_K - rec_top_k) * CAND_BYTES
+    )
     if body.size != count * stride:
         raise ValueError(
             f"{path}: expected {count * stride} body bytes for v{version}, got {body.size}"
@@ -192,7 +204,15 @@ def read_chunk(path: str) -> dict | None:
         # Pad the missing trailing plane(s) with zeros and re-align the rest.
         pad = np.zeros((count, PLANE_BYTES - plane_bytes), dtype=np.uint8)
         rec = np.concatenate([rec[:, :plane_bytes], pad, rec[:, plane_bytes:]], axis=1)
-    cands = rec[:, O_CANDS:O_HEX].reshape(count, TOP_K, CAND_BYTES)
+    # Offsets after the candidate block depend on this record's own slot count.
+    o_cands = O_CANDS
+    o_hex = o_cands + rec_top_k * CAND_BYTES
+    o_necro = o_hex + HEX_BYTES
+    o_isfull = o_necro + NECRO_BYTES
+    cands = rec[:, o_cands:o_hex].reshape(count, rec_top_k, CAND_BYTES)
+    if rec_top_k < TOP_K:
+        pad = np.zeros((count, TOP_K - rec_top_k, CAND_BYTES), dtype=np.uint8)
+        cands = np.concatenate([cands, pad], axis=1)
     return {
         "planes": rec[:, O_PLANES:O_TOMOVE].copy(),
         "value": rec[:, O_VALUE:O_VALUE + 4].copy().view("<f4").reshape(count),
@@ -202,13 +222,13 @@ def read_chunk(path: str) -> dict | None:
         "prob": cands[:, :, SPEC_BYTES:].copy().reshape(-1, 4).view("<f4").reshape(count, TOP_K),
         # Fractions stored as bytes; rescaled once here rather than per step.
         "hex_control": (
-            rec[:, O_HEX:O_HEX + HEX_BYTES].astype(np.float32) / 255.0
+            rec[:, o_hex:o_hex + HEX_BYTES].astype(np.float32) / 255.0
         ).reshape(count, 2, CELLS),
-        "necro_safety": rec[:, O_NECRO:O_NECRO + NECRO_BYTES]
+        "necro_safety": rec[:, o_necro:o_necro + NECRO_BYTES]
         .astype(np.float32)
         .reshape(count, 2, NECRO_HORIZON),
         # Playout-cap randomization: only full searches carry a policy target.
-        "is_full": rec[:, O_ISFULL].copy(),
+        "is_full": rec[:, o_isfull].copy(),
     }
 
 
