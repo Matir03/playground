@@ -1178,10 +1178,13 @@ fn prune_tb_buffer(dir: &Path, max_records: usize) -> anyhow::Result<()> {
         Err(_) => return Ok(()),
     };
     chunks.sort();
+    // Header count, for the same reason the policy pruner uses one.
     let count_of = |p: &Path| -> usize {
-        std::fs::metadata(p)
-            .map(|m| (m.len().saturating_sub(16)) as usize / TB_RECORD_BYTES)
-            .unwrap_or(0)
+        let mut buf = [0u8; 16];
+        match std::fs::File::open(p).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf)) {
+            Ok(()) => u64::from_le_bytes(buf[8..16].try_into().unwrap_or_default()) as usize,
+            Err(_) => 0,
+        }
     };
     let mut total: usize = chunks.iter().map(|p| count_of(p)).sum();
     for p in &chunks {
@@ -1219,8 +1222,18 @@ fn prune_buffer(dir: &Path, max_examples: usize, max_chunks: usize) -> anyhow::R
         .filter(|p| p.extension().is_some_and(|x| x == "bin"))
         .collect();
     chunks.sort();
+    // Read the count out of the chunk header rather than dividing by
+    // `EXAMPLE_BYTES`. The stride changes whenever the record format does, and
+    // a sliding window holds both versions at once — after `TOP_K` 8 -> 16 a
+    // size-based count read every older chunk as 0.69 of its true size, so the
+    // pruner under-pruned and the buffer silently overshot its cap. The header
+    // has always carried the exact count.
     let count_of = |p: &Path| -> usize {
-        std::fs::metadata(p).map(|m| (m.len().saturating_sub(16)) as usize / EXAMPLE_BYTES).unwrap_or(0)
+        let mut buf = [0u8; 16];
+        match std::fs::File::open(p).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf)) {
+            Ok(()) => u64::from_le_bytes(buf[8..16].try_into().unwrap_or_default()) as usize,
+            Err(_) => 0,
+        }
     };
     let mut total: usize = chunks.iter().map(|p| count_of(p)).sum();
     let mut n = chunks.len();
