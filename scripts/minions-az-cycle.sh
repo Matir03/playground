@@ -94,15 +94,21 @@ MIN_EXPLORE_VISITS="${MIN_EXPLORE_VISITS:-2.0}"
 # many promotions back the oldest data reaches, so a 4x larger generation carries
 # a 2.5x larger buffer at a shorter effective history.
 MAX_EXAMPLES="${MAX_EXAMPLES:-1000000}"
-STEPS="${STEPS:-600}"
+# Scaled with TARGET_EXAMPLES so learning per example is unchanged: 600 steps
+# covered 600*128 = 76800 samples against 80000 fresh examples, ~0.96 passes.
+# 1875 keeps that ratio against 250000. Costs ~250s per generation instead of
+# ~80s, which is affordable now that self-play runs ~40 min.
+STEPS="${STEPS:-1875}"
 # The learner idles until the buffer holds this many examples. Tie it to the
 # actor's target so a cycle can never deadlock waiting for data that a completed
 # generate phase was never going to produce.
 MIN_SAMPLES="${MIN_SAMPLES:-$TARGET_EXAMPLES}"
 BATCH="${BATCH:-128}"
-# The champion match runs every generation and gates promotion; only the greedy
-# yardstick is periodic.
-GREEDY_EVERY="${GREEDY_EVERY:-5}"
+# Both matches run every generation. Greedy was periodic while a generation cost
+# ~18 min and the yardstick was ~10% of that; at ~50 min per generation its
+# 1m45s is small enough to buy a reading every time, which also turns six
+# scattered samples into a series.
+GREEDY_EVERY="${GREEDY_EVERY:-1}"
 # Compare the newest net against the one this many generations back. One
 # generation apart is inside the noise of a 40-game match; five gives the
 # comparison enough separation while keeping the diagnostic frequent.
