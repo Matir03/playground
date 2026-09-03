@@ -55,9 +55,15 @@ use crate::units::{Attack, Unit, BUYABLE, NUM_UNITS};
 
 pub use crate::map::GRAVEYARDS_TO_WIN;
 
-/// Money the second player starts with, compensating for moving second. The
-/// full game's `START_MONEY_PER_BOARD`, for our one board.
-pub const START_MONEY_SECOND: u16 = 6;
+/// Money the second player starts with, compensating for moving second.
+///
+/// The full game's `START_MONEY_PER_BOARD` is 6, which this matched until
+/// 2026-09-02; it is now 3. This is the *base* compensation only — self-play and
+/// eval price the handicap themselves, self-play by drawing from
+/// `BID_MIN..=BID_MAX` and eval by bidding, so this constant sets the opening
+/// balance for a plain [`MinionsState::default`]: the interactive seat the UI
+/// serves, and the fallback when neither side can bid.
+pub const START_MONEY_SECOND: u16 = 3;
 
 /// Range of starting-money handicaps drawn during self-play, as *blue's*
 /// (second player's) advantage in gold. Negative gives the money to yellow.
@@ -133,7 +139,7 @@ pub fn net_worth(state: &MinionsState, side: u8) -> u32 {
 /// 25.1, units on board 16.9 -> 14.1 -> 12.4, and corr(gold, units) +0.47 ->
 /// -0.11 -> -0.23. The degenerate line is concrete: with both sides passing,
 /// income is [`BASE_INCOME`] a turn each, so after 20 turns apiece the first
-/// player holds 60 and the second 66 from [`START_MONEY_SECOND`], and "pass
+/// player holds 60 and the second 63 from [`START_MONEY_SECOND`], and "pass
 /// forever" simply wins for the second player.
 ///
 /// Scoring [`net_worth`] removes the incentive at its root rather than penalising
