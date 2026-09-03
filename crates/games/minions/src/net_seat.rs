@@ -48,6 +48,15 @@ struct Plan {
     /// so the comparison is exactly the engine's own notion of state identity.
     expect: Vec<u8>,
     actions: VecDeque<MinionsMove>,
+    /// Root value of the search that produced this turn, repeated on every
+    /// action replayed from it.
+    ///
+    /// The search runs once per *turn* and the seat hands back one action per
+    /// call, so all but the first action of a turn come from the queue with no
+    /// new search behind them. Reporting 0.0 for those made the UI read 0.00
+    /// for most of a turn — and since a turn's *last* action is always a
+    /// replay, anything keeping the latest value saw nothing else.
+    value: f64,
 }
 
 /// Called by `serve` when `--net-dir` is given.
@@ -124,7 +133,11 @@ fn plan_turn(state: &MinionsState, budget: &SolverBudget) -> anyhow::Result<Sear
 
     // Remember the state the *next* action applies to.
     let next_state = Minions::apply(state, &first);
-    *PLAN.lock().unwrap() = Some(Plan { expect: Minions::encode_state(&next_state), actions });
+    *PLAN.lock().unwrap() = Some(Plan {
+        expect: Minions::encode_state(&next_state),
+        actions,
+        value: result.value,
+    });
 
     Ok(SearchOutcome { best_move: first, value: result.value, nodes: params.simulations as u64 })
 }
@@ -143,7 +156,9 @@ pub fn choose(state: &MinionsState, budget: SolverBudget) -> Option<anyhow::Resu
                 if let Some(mv) = p.actions.pop_front() {
                     let next = Minions::apply(state, &mv);
                     p.expect = Minions::encode_state(&next);
-                    return Some(Ok(SearchOutcome { best_move: mv, value: 0.0, nodes: 0 }));
+                    // `nodes: 0` is honest — no search ran for this action —
+                    // but the value is the planned turn's, not zero.
+                    return Some(Ok(SearchOutcome { best_move: mv, value: p.value, nodes: 0 }));
                 }
             }
         }
@@ -296,6 +311,12 @@ mod tests {
         let mut state = Minions::initial_state();
         let budget = SolverBudget { max_millis: None, max_visits: None };
         let mut acted = 0;
+        // Every action replayed from a plan must carry that plan's value.
+        // `nodes > 0` marks the one action a search actually ran for; the rest
+        // come from the queue. They used to report a hardcoded 0.0, so a UI
+        // showing the newest value read 0.00 for all but the first action of
+        // every turn — and a turn's last action is always a replay.
+        let mut planned_value: Option<f64> = None;
         for _ in 0..40 {
             if Minions::outcome(&state).is_terminal() {
                 break;
@@ -312,6 +333,22 @@ mod tests {
                 out.best_move,
                 legal.len()
             );
+            if out.nodes > 0 {
+                planned_value = Some(out.value);
+            } else {
+                // NaN-tolerant: this test runs the CUDA EP, whose trunk output
+                // is all-NaN (see the `--ep trt` note in the render path), so a
+                // plain `==` would fail on NaN != NaN and hide the real check.
+                // Carrying a NaN through is still the right behaviour — what
+                // must not happen is a replay inventing 0.0.
+                let planned = planned_value.expect("a replay before any search");
+                assert!(
+                    out.value == planned || (out.value.is_nan() && planned.is_nan()),
+                    "a replayed action must report the planned turn's value \
+                     ({planned}), not a placeholder; got {}",
+                    out.value
+                );
+            }
             state = Minions::apply(&state, &out.best_move);
             acted += 1;
         }
