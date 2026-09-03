@@ -41,7 +41,6 @@ import {
   ApplyMoveRequestSchema,
   RequestMoveRequestSchema,
   SearchBudgetSchema,
-  type SearchStats,
 } from "../../gen/playground/engine/engine_pb";
 
 // ── Rules mirror ──────────────────────────────────────────────────────────────
@@ -323,7 +322,15 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
   const [firstSeat, setFirstSeat] = useState<Seat>("human");
   const [secondSeat, setSecondSeat] = useState<Seat>("solver");
   const [thinking, setThinking] = useState(false);
-  const [lastStats, setLastStats] = useState<SearchStats | null>(null);
+  /** Bot eval carried across turns so the delta a move caused stays readable.
+   *
+   * Keyed by *game turn*, not ply: a Minions turn is a sequence of actions, so
+   * the engine seat answers many plies per turn and the stats stream arrives
+   * several times within one of them. Only the last value of a turn is kept,
+   * along with the side that produced it — with two engine seats the sign flips
+   * between them, and comparing across sides would be meaningless. */
+  const [evalTurn, setEvalTurn] = useState<{ turn: number; side: number; value: number } | null>(null);
+  const [prevEval, setPrevEval] = useState<{ turn: number; side: number; value: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -336,7 +343,8 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
   const newGame = useCallback(async () => {
     setError(null);
     setBusy(true);
-    setLastStats(null);
+    setEvalTurn(null);
+    setPrevEval(null);
     setSelected(null);
     setSpawnUnit(null);
     try {
@@ -410,7 +418,15 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
               }),
               { signal: AbortSignal.timeout(30000) },
             )) {
-              if (prog.kind.case === "stats") setLastStats(prog.kind.value);
+              if (prog.kind.case === "stats") {
+                const st = prog.kind.value;
+                const dec = decode(state.payload);
+                const { turn, side } = dec;
+                setEvalTurn((cur) => {
+                  if (cur && (cur.turn !== turn || cur.side !== side)) setPrevEval(cur);
+                  return { turn, side, value: st.bestValue };
+                });
+              }
               else if (prog.kind.case === "chosen") chosen = prog.kind.value;
             }
           } catch (streamErr) {
@@ -528,9 +544,29 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
               ? `${SIDE_NAME[d.side]} — ${d.phase === PHASE_ATTACK ? "attack" : "spawn"} phase, turn ${d.turn}${thinking ? " (engine thinking…)" : ""}`
               : outcomeLabel(state.outcome)}
         </strong>
-        {lastStats != null && (
+        {evalTurn != null && (
           <span style={{ color: "#888", marginLeft: "0.75rem" }}>
-            bot eval {lastStats.bestValue.toFixed(2)}
+            bot eval {evalTurn.value.toFixed(2)}
+            {/* The previous turn's number is only comparable when the same side
+                produced it — `bestValue` is from the mover's perspective. */}
+            {prevEval != null && prevEval.side === evalTurn.side && (
+              <>
+                {" "}
+                <span title={`turn ${prevEval.turn}`}>
+                  (prev {prevEval.value.toFixed(2)}
+                  {(() => {
+                    const dv = evalTurn.value - prevEval.value;
+                    const col = dv > 0.005 ? "#6ea86e" : dv < -0.005 ? "#c07070" : "#888";
+                    return (
+                      <span style={{ color: col }}>
+                        {" "}{dv >= 0 ? "+" : "\u2212"}{Math.abs(dv).toFixed(2)}
+                      </span>
+                    );
+                  })()}
+                  )
+                </span>
+              </>
+            )}
           </span>
         )}
       </div>
