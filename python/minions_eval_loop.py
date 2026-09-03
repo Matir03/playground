@@ -284,12 +284,13 @@ def main():
             # candidate was promoted the two are the same net; when it was
             # rejected they are not, and the champion is the one that matters.
             #
-            # `--greedy-games 0` skips it. The champion gate has to run every
-            # generation to decide promotion, but greedy is a slow external
-            # yardstick whose 30-game reading is worth ±0.09; running it every
-            # generation costs time without making the number mean more, so the
-            # cycle asks for it periodically and passes 0 otherwise.
-            if args.greedy_games > 0 and os.path.exists(best):
+            # Only on a promotion. The champion gate runs every generation to
+            # decide promotion, but between promotions the champion is the same
+            # net, and re-measuring it just draws another 30-game sample of a
+            # number that is already known to the precision this run needs. One
+            # reading per champion is the coarse signal we want; `--greedy-games
+            # 0` skips it entirely.
+            if promoted and args.greedy_games > 0 and os.path.exists(best):
               champ_gen = scores.get("best_gen", gen)
               entry["greedy_gen"] = champ_gen
               try:
