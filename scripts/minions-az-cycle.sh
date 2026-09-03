@@ -20,7 +20,13 @@ BLOCKS="${BLOCKS:-8}"
 # randomization started recording fast positions too: ~4x more examples now come
 # out of the same amount of search, so holding the old target would have cut the
 # self-play per generation 4x instead of quadrupling the data from it.
-TARGET_EXAMPLES="${TARGET_EXAMPLES:-80000}"
+#
+# 80000 -> 250000 to amortise the restored promotion gate. Measured at 80000:
+# self-play ~12-13 min, training ~80s, the 40-game champion match ~3m50s, so
+# eval was ~21% of wall clock (~30% on greedy generations) -- close to the 29%
+# that motivated dropping the gate in the first place. Tripling the generation
+# stretches self-play to ~40 min against a fixed eval cost, putting eval near 8%.
+TARGET_EXAMPLES="${TARGET_EXAMPLES:-250000}"
 # Batch sizing, measured on the 7x7 net (ABBA pairs, quiet machine).
 #
 # The heads run at `MAX_BATCH * CANDIDATES` rows, but the *trunk* runs at
@@ -81,10 +87,13 @@ RANDOM_OPENING_DECAY="${RANDOM_OPENING_DECAY:-1.1335}"
 # cannot protect the ones the energy head scores near zero — which are exactly
 # the ones exploration is for. Pruned back out of the training target.
 MIN_EXPLORE_VISITS="${MIN_EXPLORE_VISITS:-2.0}"
-# ~5 generations at TARGET_EXAMPLES 80000. Deliberately short: at 800000 half
-# the buffer came from nets several promotions old, so the learner spent much of
-# each step indexing positions the current policy would no longer play.
-MAX_EXAMPLES="${MAX_EXAMPLES:-400000}"
+# 4 generations at TARGET_EXAMPLES 250000. Deliberately short in *generations*,
+# not in examples: at 800000 with 20000-example generations, half the buffer came
+# from nets several promotions old and the learner spent much of each step
+# indexing positions the current policy would no longer play. What matters is how
+# many promotions back the oldest data reaches, so a 4x larger generation carries
+# a 2.5x larger buffer at a shorter effective history.
+MAX_EXAMPLES="${MAX_EXAMPLES:-1000000}"
 STEPS="${STEPS:-600}"
 # The learner idles until the buffer holds this many examples. Tie it to the
 # actor's target so a cycle can never deadlock waiting for data that a completed
