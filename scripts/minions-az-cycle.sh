@@ -94,16 +94,27 @@ MIN_EXPLORE_VISITS="${MIN_EXPLORE_VISITS:-2.0}"
 # many promotions back the oldest data reaches, so a 4x larger generation carries
 # a 2.5x larger buffer at a shorter effective history.
 MAX_EXAMPLES="${MAX_EXAMPLES:-1000000}"
-# Scaled with TARGET_EXAMPLES so learning per example is unchanged: 600 steps
-# covered 600*128 = 76800 samples against 80000 fresh examples, ~0.96 passes.
-# 1875 keeps that ratio against 250000. Costs ~250s per generation instead of
-# ~80s, which is affordable now that self-play runs ~40 min.
-STEPS="${STEPS:-1875}"
+# One full pass over the buffer per generation: 1953 * 512 ~= MAX_EXAMPLES.
+#
+# The learner samples uniformly *from the whole buffer*, not from the newest
+# generation, so what matters is `steps * batch / buffer_size` — the expected
+# number of times each example is drawn. At 1875 steps and batch 128 that was
+# 0.24 per generation, and with examples living four generations, roughly *one*
+# draw over an entire lifetime. Every one of those positions cost 400
+# simulations to produce and was looked at once. A full pass takes the lifetime
+# figure to ~4, which is the usual range for AlphaZero-style setups.
+STEPS="${STEPS:-1953}"
 # The learner idles until the buffer holds this many examples. Tie it to the
 # actor's target so a cycle can never deadlock waiting for data that a completed
 # generate phase was never going to produce.
 MIN_SAMPLES="${MIN_SAMPLES:-$TARGET_EXAMPLES}"
-BATCH="${BATCH:-128}"
+# 512 measured 1.30x the samples/s of 128 (paired ABBA on a cooled, idle GPU:
+# 1273 -> 1657). 1024 was 0.98x of 512, so this is the knee, not a ceiling.
+BATCH="${BATCH:-512}"
+# Raised with the batch, sqrt(4) = 2x. Four times the samples per step cuts the
+# gradient noise without changing the step count, so holding 1e-3 would make
+# this a different optimisation, not the same one at higher throughput.
+LR="${LR:-2e-3}"
 # Compare the newest net against the one this many generations back. One
 # generation apart is inside the noise of a 40-game match; five gives the
 # comparison enough separation while keeping the diagnostic frequent.
@@ -193,7 +204,7 @@ while true; do
   echo "== cycle $gen: train =="
   "$PYTHON" "$repo/python/minions_az_learner.py" --live "$LIVE" \
     --channels "$CHANNELS" --blocks "$BLOCKS" \
-    --steps "$STEPS" --batch "$BATCH" --min-samples "$MIN_SAMPLES" \
+    --steps "$STEPS" --batch "$BATCH" --lr "$LR" --min-samples "$MIN_SAMPLES" \
     --tb-weight "$TB_WEIGHT" --t-steps "$T_STEPS" \
     --exit-after-gens 1
 
