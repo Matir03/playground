@@ -104,11 +104,6 @@ STEPS="${STEPS:-1875}"
 # generate phase was never going to produce.
 MIN_SAMPLES="${MIN_SAMPLES:-$TARGET_EXAMPLES}"
 BATCH="${BATCH:-128}"
-# Both matches run every generation. Greedy was periodic while a generation cost
-# ~18 min and the yardstick was ~10% of that; at ~50 min per generation its
-# 1m45s is small enough to buy a reading every time, which also turns six
-# scattered samples into a series.
-GREEDY_EVERY="${GREEDY_EVERY:-1}"
 # Compare the newest net against the one this many generations back. One
 # generation apart is inside the noise of a 40-game match; five gives the
 # comparison enough separation while keeping the diagnostic frequent.
@@ -219,17 +214,13 @@ while true; do
   # deliberately: a rejected good generation costs one cycle, an accepted bad
   # one poisons the buffer that trains all its successors.
   echo "== cycle $gen: eval vs champion (gates promotion) =="
-  # Greedy is a slow external yardstick, not a rung on the ladder, and its
-  # 30-game reading carries about +/-0.09 — so it runs every GREEDY_EVERY
-  # generations and is skipped (0 games) otherwise.
-  g_games=0
-  if (( gen % GREEDY_EVERY == 0 )); then
-    g_games="$GREEDY_GAMES"
-    echo "== cycle $gen: also measuring vs greedy =="
-  fi
+  # Greedy is a slow external yardstick, not a rung on the ladder. The eval
+  # loop runs it only when the candidate is promoted, so the games are offered
+  # unconditionally here and it decides — a schedule in this script would be a
+  # second, disagreeing mechanism.
   "$PYTHON" "$repo/python/minions_eval_loop.py" --live "$LIVE" \
     --engine "$ENGINE" --games "$EVAL_GAMES" --candidates "$EVAL_CANDIDATES" \
-    --sims "$EVAL_SIMS" --greedy-games "$g_games" \
+    --sims "$EVAL_SIMS" --greedy-games "$GREEDY_GAMES" \
     --t-steps "$T_STEPS" --promote-threshold "$PROMOTE" --once \
     --backend "$BACKEND" --ep "$EP" $FP16_FLAG || {
       # Never let evaluation kill the run. The script is `set -e`, so a bad
