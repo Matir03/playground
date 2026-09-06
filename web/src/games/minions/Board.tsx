@@ -41,7 +41,10 @@ import {
   ApplyMoveRequestSchema,
   RequestMoveRequestSchema,
   SearchBudgetSchema,
+  AnalyzeRequestSchema,
+  type AnalyzeResponse,
 } from "../../gen/playground/engine/engine_pb";
+import { AnalysisTree, type SortKey } from "./Analysis";
 
 // ── Rules mirror ──────────────────────────────────────────────────────────────
 
@@ -334,6 +337,21 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
+  // ── Analysis mode ──────────────────────────────────────────────────────────
+  //
+  // Looking without playing. `analysis` is the search on the game's current
+  // position; `walk` is the variation being viewed, which never touches the
+  // game — the engine applies it to a copy and the board just renders what
+  // comes back.
+  const [analysisOn, setAnalysisOn] = useState(false);
+  const [analysis, setAnalysis] = useState<AnalyzeResponse | null>(null);
+  const [analysing, setAnalysing] = useState(false);
+  const [walk, setWalk] = useState<{ line: Uint8Array[]; labels: string[]; at: AnalyzeResponse } | null>(null);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [sort, setSort] = useState<SortKey>("visits");
+  const [sims, setSims] = useState(400);
+  const [overlay, setOverlay] = useState<"none" | "hex0" | "hex1">("none");
+
   /** Attack phase: the selected piece. Spawn phase: the unit picked to place. */
   const [selected, setSelected] = useState<number | null>(null);
   const [spawnUnit, setSpawnUnit] = useState<number | null>(null);
@@ -453,7 +471,49 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [handle, state, firstSeat, secondSeat, client]);
 
-  const d = useMemo(() => (state ? decode(state.payload) : null), [state]);
+  // The board shows the variation when one is being walked, and the game
+  // otherwise. Rendering the walked position rather than overlaying arrows on
+  // the real one is the whole point of analysis mode: you see the position the
+  // numbers describe.
+  const shownState = walk?.at.state ?? state;
+  const d = useMemo(() => (shownState ? decode(shownState.payload) : null), [shownState]);
+
+  /** Aux for whatever position is on the board. */
+  const aux = (walk?.at ?? analysis)?.aux;
+  /** Value for the position on the board, from its side to move. */
+  const shownValue = (walk?.at ?? analysis)?.value;
+
+  const runAnalysis = useCallback(
+    async (line: Uint8Array[], labels: string[], evalOnly: boolean) => {
+      if (!handle) return;
+      setAnalysing(true);
+      setError(null);
+      try {
+        const res = await client.analyze(
+          create(AnalyzeRequestSchema, {
+            handle,
+            line,
+            budget: create(SearchBudgetSchema, { maxVisits: sims }),
+            candidates: 0,
+            evalOnly,
+          }),
+          { signal: AbortSignal.timeout(120000) },
+        );
+        if (line.length === 0) {
+          setAnalysis(res);
+          setWalk(null);
+          setExpanded(new Set());
+        } else {
+          setWalk({ line, labels, at: res });
+        }
+      } catch (err) {
+        setError(err instanceof ConnectError ? err.message : String(err));
+      } finally {
+        setAnalysing(false);
+      }
+    },
+    [client, handle, sims],
+  );
   const inProgress = state?.outcome === Outcome.IN_PROGRESS;
   const humanTurn = !!state && inProgress && seatToMove(state) === "human" && !busy && !thinking;
 
@@ -514,6 +574,25 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
         <SeatPicker label={SIDE_NAME[1]} seat={secondSeat} onChange={setSecondSeat} />
         <button onClick={() => void newGame()} disabled={busy}>New game</button>
         {inProgress && <button onClick={endPhase} disabled={!humanTurn}>{endLabel}</button>}
+        {/* Analysis is a *view*, so leaving it drops the variation and puts the
+            real game back on the board — the alternative is a board showing a
+            position the game is not in with no obvious way back. */}
+        <button
+          onClick={() => {
+            setAnalysisOn((on) => {
+              if (on) {
+                setWalk(null);
+                setAnalysis(null);
+                setExpanded(new Set());
+              }
+              return !on;
+            });
+          }}
+          style={{ marginLeft: "auto" }}
+          title="run the net on this position without playing it"
+        >
+          {analysisOn ? "exit analysis" : "analysis"}
+        </button>
       </div>
 
       {state != null && d != null && !inProgress && (
@@ -596,6 +675,22 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                     // legible under a piece or a highlight dot.
                     <polygon points={HEX_POINTS} transform="scale(0.8)" fill="none" stroke="#c8b06a" strokeWidth={1.5} style={{ pointerEvents: "none" }} />
                   )}
+                  {overlay !== "none" && aux && (() => {
+                    // Per-cell control probability from the aux head, as a
+                    // filled overlay. Drawn *under* the piece and the graveyard
+                    // ring so it tints the cell without hiding what is on it.
+                    const v = (overlay === "hex0" ? aux.hexControlFirst : aux.hexControlSecond)[i];
+                    if (v === undefined) return null;
+                    const side = overlay === "hex0" ? 0 : 1;
+                    const rgb = side === 0 ? "224,167,44" : "63,116,216";
+                    return (
+                      <polygon
+                        points={HEX_POINTS}
+                        fill={`rgba(${rgb},${(v * 0.72).toFixed(3)})`}
+                        style={{ pointerEvents: "none" }}
+                      />
+                    );
+                  })()}
                   {grave && c === 0 && !isMove && !isSpawn && (
                     <text textAnchor="middle" dy="0.35em" fontSize={15} fill="#9a8f74" style={{ pointerEvents: "none" }}>†</text>
                   )}
@@ -620,6 +715,172 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
               </g>
             )}
           </svg>
+
+          {analysisOn && (
+            <div style={{ flex: "2 1 460px", minWidth: 420, fontSize: "0.85rem" }}>
+              <div
+                style={{
+                  display: "flex",
+                  gap: "0.6rem",
+                  alignItems: "center",
+                  flexWrap: "wrap",
+                  marginBottom: "0.4rem",
+                }}
+              >
+                <button
+                  onClick={() => void runAnalysis([], [], false)}
+                  disabled={analysing || !handle}
+                  style={{ font: "inherit", padding: "0.25rem 0.7rem" }}
+                >
+                  {analysing ? "analysing…" : analysis ? "re-analyse" : "analyse"}
+                </button>
+                <label style={{ color: "#999" }}>
+                  sims{" "}
+                  <input
+                    type="number"
+                    min={16}
+                    max={20000}
+                    step={100}
+                    value={sims}
+                    onChange={(e) => setSims(Math.max(16, Number(e.target.value) || 16))}
+                    style={{ width: "5rem", font: "inherit" }}
+                  />
+                </label>
+                <label style={{ color: "#999" }}>
+                  sort{" "}
+                  <select value={sort} onChange={(e) => setSort(e.target.value as SortKey)} style={{ font: "inherit" }}>
+                    <option value="visits">visits</option>
+                    <option value="prior">prior</option>
+                    <option value="value">value</option>
+                  </select>
+                </label>
+                <label style={{ color: "#999" }}>
+                  overlay{" "}
+                  <select
+                    value={overlay}
+                    onChange={(e) => setOverlay(e.target.value as "none" | "hex0" | "hex1")}
+                    style={{ font: "inherit" }}
+                  >
+                    <option value="none">none</option>
+                    <option value="hex0">yellow control</option>
+                    <option value="hex1">blue control</option>
+                  </select>
+                </label>
+              </div>
+
+              {/* The position on the board, and what the nets say about it. The
+                  value is always from *that* position's side to move, so it
+                  flips sign down a variation — labelling the side avoids
+                  reading a sign flip as a swing. */}
+              {(analysis || walk) && (
+                <div style={{ marginBottom: "0.45rem", color: "#bbb" }}>
+                  {shownValue !== undefined && d && (
+                    <span>
+                      value{" "}
+                      <strong style={{ color: SIDE_FILL[d.side] }}>{shownValue.toFixed(3)}</strong>{" "}
+                      <span style={{ color: "#777" }}>for {SIDE_NAME[d.side]}</span>
+                    </span>
+                  )}
+                  {aux && (
+                    <span style={{ marginLeft: "0.9rem", color: "#888" }} title="trajectory-balance log-partition estimate">
+                      log Z {aux.logZ.toFixed(2)}
+                    </span>
+                  )}
+                  {analysis && analysis.nodes.length > 0 && (
+                    <span style={{ marginLeft: "0.9rem", color: "#888" }}>
+                      {analysis.nodes.length} nodes · root {analysis.nodes[0].totalVisits} visits
+                    </span>
+                  )}
+                </div>
+              )}
+
+              {/* Necromancer survival over the aux head's horizon: one bar per
+                  side-turn ahead, so a line that gets a necromancer killed
+                  shows as the curve collapsing rather than as a number. */}
+              {aux && aux.necroSafetyFirst.length > 0 && (
+                <div style={{ marginBottom: "0.5rem" }}>
+                  <div style={{ color: "#777", fontSize: "0.7rem", textTransform: "uppercase", letterSpacing: "0.04em" }}>
+                    necromancer survival
+                  </div>
+                  {[aux.necroSafetyFirst, aux.necroSafetySecond].map((curve, side) => (
+                    <div key={side} style={{ display: "flex", alignItems: "flex-end", gap: 2, height: 26, marginTop: 2 }}>
+                      <span style={{ color: SIDE_FILL[side], fontSize: "0.7rem", width: "2.6rem" }}>
+                        {SIDE_NAME[side]}
+                      </span>
+                      {curve.map((p, i) => (
+                        <div
+                          key={i}
+                          title={`+${i + 1} side-turns: ${(p * 100).toFixed(0)}%`}
+                          style={{
+                            width: 10,
+                            height: `${Math.max(2, p * 24)}px`,
+                            background: SIDE_FILL[side],
+                            opacity: 0.35 + 0.65 * p,
+                          }}
+                        />
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Breadcrumb of the variation being viewed. Clicking a step
+                  truncates to it, so backing out of a line is one click rather
+                  than a re-analyse. */}
+              {walk && (
+                <div style={{ marginBottom: "0.4rem", fontSize: "0.78rem" }}>
+                  <span
+                    onClick={() => setWalk(null)}
+                    style={{ cursor: "pointer", color: "#8ab", marginRight: "0.3rem" }}
+                  >
+                    root
+                  </span>
+                  {walk.labels.map((l, i) => (
+                    <span key={i}>
+                      <span style={{ color: "#555" }}>→</span>{" "}
+                      <span
+                        onClick={() =>
+                          void runAnalysis(walk.line.slice(0, i + 1), walk.labels.slice(0, i + 1), true)
+                        }
+                        style={{
+                          cursor: "pointer",
+                          color: i === walk.labels.length - 1 ? "#e0a72c" : "#8ab",
+                          marginRight: "0.3rem",
+                        }}
+                        title={l}
+                      >
+                        {l.length > 22 ? `${l.slice(0, 22)}…` : l}
+                      </span>
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              {analysis && analysis.nodes.length > 0 ? (
+                <AnalysisTree
+                  nodes={analysis.nodes}
+                  chosen={analysis.chosen}
+                  sort={sort}
+                  expanded={expanded}
+                  onToggle={(k) =>
+                    setExpanded((prev) => {
+                      const next = new Set(prev);
+                      if (next.has(k)) next.delete(k);
+                      else next.add(k);
+                      return next;
+                    })
+                  }
+                  onPlay={(line, labels) => void runAnalysis(line, labels, true)}
+                  maxDepth={12}
+                />
+              ) : (
+                <div style={{ color: "#777" }}>
+                  {analysing ? "running the search…" : "press analyse to search this position"}
+                </div>
+              )}
+            </div>
+          )}
+
 
           <div style={{ flex: "1 1 220px", minWidth: 220, fontSize: "0.85rem" }}>
             {[0, 1].map((side) => (
