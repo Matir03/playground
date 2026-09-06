@@ -87,14 +87,12 @@ RANDOM_OPENING_DECAY="${RANDOM_OPENING_DECAY:-1.1335}"
 # cannot protect the ones the energy head scores near zero — which are exactly
 # the ones exploration is for. Pruned back out of the training target.
 MIN_EXPLORE_VISITS="${MIN_EXPLORE_VISITS:-2.0}"
-# 4 generations at TARGET_EXAMPLES 250000. Deliberately short in *generations*,
-# not in examples: at 800000 with 20000-example generations, half the buffer came
-# from nets several promotions old and the learner spent much of each step
-# indexing positions the current policy would no longer play. What matters is how
-# many promotions back the oldest data reaches, so a 4x larger generation carries
-# a 2.5x larger buffer at a shorter effective history.
-MAX_EXAMPLES="${MAX_EXAMPLES:-1000000}"
-# One full pass over the buffer per generation: 1953 * 512 ~= MAX_EXAMPLES.
+# Exactly one generation. The retention limit that matters is how many
+# promotions back the oldest data reaches, and at 250000 that is zero: every
+# training step sees only what the current champion just played. The 1M buffer
+# held four generations, so up to three promotions of drift.
+MAX_EXAMPLES="${MAX_EXAMPLES:-250000}"
+# One full pass over the buffer per generation: 488 * 512 ~= MAX_EXAMPLES.
 #
 # The learner samples uniformly *from the whole buffer*, not from the newest
 # generation, so what matters is `steps * batch / buffer_size` — the expected
@@ -103,18 +101,23 @@ MAX_EXAMPLES="${MAX_EXAMPLES:-1000000}"
 # draw over an entire lifetime. Every one of those positions cost 400
 # simulations to produce and was looked at once. A full pass takes the lifetime
 # figure to ~4, which is the usual range for AlphaZero-style setups.
-STEPS="${STEPS:-1953}"
+STEPS="${STEPS:-488}"
 # The learner idles until the buffer holds this many examples. Tie it to the
 # actor's target so a cycle can never deadlock waiting for data that a completed
 # generate phase was never going to produce.
-MIN_SAMPLES="${MIN_SAMPLES:-$TARGET_EXAMPLES}"
+# Explicitly *below* TARGET_EXAMPLES now that MAX_EXAMPLES equals it: the
+# pruner trims to at most MAX_EXAMPLES, so the buffer can settle just under
+# 250000 and a MIN_SAMPLES of exactly 250000 would wait for data no completed
+# generate phase will ever produce.
+MIN_SAMPLES="${MIN_SAMPLES:-200000}"
 # 512 measured 1.30x the samples/s of 128 (paired ABBA on a cooled, idle GPU:
 # 1273 -> 1657). 1024 was 0.98x of 512, so this is the knee, not a ceiling.
 BATCH="${BATCH:-512}"
-# Raised with the batch, sqrt(4) = 2x. Four times the samples per step cuts the
-# gradient noise without changing the step count, so holding 1e-3 would make
-# this a different optimisation, not the same one at higher throughput.
-LR="${LR:-2e-3}"
+# Back to 1e-3, sqrt(1/4) for the 4x smaller buffer. It went to 2e-3 when the
+# batch went 128 -> 512, which cut gradient noise; a single-generation buffer
+# puts correlation back in — every step now draws from one champion's games
+# rather than four generations' worth — so the same damping applies in reverse.
+LR="${LR:-1e-3}"
 # Compare the newest net against the one this many generations back. One
 # generation apart is inside the noise of a 40-game match; five gives the
 # comparison enough separation while keeping the diagnostic frequent.
