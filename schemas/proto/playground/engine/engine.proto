@@ -18,6 +18,10 @@ service EngineService {
   // notifications as each game completes.
   rpc StartSelfPlay(SelfPlaySpec) returns (stream SelfPlayProgress);
 
+  // Analysis: run the net and the search on a position and report what they
+  // saw, without playing anything. The handle's game is left untouched.
+  rpc Analyze(AnalyzeRequest) returns (AnalyzeResponse);
+
   // Health / capabilities
   rpc Health(HealthRequest) returns (HealthResponse);
 }
@@ -135,6 +139,85 @@ message SelfPlayStats {
   uint32 games_in_flight = 1;
   uint32 games_completed = 2;
   double games_per_second = 3;
+}
+
+message AnalyzeRequest {
+  playground.game.GameHandle handle = 1;
+  // Turns to apply to the handle's current state before analysing, so the UI
+  // can walk a variation without mutating the game. Empty = analyse as-is.
+  //
+  // Opaque turn encodings as returned in `AnalyzeEdge.turn`, not
+  // `playground.game.Move`: the search's action is a whole turn, which is a
+  // *sequence* of moves, so a variation cannot be expressed as a move list
+  // without the client reconstructing the realizer.
+  repeated bytes line = 2;
+  SearchBudget budget = 3;
+  // 0 = the engine's configured default.
+  uint32 candidates = 4;
+  // Skip the search and return only the position's evaluation. Walking a
+  // variation asks for this on every click; a full search per click would make
+  // the tree unusable to click through.
+  bool eval_only = 5;
+}
+
+// A node of the search tree, flattened. `nodes[0]` is the root.
+message AnalyzeNode {
+  // Absent on the root.
+  optional uint32 parent = 1;
+  uint32 total_visits = 2;
+  // Mean value over this node's visits, from the side to move here. Absent
+  // when the node was never visited.
+  optional double value = 3;
+  bool terminal = 4;
+  double term_value = 5;
+  repeated AnalyzeEdge edges = 6;
+}
+
+message AnalyzeEdge {
+  // Opaque whole-turn encoding; pass back in `AnalyzeRequest.line` to walk here.
+  bytes turn = 1;
+  // Prior probability, normalised over this node's candidate set.
+  double prior = 2;
+  // `f(s,a) - max_a f(s,a)`: the energy the prior came from, shifted so the
+  // best candidate reads 0.
+  double energy = 3;
+  uint32 visits = 4;
+  // Absent when the edge was never visited — distinct from a value of 0.
+  optional double value = 5;
+  // Index into `AnalyzeResponse.nodes`, when this edge has been expanded.
+  optional uint32 child = 6;
+  bool explore = 7;
+  uint32 forced = 8;
+  // Human-readable rendering of the whole turn, for the tree view.
+  string label = 9;
+}
+
+// What the auxiliary heads see. Probabilities, not logits: the sigmoid is
+// applied engine-side so every consumer agrees on it.
+message AnalyzeAux {
+  // Per-cell probability that this side controls the hex, row-major over
+  // cells, for each of the two sides.
+  repeated double hex_control_first = 1;
+  repeated double hex_control_second = 2;
+  // Per-side-turn probability the necromancer is still alive, over the
+  // auxiliary head's horizon.
+  repeated double necro_safety_first = 3;
+  repeated double necro_safety_second = 4;
+  // The trajectory-balance log-partition estimate for this position.
+  double log_z = 5;
+}
+
+message AnalyzeResponse {
+  // The position analysed, after `line` was applied.
+  playground.game.GameState state = 1;
+  // Value head, from the side to move's perspective.
+  double value = 2;
+  // Absent when the engine has no aux graph (an older exported net).
+  optional AnalyzeAux aux = 3;
+  // Empty when `eval_only` was set.
+  repeated AnalyzeNode nodes = 4;
+  // Index into `nodes[0].edges` of the move the search would play.
+  optional uint32 chosen = 5;
 }
 
 message HealthRequest {}

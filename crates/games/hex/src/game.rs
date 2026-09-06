@@ -711,3 +711,7 @@ mod tests {
         }
     }
 }
+
+/// No analysable net: this game has no sampled search or auxiliary heads, so
+/// the default `analyze` (which reports "not configured") is the honest answer.
+impl playground_core::Analyzable for Hex {}

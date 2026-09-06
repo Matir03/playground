@@ -354,6 +354,45 @@ mod tests {
         }
         assert!(acted > 1, "expected the seat to play several actions, got {acted}");
 
+        // Analysis must see the same net without disturbing the seat: a tree
+        // with the numbers the search selected on, and the aux heads if the
+        // exported net has them.
+        {
+            use playground_core::Analyzable;
+            let st = Minions::initial_state();
+            let a = Minions::analyze(&st, budget, Some(8), false)
+                .expect("configured")
+                .expect("analysis");
+            assert!(!a.nodes.is_empty(), "a search analysis must return a tree");
+            assert_eq!(a.nodes[0].parent, None, "node 0 must be the root");
+            assert!(
+                a.nodes[0].total_visits > 0,
+                "the root must have been visited"
+            );
+            let chosen = a.chosen.expect("a completed search chose a move");
+            assert!(
+                chosen < a.nodes[0].edges.len(),
+                "chosen indexes past the root's candidates"
+            );
+            for e in &a.nodes[0].edges {
+                assert_eq!(e.mv.len(), 3 * crate::map::NUM_CELLS, "turn encoding size");
+                // Walking the variation must reproduce what the search searched.
+                let next = Minions::apply_encoded_turn(&st, &e.mv).expect("turn applies");
+                assert_ne!(
+                    Minions::encode_state(&next),
+                    Minions::encode_state(&st),
+                    "a turn that changes nothing would make the tree unwalkable"
+                );
+            }
+
+            // Eval-only must skip the search entirely, not return a stub tree.
+            let ev = Minions::analyze(&st, budget, None, true)
+                .expect("configured")
+                .expect("analysis");
+            assert!(ev.nodes.is_empty(), "eval_only must not build a tree");
+            assert!(ev.chosen.is_none(), "eval_only has no move to choose");
+        }
+
         // A state the plan does not expect must force a re-plan, not a stale replay.
         let fresh = Minions::initial_state();
         let out = Minions::choose_move_external(&fresh, budget).expect("configured").expect("ok");
@@ -362,4 +401,238 @@ mod tests {
             "after a desync the seat must re-plan and return a move legal *here*"
         );
     }
+}
+
+// ── Analysis ──────────────────────────────────────────────────────────────────
+//
+// Looking without playing. The interactive seat above answers "what do you
+// play"; this answers "what do you see", which is a different question and has
+// to leave the game alone to be worth asking.
+
+/// The `aux.onnx` session, built on first use.
+///
+/// Separate from the seat's backend because the auxiliary heads are their own
+/// graph — self-play never runs them, so the backend has no reason to hold one.
+static AUX: Mutex<Option<ort::session::Session>> = Mutex::new(None);
+
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// Run the auxiliary heads, or `None` if this net has no `aux.onnx`.
+///
+/// A missing graph is expected rather than exceptional: nets exported before
+/// the aux graph existed are still perfectly playable, and the view degrades to
+/// hiding those panels.
+fn aux_for(state: &MinionsState) -> Option<playground_core::AnalysisAux> {
+    let cfg = CONFIG.lock().unwrap().clone()?;
+    let (ep, fp16) = match &cfg.kind {
+        crate::net::BackendKind::Ort { ep, fp16 } => (ep.clone(), *fp16),
+        // Candle has no ONNX graphs to run.
+        crate::net::BackendKind::Candle { .. } => return None,
+    };
+    let path = cfg.dir.join("aux.onnx");
+    if !path.exists() {
+        return None;
+    }
+
+    let mut guard = AUX.lock().unwrap();
+    if guard.is_none() {
+        let cache = cfg.dir.join("trt_cache");
+        let sess = crate::ort_net::build(&path, &ep, fp16, &cache.to_string_lossy()).ok()?;
+        *guard = Some(sess);
+    }
+    let sess = guard.as_mut()?;
+
+    let mut planes = vec![0f32; crate::game::PLANES * crate::map::NUM_CELLS];
+    for (o, b) in planes.iter_mut().zip(Minions::to_features(state)) {
+        *o = b as f32;
+    }
+    let n = crate::map::N as i64;
+    let input = ort::value::TensorRef::from_array_view((
+        vec![1i64, crate::game::PLANES as i64, n, n],
+        planes.as_slice(),
+    ))
+    .ok()?;
+    let out = sess.run(ort::inputs!["planes" => input]).ok()?;
+
+    let take = |name: &str| -> Option<Vec<f32>> {
+        Some(out.get(name)?.try_extract_tensor::<f32>().ok()?.1.to_vec())
+    };
+    let hex = take("hex")?;
+    let necro = take("necro")?;
+    let logz = take("logz")?;
+
+    let cells = crate::map::NUM_CELLS;
+    let horizon = necro.len() / 2;
+    // Sigmoids here, not in each consumer: the heads emit logits, and a UI that
+    // applied its own would be one refactor away from disagreeing with the next
+    // reader about what the numbers mean.
+    Some(playground_core::AnalysisAux {
+        hex_control: [
+            hex[..cells].iter().copied().map(sigmoid).collect(),
+            hex[cells..2 * cells].iter().copied().map(sigmoid).collect(),
+        ],
+        necro_safety: [
+            necro[..horizon].iter().copied().map(sigmoid).collect(),
+            necro[horizon..2 * horizon].iter().copied().map(sigmoid).collect(),
+        ],
+        log_z: logz.first().copied().unwrap_or(0.0),
+    })
+}
+
+/// Encode a turn so a client can hand it back to walk a variation.
+pub fn encode_turn(spec: &TurnSpec) -> Vec<u8> {
+    let mut out = Vec::with_capacity(3 * crate::map::NUM_CELLS);
+    out.extend_from_slice(&spec.moves);
+    out.extend_from_slice(&spec.targets);
+    out.extend_from_slice(&spec.spawns);
+    out
+}
+
+/// Inverse of [`encode_turn`].
+pub fn decode_turn(bytes: &[u8]) -> anyhow::Result<TurnSpec> {
+    let c = crate::map::NUM_CELLS;
+    if bytes.len() != 3 * c {
+        anyhow::bail!("turn encoding is {} bytes, expected {}", bytes.len(), 3 * c);
+    }
+    let mut spec = TurnSpec::default();
+    spec.moves.copy_from_slice(&bytes[..c]);
+    spec.targets.copy_from_slice(&bytes[c..2 * c]);
+    spec.spawns.copy_from_slice(&bytes[2 * c..]);
+    Ok(spec)
+}
+
+/// Render a turn as the sequence of actions it realizes to.
+fn label_turn(state: &MinionsState, spec: &TurnSpec) -> String {
+    let actions = realize(state, spec).actions;
+    if actions.is_empty() {
+        return "pass".to_string();
+    }
+    actions.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(", ")
+}
+
+impl playground_core::Analyzable for Minions {
+    fn analyze(
+        state: &MinionsState,
+        budget: SolverBudget,
+        candidates: Option<usize>,
+        eval_only: bool,
+    ) -> Option<anyhow::Result<playground_core::Analysis>> {
+        if !is_configured() {
+            return None;
+        }
+        Some(analyze_inner(state, budget, candidates, eval_only))
+    }
+
+    fn apply_encoded_turn(state: &MinionsState, turn: &[u8]) -> anyhow::Result<MinionsState> {
+        Ok(realize(state, &decode_turn(turn)?).next)
+    }
+}
+
+fn analyze_inner(
+    state: &MinionsState,
+    budget: SolverBudget,
+    candidates: Option<usize>,
+    eval_only: bool,
+) -> anyhow::Result<playground_core::Analysis> {
+    let cfg = CONFIG.lock().unwrap().clone().ok_or_else(|| anyhow::anyhow!("no net configured"))?;
+
+    let mut guard = MODEL.lock().unwrap();
+    if guard.is_none() {
+        match crate::eval::load_seat(&cfg.dir, &cfg.kind, cfg.sampler.clone())? {
+            crate::eval::Seat::Net(m) => *guard = Some(m),
+            crate::eval::Seat::Greedy => anyhow::bail!("load_seat returned the greedy seat"),
+        }
+    }
+    let model = guard.as_ref().expect("model built above");
+
+    let aux = aux_for(state);
+
+    if eval_only {
+        // `k = 0` is the value-only expansion: trunk and value head, no
+        // candidate generation. Walking a variation asks for this on every
+        // click, and generating candidates there would cost the diffusion head
+        // for nothing.
+        use playground_core::sampled_mcts::SampledModel;
+        let (v, _) = model.expand(state, 0)?;
+        return Ok(playground_core::Analysis {
+            value: v as f64,
+            aux,
+            nodes: Vec::new(),
+            chosen: None,
+        });
+    }
+
+    let mut params = playground_core::sampled_mcts::SampledParams {
+        k_candidates: candidates.unwrap_or(cfg.sampler.k_candidates),
+        // Analysis reports what the search believes, so it must not sample a
+        // move for variety the way early self-play plies do.
+        temp_moves: 0,
+        ..Default::default()
+    };
+    params.simulations = budget.max_visits.unwrap_or(cfg.sims);
+
+    let (result, tree) = playground_core::sampled_mcts::search_analyzed::<MinionsTurns, _>(
+        &**model,
+        state.clone(),
+        &params,
+        Minions::ply(state),
+    )?;
+
+    // Labels need the state each turn is played from, so walk the tree
+    // alongside the states rather than labelling from the root throughout.
+    let mut states: Vec<Option<MinionsState>> = vec![None; tree.len()];
+    states[0] = Some(state.clone());
+    for i in 0..tree.len() {
+        let here = match &states[i] {
+            Some(s) => s.clone(),
+            // Unreachable in a well-formed tree; skip rather than panic on one.
+            None => continue,
+        };
+        for e in &tree[i].edges {
+            if let Some(c) = e.child {
+                if c < states.len() && states[c].is_none() {
+                    states[c] = Some(realize(&here, &e.mv).next);
+                }
+            }
+        }
+    }
+
+    let nodes = tree
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let here = states[i].clone().unwrap_or_else(|| state.clone());
+            playground_core::AnalysisNode {
+                parent: n.parent,
+                total_visits: n.total_visits,
+                value: n.value,
+                terminal: n.terminal,
+                term_value: n.term_value,
+                edges: n
+                    .edges
+                    .iter()
+                    .map(|e| playground_core::AnalysisEdge {
+                        mv: encode_turn(&e.mv),
+                        label: label_turn(&here, &e.mv),
+                        prior: e.prior,
+                        energy: e.energy,
+                        visits: e.visits,
+                        value: e.value,
+                        child: e.child,
+                        explore: e.explore,
+                        forced: e.forced,
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+
+    Ok(playground_core::Analysis {
+        value: result.value,
+        aux,
+        nodes,
+        chosen: Some(result.chosen),
+    })
 }

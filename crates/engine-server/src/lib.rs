@@ -8,7 +8,7 @@ use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use playground_core::{Game, ModelClient, Outcome, Player, Solver, SolverBudget};
+use playground_core::{Analyzable, Game, ModelClient, Outcome, Player, Solver, SolverBudget};
 use playground_protocol::engine_pb::engine_service_server::{EngineService, EngineServiceServer};
 use playground_protocol::engine_pb::*;
 use playground_protocol::game_pb::{self, GameHandle, GameState};
@@ -143,9 +143,94 @@ where
 #[tonic::async_trait]
 impl<G, M> EngineService for EngineServer<G, M>
 where
-    G: Solver,
+    G: Solver + Analyzable,
     M: ModelClient<G> + 'static,
 {
+    /// Run the net and the search on a position and report what they saw.
+    ///
+    /// Deliberately does not touch the handle's stored state: the point of an
+    /// analysis view is to look at a line without committing to it, so the
+    /// requested `line` is applied to a *copy* and thrown away afterwards.
+    async fn analyze(
+        &self,
+        req: Request<AnalyzeRequest>,
+    ) -> Result<Response<AnalyzeResponse>, Status> {
+        let inner = req.into_inner();
+        let handle = inner
+            .handle
+            .ok_or_else(|| Status::invalid_argument("analyze: no handle"))?;
+
+        let mut state = {
+            let games = self.games.read().await;
+            let bytes = games
+                .get(&handle.handle_id)
+                .ok_or_else(|| Status::not_found("analyze: unknown handle"))?;
+            G::decode_state(bytes).map_err(|e| Status::internal(e.to_string()))?
+        };
+
+        // Walk the requested variation on the copy. A line that does not apply
+        // is the client's bug, and reporting an analysis of a *different*
+        // position than it asked about would be worse than refusing.
+        for (i, turn) in inner.line.iter().enumerate() {
+            state = G::apply_encoded_turn(&state, turn).map_err(|e| {
+                Status::invalid_argument(format!("analyze: line[{i}] does not apply: {e}"))
+            })?;
+        }
+
+        let budget = SolverBudget {
+            max_visits: inner.budget.as_ref().and_then(|b| b.max_visits),
+            max_millis: inner.budget.as_ref().and_then(|b| b.max_millis),
+        };
+        let candidates = (inner.candidates > 0).then_some(inner.candidates as usize);
+
+        let analysis = G::analyze(&state, budget, candidates, inner.eval_only)
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "analyze: this engine has no analysable net configured",
+                )
+            })?
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(AnalyzeResponse {
+            state: Some(state_to_proto::<G>(&state)),
+            value: analysis.value,
+            aux: analysis.aux.map(|a| AnalyzeAux {
+                hex_control_first: a.hex_control[0].iter().map(|x| *x as f64).collect(),
+                hex_control_second: a.hex_control[1].iter().map(|x| *x as f64).collect(),
+                necro_safety_first: a.necro_safety[0].iter().map(|x| *x as f64).collect(),
+                necro_safety_second: a.necro_safety[1].iter().map(|x| *x as f64).collect(),
+                log_z: a.log_z as f64,
+            }),
+            nodes: analysis
+                .nodes
+                .iter()
+                .map(|n| AnalyzeNode {
+                    parent: n.parent.map(|p| p as u32),
+                    total_visits: n.total_visits,
+                    value: n.value.map(|v| v as f64),
+                    terminal: n.terminal,
+                    term_value: n.term_value as f64,
+                    edges: n
+                        .edges
+                        .iter()
+                        .map(|e| AnalyzeEdge {
+                            turn: e.mv.clone().into(),
+                            label: e.label.clone(),
+                            prior: e.prior as f64,
+                            energy: e.energy as f64,
+                            visits: e.visits,
+                            value: e.value.map(|v| v as f64),
+                            child: e.child.map(|c| c as u32),
+                            explore: e.explore,
+                            forced: e.forced,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            chosen: analysis.chosen.map(|c| c as u32),
+        }))
+    }
+
     async fn new_game(&self, req: Request<NewGameRequest>) -> Result<Response<GameHandle>, Status> {
         let inner = req.into_inner();
         let state = match inner.initial_state {
@@ -344,7 +429,7 @@ where
 /// browser can call it directly.
 pub async fn run<G, M>(addr: SocketAddr, models: HashMap<String, M>) -> anyhow::Result<()>
 where
-    G: Solver,
+    G: Solver + Analyzable,
     M: ModelClient<G> + 'static,
 {
     let model_names: Vec<String> = models.keys().cloned().collect();

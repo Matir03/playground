@@ -46,3 +46,84 @@ pub trait Solver: Game {
         None
     }
 }
+
+// ── Analysis ──────────────────────────────────────────────────────────────────
+
+/// What the auxiliary heads see at a position, as probabilities.
+///
+/// Sigmoids are applied here rather than by each consumer, so the UI and any
+/// other reader agree on what the numbers mean.
+pub struct AnalysisAux {
+    /// Per-cell probability that the side controls the hex, row-major.
+    pub hex_control: [Vec<f32>; 2],
+    /// Per-side-turn probability the necromancer is still alive.
+    pub necro_safety: [Vec<f32>; 2],
+    /// Trajectory-balance log-partition estimate for this position.
+    pub log_z: f32,
+}
+
+/// One candidate edge of an analysed search tree.
+///
+/// Moves travel as `Game::encode_move` bytes plus a rendered label, which keeps
+/// this type free of the game's move type — the engine server is generic over
+/// `Game` and cannot name it.
+pub struct AnalysisEdge {
+    pub mv: Vec<u8>,
+    pub label: String,
+    /// Normalised over the node's candidate set.
+    pub prior: f32,
+    /// `f(s,a) - max_a f(s,a)`, shifted so the best candidate reads 0.
+    pub energy: f32,
+    pub visits: u32,
+    /// `None` when never visited — deliberately distinct from a value of 0.
+    pub value: Option<f32>,
+    pub child: Option<usize>,
+    pub explore: bool,
+    pub forced: u32,
+}
+
+pub struct AnalysisNode {
+    pub parent: Option<usize>,
+    pub total_visits: u32,
+    pub value: Option<f32>,
+    pub terminal: bool,
+    pub term_value: f32,
+    pub edges: Vec<AnalysisEdge>,
+}
+
+/// A position's evaluation, and optionally the tree a search built on it.
+pub struct Analysis {
+    /// Value head, from the side to move's perspective.
+    pub value: f64,
+    pub aux: Option<AnalysisAux>,
+    /// Empty when only an evaluation was asked for. `nodes[0]` is the root.
+    pub nodes: Vec<AnalysisNode>,
+    /// Index into `nodes[0].edges` of the move the search would play.
+    pub chosen: Option<usize>,
+}
+
+/// A game that can report what its net and search see at a position.
+///
+/// Separate from [`Solver`] because analysing is not choosing: the point is to
+/// look without playing, and a game with no net has nothing to report. The
+/// default returns `None`, which the server surfaces as "not configured"
+/// rather than quietly answering with something else.
+pub trait Analyzable: crate::Game {
+    fn analyze(
+        _state: &Self::State,
+        _budget: SolverBudget,
+        _candidates: Option<usize>,
+        _eval_only: bool,
+    ) -> Option<anyhow::Result<Analysis>> {
+        None
+    }
+
+    /// Apply one opaque turn encoding, as handed out in [`AnalysisEdge::mv`].
+    ///
+    /// Needed because a search action is not always a single `Game::Move`: in
+    /// Minions it is a whole turn, a *sequence* of moves, so a client cannot
+    /// replay a variation through `apply` without reimplementing the realizer.
+    fn apply_encoded_turn(_state: &Self::State, _turn: &[u8]) -> anyhow::Result<Self::State> {
+        anyhow::bail!("this game has no turn encoding")
+    }
+}

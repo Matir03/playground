@@ -442,3 +442,7 @@ mod tests {
         assert_eq!(back.to_move, s.to_move);
     }
 }
+
+/// No analysable net: this game has no sampled search or auxiliary heads, so
+/// the default `analyze` (which reports "not configured") is the honest answer.
+impl playground_core::Analyzable for Go9 {}

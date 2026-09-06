@@ -20,4 +20,7 @@ pub use latent_state::LatentGameState;
 pub use model::{LatentModel, MixturePolicy, ModelClient, MovePolicy, PolicyCandidate};
 pub use puct::fpu;
 pub use sampled_mcts::{SampledGame, SampledModel, SampledParams, SampledSearchResult, SearchStats};
-pub use solver::{SearchOutcome, Solver, SolverBudget};
+pub use solver::{
+    Analysis, AnalysisAux, AnalysisEdge, AnalysisNode, Analyzable, SearchOutcome, Solver,
+    SolverBudget,
+};
