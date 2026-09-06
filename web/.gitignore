@@ -2,3 +2,6 @@ node_modules/
 dist/
 .vite/
 src/gen/
+
+# tsc -b emits next to the sources; vite builds from the .tsx directly.
+src/**/*.js
