@@ -410,6 +410,32 @@ class _DiffusionGraph(nn.Module):
         return torch.cat([mv, tg, sp], dim=2)
 
 
+class _AuxGraph(nn.Module):
+    """planes -> (hex-control logits, necromancer-hazard logits, log Z).
+
+    Analysis only. The auxiliary heads exist to shape the trunk during
+    training, and self-play never reads them, so they are exported as their own
+    graph rather than added to `trunk.onnx`: an extra output on the hot path
+    would cost every expansion in every self-play worker to serve a view that
+    runs once when a human asks for it.
+
+    That independence is the point — this graph can appear, change or go missing
+    without the training path noticing. It recomputes the trunk internally,
+    which is a wasted forward pass in exchange for not touching the graph the
+    actor depends on.
+    """
+
+    def __init__(self, net: "MinionsNet"):
+        super().__init__()
+        self.net = net
+
+    def forward(self, planes):
+        h = self.net.trunk(planes)
+        hexc, necro = self.net.aux_head(h)
+        # `log_z` pools the *raw* trunk (2 * channels), not the head features.
+        return hexc, necro, self.net.log_z(h)
+
+
 class _EnergyGraph(nn.Module):
     """(h, decl) -> (B,). Run once per expansion, batched over candidates."""
 
@@ -422,7 +448,7 @@ class _EnergyGraph(nn.Module):
 
 
 def export_onnx_atomic(net: MinionsNet, out_dir: str) -> None:
-    """Write ``trunk.onnx``, ``diffusion.onnx`` and ``energy.onnx``.
+    """Write ``trunk.onnx``, ``diffusion.onnx``, ``energy.onnx`` and ``aux.onnx``.
 
     Every axis that varies at run time is dynamic: batch everywhere, and the
     trunk width, so a checkpoint at different ``channels`` still loads. Written
@@ -456,6 +482,13 @@ def export_onnx_atomic(net: MinionsNet, out_dir: str) -> None:
             (torch.zeros(1, c, N, N, device=dev), torch.zeros(1, ENERGY_PLANES, N, N, device=dev)),
             ["h", "decl"],
             ["energy"],
+        ),
+        (
+            "aux.onnx",
+            _AuxGraph(net),
+            (torch.zeros(1, IN_PLANES, N, N, device=dev),),
+            ["planes"],
+            ["hex", "necro", "logz"],
         ),
     ]
     with torch.no_grad():
