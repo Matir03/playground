@@ -640,7 +640,91 @@ pub struct Search<G: SampledGame> {
     resume_at: Option<usize>,
 }
 
+/// One candidate edge, flattened for inspection.
+///
+/// Everything here is already in the tree; this exists so a caller outside the
+/// crate can read it without `Node`/`Entry` becoming public API.
+pub struct TreeEdge<G: SampledGame> {
+    pub mv: G::Move,
+    /// Prior probability, normalised over this node's candidate set.
+    pub prior: f32,
+    /// `f(s, a) - max_a f(s, a)`, the energy the prior came from.
+    ///
+    /// The sampler stores `exp(f - max)` un-normalised, so the logarithm
+    /// recovers the energy exactly, shifted so the best candidate reads 0.
+    /// Zero-prior candidates report `f32::NEG_INFINITY`.
+    pub energy: f32,
+    pub visits: u32,
+    /// Mean value over this edge's visits, from the perspective of the side to
+    /// move at the *parent*. `None` when the edge was never visited.
+    pub value: Option<f32>,
+    /// Index into the exported node list, when this edge has been expanded.
+    pub child: Option<usize>,
+    /// Drawn by forced exploration rather than proposed by the model.
+    pub explore: bool,
+    /// Of `visits`, how many a floor demanded rather than PUCT choosing.
+    pub forced: u32,
+}
+
+/// A node of the search tree, flattened for inspection.
+pub struct TreeNode<G: SampledGame> {
+    pub parent: Option<usize>,
+    pub total_visits: u32,
+    /// Mean value over this node's visits, from the side to move here.
+    pub value: Option<f32>,
+    pub terminal: bool,
+    pub term_value: f32,
+    pub edges: Vec<TreeEdge<G>>,
+}
+
 impl<G: SampledGame> Search<G> {
+
+    /// Flatten the tree for inspection: analysis views, not the search itself.
+    ///
+    /// Node 0 is the root and every `child` index refers to this list, so a
+    /// caller can walk variations without knowing the internal layout. Nothing
+    /// here is recomputed — these are the numbers the search actually selected
+    /// on, which is the point: an analysis view that re-derives priors would be
+    /// showing a different sampler draw than the one that produced the tree.
+    pub fn export_tree(&self) -> Vec<TreeNode<G>> {
+        self.tree
+            .iter()
+            .enumerate()
+            .map(|(i, node)| {
+                let total_p: f32 = node.entries.iter().map(|e| e.p).sum();
+                TreeNode {
+                    // The root is node 0 and every other node is reached by
+                    // exactly one edge, so the parent is recoverable by scan.
+                    parent: if i == 0 {
+                        None
+                    } else {
+                        self.tree.iter().position(|n| {
+                            n.entries.iter().any(|e| e.child == i as i32)
+                        })
+                    },
+                    total_visits: node.total_n,
+                    value: (node.total_n > 0)
+                        .then(|| node.w_sum / node.total_n as f32),
+                    terminal: node.terminal,
+                    term_value: node.term_v,
+                    edges: node
+                        .entries
+                        .iter()
+                        .map(|e| TreeEdge {
+                            mv: e.mv.clone(),
+                            prior: if total_p > 0.0 { e.p / total_p } else { 0.0 },
+                            energy: if e.p > 0.0 { e.p.ln() } else { f32::NEG_INFINITY },
+                            visits: e.n,
+                            value: (e.n > 0).then(|| e.w / e.n as f32),
+                            child: (e.child >= 0).then_some(e.child as usize),
+                            explore: e.explore,
+                            forced: e.forced_n,
+                        })
+                        .collect(),
+                }
+            })
+            .collect()
+    }
     pub fn new(root: G::State, params: &SampledParams, ply: u32) -> Self {
         Self {
             tree: vec![new_node::<G>(root)],
@@ -995,6 +1079,36 @@ pub fn search<G: SampledGame, M: SampledModel<G>>(
                 s.provide_widen(cands);
             }
             Step::Done => return Ok(s.finish()),
+        }
+    }
+}
+
+/// As [`search`], but also returns the tree it built.
+///
+/// `finish` consumes the search, so a caller that wants both the played move
+/// and the tree behind it cannot get them from `search` alone. Analysis wants
+/// both; self-play wants neither and should keep using `search_lockstep`.
+pub fn search_analyzed<G: SampledGame, M: SampledModel<G>>(
+    model: &M,
+    root: G::State,
+    params: &SampledParams,
+    ply: u32,
+) -> anyhow::Result<(SampledSearchResult<G>, Vec<TreeNode<G>>)> {
+    let mut s = Search::new(root, params, ply);
+    loop {
+        match s.step() {
+            Step::NeedExpansion(state) => {
+                let (v, cands) = model.expand(&state, expansion_k(params))?;
+                s.provide(v, cands);
+            }
+            Step::NeedWiden(state) => {
+                let (_, cands) = model.expand(&state, chunk_k(params))?;
+                s.provide_widen(cands);
+            }
+            Step::Done => {
+                let tree = s.export_tree();
+                return Ok((s.finish(), tree));
+            }
         }
     }
 }
@@ -1766,6 +1880,46 @@ mod tests {
         // Survival does not depend on the prior any more: the same forced count
         // is used however the policy rated the move.
         assert_eq!(survivors(6, 1, 8), 8, "survival does not depend on the prior");
+    }
+
+    /// The exported tree must be walkable: root first, child indices resolving,
+    /// parents pointing back, priors normalised per node.
+    #[test]
+    fn exported_tree_is_internally_consistent() {
+        let params = SampledParams { simulations: 60, ..Default::default() };
+        let (_, tree) = search_analyzed::<Count, _>(
+            &Mock, CountState { n: 21, side: 0 }, &params, 0,
+        )
+        .expect("search");
+
+        assert!(!tree.is_empty(), "a completed search must export at least the root");
+        assert_eq!(tree[0].parent, None, "node 0 must be the root");
+
+        for (i, node) in tree.iter().enumerate() {
+            if i > 0 {
+                let p = node.parent.expect("every non-root node has a parent");
+                assert!(
+                    tree[p].edges.iter().any(|e| e.child == Some(i)),
+                    "node {i} claims parent {p}, which does not point back"
+                );
+            }
+            let sum: f32 = node.edges.iter().map(|e| e.prior).sum();
+            if !node.edges.is_empty() {
+                assert!(
+                    (sum - 1.0).abs() < 1e-4,
+                    "node {i} priors sum to {sum}, not 1"
+                );
+            }
+            for e in &node.edges {
+                if let Some(c) = e.child {
+                    assert!(c < tree.len(), "node {i} has a child index past the end");
+                }
+                // An unvisited edge has no value to report, and a visited one
+                // must: the alternative is a caller rendering 0.0 as an opinion.
+                assert_eq!(e.value.is_some(), e.visits > 0, "node {i} value/visit disagree");
+                assert!(e.forced <= e.visits, "node {i} forced visits exceed total");
+            }
+        }
     }
 
     #[test]
