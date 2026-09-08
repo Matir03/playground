@@ -14,7 +14,12 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
     "forceConsistentCasingInFileNames": true,
-    "useDefineForClassFields": true
+    "useDefineForClassFields": true,
+    // Vite does the transpiling; tsc is only ever a type check here. Without
+    // this it emits .js beside every .tsx, and vite then resolves the stale
+    // emitted file instead of the source — which breaks the dev server the
+    // moment those files are cleaned up under it.
+    "noEmit": true
   },
   "include": ["src"],
   "exclude": ["node_modules", "dist"]
