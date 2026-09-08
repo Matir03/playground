@@ -39,9 +39,16 @@ function sortEdges(edges: AnalyzeEdge[], key: SortKey): AnalyzeEdge[] {
   return e;
 }
 
+/** Edge indices of `node` in the order the tree renders them, so a side panel
+ *  can label its axes with the same ranks the reader is looking at. */
+export function displayOrder(node: AnalyzeNode, key: SortKey): number[] {
+  return sortEdges(node.edges, key).map((e) => node.edges.indexOf(e));
+}
+
 function EdgeRow({
   edge,
   node,
+  energyRef,
   depth,
   chosen,
   expanded,
@@ -52,6 +59,13 @@ function EdgeRow({
 }: {
   edge: AnalyzeEdge;
   node: AnalyzeNode;
+  /** The node's top energy. Energies are only identified up to a per-state
+   *  additive constant (the loss is a softmax over the candidate set, which is
+   *  shift-invariant), so the absolute level is arbitrary and not worth
+   *  showing. Subtracting the best candidate's energy turns the column into
+   *  `log(p / p_best)` — nats of evidence against the leader, 0 for the leader
+   *  itself. */
+  energyRef: number;
   depth: number;
   chosen: boolean;
   expanded: boolean;
@@ -122,8 +136,11 @@ function EdgeRow({
         {pct(edge.prior)}
       </span>
 
-      <span title="energy f(s,a), shifted so the best candidate reads 0" style={{ color: "#87a" }}>
-        {edge.energy === -Infinity ? "−∞" : edge.energy.toFixed(2)}
+      <span
+        title={`energy f(s,a) relative to this node's best candidate, in nats: log(p/p_best). Raw f = ${edge.energy.toFixed(3)}`}
+        style={{ color: "#87a" }}
+      >
+        {Number.isFinite(edge.energy) ? (edge.energy - energyRef).toFixed(2) : "−∞"}
       </span>
 
       <span
@@ -194,6 +211,12 @@ export function AnalysisTree({
     const shown = sortEdges(node.edges, sort).filter(
       (e) => sort === "prior" || e.visits > 0 || depth === 0,
     );
+    // Per node, not per tree: each node's candidate set has its own arbitrary
+    // offset, so a shift shared across depths would compare incomparable scales.
+    const energyRef = node.edges.reduce(
+      (m, e) => (Number.isFinite(e.energy) && e.energy > m ? e.energy : m),
+      -Infinity,
+    );
     for (const edge of shown) {
       const ei = node.edges.indexOf(edge);
       const key = `${nodeIdx}:${ei}`;
@@ -205,6 +228,7 @@ export function AnalysisTree({
           key={key}
           edge={edge}
           node={node}
+          energyRef={energyRef}
           depth={depth}
           chosen={depth === 0 && chosen !== undefined && ei === chosen}
           expanded={isOpen}
@@ -249,6 +273,110 @@ export function AnalysisTree({
       {rows.length === 0 && (
         <div style={{ padding: "0.5rem", color: "#777", fontSize: "0.8rem" }}>
           No visited candidates — raise the simulation budget.
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The KR-PUCT influence matrix for one node.
+ *
+ * Row `i` is what candidate `i` sees when selection scores it: `Q̂(i)` and
+ * `N̂(i)` are sums over the whole set weighted by this row, so a row that is
+ * bright away from the diagonal is a candidate being judged largely on its
+ * neighbours' evidence rather than its own. The diagonal is 1 by construction
+ * and carries no information — it is drawn only so the axes are readable.
+ *
+ * Empty when `kernel_sigma = 0`, which is the search self-play and eval run;
+ * there the matrix is the identity and every candidate is scored alone.
+ */
+export function KernelMatrix({
+  node,
+  order,
+  max = 24,
+}: {
+  node: AnalyzeNode;
+  /** Edge indices in display order, so the axes match the tree above. */
+  order: number[];
+  max?: number;
+}) {
+  const k = node.edges.length;
+  if (node.kernel.length !== k * k || k === 0) return null;
+
+  // A 40x40 grid of 8px cells is unreadable and slow; the tail of the
+  // candidate list is also the part with the least influence on anything.
+  const idx = order.slice(0, max);
+  const clipped = order.length - idx.length;
+  const cell = idx.length > 16 ? 13 : 17;
+
+  // Off-diagonal mass per row: how much of this candidate's score is borrowed.
+  // This is the number the matrix exists to communicate, so state it directly
+  // rather than leaving it to be eyeballed off the colours.
+  const borrowed = idx.map((i) => {
+    let s = 0;
+    for (let j = 0; j < k; j++) if (j !== i) s += node.kernel[i * k + j];
+    return s;
+  });
+  const worst = borrowed.reduce((m, x) => Math.max(m, x), 0);
+
+  return (
+    <div style={{ marginBottom: "0.5rem" }}>
+      <div
+        style={{
+          color: "#777",
+          fontSize: "0.7rem",
+          textTransform: "uppercase",
+          letterSpacing: "0.04em",
+          marginBottom: "0.25rem",
+        }}
+      >
+        kernel influence
+        <span style={{ textTransform: "none", letterSpacing: 0, color: "#666" }}>
+          {" "}— row i borrows column j; max off-diagonal {worst.toFixed(2)}
+        </span>
+      </div>
+      <div style={{ display: "flex", gap: "0.4rem", alignItems: "flex-start", overflowX: "auto" }}>
+        <div style={{ display: "grid", gridTemplateColumns: `repeat(${idx.length}, ${cell}px)` }}>
+          {idx.map((i, ri) =>
+            idx.map((j, ci) => {
+              const w = node.kernel[i * k + j];
+              const diag = ri === ci;
+              return (
+                <div
+                  key={`${ri}:${ci}`}
+                  title={`row ${ri} (${node.edges[i].label || "pass"})\ncol ${ci} (${node.edges[j].label || "pass"})\nweight ${w.toFixed(3)}`}
+                  style={{
+                    width: cell,
+                    height: cell,
+                    background: diag
+                      ? "rgba(224,167,44,0.45)"
+                      : `rgba(90,170,220,${(w * 0.95).toFixed(3)})`,
+                    outline: "1px solid #2a2a2a",
+                    outlineOffset: -1,
+                  }}
+                />
+              );
+            }),
+          )}
+        </div>
+        {/* Per-row borrowed mass, as a bar beside its row. */}
+        <div style={{ display: "grid", gridTemplateRows: `repeat(${idx.length}, ${cell}px)` }}>
+          {borrowed.map((b, ri) => (
+            <div key={ri} style={{ display: "flex", alignItems: "center", height: cell }}>
+              <div
+                style={{
+                  width: `${worst > 0 ? (b / worst) * 42 : 0}px`,
+                  height: cell - 5,
+                  background: "rgba(138,127,176,0.8)",
+                }}
+              />
+            </div>
+          ))}
+        </div>
+      </div>
+      {clipped > 0 && (
+        <div style={{ color: "#666", fontSize: "0.7rem", marginTop: "0.2rem" }}>
+          showing the top {idx.length} of {order.length} candidates
         </div>
       )}
     </div>

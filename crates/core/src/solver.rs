@@ -81,7 +81,9 @@ pub struct AnalysisEdge {
     pub label: String,
     /// Normalised over the node's candidate set.
     pub prior: f32,
-    /// `f(s,a) - max_a f(s,a)`, shifted so the best candidate reads 0.
+    /// Raw `f(s,a)`, before any softmax. Only differences within a node mean
+    /// anything: the head's loss is a softmax CE over the candidate set, which
+    /// is invariant to a per-state shift, so the absolute level is arbitrary.
     pub energy: f32,
     pub visits: u32,
     /// `None` when never visited — deliberately distinct from a value of 0.
@@ -98,6 +100,9 @@ pub struct AnalysisNode {
     pub terminal: bool,
     pub term_value: f32,
     pub edges: Vec<AnalysisEdge>,
+    /// Row-major `k x k` KR-PUCT kernel over `edges`, empty when the kernel is
+    /// off. `(i, j)` is how much of `j`'s statistics `i` borrows in selection.
+    pub kernel: Vec<f32>,
 }
 
 /// A position's evaluation, and optionally the tree a search built on it.
@@ -111,6 +116,22 @@ pub struct Analysis {
     pub chosen: Option<usize>,
 }
 
+/// What to ask an [`Analyzable`] for.
+///
+/// A struct rather than positional arguments because the list only ever grows,
+/// and `analyze(&s, b, None, false, 0.0)` says nothing about which flag is
+/// which at the call site.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AnalysisOptions {
+    /// Candidates per expansion. `None` = the engine's configured default.
+    pub candidates: Option<usize>,
+    /// Skip the search and return only the position's evaluation.
+    pub eval_only: bool,
+    /// KR-PUCT kernel bandwidth. 0 = the flat PUCT search that self-play and
+    /// eval actually run, so analysis matches them by default.
+    pub kernel_sigma: f32,
+}
+
 /// A game that can report what its net and search see at a position.
 ///
 /// Separate from [`Solver`] because analysing is not choosing: the point is to
@@ -121,8 +142,7 @@ pub trait Analyzable: crate::Game {
     fn analyze(
         _state: &Self::State,
         _budget: SolverBudget,
-        _candidates: Option<usize>,
-        _eval_only: bool,
+        _opts: AnalysisOptions,
     ) -> Option<anyhow::Result<Analysis>> {
         None
     }

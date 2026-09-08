@@ -21,6 +21,6 @@ pub use model::{LatentModel, MixturePolicy, ModelClient, MovePolicy, PolicyCandi
 pub use puct::fpu;
 pub use sampled_mcts::{SampledGame, SampledModel, SampledParams, SampledSearchResult, SearchStats};
 pub use solver::{
-    Analysis, AnalysisAux, AnalysisEdge, AnalysisNode, Analyzable, SearchOutcome, Solver,
-    SolverBudget,
+    Analysis, AnalysisAux, AnalysisEdge, AnalysisNode, AnalysisOptions, Analyzable,
+    SearchOutcome, Solver, SolverBudget,
 };

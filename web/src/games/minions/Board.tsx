@@ -45,7 +45,7 @@ import {
   ApplyTurnRequestSchema,
   type AnalyzeResponse,
 } from "../../gen/playground/engine/engine_pb";
-import { AnalysisTree, type SortKey } from "./Analysis";
+import { AnalysisTree, KernelMatrix, displayOrder, type SortKey } from "./Analysis";
 
 // ── Rules mirror ──────────────────────────────────────────────────────────────
 
@@ -345,6 +345,11 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
   // game — the engine applies it to a copy and the board just renders what
   // comes back.
   const [analysisOn, setAnalysisOn] = useState(false);
+  // KR-PUCT bandwidth for analysis only. 0 is the flat PUCT search that
+  // self-play and eval actually run, so the default view is the real search;
+  // raising it is an experiment you opt into, and it makes every node export
+  // its kernel matrix.
+  const [sigma, setSigma] = useState(0);
   const [analysis, setAnalysis] = useState<AnalyzeResponse | null>(null);
   const [analysing, setAnalysing] = useState(false);
   const [walk, setWalk] = useState<{ line: Uint8Array[]; labels: string[]; at: AnalyzeResponse } | null>(null);
@@ -504,6 +509,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
             budget: create(SearchBudgetSchema, { maxVisits: sims }),
             candidates: 0,
             evalOnly,
+            kernelSigma: sigma,
           }),
           { signal: AbortSignal.timeout(120000) },
         );
@@ -520,7 +526,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
         setAnalysing(false);
       }
     },
-    [client, handle, sims],
+    [client, handle, sims, sigma],
   );
 
   /** Play a root candidate for real, then re-root the analysis on the result.
@@ -692,79 +698,164 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
 
       {d && (
         <div style={{ display: "flex", gap: "1.5rem", flexWrap: "wrap", alignItems: "flex-start" }}>
-          <svg width={SVG_W} height={SVG_H} style={{ background: "#20242b", borderRadius: 8, flex: "0 0 auto" }}>
-            {Array.from({ length: CELLS }, (_, i) => {
-              const c = d.cells[i];
-              const isMove = moveSet.has(i);
-              const isAttack = attackSet.has(i);
-              const isSpawn = spawnSet.has(i);
-              const isSel = selected === i;
-              const grave = IS_GRAVEYARD[i];
-              let fill = grave ? "#4a4438" : "#333942";
-              if (isSpawn) fill = "#2f5c3a";
-              return (
-                <g key={i} transform={`translate(${px(i)},${py(i)})`}>
-                  <polygon
-                    points={HEX_POINTS}
-                    fill={fill}
-                    stroke={isSel ? "#f4f4f4" : isAttack ? "#d4553f" : "#161a20"}
-                    strokeWidth={isSel || isAttack ? 2.5 : 1}
-                  />
-                  {grave && (
-                    // An inner ring, not just the glyph, so a graveyard stays
-                    // legible under a piece or a highlight dot.
-                    <polygon points={HEX_POINTS} transform="scale(0.8)" fill="none" stroke="#c8b06a" strokeWidth={1.5} style={{ pointerEvents: "none" }} />
-                  )}
-                  {overlay !== "none" && aux && (() => {
-                    // Per-cell control probability from the aux head, as a
-                    // filled overlay. Drawn *under* the piece and the graveyard
-                    // ring so it tints the cell without hiding what is on it.
-                    //
-                    // The head's channels are [mover, opponent], not
-                    // [yellow, blue] — so which channel a colour wants depends
-                    // on whose turn it is in the position being shown. Painting
-                    // channel 0 yellow throughout swaps the sides on every
-                    // blue-to-move position, which is what it did.
-                    const side = overlay === "hex0" ? 0 : 1;
-                    const chan = side === d.side ? aux.hexControlMover : aux.hexControlOpponent;
-                    const v = chan[i];
-                    if (v === undefined) return null;
-                    const rgb = side === 0 ? "224,167,44" : "63,116,216";
-                    return (
-                      <polygon
-                        points={HEX_POINTS}
-                        fill={`rgba(${rgb},${(v * 0.72).toFixed(3)})`}
-                        style={{ pointerEvents: "none" }}
-                      />
-                    );
-                  })()}
-                  {grave && c === 0 && !isMove && !isSpawn && (
-                    <text textAnchor="middle" dy="0.35em" fontSize={15} fill="#9a8f74" style={{ pointerEvents: "none" }}>†</text>
-                  )}
-                  {c !== 0 && <Piece cell={c} pstate={d.pstate[i]} />}
-                  {isMove && <circle r={5} fill="rgba(120,220,140,0.85)" style={{ pointerEvents: "none" }} />}
-                  {isSpawn && <circle r={5} fill="rgba(150,230,170,0.9)" style={{ pointerEvents: "none" }} />}
-                  {humanTurn && (
-                    <polygon points={HEX_POINTS} fill="transparent" style={{ cursor: "pointer" }} onClick={() => onCell(i)} />
-                  )}
+          {/* Board and game state are one group: the analysis panel sits
+              beside them as a third column rather than wrapping underneath,
+              so reading the tree never means scrolling away from the board
+              whose aux overlay it is driving. */}
+          <div
+            style={{
+              display: "flex",
+              gap: "1.5rem",
+              flexWrap: "wrap",
+              alignItems: "flex-start",
+              flex: "0 1 auto",
+            }}
+          >
+            <svg width={SVG_W} height={SVG_H} style={{ background: "#20242b", borderRadius: 8, flex: "0 0 auto" }}>
+              {Array.from({ length: CELLS }, (_, i) => {
+                const c = d.cells[i];
+                const isMove = moveSet.has(i);
+                const isAttack = attackSet.has(i);
+                const isSpawn = spawnSet.has(i);
+                const isSel = selected === i;
+                const grave = IS_GRAVEYARD[i];
+                let fill = grave ? "#4a4438" : "#333942";
+                if (isSpawn) fill = "#2f5c3a";
+                return (
+                  <g key={i} transform={`translate(${px(i)},${py(i)})`}>
+                    <polygon
+                      points={HEX_POINTS}
+                      fill={fill}
+                      stroke={isSel ? "#f4f4f4" : isAttack ? "#d4553f" : "#161a20"}
+                      strokeWidth={isSel || isAttack ? 2.5 : 1}
+                    />
+                    {grave && (
+                      // An inner ring, not just the glyph, so a graveyard stays
+                      // legible under a piece or a highlight dot.
+                      <polygon points={HEX_POINTS} transform="scale(0.8)" fill="none" stroke="#c8b06a" strokeWidth={1.5} style={{ pointerEvents: "none" }} />
+                    )}
+                    {overlay !== "none" && aux && (() => {
+                      // Per-cell control probability from the aux head, as a
+                      // filled overlay. Drawn *under* the piece and the graveyard
+                      // ring so it tints the cell without hiding what is on it.
+                      //
+                      // The head's channels are [mover, opponent], not
+                      // [yellow, blue] — so which channel a colour wants depends
+                      // on whose turn it is in the position being shown. Painting
+                      // channel 0 yellow throughout swaps the sides on every
+                      // blue-to-move position, which is what it did.
+                      const side = overlay === "hex0" ? 0 : 1;
+                      const chan = side === d.side ? aux.hexControlMover : aux.hexControlOpponent;
+                      const v = chan[i];
+                      if (v === undefined) return null;
+                      const rgb = side === 0 ? "224,167,44" : "63,116,216";
+                      return (
+                        <polygon
+                          points={HEX_POINTS}
+                          fill={`rgba(${rgb},${(v * 0.72).toFixed(3)})`}
+                          style={{ pointerEvents: "none" }}
+                        />
+                      );
+                    })()}
+                    {grave && c === 0 && !isMove && !isSpawn && (
+                      <text textAnchor="middle" dy="0.35em" fontSize={15} fill="#9a8f74" style={{ pointerEvents: "none" }}>†</text>
+                    )}
+                    {c !== 0 && <Piece cell={c} pstate={d.pstate[i]} />}
+                    {isMove && <circle r={5} fill="rgba(120,220,140,0.85)" style={{ pointerEvents: "none" }} />}
+                    {isSpawn && <circle r={5} fill="rgba(150,230,170,0.9)" style={{ pointerEvents: "none" }} />}
+                    {humanTurn && (
+                      <polygon points={HEX_POINTS} fill="transparent" style={{ cursor: "pointer" }} onClick={() => onCell(i)} />
+                    )}
+                  </g>
+                );
+              })}
+              {!inProgress && state != null && (
+                <g style={{ pointerEvents: "none" }}>
+                  <rect x={0} y={0} width={SVG_W} height={SVG_H} fill="rgba(16,18,22,0.74)" rx={8} />
+                  <text x={SVG_W / 2} y={SVG_H / 2 - 6} textAnchor="middle" fontSize={20} fontWeight={700} fill="#fff">
+                    Game over
+                  </text>
+                  <text x={SVG_W / 2} y={SVG_H / 2 + 20} textAnchor="middle" fontSize={15} fill="#e6e9ee">
+                    {outcomeLabel(state.outcome)}
+                  </text>
                 </g>
-              );
-            })}
-            {!inProgress && state != null && (
-              <g style={{ pointerEvents: "none" }}>
-                <rect x={0} y={0} width={SVG_W} height={SVG_H} fill="rgba(16,18,22,0.74)" rx={8} />
-                <text x={SVG_W / 2} y={SVG_H / 2 - 6} textAnchor="middle" fontSize={20} fontWeight={700} fill="#fff">
-                  Game over
-                </text>
-                <text x={SVG_W / 2} y={SVG_H / 2 + 20} textAnchor="middle" fontSize={15} fill="#e6e9ee">
-                  {outcomeLabel(state.outcome)}
-                </text>
-              </g>
-            )}
-          </svg>
+              )}
+            </svg>
+
+            <div style={{ flex: "1 1 220px", minWidth: 220, fontSize: "0.85rem" }}>
+              {[0, 1].map((side) => (
+                <div key={side} style={{ marginBottom: "0.75rem", padding: "0.5rem 0.65rem", border: "1px solid #ddd", borderRadius: 8, background: side === me ? "#fbfbf5" : "#fff" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <strong style={{ color: SIDE_FILL[side] }}>{SIDE_NAME[side]}</strong>
+                    <span style={{ color: "#666" }}>${d.money[side]}</span>
+                  </div>
+                  <div style={{ color: "#666", marginTop: 2 }}>
+                    graveyards {graveyardsHeld(d, side)}/10 (win at {GRAVEYARDS_TO_WIN}) · income{" "}
+                    ${graveyardsHeld(d, side) + 3}/turn
+                  </div>
+                  <div style={{ color: "#666", marginTop: 2 }}>
+                    reinforcements:{" "}
+                    {d.reinforcements[side].some((n) => n > 0)
+                      ? BUYABLE.filter((u) => d.reinforcements[side][u - 1] > 0)
+                          .map((u) => `${UNITS[u].name}×${d.reinforcements[side][u - 1]}`)
+                          .join(", ")
+                      : "—"}
+                  </div>
+                </div>
+              ))}
+
+              {inProgress && d.phase !== PHASE_ATTACK && (
+                <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: "0.5rem 0.65rem" }}>
+                  <strong>Spawn phase</strong>
+                  <div style={{ color: "#666", margin: "2px 0 6px" }}>
+                    Buy into reinforcements, then pick a unit and click a highlighted cell
+                    next to one of your spawners.
+                  </div>
+                  {BUYABLE.map((u) => {
+                    const def = UNITS[u];
+                    const held = d.reinforcements[me][u - 1];
+                    const affordable = d.money[me] >= def.cost;
+                    return (
+                      <div key={u} style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 4 }}>
+                        <button onClick={() => buy(u)} disabled={!humanTurn || !affordable} style={{ width: 52 }}>
+                          ${def.cost}
+                        </button>
+                        <button
+                          onClick={() => setSpawnUnit(spawnUnit === u ? null : u)}
+                          disabled={!humanTurn || held === 0}
+                          style={{
+                            flex: 1,
+                            textAlign: "left",
+                            fontWeight: spawnUnit === u ? 600 : 400,
+                            background: spawnUnit === u ? "#e8f5ec" : undefined,
+                          }}
+                        >
+                          {def.name} ×{held}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {inProgress && d.phase === PHASE_ATTACK && (
+                <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: "0.5rem 0.65rem", color: "#666" }}>
+                  <strong style={{ color: "#222" }}>Attack phase</strong>
+                  <div style={{ marginTop: 2 }}>
+                    Click one of your pieces, then a green dot to walk or a red-edged
+                    hex to strike. Each piece moves once and attacks once; lumbering
+                    pieces cannot do both.
+                  </div>
+                  {selected != null && d.cells[selected] !== 0 && (
+                    <UnitCard cell={d.cells[selected]} pstate={d.pstate[selected]} at={selected} />
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
 
           {analysisOn && (
-            <div style={{ flex: "2 1 460px", minWidth: 420, fontSize: "0.85rem" }}>
+            <div style={{ flex: "1 1 520px", minWidth: 460, fontSize: "0.85rem" }}>
               <div
                 style={{
                   display: "flex",
@@ -791,6 +882,21 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                     value={sims}
                     onChange={(e) => setSims(Math.max(16, Number(e.target.value) || 16))}
                     style={{ width: "5rem", font: "inherit" }}
+                  />
+                </label>
+                <label
+                  style={{ color: "#999" }}
+                  title="KR-PUCT kernel bandwidth. 0 = the flat PUCT search self-play and eval run. Above 0, candidates pool visits and values with nearby turns, and the influence matrix below becomes populated."
+                >
+                  σ{" "}
+                  <input
+                    type="number"
+                    min={0}
+                    max={5}
+                    step={0.05}
+                    value={sigma}
+                    onChange={(e) => setSigma(Math.max(0, Number(e.target.value) || 0))}
+                    style={{ width: "4rem", font: "inherit" }}
                   />
                 </label>
                 <label style={{ color: "#999" }}>
@@ -911,6 +1017,21 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                 </div>
               )}
 
+              {analysis && analysis.nodes.length > 0 && (
+                sigma > 0 ? (
+                  <KernelMatrix
+                    node={analysis.nodes[0]}
+                    order={displayOrder(analysis.nodes[0], sort)}
+                  />
+                ) : (
+                  <div style={{ color: "#666", fontSize: "0.72rem", marginBottom: "0.45rem" }}>
+                    kernel off (σ = 0) — candidates are scored independently, as in
+                    self-play and eval. Raise σ to pool statistics across similar
+                    turns and see the influence matrix.
+                  </div>
+                )
+              )}
+
               {analysis && analysis.nodes.length > 0 ? (
                 <AnalysisTree
                   nodes={analysis.nodes}
@@ -936,78 +1057,6 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
               )}
             </div>
           )}
-
-
-          <div style={{ flex: "1 1 220px", minWidth: 220, fontSize: "0.85rem" }}>
-            {[0, 1].map((side) => (
-              <div key={side} style={{ marginBottom: "0.75rem", padding: "0.5rem 0.65rem", border: "1px solid #ddd", borderRadius: 8, background: side === me ? "#fbfbf5" : "#fff" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                  <strong style={{ color: SIDE_FILL[side] }}>{SIDE_NAME[side]}</strong>
-                  <span style={{ color: "#666" }}>${d.money[side]}</span>
-                </div>
-                <div style={{ color: "#666", marginTop: 2 }}>
-                  graveyards {graveyardsHeld(d, side)}/10 (win at {GRAVEYARDS_TO_WIN}) · income{" "}
-                  ${graveyardsHeld(d, side) + 3}/turn
-                </div>
-                <div style={{ color: "#666", marginTop: 2 }}>
-                  reinforcements:{" "}
-                  {d.reinforcements[side].some((n) => n > 0)
-                    ? BUYABLE.filter((u) => d.reinforcements[side][u - 1] > 0)
-                        .map((u) => `${UNITS[u].name}×${d.reinforcements[side][u - 1]}`)
-                        .join(", ")
-                    : "—"}
-                </div>
-              </div>
-            ))}
-
-            {inProgress && d.phase !== PHASE_ATTACK && (
-              <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: "0.5rem 0.65rem" }}>
-                <strong>Spawn phase</strong>
-                <div style={{ color: "#666", margin: "2px 0 6px" }}>
-                  Buy into reinforcements, then pick a unit and click a highlighted cell
-                  next to one of your spawners.
-                </div>
-                {BUYABLE.map((u) => {
-                  const def = UNITS[u];
-                  const held = d.reinforcements[me][u - 1];
-                  const affordable = d.money[me] >= def.cost;
-                  return (
-                    <div key={u} style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 4 }}>
-                      <button onClick={() => buy(u)} disabled={!humanTurn || !affordable} style={{ width: 52 }}>
-                        ${def.cost}
-                      </button>
-                      <button
-                        onClick={() => setSpawnUnit(spawnUnit === u ? null : u)}
-                        disabled={!humanTurn || held === 0}
-                        style={{
-                          flex: 1,
-                          textAlign: "left",
-                          fontWeight: spawnUnit === u ? 600 : 400,
-                          background: spawnUnit === u ? "#e8f5ec" : undefined,
-                        }}
-                      >
-                        {def.name} ×{held}
-                      </button>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-
-            {inProgress && d.phase === PHASE_ATTACK && (
-              <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: "0.5rem 0.65rem", color: "#666" }}>
-                <strong style={{ color: "#222" }}>Attack phase</strong>
-                <div style={{ marginTop: 2 }}>
-                  Click one of your pieces, then a green dot to walk or a red-edged
-                  hex to strike. Each piece moves once and attacks once; lumbering
-                  pieces cannot do both.
-                </div>
-                {selected != null && d.cells[selected] !== 0 && (
-                  <UnitCard cell={d.cells[selected]} pstate={d.pstate[selected]} at={selected} />
-                )}
-              </div>
-            )}
-          </div>
         </div>
       )}
 

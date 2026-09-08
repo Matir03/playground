@@ -360,7 +360,11 @@ mod tests {
         {
             use playground_core::Analyzable;
             let st = Minions::initial_state();
-            let a = Minions::analyze(&st, budget, Some(8), false)
+            let opts = playground_core::AnalysisOptions {
+                candidates: Some(8),
+                ..Default::default()
+            };
+            let a = Minions::analyze(&st, budget, opts)
                 .expect("configured")
                 .expect("analysis");
             assert!(!a.nodes.is_empty(), "a search analysis must return a tree");
@@ -386,7 +390,11 @@ mod tests {
             }
 
             // Eval-only must skip the search entirely, not return a stub tree.
-            let ev = Minions::analyze(&st, budget, None, true)
+            let ev = Minions::analyze(
+                &st,
+                budget,
+                playground_core::AnalysisOptions { eval_only: true, ..Default::default() },
+            )
                 .expect("configured")
                 .expect("analysis");
             assert!(ev.nodes.is_empty(), "eval_only must not build a tree");
@@ -516,13 +524,12 @@ impl playground_core::Analyzable for Minions {
     fn analyze(
         state: &MinionsState,
         budget: SolverBudget,
-        candidates: Option<usize>,
-        eval_only: bool,
+        opts: playground_core::AnalysisOptions,
     ) -> Option<anyhow::Result<playground_core::Analysis>> {
         if !is_configured() {
             return None;
         }
-        Some(analyze_inner(state, budget, candidates, eval_only))
+        Some(analyze_inner(state, budget, opts))
     }
 
     fn apply_encoded_turn(state: &MinionsState, turn: &[u8]) -> anyhow::Result<MinionsState> {
@@ -533,9 +540,9 @@ impl playground_core::Analyzable for Minions {
 fn analyze_inner(
     state: &MinionsState,
     budget: SolverBudget,
-    candidates: Option<usize>,
-    eval_only: bool,
+    opts: playground_core::AnalysisOptions,
 ) -> anyhow::Result<playground_core::Analysis> {
+    let playground_core::AnalysisOptions { candidates, eval_only, kernel_sigma } = opts;
     let cfg = CONFIG.lock().unwrap().clone().ok_or_else(|| anyhow::anyhow!("no net configured"))?;
 
     let mut guard = MODEL.lock().unwrap();
@@ -569,6 +576,9 @@ fn analyze_inner(
         // Analysis reports what the search believes, so it must not sample a
         // move for variety the way early self-play plies do.
         temp_moves: 0,
+        // 0 keeps this identical to the search self-play and eval run. Above 0
+        // the kernel is live and every node exports its matrix.
+        kernel_sigma,
         ..Default::default()
     };
     params.simulations = budget.max_visits.unwrap_or(cfg.sims);
@@ -625,6 +635,7 @@ fn analyze_inner(
                         forced: e.forced,
                     })
                     .collect(),
+                kernel: n.kernel.clone(),
             }
         })
         .collect();

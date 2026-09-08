@@ -169,6 +169,12 @@ message AnalyzeRequest {
   // variation asks for this on every click; a full search per click would make
   // the tree unusable to click through.
   bool eval_only = 5;
+  // KR-PUCT kernel bandwidth. 0 (the default) is the flat PUCT search that
+  // self-play and eval run, so analysis matches the real search unless you
+  // deliberately ask otherwise. Above 0, candidates pool visits and values with
+  // their neighbours under `move_distance`, and `AnalyzeNode.kernel` comes back
+  // populated.
+  float kernel_sigma = 6;
 }
 
 // A node of the search tree, flattened. `nodes[0]` is the root.
@@ -182,6 +188,10 @@ message AnalyzeNode {
   bool terminal = 4;
   double term_value = 5;
   repeated AnalyzeEdge edges = 6;
+  // Row-major `k x k` KR-PUCT kernel over `edges`, in `edges` order. Empty when
+  // the kernel is off, which is the default. Entry `(i, j)` is the weight with
+  // which candidate `i` borrows candidate `j`'s statistics during selection.
+  repeated float kernel = 7;
 }
 
 message AnalyzeEdge {
@@ -189,8 +199,11 @@ message AnalyzeEdge {
   bytes turn = 1;
   // Prior probability, normalised over this node's candidate set.
   double prior = 2;
-  // `f(s,a) - max_a f(s,a)`: the energy the prior came from, shifted so the
-  // best candidate reads 0.
+  // Raw `f(s,a)` as the energy head reported it, before any softmax. The scale
+  // has no absolute meaning: the head is trained by a softmax cross-entropy
+  // over the candidate set, which is invariant to a per-state additive shift,
+  // so only *differences* within a node are interpretable. Clients that display
+  // it should subtract the node's maximum.
   double energy = 3;
   uint32 visits = 4;
   // Absent when the edge was never visited — distinct from a value of 0.

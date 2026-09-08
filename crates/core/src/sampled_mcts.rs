@@ -734,6 +734,12 @@ pub struct TreeNode<G: SampledGame> {
     pub terminal: bool,
     pub term_value: f32,
     pub edges: Vec<TreeEdge<G>>,
+    /// Row-major `k x k` KR-PUCT kernel over `edges`, in `edges` order, or
+    /// empty when the kernel is off (`kernel_sigma == 0`). Entry `(i, j)` is
+    /// how much of candidate `j`'s visits and value candidate `i` borrows when
+    /// selection scores it, so row `i` is exactly the "relative influence" of
+    /// the rest of the set on `i`. The diagonal is 1 by construction.
+    pub kernel: Vec<f32>,
 }
 
 impl<G: SampledGame> Search<G> {
@@ -782,6 +788,7 @@ impl<G: SampledGame> Search<G> {
                             forced: e.forced_n,
                         })
                         .collect(),
+                    kernel: node.kern.clone(),
                 }
             })
             .collect()

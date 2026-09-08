@@ -218,9 +218,13 @@ where
             max_visits: inner.budget.as_ref().and_then(|b| b.max_visits),
             max_millis: inner.budget.as_ref().and_then(|b| b.max_millis),
         };
-        let candidates = (inner.candidates > 0).then_some(inner.candidates as usize);
+        let opts = playground_core::AnalysisOptions {
+            candidates: (inner.candidates > 0).then_some(inner.candidates as usize),
+            eval_only: inner.eval_only,
+            kernel_sigma: inner.kernel_sigma,
+        };
 
-        let analysis = G::analyze(&state, budget, candidates, inner.eval_only)
+        let analysis = G::analyze(&state, budget, opts)
             .ok_or_else(|| {
                 Status::failed_precondition(
                     "analyze: this engine has no analysable net configured",
@@ -262,6 +266,7 @@ where
                             forced: e.forced,
                         })
                         .collect(),
+                    kernel: n.kernel.clone(),
                 })
                 .collect(),
             chosen: analysis.chosen.map(|c| c as u32),
