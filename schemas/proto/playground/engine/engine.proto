@@ -22,6 +22,11 @@ service EngineService {
   // saw, without playing anything. The handle's game is left untouched.
   rpc Analyze(AnalyzeRequest) returns (AnalyzeResponse);
 
+  // Commit one whole turn to the handle's game, as an opaque encoding from
+  // `AnalyzeEdge.turn`. Unlike Analyze this *does* advance the game: it is how
+  // an analysis view plays a line it likes and re-roots on the result.
+  rpc ApplyTurn(ApplyTurnRequest) returns (playground.game.GameState);
+
   // Health / capabilities
   rpc Health(HealthRequest) returns (HealthResponse);
 }
@@ -139,6 +144,12 @@ message SelfPlayStats {
   uint32 games_in_flight = 1;
   uint32 games_completed = 2;
   double games_per_second = 3;
+}
+
+message ApplyTurnRequest {
+  playground.game.GameHandle handle = 1;
+  // Opaque whole-turn encoding, as returned in `AnalyzeEdge.turn`.
+  bytes turn = 2;
 }
 
 message AnalyzeRequest {

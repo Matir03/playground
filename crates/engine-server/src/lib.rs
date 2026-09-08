@@ -146,6 +146,43 @@ where
     G: Solver + Analyzable,
     M: ModelClient<G> + 'static,
 {
+    /// Commit one whole turn to the handle's game.
+    ///
+    /// The counterpart to `analyze`: that one looks at a line on a copy, this
+    /// one plays it. Both take the same opaque encoding, so an analysis view
+    /// can hand back the turn it was just shown without translating anything.
+    ///
+    /// Legality is enforced by the game's realizer rather than by checking
+    /// against `legal_moves` the way `apply_move` does: a turn is a *sequence*
+    /// of moves, so it has no entry in that list to match.
+    async fn apply_turn(
+        &self,
+        req: Request<ApplyTurnRequest>,
+    ) -> Result<Response<GameState>, Status> {
+        let inner = req.into_inner();
+        let handle = inner
+            .handle
+            .ok_or_else(|| Status::invalid_argument("apply_turn: no handle"))?;
+        let handle_id = handle.handle_id.clone();
+
+        let mut games = self.games.write().await;
+        let bytes = games
+            .get(&handle_id)
+            .ok_or_else(|| Status::not_found(format!("unknown handle {handle_id}")))?
+            .clone();
+
+        let state = G::decode_state(&bytes).map_err(|e| Status::internal(e.to_string()))?;
+        if G::outcome(&state).is_terminal() {
+            return Err(Status::failed_precondition("game is already over"));
+        }
+
+        let next = G::apply_encoded_turn(&state, &inner.turn)
+            .map_err(|e| Status::invalid_argument(format!("apply_turn: {e}")))?;
+        games.insert(handle_id, G::encode_state(&next));
+
+        Ok(Response::new(state_to_proto::<G>(&next)))
+    }
+
     /// Run the net and the search on a position and report what they saw.
     ///
     /// Deliberately does not touch the handle's stored state: the point of an

@@ -42,6 +42,7 @@ import {
   RequestMoveRequestSchema,
   SearchBudgetSchema,
   AnalyzeRequestSchema,
+  ApplyTurnRequestSchema,
   type AnalyzeResponse,
 } from "../../gen/playground/engine/engine_pb";
 import { AnalysisTree, type SortKey } from "./Analysis";
@@ -521,6 +522,38 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
     },
     [client, handle, sims],
   );
+
+  /** Play a root candidate for real, then re-root the analysis on the result.
+   *
+   * Distinct from walking a line: that reads a position the game is not in,
+   * this advances the game. The re-analysis is a full search, not `eval_only`,
+   * because the new position is now the one being studied. */
+  const commitTurn = useCallback(
+    async (turn: Uint8Array) => {
+      if (!handle) return;
+      setAnalysing(true);
+      setError(null);
+      try {
+        const next = await client.applyTurn(
+          create(ApplyTurnRequestSchema, { handle, turn }),
+          { signal: AbortSignal.timeout(30000) },
+        );
+        setState(next);
+        setWalk(null);
+        setExpanded(new Set());
+        setAnalysis(null);
+        // The engine seat stays suspended while analysis is on, so this does
+        // not hand the game to it — the new position simply becomes the root.
+        setSelected(null);
+        setSpawnUnit(null);
+      } catch (err) {
+        setError(err instanceof ConnectError ? err.message : String(err));
+      } finally {
+        setAnalysing(false);
+      }
+    },
+    [client, handle],
+  );
   const inProgress = state?.outcome === Outcome.IN_PROGRESS;
   const humanTurn = !!state && inProgress && seatToMove(state) === "human" && !busy && !thinking;
 
@@ -893,6 +926,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                     })
                   }
                   onPlay={(line, labels) => void runAnalysis(line, labels, true)}
+                  onCommit={(turn) => void commitTurn(turn)}
                   maxDepth={12}
                 />
               ) : (

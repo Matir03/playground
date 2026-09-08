@@ -47,6 +47,7 @@ function EdgeRow({
   expanded,
   onToggle,
   onPlay,
+  onCommit,
   path,
 }: {
   edge: AnalyzeEdge;
@@ -56,6 +57,8 @@ function EdgeRow({
   expanded: boolean;
   onToggle: () => void;
   onPlay: () => void;
+  /** Absent below the root: only a root candidate is legal in the real game. */
+  onCommit?: () => void;
   path: string;
 }) {
   const share = node.totalVisits > 0 ? edge.visits / node.totalVisits : 0;
@@ -64,7 +67,7 @@ function EdgeRow({
     <div
       style={{
         display: "grid",
-        gridTemplateColumns: "1.1rem 3.4rem 3.9rem 3.6rem 3.6rem 1fr",
+        gridTemplateColumns: "1.1rem 1.3rem 3.4rem 3.9rem 3.6rem 3.6rem 1fr",
         gap: "0.35rem",
         alignItems: "center",
         padding: "0.12rem 0.25rem",
@@ -83,6 +86,26 @@ function EdgeRow({
       >
         {hasChild ? (expanded ? "▾" : "▸") : "·"}
       </span>
+
+      {/* Commit the turn to the real game and re-root the analysis here.
+          Only offered at the root: a deeper turn is legal in the variation but
+          not in the position the game is actually in, so playing it would need
+          every turn above it played first — which is what walking the line and
+          playing from there already does, one step at a time. */}
+      {onCommit ? (
+        <span
+          onClick={(e) => {
+            e.stopPropagation();
+            onCommit();
+          }}
+          title="play this turn on the board and re-analyse from there"
+          style={{ cursor: "pointer", color: "#6a9", userSelect: "none" }}
+        >
+          ▶
+        </span>
+      ) : (
+        <span />
+      )}
 
       <span title="visits, and share of this node's total">
         {edge.visits}
@@ -140,6 +163,7 @@ export function AnalysisTree({
   expanded,
   onToggle,
   onPlay,
+  onCommit,
   maxDepth,
 }: {
   nodes: AnalyzeNode[];
@@ -151,6 +175,8 @@ export function AnalysisTree({
   onToggle: (key: string) => void;
   /** The sequence of turn encodings from the root down to the clicked edge. */
   onPlay: (line: Uint8Array[], labels: string[]) => void;
+  /** Commit a root candidate to the real game. */
+  onCommit: (turn: Uint8Array) => void;
   maxDepth: number;
 }) {
   if (nodes.length === 0) return null;
@@ -184,6 +210,7 @@ export function AnalysisTree({
           expanded={isOpen}
           onToggle={() => onToggle(key)}
           onPlay={() => onPlay(nextLine, nextLabels)}
+          onCommit={depth === 0 ? () => onCommit(edge.turn) : undefined}
           path={nextLabels.join("  →  ")}
         />,
       );
@@ -200,7 +227,7 @@ export function AnalysisTree({
       <div
         style={{
           display: "grid",
-          gridTemplateColumns: "1.1rem 3.4rem 3.9rem 3.6rem 3.6rem 1fr",
+          gridTemplateColumns: "1.1rem 1.3rem 3.4rem 3.9rem 3.6rem 3.6rem 1fr",
           gap: "0.35rem",
           padding: "0.15rem 0.25rem 0.15rem 0.25rem",
           fontSize: "0.7rem",
@@ -210,6 +237,7 @@ export function AnalysisTree({
           borderBottom: "1px solid #333",
         }}
       >
+        <span />
         <span />
         <span>visits</span>
         <span>prior</span>
