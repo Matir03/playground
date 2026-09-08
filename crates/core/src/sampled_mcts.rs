@@ -80,7 +80,15 @@ pub trait SampledGame: Send + Sync + 'static {
 /// injection, realization and energy scoring all live behind this seam, which
 /// keeps the search itself testable against a mock.
 /// A node expansion: the value, and the candidate moves with their priors.
-/// A value, plus candidates as `(move, prior, explore)`.
+/// A value, plus candidates as `(move, energy, explore)`.
+///
+/// The f32 is the **raw energy** `f(s, a)`, on whatever scale the model's head
+/// emits — *not* a probability. Turning energies into priors is the search's
+/// job because only the search knows the whole candidate set: with chunked
+/// generation a model call sees one candidate at a time, and a softmax over one
+/// element is `1.0` regardless of what the head said. Normalising per chunk
+/// discards the head's opinion entirely and leaves priors that encode arrival
+/// order — every candidate 0.5, halving as the next one lands.
 ///
 /// `explore` marks a candidate drawn by **forced exploration** rather than by the
 /// model — support coverage that does not depend on the sampler being any good.
@@ -255,6 +263,12 @@ pub fn min_visits_per_candidate(k_forced: f32) -> f32 {
 
 struct Entry<G: SampledGame> {
     mv: G::Move,
+    /// Raw energy `f(s, a)` as the model reported it. Kept alongside `p`
+    /// because widening grows the candidate set, and the softmax has to be
+    /// recomputed over *all* of it — which needs the pre-normalisation values.
+    energy: f32,
+    /// Prior: `softmax(energy)` over this node's entries. Derived, never
+    /// supplied — see [`renormalise`].
     p: f32,
     n: u32,
     w: f32,
@@ -289,6 +303,55 @@ struct Node<G: SampledGame> {
     expanded: bool,
     terminal: bool,
     term_v: f32,
+}
+
+/// Recompute every entry's prior as `softmax` over the node's energies.
+///
+/// The single place priors are made, and it runs over the *whole* candidate set
+/// every time that set grows. That is the point: energies from different model
+/// calls are only comparable once they meet here, so normalising anywhere
+/// earlier — per chunk, inside the model — throws the comparison away.
+///
+/// Entries also end up sorted by prior, descending. Progressive widening
+/// reveals a prefix of this list, so the order decides which candidates a
+/// lightly-visited node considers at all; it must be the ones the policy rates
+/// highest, not the order the sampler happened to emit them in.
+fn renormalise<G: SampledGame>(entries: &mut [Entry<G>]) {
+    entries.sort_by(|a, b| b.energy.total_cmp(&a.energy));
+    let max = entries.iter().map(|e| e.energy).fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        // Every candidate was reported as impossible, or there are none. A
+        // uniform prior at least lets the search proceed on its own statistics.
+        let u = 1.0 / entries.len().max(1) as f32;
+        entries.iter_mut().for_each(|e| e.p = u);
+        return;
+    }
+    let mut sum = 0.0f32;
+    for e in entries.iter_mut() {
+        e.p = (e.energy - max).exp();
+        sum += e.p;
+    }
+    if sum > 0.0 {
+        entries.iter_mut().for_each(|e| e.p /= sum);
+    } else {
+        let u = 1.0 / entries.len().max(1) as f32;
+        entries.iter_mut().for_each(|e| e.p = u);
+    }
+}
+
+/// `ln(exp(a) + exp(b))`, overflow-safe.
+///
+/// Merging two candidates that realize to the same position: their prior mass
+/// adds, so their energies combine this way rather than by taking one.
+fn logaddexp(a: f32, b: f32) -> f32 {
+    if a == f32::NEG_INFINITY {
+        return b;
+    }
+    if b == f32::NEG_INFINITY {
+        return a;
+    }
+    let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+    hi + (lo - hi).exp().ln_1p()
 }
 
 /// Candidate-budget accounting.
@@ -648,11 +711,7 @@ pub struct TreeEdge<G: SampledGame> {
     pub mv: G::Move,
     /// Prior probability, normalised over this node's candidate set.
     pub prior: f32,
-    /// `f(s, a) - max_a f(s, a)`, the energy the prior came from.
-    ///
-    /// The sampler stores `exp(f - max)` un-normalised, so the logarithm
-    /// recovers the energy exactly, shifted so the best candidate reads 0.
-    /// Zero-prior candidates report `f32::NEG_INFINITY`.
+    /// Raw energy `f(s, a)` as the model reported it, before any softmax.
     pub energy: f32,
     pub visits: u32,
     /// Mean value over this edge's visits, from the perspective of the side to
@@ -691,7 +750,7 @@ impl<G: SampledGame> Search<G> {
             .iter()
             .enumerate()
             .map(|(i, node)| {
-                let total_p: f32 = node.entries.iter().map(|e| e.p).sum();
+
                 TreeNode {
                     // The root is node 0 and every other node is reached by
                     // exactly one edge, so the parent is recoverable by scan.
@@ -712,8 +771,10 @@ impl<G: SampledGame> Search<G> {
                         .iter()
                         .map(|e| TreeEdge {
                             mv: e.mv.clone(),
-                            prior: if total_p > 0.0 { e.p / total_p } else { 0.0 },
-                            energy: if e.p > 0.0 { e.p.ln() } else { f32::NEG_INFINITY },
+                            // Already a normalised softmax over this node's
+                            // set — `renormalise` is the only writer of `p`.
+                            prior: e.p,
+                            energy: e.energy,
                             visits: e.n,
                             value: (e.n > 0).then(|| e.w / e.n as f32),
                             child: (e.child >= 0).then_some(e.child as usize),
@@ -826,7 +887,7 @@ impl<G: SampledGame> Search<G> {
             let key = G::state_key(&G::apply(&self.tree[cur].state, &mv));
             match seen.get(&key) {
                 Some(&i) => {
-                    entries[i].p += p.max(0.0);
+                    entries[i].energy = logaddexp(entries[i].energy, p);
                     // A position the model also proposed still deserves its
                     // guaranteed look if exploration reached it independently.
                     entries[i].explore |= explore;
@@ -835,7 +896,8 @@ impl<G: SampledGame> Search<G> {
                     seen.insert(key, entries.len());
                     entries.push(Entry {
                         mv,
-                        p: p.max(0.0),
+                        energy: p,
+                        p: 0.0,
                         n: 0,
                         w: 0.0,
                         child: -1,
@@ -845,19 +907,7 @@ impl<G: SampledGame> Search<G> {
                 }
             }
         }
-        // Order by prior, descending. Progressive widening reveals a *prefix* of
-        // this list, so the order decides which candidates a lightly-visited
-        // node gets to consider at all — it must be the ones the policy rates
-        // highest, not whatever order the sampler happened to emit.
-        entries.sort_by(|a, b| b.p.total_cmp(&a.p));
-
-        let sum: f32 = entries.iter().map(|e| e.p).sum();
-        if sum > 0.0 {
-            entries.iter_mut().for_each(|e| e.p /= sum);
-        } else {
-            let u = 1.0 / entries.len().max(1) as f32;
-            entries.iter_mut().for_each(|e| e.p = u);
-        }
+        renormalise(&mut entries);
         self.tree[cur].entries = entries;
         self.tree[cur].expanded = true;
         self.build_kernel(cur);
@@ -921,14 +971,16 @@ impl<G: SampledGame> Search<G> {
             let key = G::state_key(&G::apply(&self.tree[cur].state, &mv));
             match seen.get(&key) {
                 Some(&i) => {
-                    self.tree[cur].entries[i].p += p.max(0.0);
+                    self.tree[cur].entries[i].energy =
+                        logaddexp(self.tree[cur].entries[i].energy, p);
                     self.tree[cur].entries[i].explore |= explore;
                 }
                 None => {
                     seen.insert(key, self.tree[cur].entries.len());
                     self.tree[cur].entries.push(Entry {
                         mv,
-                        p: p.max(0.0),
+                        energy: p,
+                        p: 0.0,
                         n: 0,
                         w: 0.0,
                         child: -1,
@@ -941,16 +993,9 @@ impl<G: SampledGame> Search<G> {
         if self.tree[cur].entries.len() == before {
             self.tree[cur].widen_exhausted = true;
         }
-        // Sorting is safe here because a widen abandons its simulation, so no
-        // `path` entry indexes into this node.
-        self.tree[cur].entries.sort_by(|a, b| b.p.total_cmp(&a.p));
-        let sum: f32 = self.tree[cur].entries.iter().map(|e| e.p).sum();
-        if sum > 0.0 {
-            self.tree[cur].entries.iter_mut().for_each(|e| e.p /= sum);
-        } else {
-            let u = 1.0 / self.tree[cur].entries.len().max(1) as f32;
-            self.tree[cur].entries.iter_mut().for_each(|e| e.p = u);
-        }
+        // Re-softmax over the grown set. Sorting inside is safe here because a
+        // widen abandons its simulation, so no `path` entry indexes this node.
+        renormalise(&mut self.tree[cur].entries);
         self.build_kernel(cur);
     }
 
@@ -1261,7 +1306,9 @@ mod tests {
         fn expand(&self, s: &CountState, _k: usize) -> anyhow::Result<Expansion<Count>> {
             Ok((
                 0.0,
-                (1..=3u32).filter(|m| *m <= s.n).map(|m| (m, 1.0, false)).collect(),
+                // Equal energies — any constant is a uniform prior after the
+                // search's softmax, so 0.0 states that plainly.
+                (1..=3u32).filter(|m| *m <= s.n).map(|m| (m, 0.0, false)).collect(),
             ))
         }
     }
@@ -1271,7 +1318,7 @@ mod tests {
     impl SampledModel<Count> for Duplicating {
         fn expand(&self, s: &CountState, _k: usize) -> anyhow::Result<Expansion<Count>> {
             let _ = s;
-            Ok((0.0, vec![(1, 1.0, false), (1, 1.0, false), (1, 1.0, false), (2, 1.0, false)]))
+            Ok((0.0, vec![(1, 0.0, false), (1, 0.0, false), (1, 0.0, false), (2, 0.0, false)]))
         }
     }
 
@@ -1301,7 +1348,8 @@ mod tests {
         struct Spread;
         impl SampledModel<Count> for Spread {
             fn expand(&self, s: &CountState, _k: usize) -> anyhow::Result<Expansion<Count>> {
-                Ok((0.1, (1..=3).map(|m| (m, 1.0 / m as f32, m == 3)).collect()))
+                // Descending energies, so move 1 is the policy's favourite.
+                Ok((0.1, (1..=3).map(|m| (m, -(m as f32), m == 3)).collect()))
             }
         }
         let mut params = SampledParams {
@@ -1403,7 +1451,7 @@ mod tests {
         let params = SampledParams { pw_alpha: 0.5, pw_beta: 2.0, ..Default::default() };
         let mut node = new_node::<Count>(CountState { n: 21, side: 1 });
         node.entries = (0..12)
-            .map(|i| Entry::<Count> { mv: i, p: 1.0 / 12.0, n: 0, w: 0.0, child: -1, explore: false, forced_n: 0 })
+            .map(|i| Entry::<Count> { mv: i, energy: 0.0, p: 1.0 / 12.0, n: 0, w: 0.0, child: -1, explore: false, forced_n: 0 })
             .collect();
 
         node.total_n = 1;
@@ -1432,6 +1480,7 @@ mod tests {
             node.entries = (0..64)
                 .map(|i| Entry::<Count> {
                     mv: i,
+                    energy: 0.0,
                     p: 1.0 / 64.0,
                     n: 0,
                     w: 0.0,
@@ -1471,7 +1520,7 @@ mod tests {
                     0.0,
                     (0..k.max(1))
                         .map(|i| ((start + i) % 8 + 1) as u32)
-                        .map(|m| (m, 1.0, false))
+                        .map(|m| (m, 0.0, false))
                         .collect(),
                 ))
             }
@@ -1603,7 +1652,7 @@ mod tests {
                 let moves: Vec<u32> = (1..=3u32).filter(|m| *m <= s.n).collect();
                 let cands: Vec<(u32, f32, bool)> = (0..k.max(1))
                     .map(|i| moves[(start + i) % moves.len()])
-                    .map(|m| (m, 1.0 / m as f32, false))
+                    .map(|m| (m, -(m as f32), false))
                     .collect();
                 Ok((0.0, cands))
             }
@@ -1919,6 +1968,64 @@ mod tests {
                 assert_eq!(e.value.is_some(), e.visits > 0, "node {i} value/visit disagree");
                 assert!(e.forced <= e.visits, "node {i} forced visits exceed total");
             }
+        }
+    }
+
+    /// Priors must follow the energies, not the order candidates arrived in.
+    ///
+    /// Chunked generation hands the model one candidate per call, so a model
+    /// that normalises within its own call returns `exp(f - f) = 1` every time
+    /// and the head's opinion never reaches the search. The symptom was priors
+    /// that halved — 0.5, 0.25, 0.125 — identical for *any* energies, because
+    /// each newcomer took half the mass and pushed the rest down.
+    #[test]
+    fn widened_priors_follow_energy_not_arrival_order() {
+        /// Emits a decisive energy gap: the first candidate should end up with
+        /// essentially all the prior mass.
+        struct Skewed {
+            cursor: std::sync::atomic::AtomicUsize,
+        }
+        impl SampledModel<Count> for Skewed {
+            fn expand(&self, s: &CountState, k: usize) -> anyhow::Result<Expansion<Count>> {
+                let start = self.cursor.fetch_add(k.max(1), std::sync::atomic::Ordering::Relaxed);
+                let moves: Vec<u32> = (1..=3u32).filter(|m| *m <= s.n).collect();
+                Ok((
+                    0.0,
+                    (0..k.max(1))
+                        .map(|i| {
+                            let idx = start + i;
+                            (moves[idx % moves.len()], -10.0 * idx as f32, false)
+                        })
+                        .collect(),
+                ))
+            }
+        }
+        let params = SampledParams {
+            simulations: 60,
+            k_candidates: 3,
+            pw_chunk: 1,
+            k_forced: 0.0,
+            min_explore_visits: 0.0,
+            temp_moves: 0,
+            seed: 5,
+            ..Default::default()
+        };
+        let model = Skewed { cursor: std::sync::atomic::AtomicUsize::new(0) };
+        let (_, tree) =
+            search_analyzed::<Count, _>(&model, CountState { n: 21, side: 1 }, &params, 0)
+                .expect("search");
+        let priors: Vec<f32> = tree[0].edges.iter().map(|e| e.prior).collect();
+        assert!(priors.len() > 1, "need several candidates to compare: {priors:?}");
+        assert!(
+            priors[0] > 0.98,
+            "a 10-nat lead should take nearly all the mass, got {priors:?}"
+        );
+        // The old bug produced exactly this, whatever the energies were.
+        for w in priors.windows(2) {
+            assert!(
+                (w[1] / w[0] - 0.5).abs() > 1e-3,
+                "priors are halving, which means arrival order not energy: {priors:?}"
+            );
         }
     }
 

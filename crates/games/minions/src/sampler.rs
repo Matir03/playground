@@ -600,11 +600,22 @@ impl MinionsModel {
         specs
     }
 
+    /// Candidates carry their **raw energies**; the search turns them into
+    /// priors.
+    ///
+    /// This used to return `exp(f - max)` over the batch it was handed, on the
+    /// reasoning that the search renormalises anyway so the constant cancels.
+    /// It does not cancel once generation is chunked: with `pw_chunk = 1` this
+    /// sees a single candidate, `max` is that candidate's own energy, and the
+    /// result is `exp(0) = 1` no matter what the head said. Every candidate
+    /// then arrived at the node with the same prior, and normalising over the
+    /// grown set left priors that halved with arrival order — 0.5, 0.25,
+    /// 0.125 — carrying no policy information at all.
+    ///
+    /// Kept as a named function rather than inlined so the invariant has
+    /// somewhere to live: whatever the head emits reaches the search unscaled.
     fn priors_from(&self, energies: &[f32]) -> Vec<f32> {
-        let max = energies.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        // exp(f - max); the search normalises over the candidate set, which makes
-        // this exactly softmax(f) and needs no partition function.
-        energies.iter().map(|x| (x - max).exp()).collect()
+        energies.to_vec()
     }
 }
 
