@@ -53,11 +53,20 @@ pub trait Solver: Game {
 ///
 /// Sigmoids are applied here rather than by each consumer, so the UI and any
 /// other reader agree on what the numbers mean.
+///
+/// **Both arrays are indexed `[mover, opponent]`, not `[first, second].`** The
+/// training target is built with `sides = [side_to_move, 1 - side_to_move]`, so
+/// index 0 follows whoever is to move. Treating index 0 as a fixed player
+/// swaps the two sides on every position where the other one moves.
 pub struct AnalysisAux {
-    /// Per-cell probability that the side controls the hex, row-major.
+    /// Per-cell probability that the side holds the hex over the rest of the
+    /// game, row-major.
     pub hex_control: [Vec<f32>; 2],
-    /// Per-side-turn probability the necromancer is still alive.
-    pub necro_safety: [Vec<f32>; 2],
+    /// Per-side-turn probability the necromancer is *dead* by that turn.
+    ///
+    /// Hazard, not survival: the target stores `u8::from(dead)`, so the curve
+    /// rises as death becomes more likely.
+    pub necro_hazard: [Vec<f32>; 2],
     /// Trajectory-balance log-partition estimate for this position.
     pub log_z: f32,
 }

@@ -194,15 +194,22 @@ message AnalyzeEdge {
 
 // What the auxiliary heads see. Probabilities, not logits: the sigmoid is
 // applied engine-side so every consumer agrees on it.
+//
+// Both heads are *perspective-relative*: the training target is built with
+// `sides = [side_to_move, opponent]`, so channel 0 belongs to whoever is to
+// move in `AnalyzeResponse.state`, not to the first player. A consumer that
+// paints channel 0 as one colour throughout has the two sides swapped on
+// every position where the other side is to move.
 message AnalyzeAux {
-  // Per-cell probability that this side controls the hex, row-major over
-  // cells, for each of the two sides.
-  repeated double hex_control_first = 1;
-  repeated double hex_control_second = 2;
-  // Per-side-turn probability the necromancer is still alive, over the
-  // auxiliary head's horizon.
-  repeated double necro_safety_first = 3;
-  repeated double necro_safety_second = 4;
+  // Per-cell probability that the side holds the hex over the rest of the
+  // game, row-major over cells.
+  repeated double hex_control_mover = 1;
+  repeated double hex_control_opponent = 2;
+  // Per-side-turn probability the necromancer is *dead* by that turn, over the
+  // auxiliary head's horizon. Hazard, not survival — the target stores
+  // `u8::from(dead)`, so the curve rises as death becomes more likely.
+  repeated double necro_hazard_mover = 3;
+  repeated double necro_hazard_opponent = 4;
   // The trajectory-balance log-partition estimate for this position.
   double log_z = 5;
 }

@@ -686,9 +686,16 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                     // Per-cell control probability from the aux head, as a
                     // filled overlay. Drawn *under* the piece and the graveyard
                     // ring so it tints the cell without hiding what is on it.
-                    const v = (overlay === "hex0" ? aux.hexControlFirst : aux.hexControlSecond)[i];
-                    if (v === undefined) return null;
+                    //
+                    // The head's channels are [mover, opponent], not
+                    // [yellow, blue] — so which channel a colour wants depends
+                    // on whose turn it is in the position being shown. Painting
+                    // channel 0 yellow throughout swaps the sides on every
+                    // blue-to-move position, which is what it did.
                     const side = overlay === "hex0" ? 0 : 1;
+                    const chan = side === d.side ? aux.hexControlMover : aux.hexControlOpponent;
+                    const v = chan[i];
+                    if (v === undefined) return null;
                     const rgb = side === 0 ? "224,167,44" : "63,116,216";
                     return (
                       <polygon
@@ -804,30 +811,38 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
               {/* Necromancer survival over the aux head's horizon: one bar per
                   side-turn ahead, so a line that gets a necromancer killed
                   shows as the curve collapsing rather than as a number. */}
-              {aux && aux.necroSafetyFirst.length > 0 && (
+              {aux && aux.necroHazardMover.length > 0 && d && (
                 <div style={{ marginBottom: "0.5rem" }}>
                   <div style={{ color: "#777", fontSize: "0.7rem", textTransform: "uppercase", letterSpacing: "0.04em" }}>
-                    necromancer survival
+                    necromancer risk <span style={{ textTransform: "none" }}>(taller = more likely dead by then)</span>
                   </div>
-                  {[aux.necroSafetyFirst, aux.necroSafetySecond].map((curve, side) => (
-                    <div key={side} style={{ display: "flex", alignItems: "flex-end", gap: 2, height: 26, marginTop: 2 }}>
-                      <span style={{ color: SIDE_FILL[side], fontSize: "0.7rem", width: "2.6rem" }}>
-                        {SIDE_NAME[side]}
-                      </span>
-                      {curve.map((p, i) => (
-                        <div
-                          key={i}
-                          title={`+${i + 1} side-turns: ${(p * 100).toFixed(0)}%`}
-                          style={{
-                            width: 10,
-                            height: `${Math.max(2, p * 24)}px`,
-                            background: SIDE_FILL[side],
-                            opacity: 0.35 + 0.65 * p,
-                          }}
-                        />
-                      ))}
-                    </div>
-                  ))}
+                  {/* Hazard, not survival: the target stores `dead`, so a tall
+                      bar is a necromancer in trouble. And the channels are
+                      [mover, opponent], so each row picks its channel by
+                      whether that side is the one to move here. */}
+                  {[0, 1].map((side) => {
+                    const curve =
+                      side === d.side ? aux.necroHazardMover : aux.necroHazardOpponent;
+                    return (
+                      <div key={side} style={{ display: "flex", alignItems: "flex-end", gap: 2, height: 26, marginTop: 2 }}>
+                        <span style={{ color: SIDE_FILL[side], fontSize: "0.7rem", width: "2.6rem" }}>
+                          {SIDE_NAME[side]}
+                        </span>
+                        {curve.map((p, i) => (
+                          <div
+                            key={i}
+                            title={`dead within +${i + 1} side-turns: ${(p * 100).toFixed(0)}%`}
+                            style={{
+                              width: 10,
+                              height: `${Math.max(2, p * 24)}px`,
+                              background: SIDE_FILL[side],
+                              opacity: 0.35 + 0.65 * p,
+                            }}
+                          />
+                        ))}
+                      </div>
+                    );
+                  })}
                 </div>
               )}
 

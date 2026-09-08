@@ -473,7 +473,7 @@ fn aux_for(state: &MinionsState) -> Option<playground_core::AnalysisAux> {
             hex[..cells].iter().copied().map(sigmoid).collect(),
             hex[cells..2 * cells].iter().copied().map(sigmoid).collect(),
         ],
-        necro_safety: [
+        necro_hazard: [
             necro[..horizon].iter().copied().map(sigmoid).collect(),
             necro[horizon..2 * horizon].iter().copied().map(sigmoid).collect(),
         ],

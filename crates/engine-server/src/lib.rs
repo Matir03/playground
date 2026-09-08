@@ -195,10 +195,10 @@ where
             state: Some(state_to_proto::<G>(&state)),
             value: analysis.value,
             aux: analysis.aux.map(|a| AnalyzeAux {
-                hex_control_first: a.hex_control[0].iter().map(|x| *x as f64).collect(),
-                hex_control_second: a.hex_control[1].iter().map(|x| *x as f64).collect(),
-                necro_safety_first: a.necro_safety[0].iter().map(|x| *x as f64).collect(),
-                necro_safety_second: a.necro_safety[1].iter().map(|x| *x as f64).collect(),
+                hex_control_mover: a.hex_control[0].iter().map(|x| *x as f64).collect(),
+                hex_control_opponent: a.hex_control[1].iter().map(|x| *x as f64).collect(),
+                necro_hazard_mover: a.necro_hazard[0].iter().map(|x| *x as f64).collect(),
+                necro_hazard_opponent: a.necro_hazard[1].iter().map(|x| *x as f64).collect(),
                 log_z: a.log_z as f64,
             }),
             nodes: analysis
