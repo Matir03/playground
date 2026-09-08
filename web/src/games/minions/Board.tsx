@@ -409,6 +409,10 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
   // until the turn passes back. Mirrors amazons/Board.tsx.
   useEffect(() => {
     if (!handle || !state) return;
+    // Analysis mode suspends the engine seat. The whole point is to look at a
+    // position without committing to it, and a seat that keeps answering would
+    // move the game out from under the analysis being read.
+    if (analysisOn) return;
     if (state.outcome !== Outcome.IN_PROGRESS) return;
     const mover = seatToMove(state);
     if (mover === "human") return;
@@ -469,7 +473,10 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
       setThinking(false);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [handle, state, firstSeat, secondSeat, client]);
+    // `analysisOn` belongs here: leaving analysis must let the seat resume on
+    // the position the game is actually in, and without the dependency the
+    // effect would not re-run until something else changed.
+  }, [handle, state, firstSeat, secondSeat, client, analysisOn]);
 
   // The board shows the variation when one is being walked, and the game
   // otherwise. Rendering the walked position rather than overlaying arrows on
