@@ -432,6 +432,12 @@ fn sigmoid(x: f32) -> f32 {
 /// A missing graph is expected rather than exceptional: nets exported before
 /// the aux graph existed are still perfectly playable, and the view degrades to
 /// hiding those panels.
+/// Must match `SCORE_SCALE` in python/src/playground/model_server/minions_net.py.
+/// The head is trained on `score / SCORE_SCALE`; this undoes it so every reader
+/// gets plain points. A silent disagreement here would only ever show up as an
+/// analysis panel whose numbers are off by a constant factor.
+const SCORE_SCALE: f32 = 150.0;
+
 fn aux_for(state: &MinionsState) -> Option<playground_core::AnalysisAux> {
     let cfg = CONFIG.lock().unwrap().clone()?;
     let (ep, fp16) = match &cfg.kind {
@@ -491,7 +497,7 @@ fn aux_for(state: &MinionsState) -> Option<playground_core::AnalysisAux> {
         log_z: logz.first().copied().unwrap_or(0.0),
         // Trained on score / SCORE_SCALE, so undo that here and hand every
         // consumer plain points.
-        score: score * 100.0,
+        score: score * SCORE_SCALE,
     })
 }
 

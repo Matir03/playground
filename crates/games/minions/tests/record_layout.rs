@@ -23,7 +23,7 @@ fn example_bytes_and_version_are_pinned() {
     );
     assert_eq!(
         minions_engine::selfplay::VERSION,
-        7,
+        8,
         "record version changed; the learner's COMPAT_VERSIONS must decide what \
          to do with chunks still in the sliding window"
     );

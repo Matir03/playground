@@ -43,7 +43,7 @@ from playground.model_server.minions_net import (
 
 # ── record layout — must match crates/games/minions/src/selfplay.rs ────────────
 MAGIC = 0x4D494E33
-VERSION = 7  # must match selfplay::VERSION in Rust
+VERSION = 8  # must match selfplay::VERSION in Rust
 # v4 records are identical except that they predate the trailing "turns left"
 # feature plane, so they are one plane short. They are still usable: the plane is
 # appended last, and the stem weights that read it start at zero (see
@@ -52,15 +52,16 @@ VERSION = 7  # must match selfplay::VERSION in Rust
 # window within ~10 generations.
 # v5 and earlier predate `is_full` and the turns-left plane; they are not
 # read back, since the stride differs in two places now.
-# v6 is v7 minus the trailing 4-byte terminal score. It is still worth reading:
-# the score is appended last, so a v6 record parses identically up to that point
-# and only the score target is missing. Those rows are masked out of the score
-# loss rather than trained against a fabricated 0 -- unlike the v4 plane case,
-# where a zero plane was genuinely what the net saw, a zero score is a wrong
-# label, not a neutral one.
-COMPAT_VERSIONS = {VERSION: IN_PLANES, 6: IN_PLANES}
-# Versions predating the score field, by how many trailing bytes they lack.
-SCORELESS_VERSIONS = {6}
+# v8 only. v6 and v7 have the same *layout* as v8 but not the same *meaning*:
+# both were recorded under a 20-turn cap, so their turns-left plane tops out at
+# 20 and their score's speed term is anchored to 20 rather than 30. Reading them
+# would train the net on two contradictory games at once, which no amount of
+# masking fixes -- unlike the v6 score field, which was merely absent.
+#
+# The buffer holds a single generation, so this costs one cycle of data and
+# heals itself. `read_chunk` skips unknown versions rather than raising.
+COMPAT_VERSIONS = {VERSION: IN_PLANES}
+SCORELESS_VERSIONS = set()
 TOP_K = 8
 SPEC_BYTES = 3 * CELLS
 PLANE_BYTES = IN_PLANES * CELLS

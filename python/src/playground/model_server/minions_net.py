@@ -84,10 +84,13 @@ def head_width(channels: int) -> int:
 NECRO_HORIZON = 10  # side-turns of look-ahead for the survival hazard curve
 N_BUYABLE = 5  # zombie, skeleton, serpent, warg, ghost
 # Divisor putting the terminal score into the same range as the other targets.
-# A turn-10 win is +100 from the speed term alone and material adds tens more,
-# so raw scores would give the score MSE ~10^4 the scale of `loss_value` and it
-# would dominate the shared trunk. 100 puts a decisive win near 1.0.
-SCORE_SCALE = 100.0
+# Raw scores would give the score MSE ~10^4 the scale of `loss_value` and would
+# dominate the shared trunk. Sized off the speed term's ceiling, which is
+# 10 * (MAX_TURNS - 1): 150 puts a decisive win near 1.0 at a 30-turn cap.
+#
+# MUST match SCORE_SCALE in crates/games/minions/src/net_seat.rs, which undoes
+# it so analysis reports plain points.
+SCORE_SCALE = 150.0
 
 
 class _ResBlock(nn.Module):

@@ -85,7 +85,7 @@ pub const BASE_INCOME: u16 = 3;
 /// Turns (counting each side's separately, so this is 20 apiece) after which the
 /// game is decided by [`adjudicate`] instead of being played out.
 /// 20 side-turns — ten apiece — on the 7x7 board.
-pub const MAX_TURNS: u16 = 20;
+pub const MAX_TURNS: u16 = 30;
 
 /// Turns averaged when adjudicating at the cap.
 ///
@@ -150,8 +150,13 @@ pub fn net_worth(state: &MinionsState, side: u8) -> u32 {
 /// Two terms, both in the same units so they add without a weight:
 ///
 /// * **Speed.** `10 * (MAX_TURNS - final_turn)`, signed by who won: 0 for a game
-///   that goes the distance, 100 for a win on turn 10. Games cannot exceed
-///   [`MAX_TURNS`], so this never needs clamping.
+///   that goes the distance, 200 for a win on turn 10, 290 for a win on turn 1.
+///   Games cannot exceed [`MAX_TURNS`], so this never needs clamping.
+///
+///   Anchored to the cap rather than a fixed number, so it keeps meaning
+///   "points per turn saved against the worst case" if the horizon moves
+///   again. It did: the cap was 20 through generation 279, and scores recorded
+///   before that are on the old scale and not comparable.
 /// * **Material.** The net-worth differential, the same quantity the eval
 ///   harness already reports as `A_margin`.
 ///

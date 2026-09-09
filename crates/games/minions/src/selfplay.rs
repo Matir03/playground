@@ -37,7 +37,7 @@ use crate::sampler::{MinionsModel, SamplerConfig};
 use crate::turn::{MinionsTurns, TurnSpec};
 
 pub const MAGIC: u32 = 0x4d_49_4e_33; // "MIN3"
-pub const VERSION: u32 = 7;
+pub const VERSION: u32 = 8;
 /// Horizon for the necromancer-survival target, in side-turns.
 pub const NECRO_HORIZON: usize = 10;
 /// Buyable unit classes (zombie, skeleton, serpent, warg, ghost).
@@ -190,14 +190,18 @@ impl Default for ActorConfig {
                 .and_then(|v| v.parse::<u8>().ok())
                 .map(|v| v != 0)
                 .unwrap_or(false),
-            random_opening_max: 15,
-            // Chosen so the truncated geometric on 0..=15 has mean 5 — a quarter
-            // of `MAX_TURNS`, deep enough to reach genuinely mid-game positions
-            // and tilted so short prefixes stay the most common single outcome.
-            // These two are only meaningful against the turn cap: scaled from
-            // 30/1.069 when the cap was 40, since a 30-turn opening cannot exist
-            // inside a 20-turn game.
-            random_opening_decay: 1.1335,
+            random_opening_max: 22,
+            // Chosen so the truncated geometric on 0..=22 has mean 7.5 — a
+            // quarter of `MAX_TURNS`, deep enough to reach genuinely mid-game
+            // positions and tilted so short prefixes stay the most common
+            // single outcome.
+            //
+            // These two are only meaningful against the turn cap, and the max
+            // has to move with it as well as the decay: holding the max at 15
+            // and solving for a mean of 7.5 drives the decay to ~1.0008, which
+            // is uniform, and the tilt is the point. Scaled from 15/1.1335 when
+            // the cap was 20, and 30/1.069 when it was 40.
+            random_opening_decay: 1.0884,
             temp_moves: 6,
             backend: crate::net::BackendKind::Candle { cuda: false },
         }

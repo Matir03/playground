@@ -80,8 +80,8 @@ RANDOM_FRACTION="${RANDOM_FRACTION:-0.25}"
 # from one frozen net — a Hex run stalled at parity without this. Truncated
 # geometric on 0..=MAX with P(n) proportional to DECAY^-n. 15/1.1335 has mean 5,
 # a quarter of the 20-turn cap — an opening cannot outlast the game.
-RANDOM_OPENING_MAX="${RANDOM_OPENING_MAX:-15}"
-RANDOM_OPENING_DECAY="${RANDOM_OPENING_DECAY:-1.1335}"
+RANDOM_OPENING_MAX="${RANDOM_OPENING_MAX:-22}"
+RANDOM_OPENING_DECAY="${RANDOM_OPENING_DECAY:-1.0884}"
 # Visits guaranteed to each forced-exploration candidate, regardless of prior.
 # KataGo's sqrt(k*P*N) floor only keeps an already-tried candidate alive, so it
 # cannot protect the ones the energy head scores near zero — which are exactly

@@ -1,6 +1,6 @@
 """Degeneracy watchdog for the Minions run — read the replay buffer, not the losses.
 
-`MAX_TURNS` is 40 side-turns and reaching it is adjudicated on **net worth**
+`MAX_TURNS` is 60 side-turns and reaching it is adjudicated on **net worth**
 (gold plus every owned unit at cost, on the board and in reinforcements). Under
 that rule buying is par, so hoarding earns nothing — but self-play found the
 hoarding equilibrium under the *old* raw-gold rule within three generations, and
