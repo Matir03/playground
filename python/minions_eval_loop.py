@@ -103,7 +103,11 @@ def run_match(engine, a, b, games, sims, candidates, t_steps, backend, ep, fp16,
         raise RuntimeError(f"could not parse A_score from:\n{out}")
     mg = re.search(r"A_margin\s+(-?[0-9.]+)", out)
     margin = float(mg.group(1)) if mg else None
-    return float(m.group(1)), margin
+    # Mean terminal score: margin plus a speed bonus for finishing early.
+    # Anchored to its own key rather than `A_score`, which is the win rate.
+    gs = re.search(r"A_gamescore\s+(-?[0-9.]+)", out)
+    game_score = float(gs.group(1)) if gs else None
+    return float(m.group(1)), margin, game_score
 
 
 def run_diagnostic(args, live, scores, scores_path) -> None:
@@ -141,7 +145,7 @@ def run_diagnostic(args, live, scores, scores_path) -> None:
             past = os.path.join(cand, "checkpoint.safetensors")
             break
     if past and os.path.exists(past):
-        score, margin = run_match(
+        score, margin, gscore = run_match(
             args.engine, ckpt, past, args.games, args.sims, args.candidates,
             args.t_steps, args.backend, args.ep, args.fp16, seed=gen,
             render_file=os.path.join(games_dir, f"gen_{gen:04d}_vs_lag{args.lag}.txt"),
@@ -149,6 +153,8 @@ def run_diagnostic(args, live, scores, scores_path) -> None:
         entry[f"vs_gen_minus_{args.lag}"] = score
         if margin is not None:
             entry[f"vs_gen_minus_{args.lag}_margin"] = round(margin, 3)
+        if gscore is not None:
+            entry[f"vs_gen_minus_{args.lag}_score"] = round(gscore, 2)
         if _LAST_TURNS is not None:
             entry["lag_turns_win"], entry["lag_turns_loss"] = _LAST_TURNS
     else:
@@ -156,7 +162,7 @@ def run_diagnostic(args, live, scores, scores_path) -> None:
 
     # ...and against greedy, the fixed external yardstick.
     try:
-        g, gm = run_match(
+        g, gm, ggs = run_match(
             args.engine, ckpt, None, args.greedy_games, args.sims, args.candidates,
             args.t_steps, args.backend, args.ep, args.fp16, seed=1000 + gen,
             render_file=os.path.join(games_dir, f"gen_{gen:04d}_vs_greedy.txt"),
@@ -164,6 +170,8 @@ def run_diagnostic(args, live, scores, scores_path) -> None:
         entry["vs_greedy"] = g
         if gm is not None:
             entry["vs_greedy_margin"] = round(gm, 3)
+        if ggs is not None:
+            entry["vs_greedy_score"] = round(ggs, 2)
         if _LAST_TURNS is not None:
             entry["greedy_turns_win"], entry["greedy_turns_loss"] = _LAST_TURNS
     except Exception as exc:  # noqa: BLE001
@@ -238,7 +246,7 @@ def main():
             else:
                 games_dir = os.path.join(live, "games")
                 render_file = os.path.join(games_dir, f"gen_{gen:04d}_vs_champion.txt")
-                score, margin = run_match(args.engine, ckpt, champion, args.games, args.sims,
+                score, margin, gscore = run_match(args.engine, ckpt, champion, args.games, args.sims,
                                           args.candidates, args.t_steps, args.backend, args.ep,
                                           args.fp16, seed=gen,
                                           render_file=render_file,
@@ -253,6 +261,8 @@ def main():
                 # nothing is ever promoted. Margin still separates two nets.
                 if margin is not None:
                     entry["vs_champion_margin"] = round(margin, 3)
+                if gscore is not None:
+                    entry["vs_champion_score"] = round(gscore, 2)
                 promoted = score >= args.promote_threshold
 
             if promoted:
@@ -294,7 +304,7 @@ def main():
               champ_gen = scores.get("best_gen", gen)
               entry["greedy_gen"] = champ_gen
               try:
-                  g, gm = run_match(args.engine, best, None, args.greedy_games, args.sims,
+                  g, gm, ggs = run_match(args.engine, best, None, args.greedy_games, args.sims,
                                     args.candidates, args.t_steps, args.backend, args.ep,
                                     # Seeded by the measuring generation, not the
                                     # champion's: a champion that survives several
@@ -309,6 +319,8 @@ def main():
                   entry["vs_greedy"] = g
                   if gm is not None:
                       entry["vs_greedy_margin"] = round(gm, 3)
+                  if ggs is not None:
+                      entry["vs_greedy_score"] = round(ggs, 2)
                   if _LAST_TURNS is not None:
                       entry["greedy_turns_win"], entry["greedy_turns_loss"] = _LAST_TURNS
               except Exception as exc:  # noqa: BLE001
@@ -317,8 +329,13 @@ def main():
             entry["promoted"] = promoted
             metrics = os.path.join(snap, "metrics.json")
             if os.path.exists(metrics):
+                # Losses plus the derived diagnostics. `energy_kl`/`decl_kl`
+                # subtract the target's own entropy, and `score_mae` is in
+                # points -- these are the readable forms of the raw losses, so
+                # a `loss_` prefix filter drops exactly the useful columns.
+                keep = ("loss_", "energy_", "decl_", "score_")
                 entry.update({k: v for k, v in json.load(open(metrics)).items()
-                              if k.startswith("loss_")})
+                              if k.startswith(keep)})
             scores["history"].append(entry)
             scores["processed_through"] = gen
             json.dump(scores, open(scores_path, "w"), indent=2)

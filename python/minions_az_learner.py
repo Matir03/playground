@@ -38,12 +38,12 @@ from safetensors.torch import load_file, save_file
 from playground.model_server.minions_net import (
     CELLS, DECL_PLANES, ENERGY_PLANES, IN_PLANES, N, N_OFFSETS, N_SPAWNS, N_TARGETS,
     MinionsNet, arch_of, build_model, energy_loss, export_onnx_atomic,
-    masked_declaration_loss, masked_declaration_loss_soft,
+    masked_declaration_loss, masked_declaration_loss_soft, SCORE_SCALE,
 )
 
 # ── record layout — must match crates/games/minions/src/selfplay.rs ────────────
 MAGIC = 0x4D494E33
-VERSION = 6  # must match selfplay::VERSION in Rust
+VERSION = 7  # must match selfplay::VERSION in Rust
 # v4 records are identical except that they predate the trailing "turns left"
 # feature plane, so they are one plane short. They are still usable: the plane is
 # appended last, and the stem weights that read it start at zero (see
@@ -52,7 +52,15 @@ VERSION = 6  # must match selfplay::VERSION in Rust
 # window within ~10 generations.
 # v5 and earlier predate `is_full` and the turns-left plane; they are not
 # read back, since the stride differs in two places now.
-COMPAT_VERSIONS = {VERSION: IN_PLANES}
+# v6 is v7 minus the trailing 4-byte terminal score. It is still worth reading:
+# the score is appended last, so a v6 record parses identically up to that point
+# and only the score target is missing. Those rows are masked out of the score
+# loss rather than trained against a fabricated 0 -- unlike the v4 plane case,
+# where a zero plane was genuinely what the net saw, a zero score is a wrong
+# label, not a neutral one.
+COMPAT_VERSIONS = {VERSION: IN_PLANES, 6: IN_PLANES}
+# Versions predating the score field, by how many trailing bytes they lack.
+SCORELESS_VERSIONS = {6}
 TOP_K = 8
 SPEC_BYTES = 3 * CELLS
 PLANE_BYTES = IN_PLANES * CELLS
@@ -64,9 +72,10 @@ NECRO_HORIZON = 10
 N_BUYABLE = 5
 HEX_BYTES = 2 * CELLS
 NECRO_BYTES = 2 * NECRO_HORIZON
+SCORE_BYTES = 4
 EXAMPLE_BYTES = (
     PLANE_BYTES + 1 + 4 + CELLS + 1 + TOP_K * CAND_BYTES
-    + HEX_BYTES + NECRO_BYTES + 1
+    + HEX_BYTES + NECRO_BYTES + 1 + SCORE_BYTES
 )
 
 O_PLANES = 0
@@ -78,6 +87,7 @@ O_CANDS = O_NCAND + 1
 O_HEX = O_CANDS + TOP_K * CAND_BYTES
 O_NECRO = O_HEX + HEX_BYTES
 O_ISFULL = O_NECRO + NECRO_BYTES
+O_SCORE = O_ISFULL + 1
 
 NO_MOVE = 255
 C_MOVE, C_TARGET, C_SPAWN = 1, 2, 4
@@ -178,15 +188,24 @@ def read_chunk(path: str) -> dict | None:
         )
         return None
     body = raw[16:]
-    # Older versions differ only in the plane count, which shifts every offset.
+    # Older versions differ in the plane count, which shifts every offset, and
+    # in whether the trailing score field is present.
     n_planes = COMPAT_VERSIONS[int(version)]
+    scoreless = int(version) in SCORELESS_VERSIONS
     plane_bytes = n_planes * CELLS
-    stride = EXAMPLE_BYTES - (PLANE_BYTES - plane_bytes)
+    stride = EXAMPLE_BYTES - (PLANE_BYTES - plane_bytes) - (SCORE_BYTES if scoreless else 0)
     if body.size != count * stride:
         raise ValueError(
             f"{path}: expected {count * stride} body bytes for v{version}, got {body.size}"
         )
     rec = body.reshape(count, stride)
+    if scoreless:
+        # Append the missing score field so every downstream offset is the
+        # current layout's. `has_score` is what keeps these rows out of the
+        # score loss; the zeros here are never trained against.
+        rec = np.concatenate(
+            [rec, np.zeros((count, SCORE_BYTES), dtype=np.uint8)], axis=1
+        )
     if plane_bytes != PLANE_BYTES:
         # Pad the missing trailing plane(s) with zeros and re-align the rest.
         pad = np.zeros((count, PLANE_BYTES - plane_bytes), dtype=np.uint8)
@@ -208,6 +227,9 @@ def read_chunk(path: str) -> dict | None:
         .reshape(count, 2, NECRO_HORIZON),
         # Playout-cap randomization: only full searches carry a policy target.
         "is_full": rec[:, O_ISFULL].copy(),
+        # Terminal score in raw points, from the mover's seat.
+        "score": rec[:, O_SCORE:O_SCORE + SCORE_BYTES].copy().view("<f4").reshape(count),
+        "has_score": np.full(count, 0 if scoreless else 1, dtype=np.uint8),
     }
 
 
@@ -237,7 +259,7 @@ class Buffer:
 
     def merged(self) -> dict:
         keys = ["planes", "value", "live", "n_cands", "spec", "prob",
-                "hex_control", "necro_safety", "is_full"]
+                "hex_control", "necro_safety", "is_full", "score", "has_score"]
         parts = [self.cache[k] for k in sorted(self.cache)]
         return {k: np.concatenate([p[k] for p in parts]) for k in keys}
 
@@ -427,7 +449,8 @@ def _slot_log_probs(logits, spec, step_mask, device):
 
 
 def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux=0.15,
-                tb_weight=0.0, t_steps=4, move_smoothing=0.0, tb_candidates=1):
+                tb_weight=0.0, t_steps=4, move_smoothing=0.0, tb_candidates=1,
+                w_score=0.15):
     """One generation of updates.
 
     With ``tb_weight > 0`` this runs the two-phase schedule: every step first
@@ -441,7 +464,7 @@ def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux
     regression is stationary within the generation.
     """
     n = len(batch["value"])
-    tally = np.zeros(6)
+    tally = np.zeros(8)
     tb_tally = 0.0
     net.train()
     for _ in range(steps):
@@ -549,7 +572,28 @@ def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux
             + F.binary_cross_entropy_with_logits(necro_l, necro_t)
         )
 
-        loss = loss_v + w_diff * loss_d + w_energy * loss_e + w_aux * loss_aux
+        # ── terminal-score head ───────────────────────────────────────────────
+        #
+        # Masked to rows whose chunk actually carried a score: a record written
+        # before the field existed has a placeholder 0, which is a wrong label
+        # rather than a neutral one, and training on it would teach the head
+        # that every old position was a dead draw.
+        score_t = torch.from_numpy(
+            batch["score"][idx] / SCORE_SCALE
+        ).to(device)
+        has_s = torch.from_numpy(
+            batch["has_score"][idx].astype(bool)
+        ).to(device)
+        score_p = net.score_head(h)
+        if has_s.any():
+            loss_score = F.mse_loss(score_p[has_s], score_t[has_s])
+        else:
+            loss_score = score_p.sum() * 0
+
+        loss = (
+            loss_v + w_diff * loss_d + w_energy * loss_e
+            + w_aux * loss_aux + w_score * loss_score
+        )
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
@@ -599,6 +643,13 @@ def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux
             float(loss_e.detach()),
             float(loss_aux.detach()),
             h_decl,
+            float(loss_score.detach()),
+            # Mean absolute error in *points*, which is the number worth
+            # reading: an MSE on a /100 target is not interpretable next to the
+            # score values the eval harness reports.
+            float(
+                (score_p[has_s] - score_t[has_s]).abs().mean().detach() * SCORE_SCALE
+            ) if bool(has_s.any()) else 0.0,
         ]
     return np.append(tally / max(steps, 1), tb_tally / max(steps, 1))
 
@@ -630,6 +681,11 @@ def main():
                          "Mass kept on the true label at a central cell: 0.99 at "
                          "sigma 0.25, 0.79 at 0.40, 0.55 at 0.50, 0.16 at 1.00 - so "
                          "0.4-0.5 is the useful band and 1.0 is far too flat.")
+    ap.add_argument("--score-weight", type=float, default=0.15,
+                    help="weight on the terminal-score head. Same rationale as "
+                         "--aux-weight: it is there to shape the trunk with a "
+                         "signal the saturating value head loses, not to compete "
+                         "with the value and policy objectives.")
     ap.add_argument("--tb-candidates", type=int, default=1,
                     help="stored candidates per position to run trajectory balance "
                          "over. 1 replays only the best-visited turn, which is what "
@@ -717,12 +773,13 @@ def main():
 
         batch = buf.merged()
         t0 = time.time()
-        lv, hent, ld, le, la, hdecl, ltb = train_block(
+        lv, hent, ld, le, la, hdecl, lsc, smae, ltb = train_block(
             net, opt, batch, args.steps, args.batch, device, rng,
             args.w_diff, args.w_energy, args.aux_weight,
             tb_weight=args.tb_weight, t_steps=args.t_steps,
             move_smoothing=args.move_smoothing,
             tb_candidates=args.tb_candidates,
+            w_score=args.score_weight,
         )
         generation += 1
         gens_done += 1
@@ -750,6 +807,9 @@ def main():
             # so the numbers stay comparable with every generation trained so far.
             "decl_entropy": hdecl, "decl_kl": ld - hdecl,
             "loss_tb": ltb,
+            # MSE on the /SCORE_SCALE target, plus the same error in points,
+            # which is the readable one.
+            "loss_score": lsc, "score_mae": round(smae, 2),
             "seconds": round(time.time() - t0, 1),
         }
         json.dump(metrics, open(os.path.join(live, "metrics.json"), "w"), indent=2)

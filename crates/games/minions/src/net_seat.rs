@@ -470,6 +470,9 @@ fn aux_for(state: &MinionsState) -> Option<playground_core::AnalysisAux> {
     let hex = take("hex")?;
     let necro = take("necro")?;
     let logz = take("logz")?;
+    // Optional: a checkpoint exported before the score head existed has no such
+    // output, and analysis should still work against it rather than going dark.
+    let score = take("score").and_then(|v| v.first().copied()).unwrap_or(0.0);
 
     let cells = crate::map::NUM_CELLS;
     let horizon = necro.len() / 2;
@@ -486,6 +489,9 @@ fn aux_for(state: &MinionsState) -> Option<playground_core::AnalysisAux> {
             necro[horizon..2 * horizon].iter().copied().map(sigmoid).collect(),
         ],
         log_z: logz.first().copied().unwrap_or(0.0),
+        // Trained on score / SCORE_SCALE, so undo that here and hand every
+        // consumer plain points.
+        score: score * 100.0,
     })
 }
 

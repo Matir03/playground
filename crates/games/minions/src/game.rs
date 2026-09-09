@@ -145,6 +145,38 @@ pub fn net_worth(state: &MinionsState, side: u8) -> u32 {
 /// Scoring [`net_worth`] removes the incentive at its root rather than penalising
 /// the symptom: converting gold into units is value-neutral, so the only way to
 /// gain is to take material the opponent does not take back.
+/// Terminal "how well was this won" score, from `side`'s seat.
+///
+/// Two terms, both in the same units so they add without a weight:
+///
+/// * **Speed.** `10 * (MAX_TURNS - final_turn)`, signed by who won: 0 for a game
+///   that goes the distance, 100 for a win on turn 10. Games cannot exceed
+///   [`MAX_TURNS`], so this never needs clamping.
+/// * **Material.** The net-worth differential, the same quantity the eval
+///   harness already reports as `A_margin`.
+///
+/// Signed and antisymmetric: `score(s, a) == -score(s, 1 - a)`. A draw scores 0
+/// on both terms, since the cap only draws on an exact net-worth tie.
+///
+/// Note the two terms can disagree, deliberately. A necromancer kill on turn 12
+/// while behind on material still scores well, because finishing early is what
+/// the speed term is there to reward.
+pub fn game_score(state: &MinionsState, side: u8) -> f32 {
+    // `winner` is 1/2 for a decided game (side 0 / side 1), 3 a draw, 0 still
+    // running. An unfinished position scores its material only, which is what
+    // the aux head sees for every non-terminal example.
+    let sign = match state.winner {
+        1 | 2 => {
+            if state.winner - 1 == side { 1.0f32 } else { -1.0f32 }
+        }
+        _ => 0.0f32,
+    };
+    let speed = 10.0 * (MAX_TURNS.saturating_sub(state.turn)) as f32;
+    let material =
+        net_worth(state, side) as f32 - net_worth(state, 1 - side) as f32;
+    sign * speed + material
+}
+
 pub fn adjudicate(state: &MinionsState) -> u8 {
     // Mean over the window rather than the final position: see [`ADJ_WINDOW`].
     // Summed as i32 and compared against zero, so no division and no rounding
@@ -1491,4 +1523,76 @@ mod move_targets_bench {
         );
     }
 
+}
+
+#[cfg(test)]
+mod game_score_tests {
+    use super::*;
+    use playground_core::Game;
+
+    fn at(turn: u16, winner: u8) -> MinionsState {
+        let mut s = Minions::initial_state();
+        s.turn = turn;
+        s.winner = winner;
+        s
+    }
+
+    #[test]
+    fn speed_term_matches_the_stated_schedule() {
+        // The schedule the score was specified by: 0 at the cap, 10 a turn
+        // earlier, 100 at turn 10. Material is level from `initial_state`
+        // except for the second player's starting money, so compare the
+        // *difference* between two turns rather than the absolute value.
+        let base = game_score(&at(20, 1), 0);
+        assert_eq!(game_score(&at(19, 1), 0) - base, 10.0);
+        assert_eq!(game_score(&at(10, 1), 0) - base, 100.0);
+    }
+
+    #[test]
+    fn a_game_that_goes_the_distance_scores_material_only() {
+        let s = at(MAX_TURNS, 1);
+        let material = net_worth(&s, 0) as f32 - net_worth(&s, 1) as f32;
+        assert_eq!(game_score(&s, 0), material, "no speed bonus at the cap");
+    }
+
+    #[test]
+    fn score_is_antisymmetric_between_the_seats() {
+        for (turn, winner) in [(12u16, 1u8), (17, 2), (20, 3), (14, 2)] {
+            let s = at(turn, winner);
+            assert_eq!(
+                game_score(&s, 0),
+                -game_score(&s, 1),
+                "turn {turn} winner {winner}: one seat's score must be the other's negated"
+            );
+        }
+    }
+
+    #[test]
+    fn losing_fast_is_worse_than_losing_slowly() {
+        // The mirror of the speed bonus, and the reason `sign` is applied to it
+        // rather than to the whole score: a net that is going to lose should
+        // still prefer to lose late.
+        assert!(game_score(&at(12, 2), 0) < game_score(&at(19, 2), 0));
+    }
+
+    #[test]
+    fn a_draw_scores_no_speed_either_way() {
+        let s = at(20, 3);
+        let material = net_worth(&s, 0) as f32 - net_worth(&s, 1) as f32;
+        assert_eq!(game_score(&s, 0), material);
+    }
+
+    #[test]
+    fn an_early_win_can_outscore_a_material_deficit() {
+        // The point of the speed term: finishing on turn 12 while behind on
+        // material still reads as a better game than grinding to the cap.
+        let mut fast = at(12, 1);
+        // Hand side 1 a large material edge; side 0 still won.
+        fast.money[1] = 40;
+        let slow = at(20, 1);
+        assert!(
+            game_score(&fast, 0) > game_score(&slow, 0),
+            "an 80-point speed bonus must outweigh a 40-point material deficit"
+        );
+    }
 }

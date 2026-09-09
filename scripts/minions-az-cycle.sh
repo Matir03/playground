@@ -211,6 +211,11 @@ while true; do
     --tb-weight "$TB_WEIGHT" --t-steps "$T_STEPS" \
     --exit-after-gens 1
 
+  # Losses for this generation beside the recent ones and the last few
+  # champions. A single generation's numbers are noise; the table is what makes
+  # the direction of travel, and the champion rows, readable.
+  "$PYTHON" "$repo/python/minions_loss_table.py" --live "$LIVE" || true
+
   # Degeneracy check. Gold adjudication at the 40-turn cap can be farmed by
   # hoarding, and that failure is invisible in the loss curves — every head keeps
   # improving while the games become worthless. Never fatal: it appends to

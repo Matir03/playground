@@ -241,6 +241,7 @@ where
                 necro_hazard_mover: a.necro_hazard[0].iter().map(|x| *x as f64).collect(),
                 necro_hazard_opponent: a.necro_hazard[1].iter().map(|x| *x as f64).collect(),
                 log_z: a.log_z as f64,
+                score: a.score as f64,
             }),
             nodes: analysis
                 .nodes

@@ -236,6 +236,9 @@ message AnalyzeAux {
   repeated double necro_hazard_opponent = 4;
   // The trajectory-balance log-partition estimate for this position.
   double log_z = 5;
+  // Predicted terminal score in points from the mover's seat: net-worth
+  // differential plus 10 per turn the game finishes before the cap.
+  double score = 6;
 }
 
 message AnalyzeResponse {

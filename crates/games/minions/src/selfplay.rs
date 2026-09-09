@@ -37,7 +37,7 @@ use crate::sampler::{MinionsModel, SamplerConfig};
 use crate::turn::{MinionsTurns, TurnSpec};
 
 pub const MAGIC: u32 = 0x4d_49_4e_33; // "MIN3"
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 /// Horizon for the necromancer-survival target, in side-turns.
 pub const NECRO_HORIZON: usize = 10;
 /// Buyable unit classes (zombie, skeleton, serpent, warg, ghost).
@@ -65,7 +65,8 @@ pub const EXAMPLE_BYTES: usize = PLANE_BYTES
     + TOP_K * (SPEC_BYTES + 4)
     + HEX_CONTROL_BYTES
     + NECRO_SAFETY_BYTES
-    + 1; // is_full
+    + 1 // is_full
+    + 4; // score
 
 pub struct Example {
     pub planes: Vec<u8>,
@@ -85,6 +86,12 @@ pub struct Example {
     /// For each side and each horizon `m = 1..=NECRO_HORIZON`, whether that
     /// necromancer dies on or before `m` more side-turns. Monotone in `m`.
     pub necro_safety: Vec<u8>,
+    /// Terminal [`crate::game::game_score`] from this example's mover, in raw
+    /// points. Unlike `value`, which saturates at +/-1 the moment the game is
+    /// decided, this keeps saying *how well* it was won -- so a net that
+    /// already wins reliably still has a gradient telling it to win sooner and
+    /// by more.
+    pub score: f32,
 }
 
 impl Example {
@@ -107,6 +114,7 @@ impl Example {
         out.extend_from_slice(&self.hex_control);
         out.extend_from_slice(&self.necro_safety);
         out.push(u8::from(self.is_full));
+        out.extend_from_slice(&self.score.to_le_bytes());
         debug_assert_eq!(out.len() - start, EXAMPLE_BYTES);
     }
 }
@@ -1045,6 +1053,9 @@ fn examples_from(
                 candidates,
                 hex_control,
                 necro_safety,
+                // Terminal score from this example's mover. Every position in
+                // the game gets the same final number, exactly as `value` does.
+                score: crate::game::game_score(final_state, side),
             }
         })
         .collect()
@@ -1389,6 +1400,7 @@ mod tests {
             candidates: vec![(TurnSpec::empty(), 1.0)],
             hex_control: vec![0u8; HEX_CONTROL_BYTES],
             necro_safety: vec![0u8; NECRO_SAFETY_BYTES],
+            score: 0.0,
         };
         let mut buf = Vec::new();
         e.write(&mut buf);
@@ -1486,6 +1498,7 @@ mod tests {
             candidates: (0..TOP_K).map(|_| (TurnSpec::empty(), 0.125)).collect(),
             hex_control: vec![0u8; HEX_CONTROL_BYTES],
             necro_safety: vec![0u8; NECRO_SAFETY_BYTES],
+            score: 0.0,
         };
         let mut buf = Vec::new();
         e.write(&mut buf);
@@ -1542,6 +1555,7 @@ mod tests {
                 candidates: vec![(TurnSpec::empty(), 1.0)],
             hex_control: vec![0u8; HEX_CONTROL_BYTES],
             necro_safety: vec![0u8; NECRO_SAFETY_BYTES],
+            score: 0.0,
             })
             .collect();
         let p = write_chunk(&dir, 0, &ex).unwrap();

@@ -69,6 +69,11 @@ pub struct AnalysisAux {
     pub necro_hazard: [Vec<f32>; 2],
     /// Trajectory-balance log-partition estimate for this position.
     pub log_z: f32,
+    /// Predicted terminal `game_score` in points, from the mover's seat: the
+    /// net-worth differential plus a bonus for finishing early. Distinct from
+    /// `value`, which saturates at +/-1 once the game is decided and so stops
+    /// saying *how* decisively.
+    pub score: f32,
 }
 
 /// One candidate edge of an analysed search tree.

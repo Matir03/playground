@@ -935,6 +935,17 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                     </span>
                   )}
                   {aux && (
+                    <span
+                      style={{ marginLeft: "0.9rem", color: "#888" }}
+                      title="predicted terminal score in points, from the side to move: net-worth differential plus 10 per turn the game ends before the cap. Unlike value, this keeps discriminating once a win is already certain."
+                    >
+                      score{" "}
+                      <strong style={{ color: aux.score >= 0 ? "#6a9" : "#c77" }}>
+                        {aux.score >= 0 ? "+" : ""}{aux.score.toFixed(0)}
+                      </strong>
+                    </span>
+                  )}
+                  {aux && (
                     <span style={{ marginLeft: "0.9rem", color: "#888" }} title="trajectory-balance log-partition estimate">
                       log Z {aux.logZ.toFixed(2)}
                     </span>

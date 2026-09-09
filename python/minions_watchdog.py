@@ -102,6 +102,16 @@ def main() -> int:
     print(f"corr(gold, units) {corr:+.3f}")
     print(f"outcomes          win {(v > 0).mean():.2f}  loss {(v < 0).mean():.2f}  "
           f"draw {(v == 0).mean():.2f}")
+    # Mean terminal score over self-play positions, from each position's mover.
+    # Near 0 by construction -- self-play is symmetric, so one seat's score is
+    # the other's negated -- which is exactly why the useful reading is its
+    # *spread*, not its mean: it says how decisively these games are ending.
+    sc = d.get("score")
+    has_sc = d.get("has_score")
+    if sc is not None and has_sc is not None and has_sc.any():
+        sc = sc[has_sc.astype(bool)]
+        print(f"game score        mean {sc.mean():+.1f}  |mean| {np.abs(sc).mean():.1f}  "
+              f"p10 {np.percentile(sc, 10):+.0f}  p90 {np.percentile(sc, 90):+.0f}")
 
     # Append to a per-generation history so the *trend* is visible. A single
     # generation cannot distinguish "rich because winning" from "rich because
@@ -116,6 +126,9 @@ def main() -> int:
            "gold_p90": float(np.percentile(gold, 90)), "units_mean": float(units.mean()),
            "corr": corr, "net_worth_mean": float(worth.mean()),
            "gold_share": float(idle.mean())}
+    if sc is not None and has_sc is not None and has_sc.any():
+        row["score_absmean"] = round(float(np.abs(sc).mean()), 2)
+        row["score_p90"] = round(float(np.percentile(sc, 90)), 1)
     # One row per generation. The cycle runs this after every generation and it
     # also gets run by hand, so appending unconditionally makes the trend — the
     # thing the file exists for — hard to read.

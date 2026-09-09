@@ -83,6 +83,11 @@ def head_width(channels: int) -> int:
 # crates/games/minions/src/selfplay.rs.
 NECRO_HORIZON = 10  # side-turns of look-ahead for the survival hazard curve
 N_BUYABLE = 5  # zombie, skeleton, serpent, warg, ghost
+# Divisor putting the terminal score into the same range as the other targets.
+# A turn-10 win is +100 from the speed term alone and material adds tens more,
+# so raw scores would give the score MSE ~10^4 the scale of `loss_value` and it
+# would dominate the shared trunk. 100 puts a decisive win near 1.0.
+SCORE_SCALE = 100.0
 
 
 class _ResBlock(nn.Module):
@@ -216,6 +221,17 @@ class MinionsNet(nn.Module):
         self.logz_fc1 = nn.Linear(2 * channels, 64)
         self.logz_fc2 = nn.Linear(64, 1)
 
+        # ── terminal-score head ───────────────────────────────────────────────
+        #
+        # Predicts `game::game_score` from the mover's seat: speed of the win
+        # plus the net-worth differential. Distinct from the value head, which
+        # saturates at +/-1 as soon as the game is decided and so stops
+        # discriminating between a grinding turn-20 adjudication and a turn-12
+        # necromancer kill. Trained in units of SCORE_SCALE so its MSE lands on
+        # the same order as the other losses.
+        self.score_fc1 = nn.Linear(2 * channels, 64)
+        self.score_fc2 = nn.Linear(64, 1)
+
         # ── diffusion (sampler) head ──────────────────────────────────────────
         # Conditions on the trunk plus the partially committed declaration.
         #
@@ -269,6 +285,16 @@ class MinionsNet(nn.Module):
         pooled = torch.cat([h.mean(dim=(2, 3)), h.amax(dim=(2, 3))], dim=1)
         necro = self.necro_fc2(F.relu(self.necro_fc1(F.relu(self.necro_fc0(pooled)))))
         return hexc, necro.view(-1, 2, NECRO_HORIZON)
+
+    def score_head(self, h):
+        """-> (B,) predicted terminal score, in units of `SCORE_SCALE`.
+
+        Linear output, not tanh: the score is unbounded above in principle and
+        squashing it would flatten exactly the fast, decisive wins the term
+        exists to reward.
+        """
+        pooled = torch.cat([h.mean(dim=(2, 3)), h.amax(dim=(2, 3))], dim=1)
+        return self.score_fc2(F.relu(self.score_fc1(pooled))).squeeze(-1)
 
     def log_z(self, h):
         """-> (B,) estimate of log Z(s), the log-partition of `exp f(s, .)`."""
@@ -411,7 +437,7 @@ class _DiffusionGraph(nn.Module):
 
 
 class _AuxGraph(nn.Module):
-    """planes -> (hex-control logits, necromancer-hazard logits, log Z).
+    """planes -> (hex-control logits, necromancer-hazard logits, log Z, score).
 
     Analysis only. The auxiliary heads exist to shape the trunk during
     training, and self-play never reads them, so they are exported as their own
@@ -432,8 +458,10 @@ class _AuxGraph(nn.Module):
     def forward(self, planes):
         h = self.net.trunk(planes)
         hexc, necro = self.net.aux_head(h)
-        # `log_z` pools the *raw* trunk (2 * channels), not the head features.
-        return hexc, necro, self.net.log_z(h)
+        # `log_z` and `score` pool the *raw* trunk (2 * channels), not the head
+        # features. `score` comes back in SCORE_SCALE units; the Rust side
+        # multiplies to get points.
+        return hexc, necro, self.net.log_z(h), self.net.score_head(h)
 
 
 class _EnergyGraph(nn.Module):
@@ -488,7 +516,7 @@ def export_onnx_atomic(net: MinionsNet, out_dir: str) -> None:
             _AuxGraph(net),
             (torch.zeros(1, IN_PLANES, N, N, device=dev),),
             ["planes"],
-            ["hex", "necro", "logz"],
+            ["hex", "necro", "logz", "score"],
         ),
     ]
     with torch.no_grad():

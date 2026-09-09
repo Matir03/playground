@@ -442,12 +442,20 @@ async fn main() -> anyhow::Result<()> {
             let sigma = (kernel_sigma, kernel_sigma_b.unwrap_or(kernel_sigma));
             let rf = render_file.as_ref().map(std::path::PathBuf::from);
             let render = rf.as_deref().map(|p| (p, render_games));
-            let (score, w, l, d, margin) = run_match(&sa, &sb, games, &params, sigma, render)?;
+            let (score, w, l, d, margin, game_score) =
+                run_match(&sa, &sb, games, &params, sigma, render)?;
             println!("A_wins {w} B_wins {l} draws {d}");
             println!("A_score {score:.4}");
             // Mean net-worth margin from A's seat. Reported alongside the score
             // because the score alone can be pinned at 0.5 by seat asymmetry.
             println!("A_margin {margin:.3}");
+            // Mean terminal score from A's seat: the margin plus a speed term,
+            // so a fast win outranks a slow one that ends on the same material.
+            //
+            // Deliberately *not* called `A_score` -- that name is already the
+            // win rate the eval loop gates promotion on, and a second line with
+            // the same key would be matched by its regex instead.
+            println!("A_gamescore {game_score:.3}");
         }
         Cmd::Bench { live, backend, ep, fp16, cuda, candidates, t_steps, secs, sweep } => {
             bench(&live, &backend, &ep, fp16, cuda, candidates, t_steps, secs, sweep)?

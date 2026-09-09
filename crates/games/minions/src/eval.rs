@@ -241,7 +241,7 @@ pub fn run_match(
     params: &SampledParams,
     sigma: (f32, f32),
     render: Option<(&std::path::Path, u32)>,
-) -> anyhow::Result<(f64, u32, u32, u32, f64)> {
+) -> anyhow::Result<(f64, u32, u32, u32, f64, f64)> {
     use std::io::Write as _;
     let mut sink: Option<std::io::BufWriter<std::fs::File>> = match render {
         Some((path, n)) if n > 0 => {
@@ -255,6 +255,7 @@ pub fn run_match(
     let render_games = render.map_or(0, |(_, n)| n);
     let (mut wins, mut losses, mut draws) = (0u32, 0u32, 0u32);
     let mut margin_sum = 0.0f64;
+    let mut score_sum = 0.0f64;
     // Game length split by verdict. A side that is genuinely stronger should
     // close games out *sooner* than it loses them: a short win means the
     // necromancer fell or the graveyards were taken outright, while a long loss
@@ -445,6 +446,9 @@ pub fn run_match(
         let (a_side, b_side) = if a_first { (0u8, 1u8) } else { (1u8, 0u8) };
         margin_sum += crate::game::net_worth(state, a_side) as f64
             - crate::game::net_worth(state, b_side) as f64;
+        // Terminal score from A's seat: the margin above plus a speed term, so
+        // a fast win reads higher than a grinding one that ends level.
+        score_sum += crate::game::game_score(state, a_side) as f64;
 
         let a_won = match Minions::outcome(state) {
             Outcome::FirstWins => a_first,
@@ -464,6 +468,9 @@ pub fn run_match(
     }
     let score = (wins as f64 + 0.5 * draws as f64) / games.max(1) as f64;
     let margin = margin_sum / games.max(1) as f64;
+    // Named apart from `score` above, which is the win rate. This is the mean
+    // terminal `game_score` in points.
+    let game_score = score_sum / games.max(1) as f64;
     // How the games ended, not just who won. Material parity with a losing
     // record means the opponent is winning on a *condition* — necromancer kill
     // or graveyard control — rather than on net worth, and the score alone
@@ -495,7 +502,7 @@ pub fn run_match(
         "node visits: 1:{} 2:{} 3-4:{} 5-8:{} 9-16:{} 17-32:{} 33-64:{} 65+:{}",
         h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]
     );
-    Ok((score, wins, losses, draws, margin))
+    Ok((score, wins, losses, draws, margin, game_score))
 }
 
 /// A seat backed by a checkpoint directory or file, on whichever backend.
