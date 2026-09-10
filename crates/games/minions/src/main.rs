@@ -145,6 +145,15 @@ enum Cmd {
         /// visit for a candidate the energy head scores near zero.
         #[arg(long, default_value_t = 2.0)]
         min_explore_visits: f32,
+        /// Flat visits guaranteed to each forced-exploration candidate. These
+        /// are excluded from PUCT and from the policy target; they buy a value
+        /// estimate only.
+        #[arg(long, default_value_t = 30)]
+        forced_visits: u32,
+        /// Non-explore candidates drawn at random to also get a quota, on top
+        /// of every explore candidate.
+        #[arg(long, default_value_t = 4)]
+        forced_extra: u32,
         /// KR-PUCT kernel bandwidth over the turn metric (`turn::distance`).
         /// Candidates within roughly this distance share visit counts and
         /// values instead of being scored as unrelated actions.
@@ -376,14 +385,16 @@ async fn main() -> anyhow::Result<()> {
             live, backend, ep, fp16, cuda, concurrency, max_batch, sims, fast_sims,
             full_search_prob,
             candidates, candidates_fast, t_steps, t_steps_fast, random_fraction,
-            random_opening_max, random_opening_decay, min_explore_visits, workers, no_energy,
+            random_opening_max, random_opening_decay, min_explore_visits,
+            forced_visits, forced_extra, workers, no_energy,
             kernel_sigma, pw_chunk,
             chunk_secs, max_examples,
             max_chunks, target_examples, seed,
         } => {
             let kind = minions_engine::net::BackendKind::parse(&backend, &ep, fp16, cuda)?;
             let actor = minions_engine::selfplay::ActorConfig {
-                sims, fast_sims, full_search_prob, backend: kind, min_explore_visits, workers,
+                sims, fast_sims, full_search_prob, backend: kind, min_explore_visits,
+                forced_visits, forced_extra, workers,
                 random_opening_max, random_opening_decay, kernel_sigma, pw_chunk,
                 ..Default::default()
             };

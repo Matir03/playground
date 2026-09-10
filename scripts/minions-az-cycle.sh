@@ -87,6 +87,15 @@ RANDOM_OPENING_DECAY="${RANDOM_OPENING_DECAY:-1.0884}"
 # cannot protect the ones the energy head scores near zero — which are exactly
 # the ones exploration is for. Pruned back out of the training target.
 MIN_EXPLORE_VISITS="${MIN_EXPLORE_VISITS:-2.0}"
+# Flat forced-exploration quota, replacing the prior-proportional KataGo floor.
+# These visits are invisible to PUCT and subtracted from the policy target, so
+# they buy a value estimate and nothing else. Capped in the search at half the
+# simulation budget: at the measured 4.3 explore candidates per node plus the
+# extras below, 30 each would otherwise be ~250 of 400 simulations.
+FORCED_VISITS="${FORCED_VISITS:-30}"
+# Non-explore candidates drawn at random to also get a quota, so trustworthy
+# value estimates are not confined to the injected set.
+FORCED_EXTRA="${FORCED_EXTRA:-4}"
 # Exactly one generation. The retention limit that matters is how many
 # promotions back the oldest data reaches, and at 250000 that is zero: every
 # training step sees only what the current champion just played. The 1M buffer
@@ -201,6 +210,7 @@ while true; do
     --random-opening-max "$RANDOM_OPENING_MAX" \
     --random-opening-decay "$RANDOM_OPENING_DECAY" \
     --min-explore-visits "$MIN_EXPLORE_VISITS" \
+    --forced-visits "$FORCED_VISITS" --forced-extra "$FORCED_EXTRA" \
     --max-examples "$MAX_EXAMPLES" --target-examples "$TARGET_EXAMPLES" \
     --seed "$gen" --backend "$BACKEND" --ep "$EP" $FP16_FLAG $CUDA_FLAG
 

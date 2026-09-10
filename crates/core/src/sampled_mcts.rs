@@ -154,6 +154,23 @@ pub struct SampledParams {
     /// a candidate that earned nothing beyond them contributes nothing.
     /// 0 disables it.
     pub min_explore_visits: f32,
+    /// Visits guaranteed to every candidate holding a forced-exploration quota,
+    /// as a flat constant rather than a function of the prior.
+    ///
+    /// The prior-proportional KataGo floor `sqrt(k*p*N)` gave the *most* forced
+    /// visits to the candidates the policy already rated highest, which is
+    /// backwards for a mechanism whose job is to measure the ones it does not.
+    /// A constant spends the same evidence on every candidate it examines.
+    ///
+    /// These visits are excluded from PUCT entirely (see [`Entry::n_eff`]) and
+    /// from the policy target; they buy a value estimate, nothing else.
+    pub forced_visits: u32,
+    /// Non-explore candidates chosen at random to also receive a quota.
+    ///
+    /// Explore candidates are always covered. These extras widen the set of
+    /// moves that get a trustworthy value estimate beyond the ones the sampler
+    /// happened to flag.
+    pub forced_extra: u32,
     /// Plies sampled proportional to visits before switching to argmax.
     pub temp_moves: u32,
     /// Progressive widening for **non-root** nodes: how many of the generated
@@ -225,6 +242,8 @@ impl Default for SampledParams {
             k_candidates: 32,
             k_forced: 2.0,
             min_explore_visits: 2.0,
+            forced_visits: 30,
+            forced_extra: 4,
             temp_moves: 8,
             pw_alpha: 0.5,
             pw_beta: 2.0,
@@ -281,6 +300,23 @@ struct Entry<G: SampledGame> {
     /// from high-prior candidates — the floor grows with the prior, so the
     /// moves the policy rates highest were the most likely to be zeroed.
     forced_n: u32,
+    /// Forced visits this entry is entitled to, set once when the node expands.
+    /// 0 for candidates outside the forced-exploration set.
+    forced_quota: u32,
+}
+
+impl<G: SampledGame> Entry<G> {
+    /// Visits PUCT is allowed to see: everything the search *chose*, with the
+    /// forced quota removed.
+    ///
+    /// The forced visits still count toward `w`, and so toward `q` below --
+    /// measuring the candidate's value is the entire reason they were spent.
+    /// What they must not do is make the candidate look *explored*, because
+    /// then PUCT would treat evidence we insisted on buying as evidence the
+    /// search had chosen to buy, and stop looking.
+    fn n_eff(&self) -> u32 {
+        self.n.saturating_sub(self.forced_n)
+    }
 }
 
 struct Node<G: SampledGame> {
@@ -454,52 +490,46 @@ impl<G: SampledGame> SampledSearchResult<G> {
     /// here, because the target reads the counts the search recorded as it
     /// granted them rather than reconstructing a floor from the priors.
     pub fn policy_target_with(&self, params: &SampledParams) -> Vec<f32> {
-        let k_forced = params.k_forced;
-        let priors = &self.priors;
+        let _ = params;
         let n = self.candidates.len();
-        let total: u32 = self.candidates.iter().map(|(_, v)| *v).sum();
-        let mut counts: Vec<f32> = self.candidates.iter().map(|(_, v)| *v as f32).collect();
-        if n == 0 || total == 0 {
-            return counts;
-        }
-        let best = self
-            .candidates
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, (_, v))| *v)
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        // Every root candidate is seeded with one visit by `select` so that it
-        // has a real value estimate. That visit is the search *asking*, not the
-        // search *choosing*, so it must not appear in the training target — the
-        // same reason forced playouts and injected explore visits are stripped.
-        // Forced visits decide *whether* a candidate counts, not how much.
+        let mut counts: Vec<f32> = Vec::with_capacity(n);
+        // Every candidate is in the target, forced-exploration ones included --
+        // they are part of the sample the energy head is being fit to, and
+        // omitting them would make the softmax normalise over a set the search
+        // did not actually consider.
         //
-        // A candidate that never attracted a visit search chose for itself has
-        // shown nothing, and drops out. But once it has earned even one, the
-        // forced visits are evidence about it too — they were spent looking at
-        // this move and the results came back — so its full visit count is what
-        // search actually concluded. Subtracting them there would understate a
-        // candidate precisely because we had insisted on examining it.
+        // What is removed is the forced visits themselves. Those were bought,
+        // not chosen, so they say nothing about which move search preferred. A
+        // candidate that attracted no chosen visits therefore targets exactly
+        // 0: it was examined, and the search declined to come back. That is a
+        // real signal rather than missing data, which is why it is trained on
+        // rather than pruned.
         //
-        // The count is exact, taken as the visits happened. The old estimate
-        // `max(sqrt(k*p*N), min_explore)` grew with the prior, so it
-        // over-subtracted from the candidates the policy rated highest and
-        // zeroed them — and a zeroed candidate stored as a negative teaches the
-        // energy head to suppress the moves it currently likes.
-        let _ = k_forced;
-        for (i, c) in counts.iter_mut().enumerate() {
-            let forced = self.forced.get(i).copied().unwrap_or(0) as f32;
-            if i != best && *c <= forced {
-                *c = 0.0;
-            }
+        // In practice 0 is rare. A forced candidate ends the search with
+        // `n_eff = 0`, which makes its PUCT exploration term maximal, so it is
+        // among the first things selection reaches for once the quotas are paid
+        // -- and by then its value estimate is trustworthy, because paying the
+        // quota is what made it so.
+        for (i, (_, v)) in self.candidates.iter().enumerate() {
+            let forced = self.forced.get(i).copied().unwrap_or(0);
+            counts.push(v.saturating_sub(forced) as f32);
         }
         let sum: f32 = counts.iter().sum();
         if sum <= 0.0 {
-            // Everything pruned away — fall back to the single best child, so a
-            // target is never all zeros.
+            // No candidate earned a chosen visit anywhere -- only reachable at
+            // absurdly small budgets. Fall back to the most-visited child so a
+            // target is never all zeros, which would be a zero-gradient row.
+            let best = self
+                .candidates
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, (_, v))| *v)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
             counts.iter_mut().for_each(|c| *c = 0.0);
-            counts[best] = 1.0;
+            if !counts.is_empty() {
+                counts[best] = 1.0;
+            }
             return counts;
         }
         counts.iter_mut().for_each(|c| *c /= sum);
@@ -523,20 +553,60 @@ fn new_node<G: SampledGame>(state: G::State) -> Node<G> {
     }
 }
 
-/// The visit floor a root candidate is entitled to before PUCT may starve it.
+/// Assign forced-exploration quotas over a node's candidates.
 ///
-/// Used by selection; the training target no longer recomputes it, reading the
-/// per-entry forced counts instead, so the two cannot drift.
-fn explore_floor(explore: bool, p: f32, total: f32, params: &SampledParams) -> f32 {
-    let katago = if params.k_forced > 0.0 {
-        (params.k_forced * p * total).max(0.0).sqrt()
-    } else {
-        0.0
-    };
-    if explore {
-        katago.max(params.min_explore_visits)
-    } else {
-        katago
+/// Every explore candidate is covered first -- those are the moves the sampler
+/// injected precisely because the energy head would not have proposed them, and
+/// they are worthless without a value estimate. `forced_extra` more are drawn at
+/// random from the rest, so the trustworthy estimates are not confined to the
+/// injected set.
+///
+/// **Budgeted.** The quotas are capped at half the simulation budget. Without
+/// that, the measured 4.3 explore candidates per node plus 4 extras at 30 visits
+/// each demand ~250 forced visits, which is 62% of a 400-simulation search and
+/// more than a 100-simulation fast search has in total -- the fast search would
+/// become entirely forced visits and never run PUCT at all, silently disabling
+/// playout-cap randomization. Explore candidates keep priority as the budget
+/// tightens; the random extras are what get dropped.
+fn assign_forced_quotas<G: SampledGame>(
+    entries: &mut [Entry<G>],
+    params: &SampledParams,
+    rng: &mut ChaCha8Rng,
+) {
+    for e in entries.iter_mut() {
+        e.forced_quota = 0;
+    }
+    let per = params.forced_visits;
+    if per == 0 {
+        return;
+    }
+    let budget = (params.simulations / 2).max(per);
+    let mut spent = 0u32;
+
+    for e in entries.iter_mut().filter(|e| e.explore) {
+        if spent + per > budget {
+            return;
+        }
+        e.forced_quota = per;
+        spent += per;
+    }
+
+    let mut rest: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !e.explore)
+        .map(|(i, _)| i)
+        .collect();
+    // Partial Fisher-Yates: only as many draws as we will actually use.
+    let want = params.forced_extra as usize;
+    for k in 0..want.min(rest.len()) {
+        if spent + per > budget {
+            break;
+        }
+        let j = k + (rng.gen::<u32>() as usize) % (rest.len() - k);
+        rest.swap(k, j);
+        entries[rest[k]].forced_quota = per;
+        spent += per;
     }
 }
 
@@ -580,7 +650,6 @@ fn earned<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool)
 fn select<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool) -> (usize, bool) {
     let n = visible(node, params, is_root);
     debug_assert!(n > 0);
-    let total = node.total_n.max(1) as f32;
 
     // Sweep the root once: every candidate is visited a single time before PUCT
     // takes over, so each has a real value estimate behind it rather than an FPU
@@ -593,24 +662,15 @@ fn select<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool)
         }
     }
 
-    if is_root && (params.k_forced > 0.0 || params.min_explore_visits > 0.0) {
-        // A candidate that has been tried at least once is floored at
-        // sqrt(k·P·N) visits before PUCT is allowed to starve it.
-        let mut best_deficit = 0.0f32;
+    if is_root && params.forced_visits > 0 {
+        // Serve the largest outstanding quota. Unlike the KataGo floor this
+        // replaces, the quota is flat and is bought from `n = 0` -- the whole
+        // point is to measure candidates PUCT would never try, and a floor that
+        // only keeps *already-tried* candidates alive cannot do that.
+        let mut best_deficit = 0u32;
         let mut forced_pick = usize::MAX;
         for (i, e) in node.entries.iter().enumerate().take(n) {
-            // KataGo's floor only *keeps a tried candidate alive*; it never buys
-            // a first visit, because a candidate with n = 0 is skipped. That is
-            // fine for model proposals but defeats forced exploration: the
-            // candidates most worth looking at are exactly the ones the energy
-            // head scores lowest, and with a small enough prior PUCT may never
-            // try them even once. Explore candidates are therefore floored from
-            // n = 0.
-            if e.n == 0 && !e.explore {
-                continue;
-            }
-            let floor = explore_floor(e.explore, e.p, total, params);
-            let deficit = floor - e.n as f32;
+            let deficit = e.forced_quota.saturating_sub(e.forced_n);
             if deficit > best_deficit {
                 best_deficit = deficit;
                 forced_pick = i;
@@ -635,11 +695,17 @@ fn select<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool)
     let m = node.entries.len();
     if params.kernel_sigma > 0.0 && node.kern.len() == m * m {
         let mut n_hat = vec![0.0f32; n];
+        let mut nq_hat = vec![0.0f32; n];
         let mut w_hat = vec![0.0f32; n];
         for i in 0..n {
             let row = &node.kern[i * m..(i + 1) * m];
             for (j, e) in node.entries.iter().enumerate() {
-                n_hat[i] += row[j] * e.n as f32;
+                // Two different visit counts on purpose: `n_hat` drives the
+                // exploration term and so excludes forced visits, while
+                // `q_hat`'s denominator is the full count that `w` was
+                // accumulated over.
+                n_hat[i] += row[j] * e.n_eff() as f32;
+                nq_hat[i] += row[j] * e.n as f32;
                 w_hat[i] += row[j] * e.w;
             }
         }
@@ -650,7 +716,7 @@ fn select<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool)
             // A candidate with no kernel-weighted visits falls back to the
             // node's own value, never a flat 0 — see `puct::fpu` for why 0 is a
             // trap. Normally a neighbour supplies an estimate and this is dead.
-            let q = if n_hat[i] > 0.0 { w_hat[i] / n_hat[i] } else { fpu };
+            let q = if nq_hat[i] > 0.0 { w_hat[i] / nq_hat[i] } else { fpu };
             let u = params.c_puct * node.entries[i].p * sqrt_total / (1.0 + n_hat[i]);
             let s = q + u;
             if s > best_score {
@@ -661,14 +727,21 @@ fn select<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool)
         return (best, false);
     }
 
-    let sqrt_total = total.sqrt();
+    // Forced visits are invisible to the exploration term, in the numerator as
+    // well as the denominator: a node whose visits were mostly bought rather
+    // than chosen has explored less than its raw count suggests, and `sqrt(N)`
+    // should say so.
+    let eff_total: u32 = node.entries.iter().map(|e| e.n_eff()).sum();
+    let sqrt_total = (eff_total as f32).max(1.0).sqrt();
     let mut best = 0usize;
     let mut best_score = f32::NEG_INFINITY;
     for (i, e) in node.entries.iter().enumerate().take(n) {
         // `e.w` is accumulated in the *owning node's* perspective (the backup
-        // negates on the way up), so it is used as-is here.
+        // negates on the way up), so it is used as-is here. `q` deliberately
+        // uses the *full* visit count: the forced visits were spent measuring
+        // exactly this, and discarding them would throw the estimate away.
         let q = if e.n > 0 { e.w / e.n as f32 } else { fpu };
-        let u = params.c_puct * e.p * sqrt_total / (1.0 + e.n as f32);
+        let u = params.c_puct * e.p * sqrt_total / (1.0 + e.n_eff() as f32);
         let s = q + u;
         if s > best_score {
             best_score = s;
@@ -910,11 +983,19 @@ impl<G: SampledGame> Search<G> {
                         child: -1,
                         explore,
                         forced_n: 0,
+                        forced_quota: 0,
                     });
                 }
             }
         }
         renormalise(&mut entries);
+        // Quotas are set once, over the node's initial candidate set. Widening
+        // appends later; a widened explore candidate is covered by the top-up
+        // in `provide_widen`, and widened ordinary candidates are not drawn into
+        // the random extras -- the draw would no longer be uniform over the set
+        // it was specified against, and re-drawing would revoke quotas already
+        // being paid.
+        assign_forced_quotas(&mut entries, &self.params, &mut self.rng);
         self.tree[cur].entries = entries;
         self.tree[cur].expanded = true;
         self.build_kernel(cur);
@@ -993,6 +1074,7 @@ impl<G: SampledGame> Search<G> {
                         child: -1,
                         explore,
                         forced_n: 0,
+                        forced_quota: 0,
                     });
                 }
             }
@@ -1003,6 +1085,17 @@ impl<G: SampledGame> Search<G> {
         // Re-softmax over the grown set. Sorting inside is safe here because a
         // widen abandons its simulation, so no `path` entry indexes this node.
         renormalise(&mut self.tree[cur].entries);
+        // Top up only: an explore candidate that arrived by widening still needs
+        // a value estimate, but the random extras were drawn over the initial
+        // set and are not redrawn (see `provide`).
+        let per = self.params.forced_visits;
+        if per > 0 {
+            for e in self.tree[cur].entries.iter_mut() {
+                if e.explore && e.forced_quota == 0 {
+                    e.forced_quota = per;
+                }
+            }
+        }
         self.build_kernel(cur);
     }
 
@@ -1050,20 +1143,51 @@ impl<G: SampledGame> Search<G> {
         let priors: Vec<f32> = root.entries.iter().map(|e| e.p).collect();
         let explore: Vec<bool> = root.entries.iter().map(|e| e.explore).collect();
         let forced: Vec<u32> = root.entries.iter().map(|e| e.forced_n).collect();
-        let value =
-            if root.total_n > 0 { root.w_sum as f64 / root.total_n as f64 } else { 0.0 };
+        // Weight each candidate's value by its *chosen* visits, not its raw
+        // ones. Each candidate's own `q` still uses every visit it received --
+        // the forced ones were spent measuring it and are good evidence -- but
+        // the position's value is a statement about what search concluded, and
+        // a plain `w_sum / total_n` lets a quota spent proving a move is bad
+        // drag the position's evaluation down with it. At a 100-simulation
+        // budget with one 30-visit quota that was enough to report a won
+        // position at 0.36, which `an_immediate_win_is_taken` caught.
+        let eff_n: u32 = root.entries.iter().map(|e| e.n_eff()).sum();
+        let value = if eff_n > 0 {
+            let acc: f64 = root
+                .entries
+                .iter()
+                .filter(|e| e.n > 0)
+                .map(|e| e.n_eff() as f64 * (e.w as f64 / e.n as f64))
+                .sum();
+            acc / eff_n as f64
+        } else if root.total_n > 0 {
+            // Every visit was forced -- only at budgets below the quota total.
+            root.w_sum as f64 / root.total_n as f64
+        } else {
+            0.0
+        };
 
+        // Play on *chosen* visits, the same counts the policy target is built
+        // from. Forced visits are bought, not preferred, and a candidate given a
+        // 30-visit quota would otherwise win the argmax outright at small
+        // budgets purely because we insisted on measuring it -- which is exactly
+        // what `an_immediate_win_is_taken` caught.
+        let eff: Vec<u32> = root
+            .entries
+            .iter()
+            .map(|e| e.n_eff())
+            .collect();
         let chosen = if candidates.is_empty() {
             0
         } else if self.ply < self.params.temp_moves {
             // Opening plies: sample proportional to visits, for self-play diversity.
-            let total: u32 = candidates.iter().map(|(_, n)| *n).sum();
+            let total: u32 = eff.iter().sum();
             if total == 0 {
                 self.rng.gen_range(0..candidates.len())
             } else {
                 let mut r = self.rng.gen_range(0..total);
                 let mut pick = candidates.len() - 1;
-                for (i, (_, n)) in candidates.iter().enumerate() {
+                for (i, n) in eff.iter().enumerate() {
                     if r < *n {
                         pick = i;
                         break;
@@ -1073,10 +1197,9 @@ impl<G: SampledGame> Search<G> {
                 pick
             }
         } else {
-            candidates
-                .iter()
+            eff.iter()
                 .enumerate()
-                .max_by_key(|(_, (_, n))| *n)
+                .max_by_key(|(_, n)| **n)
                 .map(|(i, _)| i)
                 .unwrap_or(0)
         };
@@ -1363,6 +1486,8 @@ mod tests {
             simulations: 120,
             k_forced: 2.0,
             min_explore_visits: 2.0,
+            forced_visits: 30,
+            forced_extra: 4,
             temp_moves: 0,
             seed: 7,
             ..Default::default()
@@ -1458,7 +1583,7 @@ mod tests {
         let params = SampledParams { pw_alpha: 0.5, pw_beta: 2.0, ..Default::default() };
         let mut node = new_node::<Count>(CountState { n: 21, side: 1 });
         node.entries = (0..12)
-            .map(|i| Entry::<Count> { mv: i, energy: 0.0, p: 1.0 / 12.0, n: 0, w: 0.0, child: -1, explore: false, forced_n: 0 })
+            .map(|i| Entry::<Count> { mv: i, energy: 0.0, p: 1.0 / 12.0, n: 0, w: 0.0, child: -1, explore: false, forced_n: 0, forced_quota: 0 })
             .collect();
 
         node.total_n = 1;
@@ -1494,6 +1619,7 @@ mod tests {
                     child: -1,
                     explore: false,
                     forced_n: 0,
+                    forced_quota: 0,
                 })
                 .collect();
             let mut prev = 0usize;
@@ -1863,11 +1989,12 @@ mod tests {
     }
 
     #[test]
-    fn policy_target_prunes_forced_visits_away() {
-        // A candidate that only ever got its forced visits must not appear in
-        // the training target. `forced` now carries the visits a floor actually
-        // demanded, counted as they happened, so the fixture states them rather
-        // than relying on the old prior-proportional estimate.
+    fn policy_target_subtracts_forced_visits() {
+        // Forced visits are bought, not chosen, so they are removed from every
+        // candidate's count -- the winner's included. A candidate left with
+        // nothing it earned targets exactly 0, which is a real observation
+        // ("we examined this and search declined to return") rather than
+        // missing data.
         let r = SampledSearchResult::<Count> {
             forced: vec![1, 3, 4],
             stats: SearchStats::default(),
@@ -1880,41 +2007,36 @@ mod tests {
         };
         let t = r.policy_target(2.0);
         assert!((t.iter().sum::<f32>() - 1.0).abs() < 1e-5, "target must be normalised");
-        assert!(t[0] > 0.9, "the earned child should dominate: {t:?}");
-        assert_eq!(t[1], 0.0, "forced-only visits must be pruned: {t:?}");
-        assert_eq!(t[2], 0.0, "forced-only visits must be pruned: {t:?}");
-        // The winner keeps its whole count rather than a floor-adjusted one.
-        assert!(t[0] > 0.99, "an earned candidate keeps its full visits: {t:?}");
+        assert_eq!(t[1], 0.0, "forced-only visits earn no mass: {t:?}");
+        assert_eq!(t[2], 0.0, "forced-only visits earn no mass: {t:?}");
+        assert!((t[0] - 1.0).abs() < 1e-6, "92 of 92 chosen visits: {t:?}");
     }
 
     #[test]
-    fn policy_target_keeps_a_candidate_that_earned_its_visits() {
-        // Same tiny prior, but this one attracted far more visits than its
-        // forced floor — it survives on merit. This is how an injected random
-        // candidate gets promoted.
+    fn the_leader_is_not_exempt_from_subtraction() {
+        // The old rule never subtracted from the most-visited child. It does
+        // now, so two candidates with equal raw counts but different quotas do
+        // not tie.
         let r = SampledSearchResult::<Count> {
-            forced: vec![],
+            forced: vec![30, 0],
             stats: SearchStats::default(),
-            candidates: vec![(1, 55), (2, 45)],
-            priors: vec![0.95, 0.05],
-            explore: vec![false; 8],
-            chosen: 0,
+            candidates: vec![(1, 60), (2, 60)],
+            priors: vec![0.5, 0.5],
+            explore: vec![true, false],
+            chosen: 1,
             value: 0.0,
             nodes: 0,
         };
         let t = r.policy_target(2.0);
-        assert!(t[1] > 0.3, "an organically visited child must survive pruning: {t:?}");
+        assert!((t[0] - 30.0 / 90.0).abs() < 1e-5, "{t:?}");
+        assert!((t[1] - 60.0 / 90.0).abs() < 1e-5, "{t:?}");
     }
 
     #[test]
-    fn forced_visits_gate_a_candidate_but_are_not_subtracted() {
-        // Survival is now exact: a candidate keeps mass when the visits it was
-        // *not* forced into exceed one. The old rule subtracted an estimate,
-        // `max(sqrt(k*p*N), min_explore)`, which grew with the prior and so
-        // over-subtracted from precisely the candidates the policy rated
-        // highest — the reason `min_visits_per_candidate` no longer predicts
-        // this and is kept only as a startup warning.
-        let survivors = |visits: u32, forced: u32, k: usize| -> usize {
+    fn a_candidate_counts_only_what_it_earned() {
+        // Mass is now proportional to `n - forced` rather than gated on it, so
+        // a candidate contributes exactly the visits search chose to give it.
+        let target = |visits: u32, forced: u32, k: usize| -> Vec<f32> {
             let r = SampledSearchResult::<Count> {
                 forced: vec![forced; k],
                 stats: SearchStats::default(),
@@ -1925,17 +2047,19 @@ mod tests {
                 value: 0.0,
                 nodes: 0,
             };
-            r.policy_target(2.0).iter().filter(|&&p| p > 0.0).count()
+            r.policy_target(2.0)
         };
-        // Every visit was forced: nothing earned anything, so the target falls
-        // back to the single best child rather than returning all zeros.
-        assert_eq!(survivors(4, 4, 8), 1, "forced-only visits leave nothing to learn from");
-        // A single earned visit is enough to count, and then the *whole* visit
-        // count stands — the forced visits looked at this move too.
-        assert_eq!(survivors(5, 4, 8), 8, "one earned visit puts a candidate back in");
-        // Survival does not depend on the prior any more: the same forced count
-        // is used however the policy rated the move.
-        assert_eq!(survivors(6, 1, 8), 8, "survival does not depend on the prior");
+        // Every visit forced: nothing earned anything, so the target falls back
+        // to a single child rather than returning all zeros, which would be a
+        // zero-gradient row.
+        let t = target(4, 4, 8);
+        assert_eq!(t.iter().filter(|&&p| p > 0.0).count(), 1, "{t:?}");
+        // One earned visit each: equal counts, so a uniform target.
+        let t = target(5, 4, 8);
+        assert!(t.iter().all(|&p| (p - 0.125).abs() < 1e-6), "{t:?}");
+        // Five earned each -- still uniform, and independent of the prior.
+        let t = target(6, 1, 8);
+        assert!(t.iter().all(|&p| (p - 0.125).abs() < 1e-6), "{t:?}");
     }
 
     /// The exported tree must be walkable: root first, child indices resolving,
@@ -2063,5 +2187,112 @@ mod tests {
             })
             .collect();
         assert!(picks.len() > 1, "temperature should diversify the opening, got {picks:?}");
+    }
+}
+
+#[cfg(test)]
+mod forced_quota_tests {
+    use super::*;
+
+    /// Minimal game: the quota logic only reads `explore`, never the moves.
+    struct G0;
+    impl SampledGame for G0 {
+        type State = ();
+        type Move = u32;
+        const PLANES: usize = 1;
+        fn initial_state() -> Self::State {}
+        fn to_move(_: &Self::State) -> u8 { 1 }
+        fn apply(_: &Self::State, _: &Self::Move) -> Self::State {}
+        fn terminal_value(_: &Self::State) -> Option<f32> { None }
+        fn encode_planes(_: &Self::State, _: &mut [f32]) {}
+        fn state_key(_: &Self::State) -> u128 { 0 }
+    }
+
+    fn entry(explore: bool) -> Entry<G0> {
+        Entry { mv: 1, energy: 0.0, p: 0.25, n: 0, w: 0.0, child: -1, explore, forced_n: 0, forced_quota: 0 }
+    }
+
+    fn quotas(n_explore: usize, n_plain: usize, params: &SampledParams) -> Vec<u32> {
+        let mut es: Vec<Entry<G0>> = (0..n_explore).map(|_| entry(true))
+            .chain((0..n_plain).map(|_| entry(false)))
+            .collect();
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        assign_forced_quotas(&mut es, params, &mut rng);
+        es.iter().map(|e| e.forced_quota).collect()
+    }
+
+    #[test]
+    fn every_explore_candidate_is_covered() {
+        let p = SampledParams { simulations: 4000, forced_visits: 30, forced_extra: 4, ..Default::default() };
+        let q = quotas(5, 10, &p);
+        assert!(q[..5].iter().all(|&x| x == 30), "explore candidates must all be covered: {q:?}");
+    }
+
+    #[test]
+    fn exactly_forced_extra_plain_candidates_are_drawn() {
+        let p = SampledParams { simulations: 4000, forced_visits: 30, forced_extra: 4, ..Default::default() };
+        let q = quotas(5, 10, &p);
+        assert_eq!(q[5..].iter().filter(|&&x| x > 0).count(), 4, "expected 4 extras: {q:?}");
+    }
+
+    #[test]
+    fn quotas_are_capped_at_half_the_simulation_budget() {
+        // 4.3 explore candidates per node plus 4 extras at 30 each is ~250
+        // visits, which is 62% of a 400-simulation search. The cap is what
+        // stops forced exploration from crowding out the search it informs.
+        let p = SampledParams { simulations: 400, forced_visits: 30, forced_extra: 4, ..Default::default() };
+        let q = quotas(5, 10, &p);
+        let total: u32 = q.iter().sum();
+        assert!(total <= 200, "forced total {total} exceeds half of 400");
+    }
+
+    #[test]
+    fn explore_candidates_keep_priority_when_the_budget_binds() {
+        // Under pressure the random extras are what gets dropped, never the
+        // injected candidates -- those are the ones with no value estimate.
+        let p = SampledParams { simulations: 120, forced_visits: 30, forced_extra: 4, ..Default::default() };
+        let q = quotas(2, 10, &p);
+        assert!(q[..2].iter().all(|&x| x == 30), "explore dropped before extras: {q:?}");
+        assert_eq!(q.iter().sum::<u32>(), 60, "budget 60 should buy exactly the two explore quotas");
+    }
+
+    #[test]
+    fn a_candidate_with_only_forced_visits_targets_zero() {
+        // The specified behaviour: forced visits are not evidence the search
+        // preferred a move, so a candidate that attracted none of its own is a
+        // real zero in the target rather than missing data.
+        let r = SampledSearchResult::<G0> {
+            candidates: vec![(1, 40), (2, 30), (3, 10)],
+            priors: vec![0.4, 0.3, 0.3],
+            explore: vec![false, true, false],
+            forced: vec![0, 30, 0],
+            chosen: 0,
+            value: 0.0,
+            nodes: 0,
+            stats: SearchStats::default(),
+        };
+        let t = r.policy_target_with(&SampledParams::default());
+        assert_eq!(t[1], 0.0, "a purely-forced candidate must target 0, got {t:?}");
+        assert!((t[0] - 0.8).abs() < 1e-6, "40 of 50 chosen visits: {t:?}");
+        assert!((t[2] - 0.2).abs() < 1e-6, "10 of 50 chosen visits: {t:?}");
+    }
+
+    #[test]
+    fn forced_candidates_stay_in_the_target_when_they_earn_visits() {
+        // Still part of the sample set -- the softmax normalises over every
+        // candidate the search saw, forced ones included.
+        let r = SampledSearchResult::<G0> {
+            candidates: vec![(1, 40), (2, 40)],
+            priors: vec![0.5, 0.5],
+            explore: vec![false, true],
+            forced: vec![0, 30],
+            chosen: 0,
+            value: 0.0,
+            nodes: 0,
+            stats: SearchStats::default(),
+        };
+        let t = r.policy_target_with(&SampledParams::default());
+        assert!((t[0] - 0.8).abs() < 1e-6, "{t:?}");
+        assert!((t[1] - 0.2).abs() < 1e-6, "10 chosen of 50: {t:?}");
     }
 }

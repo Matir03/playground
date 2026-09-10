@@ -160,6 +160,10 @@ pub struct ActorConfig {
     /// are subtracted again before the policy target forms, so they cost search
     /// budget but leave no trace in what the policy learns.
     pub min_explore_visits: f32,
+    /// Flat forced-exploration quota per covered candidate.
+    pub forced_visits: u32,
+    /// Non-explore candidates drawn at random to also receive a quota.
+    pub forced_extra: u32,
     /// Pool workers. Each owns a disjoint slice of the pool and runs the whole
     /// gather → expand → provide loop, so one worker's CPU phases overlap
     /// another's GPU phases. 1 restores the single-threaded actor.
@@ -177,6 +181,8 @@ impl Default for ActorConfig {
             c_puct: 1.5,
             k_forced: 2.0,
             min_explore_visits: 2.0,
+            forced_visits: 30,
+            forced_extra: 4,
             workers: 4,
             kernel_sigma: 0.0,
             pw_alpha: 0.5,
@@ -392,6 +398,10 @@ fn drive_pool_worker(
             // Fast searches produce no training data, so there is nothing to
             // keep the support of — and no pruning to correct it either.
             min_explore_visits: if full { cfg.min_explore_visits } else { 0.0 },
+            // Fast searches buy no forced exploration: they carry no policy
+            // target, and at 100 simulations the quotas would eat the budget.
+            forced_visits: if full { cfg.forced_visits } else { 0 },
+            forced_extra: cfg.forced_extra,
             temp_moves: cfg.temp_moves,
             pw_alpha: cfg.pw_alpha,
             pw_beta: cfg.pw_beta,
@@ -801,6 +811,10 @@ pub fn new_pool(model: &MinionsModel, cfg: &ActorConfig, n: usize, seed: u64) ->
                 k_candidates: model.cfg.k_for(full),
                 k_forced: if full { cfg.k_forced } else { 0.0 },
                 min_explore_visits: if full { cfg.min_explore_visits } else { 0.0 },
+            // Fast searches buy no forced exploration: they carry no policy
+            // target, and at 100 simulations the quotas would eat the budget.
+            forced_visits: if full { cfg.forced_visits } else { 0 },
+            forced_extra: cfg.forced_extra,
                 temp_moves: cfg.temp_moves,
                 pw_alpha: cfg.pw_alpha,
             pw_beta: cfg.pw_beta,
@@ -856,6 +870,8 @@ fn advance_turn(
         let target = result.policy_target_with(&SampledParams {
             k_forced: cfg.k_forced,
             min_explore_visits: cfg.min_explore_visits,
+            forced_visits: cfg.forced_visits,
+            forced_extra: cfg.forced_extra,
             ..Default::default()
         });
         let mut scored: Vec<(TurnSpec, f32)> = result
