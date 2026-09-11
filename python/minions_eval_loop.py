@@ -2,10 +2,12 @@
 
 Two measurements, deliberately separate (the Hex run's structure):
 
-* **relative** — the newest snapshot against the reigning champion. Promote only
-  above ``--promote-threshold``. The actor resolves its weights to ``best.*``
-  when that file exists, so this gate is also what keeps a losing net's games
-  out of the replay buffer.
+* **relative** — the newest snapshot against the last ``--gate-opponents``
+  champions, ``--gate-games`` each, every generation. Promote when the
+  Bradley-Terry fit over the whole match record puts the candidate above the
+  reigning champion. The actor resolves its weights to ``best.*`` when that
+  file exists, so this gate is also what keeps a losing net's games out of the
+  replay buffer.
 * **absolute** — against the greedy heuristic in ``solver.rs``, the fixed
   yardstick that does not drift as the ladder climbs. Only run for nets that
   promoted, because it costs a full match and tells us nothing about a net that
@@ -131,17 +133,12 @@ def elo_mod():
     return _ELO
 
 
-def past_champions(scores, exclude, n):
-    """The `n` most recent promoted generations, newest first, minus `exclude`.
-
-    `exclude` is the champion the candidate just played 40 games against -- that
-    match is already logged and far better resolved than 6 games would be, so
-    spending games on it again buys nothing.
-    """
+def champion_ladder(scores, n):
+    """The `n` most recent champions, newest first."""
     promoted = [r["gen"] for r in scores.get("history", []) if r.get("promoted")]
     out = []
     for g in reversed(promoted):
-        if g == exclude or g in out:
+        if g in out:
             continue
         out.append(g)
         if len(out) >= n:
@@ -149,41 +146,100 @@ def past_champions(scores, exclude, n):
     return out
 
 
-def run_ladder_matches(args, live, scores, gen, exclude):
-    """Play the new champion against several earlier ones.
+def run_gate_matches(args, live, scores, gen, ckpt, champion, champion_gen):
+    """Play the candidate against the several most recent champions.
 
-    The promotion gate only ever compares adjacent rungs, which measures each
-    step but never the ladder: a run can promote thirty times on 0.55 margins
-    and still be walking sideways if each net is merely different from the last
-    rather than better. Matches against older champions tie distant rungs
-    together, and BT turns that into one consistent rating scale.
+    The old gate was one 40-game match against the reigning champion. That
+    measures each step of the ladder and never the ladder itself: pooled over
+    every recorded match, a champion scored 0.490 against champions four to
+    nine generations back while beating its immediate predecessor at 0.6-0.75.
+    A run can promote indefinitely on that, walking sideways -- each net merely
+    different from the last rather than better.
 
-    Six games each is deliberately coarse -- far too few to read on their own,
-    which is the point of fitting them jointly rather than reporting them.
+    So the gate is the ladder. Every candidate, promoted or not, plays the last
+    few champions before anything is decided, and the decision is made on the
+    Bradley-Terry fit rather than on one pairwise score. Beating the current
+    champion is no longer sufficient; out-rating it is.
+
+    Games per opponent drop (40 against one, 20 against each of five), which
+    sounds like a loss of resolution on the match that used to decide and is
+    not: the rating that decides is fitted over the whole record, so the older
+    champions arrive already resolved to hundreds of games and the candidate is
+    placed against all of them at once.
+
+    Returns `(rows, bits)` -- match rows to log, and the fields the reigning
+    champion's match contributes to the scores entry.
     """
-    rows = []
-    opponents = past_champions(scores, exclude, args.ladder_opponents)
+    rows, bits = [], {"gate_games": args.gate_games}
+    opponents = champion_ladder(scores, args.gate_opponents)
+    if champion_gen is not None and champion_gen not in opponents:
+        opponents.insert(0, champion_gen)
     for i, opp in enumerate(opponents):
-        ckpt = os.path.join(live, "snapshots", f"gen{opp}", "checkpoint.safetensors")
-        if not os.path.exists(ckpt):
-            # Snapshots are pruned eventually; a missing rung is normal.
-            continue
+        reigning = opp == champion_gen
+        if reigning:
+            # The reigning champion is `best.safetensors`, which is guaranteed
+            # present; its snapshot may since have been pruned.
+            other = champion
+        else:
+            other = os.path.join(live, "snapshots", f"gen{opp}", "checkpoint.safetensors")
+            if not os.path.exists(other):
+                # Snapshots are pruned eventually; a missing rung is normal.
+                continue
         try:
-            sc, _, _ = run_match(
-                args.engine, os.path.join(live, "best.safetensors"), ckpt,
-                args.ladder_games, args.sims, args.candidates, args.t_steps,
-                args.backend, args.ep, args.fp16,
-                # Distinct per opponent and per measuring generation, so repeat
-                # pairings are independent samples rather than replays.
-                seed=50000 + gen * 16 + i,
-                render_file=None, render_games=0)
+            sc, margin, gscore = run_match(
+                args.engine, ckpt, other, args.gate_games, args.sims,
+                args.candidates, args.t_steps, args.backend, args.ep, args.fp16,
+                # The reigning-champion match keeps `seed=gen` so it stays
+                # comparable with every `vs_champion` already in the history.
+                # The rest are distinct per opponent and per measuring
+                # generation, so repeat pairings are independent samples rather
+                # than replays of the same games.
+                seed=gen if reigning else 50000 + gen * 16 + i,
+                render_file=(os.path.join(live, "games", f"gen_{gen:04d}_vs_champion.txt")
+                             if reigning else None),
+                render_games=args.render_games if reigning else 0)
         except Exception as exc:  # noqa: BLE001
-            print(f"gen {gen}: ladder match vs gen{opp} failed: {exc}", file=sys.stderr)
+            print(f"gen {gen}: gate match vs gen{opp} failed: {exc}", file=sys.stderr)
             continue
-        rows.append({"a": f"gen{gen}", "b": f"gen{opp}", "games": args.ladder_games,
-                     "score_a": sc, "kind": "ladder"})
-        print(f"  ladder: gen{gen} vs gen{opp}: {sc:.3f} over {args.ladder_games}")
-    return rows
+        rows.append({"a": f"gen{gen}", "b": f"gen{opp}", "games": args.gate_games,
+                     "score_a": sc, "kind": "gate" if reigning else "ladder"})
+        print(f"  gate: gen{gen} vs gen{opp}: {sc:.3f} over {args.gate_games}")
+        if not reigning:
+            continue
+        bits["vs_champion"] = sc
+        if _LAST_BIDS is not None:
+            bits["bid_candidate"], bits["bid_champion"] = _LAST_BIDS
+        if _LAST_TURNS is not None:
+            bits["champ_turns_win"], bits["champ_turns_loss"] = _LAST_TURNS
+        if margin is not None:
+            bits["vs_champion_margin"] = round(margin, 3)
+        if gscore is not None:
+            bits["vs_champion_score"] = round(gscore, 2)
+    return rows, bits
+
+
+def decide_promotion(live, gen, champion_gen, rows, margin):
+    """Log `rows`, refit every rating, and say whether the candidate out-rates
+    the champion.
+
+    The fit is joint and over the whole record, so this is not "did it beat the
+    champion" restated -- a candidate that beats the champion while losing to
+    two champions behind it lands below the champion and is rejected, which is
+    the entire point of the change.
+
+    Returns `(promoted, ratings, matches)`; `promoted` is None when the fit
+    could not place both nets, which is treated as a rejection by the caller.
+    A rejected good generation costs one cycle; an accepted bad one poisons the
+    buffer that trains all of its successors.
+    """
+    E = elo_mod()
+    E.append(live, rows)
+    matches = E.load_matches(os.path.join(live, "matches.jsonl"))
+    ratings = E.fit(matches)
+    mine, theirs = ratings.get(f"gen{gen}"), ratings.get(f"gen{champion_gen}")
+    if mine is None or theirs is None:
+        return None, ratings, matches
+    return mine > theirs + margin, ratings, matches
 
 
 def run_diagnostic(args, live, scores, scores_path) -> None:
@@ -270,7 +326,17 @@ def main():
     ap.add_argument("--sims", type=int, default=100)
     ap.add_argument("--candidates", type=int, default=16)
     ap.add_argument("--t-steps", type=int, default=6)
-    ap.add_argument("--promote-threshold", type=float, default=0.52)
+    ap.add_argument("--promote-threshold", type=float, default=0.52,
+                    help="superseded by the rating gate and ignored; still "
+                         "accepted so a running cycle script keeps working.")
+    ap.add_argument("--gate-games", type=int, default=20,
+                    help="games against each recent champion, every generation.")
+    ap.add_argument("--gate-opponents", type=int, default=5,
+                    help="how many recent champions the candidate plays, "
+                         "newest first, starting with the reigning one.")
+    ap.add_argument("--promote-elo-margin", type=float, default=0.0,
+                    help="rating points the candidate must exceed the champion "
+                         "by. 0 is a plain `higher rating promotes`.")
     ap.add_argument("--greedy-games", type=int, default=12)
     ap.add_argument("--render-games", type=int, default=5,
                     help="games per match written turn-by-turn to <live>/games/. "
@@ -282,13 +348,6 @@ def main():
                     help="diagnostic mode: skip promotion entirely and measure the "
                          "newest net against the one from LAG generations back, "
                          "plus greedy. 0 keeps the promotion-gated ladder.")
-    ap.add_argument("--ladder-games", type=int, default=6,
-                    help="games against each earlier champion when a new one is "
-                         "promoted. Coarse on purpose: they are fitted jointly "
-                         "by Bradley-Terry, not read individually.")
-    ap.add_argument("--ladder-opponents", type=int, default=4,
-                    help="how many earlier champions to play, newest first, "
-                         "skipping the one the gate just used.")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--period", type=int, default=120)
     args = ap.parse_args()
@@ -330,26 +389,49 @@ def main():
                 score, promoted = None, True
                 print(f"gen {gen}: no champion yet — seeding the ladder")
             else:
-                games_dir = os.path.join(live, "games")
-                render_file = os.path.join(games_dir, f"gen_{gen:04d}_vs_champion.txt")
-                score, margin, gscore = run_match(args.engine, ckpt, champion, args.games, args.sims,
-                                          args.candidates, args.t_steps, args.backend, args.ep,
-                                          args.fp16, seed=gen,
-                                          render_file=render_file,
-                                          render_games=args.render_games)
-                entry["vs_champion"] = score
-                if _LAST_BIDS is not None:
-                    entry["bid_candidate"], entry["bid_champion"] = _LAST_BIDS
-                if _LAST_TURNS is not None:
-                    entry["champ_turns_win"], entry["champ_turns_loss"] = _LAST_TURNS
-                # Recorded, not yet gated on. Win/loss here can be a constant —
-                # seat decides the game at the turn cap — and a pinned 0.5 means
-                # nothing is ever promoted. Margin still separates two nets.
-                if margin is not None:
-                    entry["vs_champion_margin"] = round(margin, 3)
-                if gscore is not None:
-                    entry["vs_champion_score"] = round(gscore, 2)
-                promoted = score >= args.promote_threshold
+                gate_rows, bits = run_gate_matches(args, live, scores, gen, ckpt,
+                                                   champion, champion_gen)
+                entry.update(bits)
+                score = bits.get("vs_champion")
+                if not gate_rows:
+                    # Every match failed. Nothing was measured, so nothing is
+                    # promoted and the champion stands another generation.
+                    print(f"gen {gen}: no gate match completed; not promoting",
+                          file=sys.stderr)
+                    promoted = False
+                else:
+                    try:
+                        promoted, ratings, allm = decide_promotion(
+                            live, gen, champion_gen, gate_rows,
+                            args.promote_elo_margin)
+                    except Exception as exc:  # noqa: BLE001
+                        # Ratings used to be a diagnostic that must never break
+                        # the ladder. They are the gate now, so a failure here
+                        # cannot be shrugged off -- but it still must not
+                        # promote on no evidence.
+                        print(f"gen {gen}: rating gate failed: {exc}", file=sys.stderr)
+                        promoted, ratings, allm = False, {}, []
+                    if promoted is None:
+                        print(f"gen {gen}: rating gate could not place both nets; "
+                              f"not promoting", file=sys.stderr)
+                        promoted = False
+                    mine = ratings.get(f"gen{gen}")
+                    theirs = ratings.get(f"gen{champion_gen}")
+                    if mine is not None:
+                        entry["elo"] = round(mine, 1)
+                    if theirs is not None:
+                        entry["elo_champion"] = round(theirs, 1)
+                    if mine is not None and theirs is not None:
+                        print(f"  rating: gen{gen} {mine:.0f} vs "
+                              f"gen{champion_gen} {theirs:.0f} "
+                              f"({mine - theirs:+.0f})")
+                    if ratings:
+                        try:
+                            E = elo_mod()
+                            E.write_ratings(live, ratings, E.games_played(allm), len(allm))
+                        except Exception as exc:  # noqa: BLE001
+                            print(f"gen {gen}: elo.json write failed: {exc}",
+                                  file=sys.stderr)
 
             if promoted:
                 shutil.copyfile(ckpt, best + ".tmp")
@@ -368,16 +450,10 @@ def main():
                 json.dump(scores, open(scores_path, "w"), indent=2)
                 scores["history"].pop()  # replaced below, after the yardstick
 
-            # Every gate match is a rated result whether or not it promoted:
-            # a rejected candidate losing 0.3 to the champion says as much
-            # about both nets as a win does.
+            # The gate matches are already logged and fitted -- `decide_promotion`
+            # had to append them before it could rate anything. Only the greedy
+            # yardstick below is still outstanding.
             match_rows = []
-            if champion_gen is not None and score is not None:
-                match_rows.append({"a": f"gen{gen}", "b": f"gen{champion_gen}",
-                                   "games": args.games, "score_a": score,
-                                   "kind": "gate"})
-            if promoted and args.ladder_games > 0 and args.ladder_opponents > 0:
-                match_rows += run_ladder_matches(args, live, scores, gen, champion_gen)
 
             # Absolute yardstick against the greedy heuristic. Tracking only —
             # it never gates promotion, so a weak early net still climbs its own

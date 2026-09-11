@@ -98,11 +98,22 @@ def fit(matches, iters=10000, tol=1e-9):
         return {}
 
     # A player who never lost (or never won) has an unbounded MLE. A symmetric
-    # 0.5-game prior against a phantom average opponent bounds it, at the cost
-    # of shrinking extreme ratings slightly toward the field -- the standard
-    # fix, and the alternative is a rating of +inf.
+    # half-game prior against a phantom opponent at the field's geometric mean
+    # bounds it, at the cost of shrinking that player's rating toward the field.
+    #
+    # Applied *only* to the players that need it. Giving it to everyone looks
+    # harmless -- half a game against hundreds of real ones -- but it is a pull
+    # toward the field mean whose strength grows with distance from that mean,
+    # so it compresses the whole scale, and the compression *moves* whenever the
+    # field does. Three rejected candidates entering the record shifted every
+    # champion down 17-36 points that way, on no evidence about those champions
+    # at all. Ratings that drift when unrelated players are added cannot be a
+    # promotion criterion, and they now are one.
     prior = 0.5
-    total = {p: sum(wins[p].values()) + prior for p in players}
+    won = {p: sum(wins[p].values()) for p in players}
+    lost = {p: sum(wins[q].get(p, 0.0) for q in players) for p in players}
+    reg = {p: prior if won[p] <= 1e-9 or lost[p] <= 1e-9 else 0.0 for p in players}
+    total = {p: won[p] + reg[p] for p in players}
 
     strength = {p: 1.0 for p in players}
     for _ in range(iters):
@@ -115,8 +126,9 @@ def fit(matches, iters=10000, tol=1e-9):
                 n_pq = wins[p].get(q, 0.0) + wins[q].get(p, 0.0)
                 denom += n_pq / (strength[p] + strength[q])
             # The phantom opponent sits at the geometric mean, which is 1.0 by
-            # the normalisation below.
-            denom += 2.0 * prior / (strength[p] + 1.0)
+            # the normalisation below. Zero for players with a bounded MLE.
+            if reg[p]:
+                denom += 2.0 * reg[p] / (strength[p] + 1.0)
             new[p] = total[p] / denom if denom > 0 else strength[p]
         # Normalise to geometric mean 1 so the iteration cannot drift as a
         # whole; the anchor is applied after convergence.
@@ -190,7 +202,10 @@ def backfill(live):
             continue
         if r.get("vs_champion") is not None and champion is not None:
             out.append({
-                "a": f"gen{gen}", "b": f"gen{champion}", "games": 40,
+                # Pre-rating-gate generations played 40; entries written since
+                # record what they actually played.
+                "a": f"gen{gen}", "b": f"gen{champion}",
+                "games": int(r.get("gate_games", 40)),
                 "score_a": float(r["vs_champion"]), "kind": "gate",
             })
         if r.get("vs_greedy") is not None:
@@ -237,9 +252,11 @@ def main():
                     help="also write <live>/elo.json")
     ap.add_argument("--backfill", action="store_true",
                     help="rebuild matches.jsonl from scores.json, discarding "
-                         "whatever is there. Safe to re-run: the gate and "
-                         "greedy matches it reconstructs are exactly the ones "
-                         "the eval loop would have logged.")
+                         "whatever is there. DESTRUCTIVE since the rating "
+                         "gate landed: only gate and greedy rows are "
+                         "recoverable from scores.json, so every match against "
+                         "a non-reigning champion -- now most of the record -- "
+                         "is lost. The displaced file is kept as .bak.")
     args = ap.parse_args()
 
     if args.backfill:
