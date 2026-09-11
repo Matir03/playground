@@ -508,6 +508,17 @@ def main():
                         mine = ratings.get(f"gen{gen}")
                         if mine is not None:
                             entry["elo"] = round(mine, 1)
+                        # Refresh the champion's rating from *this* fit. The
+                        # rating gate recorded it several matches ago, and the
+                        # greedy row appended since moves both numbers -- a
+                        # 0.967 sweep of greedy rates near 590, well under what
+                        # the ladder rates these nets, so it pulls the winner
+                        # down. Leaving the stale value in place made gen328
+                        # read as elo 793 against elo_champion 801 in the very
+                        # entry that promoted it on +11.
+                        theirs = ratings.get(f"gen{champion_gen}")
+                        if theirs is not None:
+                            entry["elo_champion"] = round(theirs, 1)
                 except Exception as exc:  # noqa: BLE001
                     # The rating gate has already run by this point, so this is
                     # back to being a diagnostic. Never let it break the ladder.
