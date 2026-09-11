@@ -19,6 +19,7 @@ own and can be re-run at any time.
 """
 
 import argparse
+import importlib.util as _ilu
 import json
 import os
 import sys
@@ -65,6 +66,8 @@ def main():
     ap.add_argument("--live", required=True)
     ap.add_argument("--rows", type=int, default=8,
                     help="recent generations to show (default 8)")
+    ap.add_argument("--elo-rows", type=int, default=8,
+                    help="champions to show in the Bradley-Terry table")
     ap.add_argument("--champions", type=int, default=4,
                     help="most recent promoted generations to always include, "
                          "even if they fall outside --rows (default 4)")
@@ -123,6 +126,22 @@ def main():
                 dline += " " + _delta(r.get(key), prev.get(key), w)
             print(dline)
         prev = r
+
+    # Bradley-Terry ratings, if any matches have been logged. Printed here
+    # rather than from the cycle script so the script does not have to change
+    # while it is running -- bash reads a script lazily, and shifting byte
+    # offsets under a live `while` loop corrupts it.
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "minions_elo.py")
+        spec = _ilu.spec_from_file_location("minions_elo", path)
+        E = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(E)
+        matches = E.load_matches(os.path.join(args.live, "matches.jsonl"))
+        if matches:
+            print()
+            print(E.report(matches, top=args.elo_rows))
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (elo unavailable: {exc})", file=sys.stderr)
 
     print()
     print("  * promoted    > reigning champion")
