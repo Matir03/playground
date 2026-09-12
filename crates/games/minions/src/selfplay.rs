@@ -18,12 +18,14 @@
 //! | `value` | 4 `f32` | game result from this position's mover's view |
 //! | `live` | 100 | which variables exist here: bit 0 move, 1 target, 2 spawn |
 //! | `n_cands` | 1 | how many candidate slots are populated (0 for a fast search) |
-//! | `cands` | 8 × (300 + 4) | realized [`TurnSpec`] bytes and its **pruned** visit share |
+//! | `cands` | 16 × (147 + 4) | realized [`TurnSpec`] bytes and its visit share, forced visits removed |
 //!
-//! The candidate list carries pruned visit shares, not raw counts: forced
-//! playouts and injected random candidates are subtracted before recording, so
-//! the learner never sees exploration as if the search had chosen it. Value
-//! targets deliberately come from every visit.
+//! The candidate list is *every* child of the root, in descending target order,
+//! zero targets included. Shares are visits with the forced-exploration quota
+//! subtracted, so the learner never sees exploration as if the search had chosen
+//! it; a child the search examined and never came back to stores 0, which is a
+//! negative the energy head trains against rather than missing data. Value
+//! targets come from every visit.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -37,14 +39,19 @@ use crate::sampler::{MinionsModel, SamplerConfig};
 use crate::turn::{MinionsTurns, TurnSpec};
 
 pub const MAGIC: u32 = 0x4d_49_4e_33; // "MIN3"
-pub const VERSION: u32 = 8;
+pub const VERSION: u32 = 9;
 /// Horizon for the necromancer-survival target, in side-turns.
 pub const NECRO_HORIZON: usize = 10;
 /// Buyable unit classes (zombie, skeleton, serpent, warg, ghost).
 pub const N_BUYABLE: usize = 5;
-/// Candidate slots stored per example. Policy-target pruning usually leaves far
-/// fewer than this with any mass.
-pub const TOP_K: usize = 8;
+/// Candidate slots stored per example: every child of a full-search root, zero
+/// targets included. The record is fixed-stride, so this is a capacity, not a
+/// selection -- it must be at least the full-search candidate count, which the
+/// actor checks at startup. It was 8, and recording kept only the top 8 children
+/// with non-zero targets: the energy head never saw a move the search declined,
+/// and on 89% of positions it also lost children that had earned visits (up to
+/// ~24% of the target's mass).
+pub const TOP_K: usize = 16;
 pub const SPEC_BYTES: usize = 3 * NUM_CELLS;
 pub const PLANE_BYTES: usize = crate::game::PLANES * NUM_CELLS;
 /// Auxiliary "rest of the game" targets, all in the canonical frame — index 0 is
@@ -874,32 +881,9 @@ fn advance_turn(
             forced_extra: cfg.forced_extra,
             ..Default::default()
         });
-        let mut scored: Vec<(TurnSpec, f32)> = result
-            .candidates
-            .iter()
-            .zip(&target)
-            .filter(|(_, &p)| p > 0.0)
-            .map(|((spec, _), &p)| (*spec, p))
-            .collect();
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-        scored.truncate(TOP_K);
-        // Renormalise over the candidates that survived truncation.
-        //
-        // `policy_target` normalises across *all* candidates, so keeping only
-        // the top `TOP_K` silently discards the tail's mass and stores a target
-        // that does not sum to one. The energy head is trained by cross-entropy
-        // against exactly this vector, so the missing mass becomes an
-        // irreducible floor on its loss — it has gradient but cannot descend.
-        // Candidate sets saturate `TOP_K` in practice (mean 7.7 of 8), so this
-        // is the common path, not an edge case. Conditioning the target on the
-        // stored set is also the right thing: `softmax f` at training time is
-        // taken over that set and nothing else.
-        let mass: f32 = scored.iter().map(|(_, p)| *p).sum();
-        if mass > 0.0 {
-            for (_, p) in scored.iter_mut() {
-                *p /= mass;
-            }
-        }
+        let scored = policy_record(
+            result.candidates.iter().map(|(spec, _)| *spec).zip(target.iter().copied()),
+        );
         // Promotion rate: did forced exploration actually contribute anything the
         // policy learns from? The pruning has already subtracted the guaranteed
         // visits, so surviving here means the candidate earned organic visits on
@@ -1100,6 +1084,38 @@ fn write_chunk(dir: &Path, index: usize, examples: &[Example]) -> anyhow::Result
 /// Drop oldest chunks until the buffer fits. Bounded by **examples first**: the
 /// Hex run learned the hard way that a chunk-count bound silently collapses the
 /// window when games get shorter, spiking reuse and with it the value loss.
+/// The policy target as recorded: every child of the root, strongest first,
+/// zero targets included.
+///
+/// Nothing is filtered and nothing is renormalised. `policy_target_with` already
+/// normalises over all children, and keeping the zeros is the point: a child the
+/// search examined and declined is the negative the energy head most needs, and
+/// dropping it made `softmax f` train over a set the search never considered.
+/// Order matters to the learner, whose trajectory-balance step takes the first
+/// *k* slots, so the strongest children must come first.
+///
+/// More children than `TOP_K` cannot happen -- `run_loop` refuses a full-search
+/// candidate count above it, and widening never touches the root -- so overflow
+/// is a bug: an assertion in debug, and in release a one-time `WARNING` (which
+/// the cycle monitor catches) rather than an actor that dies mid-generation.
+fn policy_record(children: impl Iterator<Item = (TurnSpec, f32)>) -> Vec<(TurnSpec, f32)> {
+    let mut v: Vec<(TurnSpec, f32)> = children.collect();
+    v.sort_by(|a, b| b.1.total_cmp(&a.1));
+    if v.len() > TOP_K {
+        debug_assert!(false, "{} root children exceed TOP_K = {}", v.len(), TOP_K);
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "WARNING: {} root children exceed TOP_K = {}; the weakest are not recorded",
+                v.len(),
+                TOP_K
+            );
+        }
+        v.truncate(TOP_K);
+    }
+    v
+}
+
 fn prune_buffer(dir: &Path, max_examples: usize, max_chunks: usize) -> anyhow::Result<()> {
     let mut chunks: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -1158,6 +1174,18 @@ pub fn run_loop(
     // Generate from the champion when there is one — that indirection *is* the
     // promotion gate, so data never comes from a net that lost its match.
     let resolve = || if best.exists() { best.clone() } else { weights.clone() };
+
+    // Every root child is recorded, and a record holds `TOP_K` of them. Widening
+    // stops at `k_candidates`, so this bound is the whole guarantee that nothing
+    // the search considered is left out of the target -- refuse to start rather
+    // than truncate silently for a whole generation.
+    anyhow::ensure!(
+        sampler.k_candidates <= TOP_K,
+        "--candidates {} exceeds the {} root children a record can hold; raise TOP_K \
+         (and the record VERSION, in every file scripts/check-record-layout.sh checks)",
+        sampler.k_candidates,
+        TOP_K
+    );
 
     // Falling below the pruning threshold is silent and ruinous for the energy
     // head, so say so at startup rather than leaving it to be discovered from a
@@ -1435,42 +1463,33 @@ mod tests {
         );
     }
 
-    #[test]
-    /// A stored policy target must be a distribution over the slots it stores.
+    /// Every root child is recorded, zero targets included, strongest first.
     ///
-    /// Regression: the target was normalised across *all* candidates and then
-    /// truncated to `TOP_K`, so the tail's mass vanished and the stored vector
-    /// summed to less than one. The energy head trains by cross-entropy against
-    /// it, so that missing mass was an irreducible floor on its loss — the head
-    /// had gradient and still could not descend. Invisible except through
-    /// `python/minions_validate.py`, which is what caught it.
+    /// Regression: recording filtered out zero-target children and then kept
+    /// only the top 8 of the rest, so the energy head never trained against a
+    /// move the search declined -- and on 89% of positions it also lost children
+    /// that had earned visits. The stored vector must be the search's own
+    /// target, whole. Calls the real rule rather than restating it, which is
+    /// what the test it replaces did.
     #[test]
-    fn truncated_policy_target_is_renormalised() {
-        // A search target over more candidates than we can store, with real
-        // mass in the tail that truncation will drop.
-        let full: Vec<f32> = vec![0.30, 0.20, 0.12, 0.10, 0.08, 0.07, 0.05, 0.04, 0.03, 0.01];
-        assert!((full.iter().sum::<f32>() - 1.0).abs() < 1e-6, "test fixture must be a distribution");
+    fn every_root_child_is_recorded() {
+        let mut target = vec![0.0f32; TOP_K];
+        target[1] = 0.30;
+        target[2] = 0.05;
+        target[4] = 0.40;
+        target[5] = 0.25;
+        let zeros = target.iter().filter(|&&p| p == 0.0).count();
+        assert!(zeros > TOP_K / 2, "fixture must be mostly zeros, like a real root");
 
-        let mut scored: Vec<f32> = full.clone();
-        scored.sort_by(|a, b| b.total_cmp(a));
-        scored.truncate(TOP_K);
-        let kept: f32 = scored.iter().sum();
-        assert!(kept < 0.97, "fixture should lose real mass to truncation, lost {}", 1.0 - kept);
-
-        let mass: f32 = scored.iter().sum();
-        for p in scored.iter_mut() {
-            *p /= mass;
-        }
-
-        assert_eq!(scored.len(), TOP_K);
+        let rec = policy_record(target.iter().map(|&p| (TurnSpec::empty(), p)));
+        assert_eq!(rec.len(), TOP_K, "no child may be dropped");
+        assert_eq!(rec.iter().filter(|(_, p)| *p == 0.0).count(), zeros, "zeros are kept");
         assert!(
-            (scored.iter().sum::<f32>() - 1.0).abs() < 1e-6,
-            "stored target must sum to 1, got {}",
-            scored.iter().sum::<f32>()
+            (rec.iter().map(|(_, p)| p).sum::<f32>() - 1.0).abs() < 1e-6,
+            "the search's own normalisation is stored unchanged"
         );
-        // Renormalising must not reorder or distort relative weights.
-        assert!(scored.windows(2).all(|w| w[0] >= w[1]));
-        assert!((scored[0] / scored[1] - full[0] / full[1]).abs() < 1e-5);
+        assert!(rec.windows(2).all(|w| w[0].1 >= w[1].1), "strongest first");
+        assert_eq!(rec[0].1, 0.40);
     }
 
     /// The batch gatherer must never schedule a kind that cannot fill a batch
@@ -1515,7 +1534,7 @@ mod tests {
             to_move: 2,
             value: 1.0,
             live: vec![3u8; NUM_CELLS],
-            candidates: (0..TOP_K).map(|_| (TurnSpec::empty(), 0.125)).collect(),
+            candidates: (0..TOP_K).map(|_| (TurnSpec::empty(), 1.0 / TOP_K as f32)).collect(),
             hex_control: vec![0u8; HEX_CONTROL_BYTES],
             necro_safety: vec![0u8; NECRO_SAFETY_BYTES],
             score: 0.0,

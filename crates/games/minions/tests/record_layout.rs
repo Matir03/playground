@@ -18,12 +18,12 @@ fn example_bytes_and_version_are_pinned() {
     // then run scripts/check-record-layout.sh.
     assert_eq!(
         minions_engine::selfplay::EXAMPLE_BYTES,
-        2660,
+        3868,
         "record size changed; update the Python mirror and the offsets with it"
     );
     assert_eq!(
         minions_engine::selfplay::VERSION,
-        8,
+        9,
         "record version changed; the learner's COMPAT_VERSIONS must decide what \
          to do with chunks still in the sliding window"
     );

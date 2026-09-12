@@ -43,7 +43,7 @@ from playground.model_server.minions_net import (
 
 # ── record layout — must match crates/games/minions/src/selfplay.rs ────────────
 MAGIC = 0x4D494E33
-VERSION = 8  # must match selfplay::VERSION in Rust
+VERSION = 9  # must match selfplay::VERSION in Rust
 # v4 records are identical except that they predate the trailing "turns left"
 # feature plane, so they are one plane short. They are still usable: the plane is
 # appended last, and the stem weights that read it start at zero (see
@@ -62,7 +62,11 @@ VERSION = 8  # must match selfplay::VERSION in Rust
 # heals itself. `read_chunk` skips unknown versions rather than raising.
 COMPAT_VERSIONS = {VERSION: IN_PLANES}
 SCORELESS_VERSIONS = set()
-TOP_K = 8
+# Every child of a full-search root, zero targets included; must match
+# selfplay::TOP_K. v8 stored only the top 8 with non-zero targets, so v8 chunks
+# are not in COMPAT_VERSIONS -- same stride would not even be the question, the
+# candidate set means something different.
+TOP_K = 16
 SPEC_BYTES = 3 * CELLS
 PLANE_BYTES = IN_PLANES * CELLS
 CAND_BYTES = SPEC_BYTES + 4
