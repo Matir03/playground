@@ -34,6 +34,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use half::f16;
+
 use playground_core::sampled_mcts::Expansion;
 use playground_core::{Game, SampledModel};
 use rand::{Rng, SeedableRng};
@@ -460,7 +462,7 @@ impl MinionsModel {
     fn sample_declarations_batch(
         &self,
         states: &[MinionsState],
-        h_all: &[f32],
+        h_all: &[f16],
         k: usize,
         full: bool,
         rng: &mut ChaCha8Rng,
@@ -555,7 +557,7 @@ impl MinionsModel {
     fn sample_declarations(
         &self,
         state: &MinionsState,
-        h: &[f32],
+        h: &[f16],
         k: usize,
         rng: &mut ChaCha8Rng,
     ) -> anyhow::Result<Vec<TurnSpec>> {
@@ -651,12 +653,12 @@ impl SampledModel<MinionsTurns> for MinionsModel {
 /// around an 8 GB cache.
 pub struct TrunkRows {
     pub stride: usize,
-    pub h: Vec<f32>,
+    pub h: Vec<f16>,
     pub fresh: Vec<Option<f32>>,
 }
 
 impl TrunkRows {
-    pub fn row(&self, i: usize) -> &[f32] {
+    pub fn row(&self, i: usize) -> &[f16] {
         &self.h[i * self.stride..(i + 1) * self.stride]
     }
 }
@@ -706,7 +708,7 @@ impl MinionsModel {
         k: usize,
         full: bool,
         batch_seq: u64,
-        cached: &[Option<(f32, &[f32])>],
+        cached: &[Option<(f32, &[f16])>],
         trunk_rows: &dyn Fn(usize) -> usize,
         want_fresh: bool,
     ) -> anyhow::Result<(Vec<Expansion<MinionsTurns>>, TrunkRows)> {
@@ -761,7 +763,7 @@ impl MinionsModel {
             planes
         };
         let miss: Vec<usize> = (0..g).filter(|&gi| hit(gi).is_none()).collect();
-        let (values, h): (Vec<f32>, Vec<f32>) = if miss.len() == g {
+        let (values, h): (Vec<f32>, Vec<f16>) = if miss.len() == g {
             let t = Instant::now();
             let planes = features(&miss, g);
             Phases::add(&self.phases.features_ns, t);
@@ -771,7 +773,7 @@ impl MinionsModel {
             (tr.value, tr.h)
         } else {
             let mut values = vec![0f32; g];
-            let mut h = vec![0f32; g * hstride];
+            let mut h = vec![f16::ZERO; g * hstride];
             for gi in 0..g {
                 if let Some((v, hc)) = hit(gi) {
                     values[gi] = v;
@@ -885,7 +887,7 @@ impl MinionsModel {
                 Vec::new()
             } else {
                 decl.resize(padded * dstride, 0.0);
-                h_b.resize(padded * hstride, 0.0);
+                h_b.resize(padded * hstride, f16::ZERO);
                 let clk = Instant::now();
                 let mut e = self.net.energy(&h_b, &decl, padded)?;
                 Phases::add(&self.phases.energy_ns, clk);
@@ -998,9 +1000,9 @@ mod tests {
         );
 
         // A value-only expansion, keeping what the trunk computed.
-        let none: Vec<Option<(f32, &[f32])>> = vec![None; states.len()];
+        let none: Vec<Option<(f32, &[f16])>> = vec![None; states.len()];
         let (exp, rows) = m.expand_batch_cached(&states, 0, true, 1, &none, &|n| n, true).unwrap();
-        let kept: Vec<(f32, Vec<f32>)> = rows
+        let kept: Vec<(f32, Vec<f16>)> = rows
             .fresh
             .iter()
             .enumerate()
@@ -1011,14 +1013,16 @@ mod tests {
         }
 
         let want = m.expand_batch_mode(&states, 2, true, 42).unwrap();
-        let all: Vec<Option<(f32, &[f32])>> = kept.iter().map(|(v, h)| Some((*v, &h[..]))).collect();
-        let half: Vec<Option<(f32, &[f32])>> =
+        let all: Vec<Option<(f32, &[f16])>> = kept.iter().map(|(v, h)| Some((*v, &h[..]))).collect();
+        let half: Vec<Option<(f32, &[f16])>> =
             all.iter().enumerate().map(|(i, c)| if i % 2 == 0 { *c } else { None }).collect();
         // Rows must be far apart, or a misplaced one could pass unnoticed.
-        let dist = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| (p - q).abs()).fold(0f32, f32::max);
+        let dist = |x: &[f16], y: &[f16]| {
+            x.iter().zip(y).map(|(p, q)| (p.to_f32() - q.to_f32()).abs()).fold(0f32, f32::max)
+        };
         for i in 0..kept.len() {
             for j in i + 1..kept.len() {
-                assert!(dist(&kept[i].1, &kept[j].1) > 1e-2, "rows {i} and {j} are indistinguishable");
+                assert!(dist(&kept[i].1, &kept[j].1) > 0.1, "rows {i} and {j} are indistinguishable");
             }
         }
 
@@ -1037,9 +1041,10 @@ mod tests {
         }
 
         // Half cached: the misses run through a trunk batch of their own, so
-        // they round differently (~1e-7) -- as rows do in production, where
-        // batch composition changes every wave. Hits must still be exact, and a
-        // miss placed on the wrong row would be off by the row distance above.
+        // they round differently -- ~1e-7 in f32, which can tip an fp16 `h` to
+        // the neighbouring value (one ulp, <0.01 at these magnitudes) -- as rows
+        // do in production, where batch composition changes every wave. Hits
+        // must still be exact; a miss on the wrong row would be off by >0.1.
         let (got, fresh) = m
             .expand_batch_cached(&states, 2, true, 42, &half, &|n| n.next_multiple_of(4), true)
             .unwrap();
@@ -1052,7 +1057,7 @@ mod tests {
                 let h = fresh.row(i);
                 assert!((v - kept[i].0).abs() < 1e-4, "row {i}: miss value {v} vs {}", kept[i].0);
                 assert!((got[i].0 - kept[i].0).abs() < 1e-4, "row {i}: returned value");
-                assert!(dist(h, &kept[i].1) < 1e-4, "row {i}: miss computed for the wrong position");
+                assert!(dist(h, &kept[i].1) < 2e-2, "row {i}: miss computed for the wrong position");
             }
         }
     }

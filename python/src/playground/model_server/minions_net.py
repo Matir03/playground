@@ -478,9 +478,11 @@ class _EnergyGraph(nn.Module):
         return self.net.energy_head(h, decl)
 
 
-def export_onnx_atomic(net: MinionsNet, out_dir: str) -> None:
-    """Write ``trunk.onnx``, ``diffusion.onnx``, ``energy.onnx``, ``aux.onnx``, and
-    fp16-I/O variants of the two heads (see ``onnx_f16io``).
+def export_onnx_atomic(net: MinionsNet, out_dir: str, f16_io: bool = True) -> None:
+    """Write ``trunk.onnx``, ``diffusion.onnx``, ``energy.onnx`` and ``aux.onnx``.
+
+    With ``f16_io`` (the default) the trunk and heads take and return fp16 at
+    every edge ``h`` crosses (see ``onnx_f16io``); ``aux.onnx`` stays fp32.
 
     Every axis that varies at run time is dynamic: batch everywhere, and the
     trunk width, so a checkpoint at different ``channels`` still loads. Written
@@ -524,15 +526,13 @@ def export_onnx_atomic(net: MinionsNet, out_dir: str) -> None:
         ),
     ]
     # Order matters: the actor reloads when `trunk.onnx` changes, so the
-    # trunk goes last. Every head, and its fp16-I/O variant, is already in
-    # place when the reload fires; the trunk used to go first, leaving a
-    # window where a reload paired a new trunk with the old heads.
-    from playground.model_server.onnx_f16io import write_variants
+    # trunk goes last and every head is already in place when the reload
+    # fires. The trunk used to go first, leaving a window where a reload
+    # paired a new trunk with the old heads.
+    from playground.model_server.onnx_f16io import NATIVE, f16io
 
     with torch.no_grad():
         for name, mod, args, ins, outs in specs:
-            if name == "trunk.onnx":
-                write_variants(out_dir)
             path = os.path.join(out_dir, name)
             tmp = path + ".tmp"
             torch.onnx.export(
@@ -541,6 +541,8 @@ def export_onnx_atomic(net: MinionsNet, out_dir: str) -> None:
                 dynamic_axes={k: {0: "b"} for k in (*ins, *outs)},
                 opset_version=17, dynamo=False,
             )
+            if f16_io and name in NATIVE:
+                f16io(tmp, tmp, *NATIVE[name])
             os.replace(tmp, path)
     if was_training:
         net.train()

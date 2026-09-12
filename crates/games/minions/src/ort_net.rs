@@ -29,40 +29,56 @@ use half::f16;
 use half::slice::HalfFloatSliceExt;
 use half::vec::HalfFloatVecExt;
 
-/// Whether head calls use the fp16-I/O graphs, when a valid pair is loaded.
-/// Always on, except that `run_loop` flips it per window during an A/B (the
-/// `head_f16_ab` file). Flipped only between windows, when no worker is mid-wave.
-pub static HEAD_F16_USE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// Whether this process runs the fp16-edge graphs, or -- when an `fp32/`
+/// sibling export of the same net is loaded -- the fp32 ones. Always true
+/// outside an A/B: `run_loop` flips it per window while `graph_f16_ab` exists,
+/// only between windows, when no worker is mid-wave.
+pub static GRAPH_F16_USE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-/// `<dir>/diffusion.f16io.onnx` and `energy.f16io.onnx`, if both exist and were
-/// made from the fp32 graphs beside them.
+/// Whether a graph takes and returns fp16 at the edges `h` crosses.
 ///
-/// The variant stamps its source's sha256 into its metadata; a variant left
-/// over from another export would pair this trunk with another net's heads and
-/// produce plausible garbage, so a mismatch disables the fp16 path with a
-/// warning. Checked as a byte search for the hex digest -- the metadata string
-/// is stored verbatim -- so no ONNX parsing is needed here.
-fn f16io_variants(dir: &Path) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-    use sha2::{Digest, Sha256};
-    if !env_flag("MINIONS_HEAD_F16", true) {
-        return None;
-    }
-    let check = |stem: &str| -> Option<std::path::PathBuf> {
-        let variant = dir.join(format!("{stem}.f16io.onnx"));
-        let src = std::fs::read(dir.join(format!("{stem}.onnx"))).ok()?;
-        let bytes = std::fs::read(&variant).ok()?;
-        let hex = format!("{:x}", Sha256::digest(&src));
-        if bytes.windows(hex.len()).any(|w| w == hex.as_bytes()) {
-            Some(variant)
+/// Current exports are fp16 at `planes`/`h`/`decl`/logits (`onnx_f16io.py`);
+/// older snapshots, which the ladder still plays, are fp32 there. Read from
+/// the session at load, so both kinds run with no flag, converting only at the
+/// edges of an fp32 graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Edges {
+    in16: bool,
+    out16: bool,
+}
+
+fn edges(sess: &Session, input: &str, output: &str) -> Edges {
+    let is16 = |outlets: &[ort::value::Outlet], name: &str| {
+        outlets.iter().find(|o| o.name() == name).and_then(|o| o.dtype().tensor_type())
+            == Some(ort::value::TensorElementType::Float16)
+    };
+    Edges { in16: is16(sess.inputs(), input), out16: is16(sess.outputs(), output) }
+}
+
+/// One output as f32, widened when the graph emits fp16.
+macro_rules! take_f32 {
+    ($outputs:expr, $name:expr, $out16:expr) => {
+        if $out16 {
+            let (_, v) = $outputs[$name].try_extract_tensor::<f16>().map_err(e2a)?;
+            v.to_f32_vec()
         } else {
-            eprintln!(
-                "WARNING: {} was not made from the {stem}.onnx beside it; using fp32 heads",
-                variant.display()
-            );
-            None
+            let (_, v) = $outputs[$name].try_extract_tensor::<f32>().map_err(e2a)?;
+            v.to_vec()
         }
     };
-    Some((check("diffusion")?, check("energy")?))
+}
+
+/// One output as fp16, narrowed when the graph emits f32.
+macro_rules! take_f16 {
+    ($outputs:expr, $name:expr, $out16:expr) => {
+        if $out16 {
+            let (_, v) = $outputs[$name].try_extract_tensor::<f16>().map_err(e2a)?;
+            v.to_vec()
+        } else {
+            let (_, v) = $outputs[$name].try_extract_tensor::<f32>().map_err(e2a)?;
+            Vec::<f16>::from_f32_slice(v)
+        }
+    };
 }
 
 fn e2a<E: std::fmt::Display>(e: E) -> anyhow::Error {
@@ -79,10 +95,13 @@ pub struct OrtNet {
     trunk: Option<Vec<Mutex<Session>>>,
     diffusion: Option<Vec<Mutex<Session>>>,
     energy: Option<Vec<Mutex<Session>>>,
-    /// fp16-I/O twins of the heads, when valid variants are present. Same
-    /// computation, half the bytes across PCIe (see `onnx_f16io.py`).
-    diffusion16: Option<Vec<Mutex<Session>>>,
-    energy16: Option<Vec<Mutex<Session>>>,
+    /// Edge dtypes of each graph, read at load (see [`Edges`]).
+    trunk_io: Edges,
+    diffusion_io: Edges,
+    energy_io: Edges,
+    /// The same net exported with fp32 edges, from `<dir>/fp32/`, when that
+    /// exists: the other arm of a `graph_f16_ab` A/B. `None` otherwise.
+    fp32_alt: Option<Box<OrtNet>>,
     /// Rotates the starting slot so callers do not all probe slot 0 first.
     rr: std::sync::atomic::AtomicUsize,
     channels: usize,
@@ -107,8 +126,6 @@ impl Drop for OrtNet {
         std::mem::forget(self.trunk.take());
         std::mem::forget(self.diffusion.take());
         std::mem::forget(self.energy.take());
-        std::mem::forget(self.diffusion16.take());
-        std::mem::forget(self.energy16.take());
     }
 }
 
@@ -224,16 +241,26 @@ impl OrtNet {
         }
         let (channels, _, _) = crate::net::read_arch(&probe);
 
-        let (diffusion16, energy16) = match f16io_variants(dir) {
-            Some((d, e)) => (Some(pool(d)?), Some(pool(e)?)),
-            None => (None, None),
+        let diffusion = pool(dir.join("diffusion.onnx"))?;
+        let energy = pool(dir.join("energy.onnx"))?;
+        let io = |p: &[Mutex<Session>], i: &str, o: &str| edges(&p[0].lock().unwrap(), i, o);
+        let (trunk_io, diffusion_io, energy_io) =
+            (io(&trunk, "planes", "h"), io(&diffusion, "h", "logits"), io(&energy, "h", "energy"));
+        let alt = dir.join("fp32");
+        let fp32_alt = if alt.join("trunk.onnx").exists() {
+            eprintln!("loaded the fp32 graph set in {} (A/B arm)", alt.display());
+            Some(Box::new(Self::with_pool(&alt, ep, fp16, cache_dir, n_pool)?))
+        } else {
+            None
         };
         Ok(Self {
             trunk: Some(trunk),
-            diffusion: Some(pool(dir.join("diffusion.onnx"))?),
-            energy: Some(pool(dir.join("energy.onnx"))?),
-            diffusion16,
-            energy16,
+            diffusion: Some(diffusion),
+            energy: Some(energy),
+            trunk_io,
+            diffusion_io,
+            energy_io,
+            fp32_alt,
             rr: std::sync::atomic::AtomicUsize::new(0),
             channels,
         })
@@ -251,71 +278,47 @@ impl OrtNet {
         pool[start % pool.len()].lock().unwrap()
     }
 
-    fn use_f16(&self) -> bool {
-        self.diffusion16.is_some() && HEAD_F16_USE.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// A head call through an fp16-I/O graph: `h` already converted (a pass
-    /// converts it once for all `T` steps), `decl` converted here, and the
-    /// output widened back to f32 for the sampler.
-    fn run_head16(
-        &self,
-        which: &Option<Vec<Mutex<Session>>>,
-        h16: &[f16],
-        decl: &[f32],
-        b: usize,
-        output: &str,
-        decl_planes: usize,
-    ) -> anyhow::Result<Vec<f32>> {
-        let c = crate::net::head_width(self.channels) as i64;
-        let d16: Vec<f16> = Vec::from_f32_slice(decl);
-        let ht = TensorRef::from_array_view((vec![b as i64, c, N as i64, N as i64], h16)).map_err(e2a)?;
-        let dt = TensorRef::from_array_view((vec![b as i64, decl_planes as i64, N as i64, N as i64], &d16[..]))
-            .map_err(e2a)?;
-        let mut sess = self.acquire(which.as_ref().expect("session outlives run"));
-        let outputs = sess.run(ort::inputs!["h" => ht, "decl" => dt]).map_err(e2a)?;
-        let (_, v) = outputs[output].try_extract_tensor::<f16>().map_err(e2a)?;
-        Ok(v.to_f32_vec())
-    }
-
+    /// One head call. `h` is fp16 on the host; it and `decl` are widened, and
+    /// the output converted, only for a graph whose edges are fp32. Borrowed
+    /// views, not copies: at `max_batch x K` rows these buffers run to ~10-19 MB
+    /// per call, `T` times per expansion.
+    #[allow(clippy::too_many_arguments)]
     fn run_head(
         &self,
         which: &Option<Vec<Mutex<Session>>>,
-        h: &[f32],
+        io: Edges,
+        h: &[f16],
         decl: &[f32],
         b: usize,
-        input_name: &'static str,
-        output: &str,
-    ) -> anyhow::Result<Vec<f32>> {
-        self.run_head_w(which, h, decl, b, input_name, output, DECL_PLANES)
-    }
-
-    /// As [`Self::run_head`] but with an explicit declaration width — the energy
-    /// head takes `ENERGY_PLANES`, the diffusion head `DECL_PLANES`.
-    #[allow(clippy::too_many_arguments)]
-    fn run_head_w(
-        &self,
-        which: &Option<Vec<Mutex<Session>>>,
-        h: &[f32],
-        decl: &[f32],
-        b: usize,
-        input_name: &'static str,
         output: &str,
         decl_planes: usize,
     ) -> anyhow::Result<Vec<f32>> {
         let c = crate::net::head_width(self.channels) as i64;
-        // Borrow rather than copy. At the batch the sampler actually uses
-        // (max_batch x K rows) these two buffers are ~19 MB per call and the
-        // diffusion head is called T times per expansion, so `to_vec()` here was
-        // ~113 MB of pure host memcpy per expansion batch — billed to the
-        // "diffusion" phase and easily mistaken for GPU time.
-        let ht = TensorRef::from_array_view((vec![b as i64, c, N as i64, N as i64], h)).map_err(e2a)?;
-        let dt = TensorRef::from_array_view((vec![b as i64, decl_planes as i64, N as i64, N as i64], decl))
-            .map_err(e2a)?;
+        let hshape = vec![b as i64, c, N as i64, N as i64];
+        let dshape = vec![b as i64, decl_planes as i64, N as i64, N as i64];
         let mut sess = self.acquire(which.as_ref().expect("session outlives run"));
-        let outputs = sess.run(ort::inputs![input_name => ht, "decl" => dt]).map_err(e2a)?;
-        let (_, v) = outputs[output].try_extract_tensor::<f32>().map_err(e2a)?;
-        Ok(v.to_vec())
+        if io.in16 {
+            let d16: Vec<f16> = Vec::from_f32_slice(decl);
+            let ht = TensorRef::from_array_view((hshape, h)).map_err(e2a)?;
+            let dt = TensorRef::from_array_view((dshape, &d16[..])).map_err(e2a)?;
+            let outputs = sess.run(ort::inputs!["h" => ht, "decl" => dt]).map_err(e2a)?;
+            Ok(take_f32!(outputs, output, io.out16))
+        } else {
+            let h32 = h.to_f32_vec();
+            let ht = TensorRef::from_array_view((hshape, &h32[..])).map_err(e2a)?;
+            let dt = TensorRef::from_array_view((dshape, decl)).map_err(e2a)?;
+            let outputs = sess.run(ort::inputs!["h" => ht, "decl" => dt]).map_err(e2a)?;
+            Ok(take_f32!(outputs, output, io.out16))
+        }
+    }
+
+    /// The graph set this window runs: the fp32 sibling while an A/B has the
+    /// fp16 set switched off, otherwise this one.
+    fn active(&self) -> &OrtNet {
+        match &self.fp32_alt {
+            Some(alt) if !GRAPH_F16_USE.load(std::sync::atomic::Ordering::Relaxed) => alt,
+            _ => self,
+        }
     }
 }
 
@@ -326,64 +329,61 @@ impl Backend for OrtNet {
     }
 
     fn trunk(&self, planes: &[f32], b: usize) -> anyhow::Result<TrunkOut> {
-        let input =
-            TensorRef::from_array_view((vec![b as i64, IN_PLANES as i64, N as i64, N as i64], planes))
-                .map_err(e2a)?;
-        let mut sess = self.acquire(self.trunk.as_ref().expect("session outlives forward"));
-        let outputs = sess.run(ort::inputs!["planes" => input]).map_err(e2a)?;
-        let (hs, h) = outputs["h"].try_extract_tensor::<f32>().map_err(e2a)?;
-        let (_, v) = outputs["value"].try_extract_tensor::<f32>().map_err(e2a)?;
+        let net = self.active();
+        let shape = vec![b as i64, IN_PLANES as i64, N as i64, N as i64];
+        let mut sess = net.acquire(net.trunk.as_ref().expect("session outlives forward"));
+        // Features are small integers, exact in fp16.
+        let (h, value) = if net.trunk_io.in16 {
+            let p16: Vec<f16> = Vec::from_f32_slice(planes);
+            let input = TensorRef::from_array_view((shape, &p16[..])).map_err(e2a)?;
+            let outputs = sess.run(ort::inputs!["planes" => input]).map_err(e2a)?;
+            (take_f16!(outputs, "h", net.trunk_io.out16), take_f32!(outputs, "value", false))
+        } else {
+            let input = TensorRef::from_array_view((shape, planes)).map_err(e2a)?;
+            let outputs = sess.run(ort::inputs!["planes" => input]).map_err(e2a)?;
+            (take_f16!(outputs, "h", net.trunk_io.out16), take_f32!(outputs, "value", false))
+        };
         // Cheap guard against a config.json that has drifted from the graph:
         // silently wrong channel counts would reshape every later head call.
         // `trunk.onnx` emits `head_features(h)`, so the expected width is the
         // head width derived from the trunk width, not the trunk width itself.
-        let want = crate::net::head_width(self.channels);
+        let want = crate::net::head_width(net.channels);
         if h.len() != b * want * NUM_CELLS {
             anyhow::bail!(
-                "trunk.onnx emitted {} floats for batch {b} (shape {hs:?}), but config.json \
-                 says {} trunk channels -> {want} head channels — regenerate the ONNX exports",
+                "trunk.onnx emitted {} values for batch {b}, but config.json says {} trunk \
+                 channels -> {want} head channels — regenerate the ONNX exports",
                 h.len(),
-                self.channels
+                net.channels
             );
         }
-        Ok(TrunkOut { h: h.to_vec(), value: v.to_vec() })
+        Ok(TrunkOut { h, value })
     }
 
-    fn diffusion(&self, h: &[f32], decl: &[f32], b: usize) -> anyhow::Result<Vec<f32>> {
-        let out = if self.use_f16() {
-            self.run_head16(&self.diffusion16, &Vec::from_f32_slice(h), decl, b, "logits", DECL_PLANES)?
-        } else {
-            self.run_head(&self.diffusion, h, decl, b, "h", "logits")?
-        };
+    fn diffusion(&self, h: &[f16], decl: &[f32], b: usize) -> anyhow::Result<Vec<f32>> {
+        let net = self.active();
+        let out = net.run_head(&net.diffusion, net.diffusion_io, h, decl, b, "logits", DECL_PLANES)?;
         debug_assert_eq!(out.len(), b * NUM_CELLS * DECL_LOGITS);
         Ok(out)
     }
 
-    fn energy(&self, h: &[f32], decl: &[f32], b: usize) -> anyhow::Result<Vec<f32>> {
-        if self.use_f16() {
-            return self.run_head16(&self.energy16, &Vec::from_f32_slice(h), decl, b, "energy", ENERGY_PLANES);
-        }
-        self.run_head_w(&self.energy, h, decl, b, "h", "energy", ENERGY_PLANES)
+    fn energy(&self, h: &[f16], decl: &[f32], b: usize) -> anyhow::Result<Vec<f32>> {
+        let net = self.active();
+        net.run_head(&net.energy, net.energy_io, h, decl, b, "energy", ENERGY_PLANES)
     }
 
-    /// Bind `h` to the device once for the whole pass.
+    /// Per-step by default: with fp16 edges `h` is already in the graph's
+    /// dtype, so a pass has nothing to convert or cache.
     ///
-    /// Only worth it with a session pool: the binding lives on one session, so
-    /// the pass must hold that session for all `T` steps. With a single shared
-    /// session that would block the other self-play workers for the whole pass
-    /// — costing more than the ~15.7% the saved uploads buy — so we fall back
-    /// to the per-step path, which is byte-for-byte the old behaviour.
-    fn diffusion_pass<'a>(&'a self, h: &'a [f32], b: usize) -> anyhow::Result<Box<dyn DiffusionPass + 'a>> {
-        if self.use_f16() {
-            return Ok(Box::new(F16Pass { net: self, h16: Vec::from_f32_slice(h), b }));
+    /// `BoundPass` would bind `h` on the device once, but it is broken (see
+    /// there), fp32-only, and needs a session pool, since it holds one session
+    /// for the whole pass -- so it stays behind `MINIONS_ORT_BIND`.
+    fn diffusion_pass<'a>(&'a self, h: &'a [f16], b: usize) -> anyhow::Result<Box<dyn DiffusionPass + 'a>> {
+        let net = self.active();
+        let pool = net.diffusion.as_ref().expect("session outlives run");
+        if !net.diffusion_io.in16 && pool.len() >= 2 && env_flag("MINIONS_ORT_BIND", false) {
+            return Ok(Box::new(BoundPass::new(net.acquire(pool), &h.to_f32_vec(), b, net.channels)?));
         }
-        let pool = self.diffusion.as_ref().expect("session outlives run");
-        // BROKEN — off by default; see `BoundPass`. Needs a pool as well, since
-        // it holds one session for the whole pass.
-        if pool.len() < 2 || !env_flag("MINIONS_ORT_BIND", false) {
-            return Ok(Box::new(NaivePass { net: self, h, b }));
-        }
-        Ok(Box::new(BoundPass::new(self.acquire(pool), h, b, self.channels)?))
+        Ok(Box::new(NaivePass { net, h, b }))
     }
 }
 
@@ -532,6 +532,7 @@ mod tests {
         let c = ort.channels();
         let h: Vec<f32> =
             (0..b * c * NUM_CELLS).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
+        let h: Vec<f16> = Vec::from_f32_slice(&h);
         let d0: Vec<f32> = (0..b * DECL_PLANES * NUM_CELLS)
             .map(|i| ((i % 7) as f32 - 3.0) / 3.0)
             .collect();
@@ -592,6 +593,7 @@ mod tests {
         // transposed the batch, would still look sane against uniform input.
         let h: Vec<f32> =
             (0..b * c * NUM_CELLS).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
+        let h: Vec<f16> = Vec::from_f32_slice(&h);
         let steps = 4usize;
         let decls: Vec<Vec<f32>> = (0..steps)
             .map(|t| {
@@ -658,7 +660,7 @@ mod tests {
             let scale = a.iter().fold(1.0f32, |m, v| m.max(v.abs()));
             abs / scale
         };
-        assert!(worst(&tc.h, &to.h) < 1e-3, "trunk differs by {}", worst(&tc.h, &to.h));
+        assert!(worst(&tc.h.to_f32_vec(), &to.h.to_f32_vec()) < 1e-3, "trunk differs by {}", worst(&tc.h.to_f32_vec(), &to.h.to_f32_vec()));
         assert!(worst(&tc.value, &to.value) < 1e-3, "value differs by {}", worst(&tc.value, &to.value));
 
         // Heads, batched over two distinct declarations so a batch-axis bug
@@ -682,13 +684,14 @@ mod tests {
         assert!(worst(&ec, &eo) < 1e-3, "energy differs by {}", worst(&ec, &eo));
         eprintln!(
             "ort parity ok — trunk {:e}, diffusion {:e}, energy {:e}",
-            worst(&tc.h, &to.h), worst(&dc, &do_), worst(&ec, &eo)
+            worst(&tc.h.to_f32_vec(), &to.h.to_f32_vec()), worst(&dc, &do_), worst(&ec, &eo)
         );
     }
 }
 
 /// Microbenchmark: is re-sending the trunk features on every diffusion step
-/// actually costing us? Arm A rebinds `h` each run (what the sampler does
+/// actually costing us? Drives the raw session with f32 tensors, so it needs
+/// an fp32-edge export (`export_onnx_atomic(..., f16_io=False)`). Arm A rebinds `h` each run (what the sampler does
 /// today); arm B binds `h` once and rebinds only `decl`. Interleaved ABBA,
 /// because sequential arms on this thermally-capped GPU drift ~19%.
 pub fn bench_binding(
@@ -776,61 +779,86 @@ pub fn bench_binding(
     Ok(())
 }
 
-/// A diffusion pass through the fp16-I/O graph: `h` is converted once for the
-/// whole pass instead of once per step.
-struct F16Pass<'a> {
-    net: &'a OrtNet,
-    h16: Vec<f16>,
-    b: usize,
-}
-
-impl DiffusionPass for F16Pass<'_> {
-    fn step(&mut self, decl: &[f32]) -> anyhow::Result<Vec<f32>> {
-        self.net.run_head16(&self.net.diffusion16, &self.h16, decl, self.b, "logits", DECL_PLANES)
-    }
-}
-
 #[cfg(test)]
-mod f16io_tests {
+mod native_f16_tests {
     use super::*;
+    use crate::game::Minions;
+    use playground_core::Game;
 
-    /// fp16-I/O heads compute what the fp32 heads compute, up to fp16 rounding
-    /// of their inputs and outputs. A wrong variant (stale, mis-wired Casts, a
-    /// swapped input) is O(1) off, not O(1e-3). Needs the GPU and a graph dir
-    /// holding both variants:
+    /// Graphs exported with fp16 edges compute what the fp32 export of the same
+    /// weights computes, up to fp16 rounding at the edges. A mis-wired Cast, a
+    /// swapped input or a stale head is O(1) off, not O(1e-3). Heads are fed the
+    /// fp32 graph's `h`, so their error is not compounded with the trunk's.
+    /// Needs the GPU and both exports:
     ///
-    ///   MINIONS_ORT_DIR=<dir> cargo test --release -p minions-engine -- --ignored f16io
+    ///   MINIONS_ORT_DIR16=<dir> MINIONS_ORT_DIR32=<dir> \
+    ///     cargo test --release -p minions-engine -- --ignored native_f16
     #[test]
-    #[ignore = "needs a GPU and MINIONS_ORT_DIR"]
-    fn f16io_heads_match_fp32_heads() {
-        let Ok(dir) = std::env::var("MINIONS_ORT_DIR") else { return };
-        let cache = std::env::temp_dir().join("minions-f16io-test-trt");
-        let net = OrtNet::with_pool(Path::new(&dir), "trt", true, cache.to_str().unwrap(), 1).unwrap();
-        assert!(net.diffusion16.is_some(), "no valid f16io variants in {dir}");
-        let (b, c) = (64usize, crate::net::head_width(net.channels));
-        let mut x = 0x2545F4914F6CDD1Du64;
+    #[ignore = "needs a GPU and two exports of one net"]
+    fn native_f16_graphs_match_fp32_graphs() {
+        let (Ok(d16), Ok(d32)) = (std::env::var("MINIONS_ORT_DIR16"), std::env::var("MINIONS_ORT_DIR32")) else {
+            return;
+        };
+        let cache = std::env::temp_dir().join("minions-native-f16-test-trt");
+        let cache = cache.to_str().unwrap();
+        let n16 = OrtNet::with_pool(Path::new(&d16), "trt", true, cache, 1).unwrap();
+        let n32 = OrtNet::with_pool(Path::new(&d32), "trt", true, cache, 1).unwrap();
+        let all16 = Edges { in16: true, out16: true };
+        assert!(
+            n16.trunk_io == all16 && n16.diffusion_io == all16 && n16.energy_io == all16,
+            "{d16} is not an fp16-edge export: {:?} {:?} {:?}",
+            n16.trunk_io, n16.diffusion_io, n16.energy_io
+        );
+        assert!(!n32.trunk_io.in16 && !n32.diffusion_io.in16 && !n32.energy_io.in16, "{d32} is not fp32");
+
+        let mut st = Minions::initial_state();
+        let mut planes = Vec::new();
+        for _ in 0..8 {
+            planes.extend(Minions::to_features(&st).iter().map(|&x| x as f32));
+            let legal = Minions::legal_moves(&st);
+            if legal.is_empty() {
+                break;
+            }
+            st = Minions::apply(&st, &legal[legal.len() / 2]);
+        }
+        let b = planes.len() / (IN_PLANES * NUM_CELLS);
+        let (t16, t32) = (n16.trunk(&planes, b).unwrap(), n32.trunk(&planes, b).unwrap());
+        let rel = |a: &[f32], z: &[f32]| {
+            let scale = a.iter().fold(1e-6f32, |m, v| m.max(v.abs()));
+            a.iter().zip(z).fold(0f32, |m, (p, q)| m.max((p - q).abs())) / scale
+        };
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
         let mut rnd = move || {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
             (x >> 40) as f32 / (1u64 << 24) as f32
         };
-        let h: Vec<f32> = (0..b * c * NUM_CELLS).map(|_| 2.0 * rnd()).collect();
         let decl: Vec<f32> = (0..b * DECL_PLANES * NUM_CELLS).map(|_| (rnd() < 0.2) as u8 as f32).collect();
         let edecl: Vec<f32> = (0..b * ENERGY_PLANES * NUM_CELLS).map(|_| (rnd() < 0.2) as u8 as f32).collect();
-        let order = std::sync::atomic::Ordering::Relaxed;
-        HEAD_F16_USE.store(false, order);
-        let (d32, e32) = (net.diffusion(&h, &decl, b).unwrap(), net.energy(&h, &edecl, b).unwrap());
-        HEAD_F16_USE.store(true, order);
-        let (d16, e16) = (net.diffusion(&h, &decl, b).unwrap(), net.energy(&h, &edecl, b).unwrap());
-        let mut pass = net.diffusion_pass(&h, b).unwrap();
-        let p16 = pass.step(&decl).unwrap();
-        let rel = |a: &[f32], z: &[f32]| {
-            let scale = a.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
-            a.iter().zip(z).fold(0f32, |m, (p, q)| m.max((p - q).abs())) / scale
-        };
-        let (rd, re, rp) = (rel(&d32, &d16), rel(&e32, &e16), rel(&d32, &p16));
-        eprintln!("f16io vs fp32: diffusion {rd:.2e}  energy {re:.2e}  pass {rp:.2e}");
-        assert!(rd < 2e-2 && re < 2e-2 && rp < 2e-2, "fp16-I/O heads disagree: {rd} {re} {rp}");
+        let d32 = n32.diffusion(&t32.h, &decl, b).unwrap();
+        let rh = rel(&t32.h.to_f32_vec(), &t16.h.to_f32_vec());
+        let rd = rel(&d32, &n16.diffusion(&t32.h, &decl, b).unwrap());
+        let re = rel(&n32.energy(&t32.h, &edecl, b).unwrap(), &n16.energy(&t32.h, &edecl, b).unwrap());
+        let rp = rel(&d32, &n16.diffusion_pass(&t32.h, b).unwrap().step(&decl).unwrap());
+        // `value` is a tanh near zero on these positions, so an error relative
+        // to its largest magnitude overstates it. Judge it absolutely, and --
+        // given the checkpoint -- against candle's fp32 truth: the question is
+        // whether fp16 edges make TensorRT's value *worse*, not whether two fp16
+        // engines agree to the last bit.
+        let abs = |a: &[f32], z: &[f32]| a.iter().zip(z).fold(0f32, |m, (p, q)| m.max((p - q).abs()));
+        let va = abs(&t32.value, &t16.value);
+        eprintln!("value, fp32 edges {:?}\nvalue, fp16 edges {:?}", t32.value, t16.value);
+        if let Ok(ck) = std::env::var("MINIONS_CKPT") {
+            let truth = crate::net::LocalNet::load(Path::new(&ck), false).unwrap().trunk(&planes, b).unwrap().value;
+            let (e32, e16) = (abs(&truth, &t32.value), abs(&truth, &t16.value));
+            eprintln!("value, candle fp32 {truth:?}\nvalue error vs fp32 truth: fp32 edges {e32:.2e}  fp16 edges {e16:.2e}");
+            assert!(e16 <= 2.0 * e32 + 1e-2, "fp16 edges make value worse: {e16} vs {e32}");
+        }
+        eprintln!("fp16 vs fp32 edges (b={b}): trunk h {rh:.2e}  value |d| {va:.2e}  diffusion {rd:.2e}  energy {re:.2e}  pass {rp:.2e}");
+        assert!(va < 5e-2, "value differs by {va}");
+        for (name, r) in [("trunk h", rh), ("diffusion", rd), ("energy", re), ("pass", rp)] {
+            assert!(r < 2e-2, "{name} disagrees by {r}");
+        }
     }
 }

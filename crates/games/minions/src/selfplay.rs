@@ -294,7 +294,7 @@ pub struct Slot {
     /// node expanded earlier; without this it re-ran the trunk on a position
     /// whose output had just been discarded -- ~60% of trunk rows, and 45% of
     /// the FLOPs self-play spent. Cleared when the search ends, and on reload.
-    trunk_cache: std::collections::HashMap<u128, (f32, Box<[f32]>)>,
+    trunk_cache: std::collections::HashMap<u128, (f32, Box<[half::f16]>)>,
 }
 
 /// Play a **pool** of games, batching expansions across whichever ones happen to
@@ -690,11 +690,13 @@ static WINDOWS_RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// Off windows still *store* expansion output and only skip the lookups, so an
 /// on window never starts cold. Delete the file and every window uses it.
 const TRUNK_CACHE_AB_FILE: &str = "trunk_cache_ab";
-/// The same A B B A switch for the fp16-I/O head graphs (`ort_net::HEAD_F16_USE`).
-const HEAD_F16_AB_FILE: &str = "head_f16_ab";
+/// The same A B B A switch between the fp16-edge graphs and an fp32 export of
+/// the same net in `best/fp32/` (`ort_net::GRAPH_F16_USE`). Needs that
+/// directory; without it the switch has nothing to switch to.
+const GRAPH_F16_AB_FILE: &str = "graph_f16_ab";
 
 fn entry_bytes(h_len: usize) -> usize {
-    h_len * 4 + 64
+    h_len * std::mem::size_of::<half::f16>() + 64
 }
 
 fn cache_size(slot: &Slot) -> usize {
@@ -707,9 +709,9 @@ fn cache_size(slot: &Slot) -> usize {
 /// interleaved them with the per-wave multi-MB buffers in glibc's thread
 /// arenas, which grew to 17.2 GB (276 x 64 MB heaps) around an 8 GB cache.
 /// Recycling caps the footprint at the peak live cache, which the budget bounds.
-static BLOCK_POOL: std::sync::Mutex<Vec<Box<[f32]>>> = std::sync::Mutex::new(Vec::new());
+static BLOCK_POOL: std::sync::Mutex<Vec<Box<[half::f16]>>> = std::sync::Mutex::new(Vec::new());
 
-fn take_blocks(n: usize) -> Vec<Box<[f32]>> {
+fn take_blocks(n: usize) -> Vec<Box<[half::f16]>> {
     if n == 0 {
         return Vec::new();
     }
@@ -718,7 +720,7 @@ fn take_blocks(n: usize) -> Vec<Box<[f32]>> {
     pool.split_off(keep)
 }
 
-fn return_blocks(mut blocks: Vec<Box<[f32]>>) {
+fn return_blocks(mut blocks: Vec<Box<[half::f16]>>) {
     if !blocks.is_empty() {
         BLOCK_POOL.lock().unwrap_or_else(|e| e.into_inner()).append(&mut blocks);
     }
@@ -740,7 +742,7 @@ fn cache_lookup<'a>(
     ids: &[usize],
     keys: &[u128],
     idx: &[usize],
-) -> Vec<Option<(f32, &'a [f32])>> {
+) -> Vec<Option<(f32, &'a [half::f16])>> {
     if keys.is_empty() {
         return Vec::new();
     }
@@ -775,7 +777,7 @@ fn cache_store(
         }
         let mut blk = match blocks.pop() {
             Some(blk) if blk.len() == rows.stride => blk,
-            _ => vec![0f32; rows.stride].into_boxed_slice(),
+            _ => vec![half::f16::ZERO; rows.stride].into_boxed_slice(),
         };
         blk.copy_from_slice(rows.row(n));
         match slots[ids[j]].trunk_cache.insert(keys[j], (v, blk)) {
@@ -1426,9 +1428,9 @@ pub fn run_loop(
         let ab = live.join(TRUNK_CACHE_AB_FILE).exists();
         let cache_on = !ab || matches!(window % 4, 1 | 2);
         TRUNK_CACHE_USE.store(cache_on, std::sync::atomic::Ordering::Relaxed);
-        let f16_ab = live.join(HEAD_F16_AB_FILE).exists();
+        let f16_ab = live.join(GRAPH_F16_AB_FILE).exists();
         let f16_on = !f16_ab || matches!(window % 4, 1 | 2);
-        crate::ort_net::HEAD_F16_USE.store(f16_on, std::sync::atomic::Ordering::Relaxed);
+        crate::ort_net::GRAPH_F16_USE.store(f16_on, std::sync::atomic::Ordering::Relaxed);
         let deadline = Instant::now() + Duration::from_secs(chunk_secs);
         let mut stats = PoolStats::default();
         let t0 = Instant::now();

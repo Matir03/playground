@@ -20,6 +20,9 @@ use candle_nn::{
 use crate::game::PLANES as IN_PLANES;
 use crate::map::{N, NUM_CELLS};
 use crate::turn::{DECL_PLANES, ENERGY_PLANES, N_OFFSETS, N_SPAWNS, N_TARGETS};
+use half::f16;
+use half::slice::HalfFloatSliceExt;
+use half::vec::HalfFloatVecExt;
 
 /// Declaration logits emitted per cell: 37 move offsets + 3 targets + 6 spawns.
 pub const DECL_LOGITS: usize = N_OFFSETS + N_TARGETS + N_SPAWNS;
@@ -144,8 +147,13 @@ impl GlobalPoolBias {
 /// energy head once against it. Fusing them would recompute the trunk every
 /// round and throw away the only thing that makes T-step sampling affordable.
 /// What one trunk pass yields. `h` feeds both heads.
+///
+/// `h` is fp16 on the host. The host never computes with it -- it only
+/// carries it from the trunk to the cache and on to the heads -- so fp16 costs
+/// nothing in accuracy (TensorRT runs fp16 inside) and halves the cache and
+/// every transfer. `value` stays f32.
 pub struct TrunkOut {
-    pub h: Vec<f32>,
+    pub h: Vec<f16>,
     pub value: Vec<f32>,
 }
 
@@ -164,7 +172,7 @@ pub trait DiffusionPass {
 /// i.e. exactly the old behaviour.
 pub struct NaivePass<'a> {
     pub net: &'a dyn Backend,
-    pub h: &'a [f32],
+    pub h: &'a [f16],
     pub b: usize,
 }
 
@@ -180,9 +188,9 @@ pub trait Backend: Send + Sync {
     /// `planes (b, IN_PLANES, N, N)` → value and the head projections.
     fn trunk(&self, planes: &[f32], b: usize) -> anyhow::Result<TrunkOut>;
     /// `(h, decl)` → declaration logits `(b, NUM_CELLS, DECL_LOGITS)`.
-    fn diffusion(&self, h: &[f32], decl: &[f32], b: usize) -> anyhow::Result<Vec<f32>>;
+    fn diffusion(&self, h: &[f16], decl: &[f32], b: usize) -> anyhow::Result<Vec<f32>>;
     /// `(h, decl)` → `f(s, a)` per row.
-    fn energy(&self, h: &[f32], decl: &[f32], b: usize) -> anyhow::Result<Vec<f32>>;
+    fn energy(&self, h: &[f16], decl: &[f32], b: usize) -> anyhow::Result<Vec<f32>>;
 
     /// Begin a `T`-step diffusion pass with `h` held fixed.
     ///
@@ -190,12 +198,12 @@ pub trait Backend: Send + Sync {
     /// once — but only when it has a session pool, because binding requires
     /// holding one session for the whole pass, which with a single shared
     /// session would serialize the self-play workers.
-    fn diffusion_pass<'a>(&'a self, h: &'a [f32], b: usize) -> anyhow::Result<Box<dyn DiffusionPass + 'a>>;
+    fn diffusion_pass<'a>(&'a self, h: &'a [f16], b: usize) -> anyhow::Result<Box<dyn DiffusionPass + 'a>>;
 }
 
 /// Repeat one position's trunk features across `n` rows, so a batch of `n`
 /// declarations for the *same* state reuses a single trunk pass.
-pub fn repeat_trunk(h: &[f32], n: usize) -> Vec<f32> {
+pub fn repeat_trunk<T: Copy>(h: &[T], n: usize) -> Vec<T> {
     let mut out = Vec::with_capacity(h.len() * n);
     for _ in 0..n {
         out.extend_from_slice(h);
@@ -472,22 +480,22 @@ impl Backend for LocalNet {
         let value = self.net.value(&h)?;
         // Emit the head features, not the raw trunk: they are what the sampler
         // repeats across chains and reuses for every diffusion round.
-        let hh = self.net.head_features(&h)?;
-        Ok(TrunkOut { h: hh.flatten_all()?.to_vec1()?, value })
+        let hh: Vec<f32> = self.net.head_features(&h)?.flatten_all()?.to_vec1()?;
+        Ok(TrunkOut { h: Vec::from_f32_slice(&hh), value })
     }
 
-    fn diffusion(&self, h: &[f32], decl: &[f32], b: usize) -> anyhow::Result<Vec<f32>> {
-        let ht = self.h_tensor(h, b)?;
+    fn diffusion(&self, h: &[f16], decl: &[f32], b: usize) -> anyhow::Result<Vec<f32>> {
+        let ht = self.h_tensor(&h.to_f32_vec(), b)?;
         let dt = self.decl_tensor(decl, b)?;
         Ok(self.net.declaration_logits(&ht, &dt)?.flatten_all()?.to_vec1()?)
     }
 
-    fn diffusion_pass<'a>(&'a self, h: &'a [f32], b: usize) -> anyhow::Result<Box<dyn DiffusionPass + 'a>> {
+    fn diffusion_pass<'a>(&'a self, h: &'a [f16], b: usize) -> anyhow::Result<Box<dyn DiffusionPass + 'a>> {
         Ok(Box::new(NaivePass { net: self, h, b }))
     }
 
-    fn energy(&self, h: &[f32], decl: &[f32], b: usize) -> anyhow::Result<Vec<f32>> {
-        let ht = self.h_tensor(h, b)?;
+    fn energy(&self, h: &[f16], decl: &[f32], b: usize) -> anyhow::Result<Vec<f32>> {
+        let ht = self.h_tensor(&h.to_f32_vec(), b)?;
         let dt = self.energy_decl_tensor(decl, b)?;
         Ok(self.net.energy(&ht, &dt)?)
     }
