@@ -141,7 +141,13 @@ EVAL_GAMES="${EVAL_GAMES:-40}"
 # reported before the full history showed a flat plateau. This is the only
 # opponent outside the self-play lineage, so it needs to be trustworthy.
 GREEDY_GAMES="${GREEDY_GAMES:-30}"
-PROMOTE="${PROMOTE:-0.52}"
+# A pre-filter, not the decision, since the rating gate landed. It exists only
+# to avoid paying four ladder matches for a candidate that is plainly worse, so
+# it sits below parity: a candidate that lost the head-to-head 0.45 has said
+# little over 40 games, and the ladder plus the Bradley-Terry fit over the whole
+# record is a far better judge of it than this number is. Anything that clears
+# this still has to out-rate the champion to be promoted.
+PROMOTE="${PROMOTE:-0.40}"
 # Inference backend. `ort` with the TensorRT EP and fp16 is the fast path:
 # +73% end to end against the CUDA EP (ABBA pairs, 516->894 and 524->908
 # expansions/s) and 1.8x on isolated forwards. Needs `source scripts/ort-env.sh`

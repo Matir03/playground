@@ -307,9 +307,11 @@ def main():
     ap.add_argument("--sims", type=int, default=100)
     ap.add_argument("--candidates", type=int, default=16)
     ap.add_argument("--t-steps", type=int, default=6)
-    ap.add_argument("--promote-threshold", type=float, default=0.52,
+    ap.add_argument("--promote-threshold", type=float, default=0.40,
                     help="score against the reigning champion needed to reach "
-                         "the ladder. Necessary, no longer sufficient.")
+                         "the ladder. A pre-filter that keeps hopeless "
+                         "candidates from paying for four ladder matches, not "
+                         "the promotion decision -- so it sits below parity.")
     ap.add_argument("--promote-elo-margin", type=float, default=0.0,
                     help="rating points the candidate must exceed the champion "
                          "by once the ladder has been played. 0 is a plain "
