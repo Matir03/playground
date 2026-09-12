@@ -141,15 +141,13 @@ EVAL_GAMES="${EVAL_GAMES:-40}"
 # reported before the full history showed a flat plateau. This is the only
 # opponent outside the self-play lineage, so it needs to be trustworthy.
 #
-# Off for new nets. The champions now beat greedy 0.90-1.00, where a 30-game
-# match carries about one unit of Fisher information -- a fifth of a single
-# 20-game ladder rung -- so it measures noise, not strength. It also cost
-# promotions their consistency: the row landed after the decision, so the fit
-# a candidate was judged on was not the fit recorded for it, and gen334 was
-# promoted on +0.3 that way. Ratings stay anchored at greedy = 0 through the
-# 6000 games older champions already played against it; new nets connect to
-# those through the gate and ladder. `GREEDY_GAMES=30` turns it back on.
-GREEDY_GAMES="${GREEDY_GAMES:-0}"
+# Played only every 5th champion now (`--greedy-every` in the eval loop), as a
+# check that the ladder is not regressing against a fixed opponent, and never
+# rated: the champions beat greedy 0.90-1.00, where 30 games carry about one
+# unit of Fisher information, so rating them added noise and -- landing after
+# the promotion decision -- made the fit a candidate was judged on differ from
+# the one recorded for it.
+GREEDY_GAMES="${GREEDY_GAMES:-30}"
 # A pre-filter, not the decision, since the rating gate landed. It exists only
 # to avoid paying four ladder matches for a candidate that is plainly worse, so
 # it sits below parity: a candidate that lost the head-to-head 0.45 has said

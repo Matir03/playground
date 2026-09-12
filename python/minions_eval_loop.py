@@ -223,6 +223,21 @@ def rate_gate(args, live, gen, champion_gen, rows):
     return ok, ratings, matches
 
 
+def promotions_since_greedy(scores):
+    """Champions promoted since the last one that was measured against greedy.
+
+    Counted from the record rather than kept as a counter, so it survives
+    restarts and a failed greedy match simply comes due again next promotion.
+    """
+    n = 0
+    for r in reversed(scores.get("history", [])):
+        if r.get("vs_greedy") is not None:
+            break
+        if r.get("promoted"):
+            n += 1
+    return n
+
+
 def run_diagnostic(args, live, scores, scores_path) -> None:
     """Measure the newest net without gating anything on the result.
 
@@ -317,6 +332,9 @@ def main():
                          "by once the ladder has been played. 0 is a plain "
                          "`higher rating promotes`.")
     ap.add_argument("--greedy-games", type=int, default=12)
+    ap.add_argument("--greedy-every", type=int, default=5,
+                    help="play greedy once per this many champions. A check "
+                         "that greedy is not regressing; never rated.")
     ap.add_argument("--render-games", type=int, default=5,
                     help="games per match written turn-by-turn to <live>/games/. "
                          "0 disables. These are the scored games themselves.")
@@ -459,7 +477,12 @@ def main():
             # number that is already known to the precision this run needs. One
             # reading per champion is the coarse signal we want; `--greedy-games
             # 0` skips it entirely.
-            if promoted and args.greedy_games > 0 and os.path.exists(best):
+            # A regression check, not a rating: every `--greedy-every`
+            # champions, and `minions_elo.fit` ignores greedy rows, so these
+            # games can never move a promotion. The current entry is not in the
+            # history yet (it was persisted and popped above), hence the +1.
+            if (promoted and args.greedy_games > 0 and os.path.exists(best)
+                    and promotions_since_greedy(scores) + 1 >= args.greedy_every):
               champ_gen = scores.get("best_gen", gen)
               entry["greedy_gen"] = champ_gen
               try:

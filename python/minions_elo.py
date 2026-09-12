@@ -16,11 +16,20 @@ fitted by maximum likelihood. Draws count as half a win to each side, which is
 the usual treatment and adequate here -- Minions draws only on an exact
 net-worth tie at the turn cap and they are rare.
 
-**Greedy is the anchor.** It is the one opponent that never changes, so pinning
-it at 0 makes the whole history commensurable: a champion's rating means "this
-far above the fixed heuristic", and it cannot drift just because the self-play
-ladder as a whole moved. Anchoring on a *generation* instead would make every
-rating relative to a net that is itself only defined by other ratings.
+**Greedy games are not rated.** The champions beat greedy 0.90-1.00, where a
+30-game match carries about one unit of Fisher information -- a fifth of a
+20-game ladder rung -- so those rows mostly add noise near the top. Greedy is
+still played every few champions as a regression check, and every greedy row
+stays in the match log, but `fit` drops them unless asked not to.
+
+The anchor is therefore the earliest generation in the rated graph, pinned at 0.
+BT only defines differences, so this changes no comparison between nets. What it
+does change is what long-range differences rest on: with greedy gone, the only
+path from gen1 to a recent net is the chain of ~130 gate and ladder steps
+between them, and each step carries selection bias -- a candidate promotes
+*because* it scored well -- so the far end of the scale is inflated relative to
+the near end. Read short-range differences (what the gate uses) as ratings and
+the long-range shape as a trend.
 """
 
 import argparse
@@ -53,16 +62,18 @@ def load_matches(path):
     return out
 
 
-def fit(matches, iters=10000, tol=1e-9):
+def fit(matches, iters=10000, tol=1e-9, include_greedy=False):
     """Minorization-maximization fit of BT strengths.
 
     MM rather than gradient descent: it has no step size to tune, every update
     is a closed form, and it is monotone in the likelihood, so it cannot
     diverge on a sparse or badly conditioned match graph.
 
-    Returns `{player: elo}` with greedy pinned at 0, or `{}` if there is
-    nothing to fit.
+    Returns `{player: elo}` with the earliest rated generation pinned at 0
+    (greedy, with `include_greedy`), or `{}` if there is nothing to fit.
     """
+    if not include_greedy:
+        matches = rated(matches)
     # wins[i][j] = fractional games i won against j.
     wins, opponents = {}, {}
     for m in matches:
@@ -82,18 +93,26 @@ def fit(matches, iters=10000, tol=1e-9):
     if not players:
         return {}
 
-    # Keep only the component containing greedy: ratings in a disconnected
-    # component are unidentifiable against the anchor, and reporting them would
-    # invent a comparison no game supports.
-    if GREEDY in opponents:
-        seen, stack = {GREEDY}, [GREEDY]
+    # Keep one connected component: ratings in another are unidentifiable
+    # against the anchor, and reporting them would invent a comparison no game
+    # supports. Greedy's component when greedy is rated, else the largest --
+    # without greedy, generations that only ever played greedy (the diagnostic
+    # stretch around gen 120-147) fall out here, which is correct.
+    comps, seen = [], set()
+    for start in players:
+        if start in seen:
+            continue
+        comp, stack = {start}, [start]
         while stack:
             cur = stack.pop()
             for nxt in opponents.get(cur, ()):
-                if nxt not in seen:
-                    seen.add(nxt)
+                if nxt not in comp:
+                    comp.add(nxt)
                     stack.append(nxt)
-        players = [p for p in players if p in seen]
+        seen |= comp
+        comps.append(comp)
+    main = next((c for c in comps if GREEDY in c), None) or max(comps, key=len)
+    players = [p for p in players if p in main]
     if not players:
         return {}
 
@@ -141,11 +160,23 @@ def fit(matches, iters=10000, tol=1e-9):
             break
 
     elo = {p: SCALE * math.log(max(s, 1e-12)) for p, s in strength.items()}
-    anchor = elo.get(GREEDY, 0.0)
+    anchor = elo[GREEDY] if GREEDY in elo else elo[min(elo, key=gen_number)]
     return {p: r - anchor for p, r in elo.items()}
 
 
+def gen_number(p):
+    """`gen123` -> 123; anything else sorts last."""
+    return int(p[3:]) if p.startswith("gen") and p[3:].isdigit() else 1 << 30
+
+
+def rated(matches):
+    """The rows the fit uses: everything except games against greedy."""
+    return [m for m in matches if GREEDY not in (m["a"], m["b"])]
+
+
 def games_played(matches):
+    """Rated games per player -- the games the fit actually saw."""
+    matches = rated(matches)
     counts = {}
     for m in matches:
         counts[m["a"]] = counts.get(m["a"], 0) + m["games"]
@@ -170,7 +201,8 @@ def report(matches, top=12):
     if GREEDY in ratings and GREEDY not in rows:
         out.append(f"{GREEDY:>10} {ratings[GREEDY]:>8.0f} {counts.get(GREEDY, 0):>6}")
     out.append("")
-    out.append("  greedy anchored at 0; BT fit over the whole match record")
+    anchor = min((p for p in ratings if p.startswith("gen")), key=gen_number, default="?")
+    out.append(f"  {anchor} anchored at 0; BT over every match except greedy games")
     return "\n".join(out)
 
 
