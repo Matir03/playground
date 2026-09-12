@@ -22,6 +22,7 @@
  */
 
 import type { GameState } from "../../gen/playground/game/game_pb";
+import { UNITS } from "./units";
 
 export interface HNode {
   id: number;
@@ -223,10 +224,11 @@ export function cellName(i: number): string {
   return `${FILES[i % 7]}${Math.floor(i / 7) + 1}`;
 }
 
-const UNIT_NAMES = ["", "Zombie", "Initiate", "Skeleton", "Serpent", "Warg"];
-
+/** Named from the shared table rather than a copy of it. The first copy of
+ *  this list invented a unit and shifted every index above zombie by one,
+ *  which the record then displayed as fact. */
 function unitName(u: number): string {
-  return UNIT_NAMES[u] ?? `unit${u}`;
+  return UNITS[u]?.name ?? `unit${u}`;
 }
 
 /** A move as it should read in the record. Mirrors `MinionsMove` in game.rs;

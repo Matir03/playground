@@ -23,6 +23,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as H from "./history";
+import { UNITS, BUYABLE } from "./units";
 import { MoveList } from "./MoveList";
 import { create } from "@bufbuild/protobuf";
 import type { Client } from "@connectrpc/connect";
@@ -91,34 +92,6 @@ const IS_GRAVEYARD = (() => {
 })();
 const GRAVEYARDS_TO_WIN = 4;
 
-interface UnitDef {
-  name: string;
-  ch: string;
-  attack: string;
-  damage: number; // 0 for unsummon
-  defense: number;
-  speed: number;
-  range: number;
-  cost: number;
-  rebate: number;
-  necromancer?: boolean;
-  lumbering?: boolean;
-  flying?: boolean;
-  persistent?: boolean;
-  spawn?: boolean;
-}
-
-/** Index = unit byte in the payload. Must match crates/games/minions/src/units.rs. */
-const UNITS: UnitDef[] = [
-  { name: "necromancer", ch: "N", attack: "unsummon", damage: 0, defense: 7, speed: 1, range: 1, cost: 0, rebate: 0, necromancer: true, persistent: true, spawn: true },
-  { name: "zombie", ch: "Z", attack: "1", damage: 1, defense: 1, speed: 1, range: 1, cost: 2, rebate: 0, lumbering: true, spawn: true },
-  { name: "skeleton", ch: "S", attack: "5", damage: 5, defense: 2, speed: 1, range: 1, cost: 4, rebate: 2, flying: true, persistent: true },
-  { name: "serpent", ch: "P", attack: "3", damage: 3, defense: 1, speed: 2, range: 1, cost: 4, rebate: 2 },
-  { name: "warg", ch: "W", attack: "1", damage: 1, defense: 1, speed: 3, range: 1, cost: 4, rebate: 2 },
-  { name: "ghost", ch: "G", attack: "1", damage: 1, defense: 4, speed: 1, range: 1, cost: 3, rebate: 1, flying: true, persistent: true },
-];
-/** Buyable units, as unit indices (everything but the necromancer). */
-const BUYABLE = [1, 2, 3, 4, 5];
 
 interface Decoded {
   cells: Uint8Array;
