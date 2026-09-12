@@ -22,6 +22,8 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import * as H from "./history";
+import { MoveList } from "./MoveList";
 import { create } from "@bufbuild/protobuf";
 import type { Client } from "@connectrpc/connect";
 import { ConnectError } from "@connectrpc/connect";
@@ -364,6 +366,23 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
 
   const engineTurnRef = useRef<string | null>(null);
 
+  // ── Record ────────────────────────────────────────────────────────────────
+  //
+  // Every move that reaches the server is recorded here, whoever played it.
+  // The tree owns the positions; `handle` is just whichever one the server
+  // happens to be sitting on, tracked by `handleAt` so a sync can be skipped
+  // when it would be a no-op. The server has no rewind, so moving to an
+  // earlier node means replaying from a fresh game -- `ensureAt` does that,
+  // and only when a position is actually used rather than merely looked at.
+  const [hist, setHist] = useState<H.History | null>(null);
+  const handleAt = useRef<number | null>(null);
+  /** Suspends the engine seat without leaving analysis or losing the record.
+   *  An in-flight search is aborted too, or "pause" would only take effect
+   *  after the move it was meant to stop. */
+  const [paused, setPaused] = useState(false);
+  const engineAbort = useRef<AbortController | null>(null);
+  const [syncing, setSyncing] = useState(false);
+
   const newGame = useCallback(async () => {
     setError(null);
     setBusy(true);
@@ -374,7 +393,10 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
     try {
       const h = await client.newGame(create(NewGameRequestSchema, { gameId: GameId.MINIONS }));
       setHandle(h);
-      setState(await client.getState(h));
+      const st = await client.getState(h);
+      setState(st);
+      setHist(H.newHistory(st));
+      handleAt.current = 0;
     } catch (e) {
       setError(e instanceof ConnectError ? e.message : String(e));
     } finally {
@@ -388,19 +410,111 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
 
   const seatToMove = (s: GameState): Seat => (s.toMove === Player.FIRST ? firstSeat : secondSeat);
 
+  /** Move the board to a recorded position.
+   *
+   * Purely local: the state came back from the server when the move was played
+   * and is kept verbatim, so browsing never waits on a round trip. The handle
+   * is left where it was and re-synced only if the position gets used. Any
+   * variation being walked in the analyser is dropped, since it was rooted at
+   * the position we just left. */
+  const goto = useCallback(
+    (id: number) => {
+      if (!hist) return;
+      const n = H.node(hist, id);
+      if (!n) return;
+      setHist({ ...hist, current: id });
+      setState(n.state);
+      setSelected(null);
+      setSpawnUnit(null);
+      setWalk(null);
+      setAnalysis(null);
+      setExpanded(new Set());
+    },
+    [hist],
+  );
+
+  /** Arrow keys walk the record. Skipped while a text field has focus, so the
+   *  sims and sigma inputs still take arrow keys as arrow keys. */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA")) return;
+      if (!hist) return;
+      const to = e.key === "ArrowLeft" ? H.prevId(hist, hist.current) : H.nextId(hist, hist.current);
+      if (to === null) return;
+      goto(to);
+      e.preventDefault();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [hist, goto]);
+
+  const atTip = !!hist && hist.current === H.tipOf(hist, hist.current);
+  const canBack = !!hist && H.prevId(hist, hist.current) !== null;
+  const canFwd = !!hist && H.nextId(hist, hist.current) !== null;
+
+  /** Bring the server to `id`, replaying from a fresh game when it must.
+   *
+   * Cheap in the common case -- playing on at the tip leaves the handle where
+   * it already is. Stepping back and playing there is the expensive one, and
+   * it is a full replay because the engine holds one position per handle and
+   * cannot rewind. Returns the handle to use, or null if the sync failed;
+   * callers must not fall back to the stale handle, which is pointing at a
+   * different position entirely. */
+  const ensureAt = useCallback(
+    async (id: number): Promise<GameHandle | null> => {
+      if (!hist) return null;
+      if (handle && handleAt.current === id) return handle;
+      setSyncing(true);
+      try {
+        const h = await client.newGame(create(NewGameRequestSchema, { gameId: GameId.MINIONS }));
+        for (const step of H.pathMoves(hist, id)) {
+          if (step.kind === "turn") {
+            await client.applyTurn(create(ApplyTurnRequestSchema, { handle: h, turn: step.move }));
+          } else {
+            await client.applyMove(
+              create(ApplyMoveRequestSchema, {
+                handle: h,
+                move: create(MoveSchema, { gameId: GameId.MINIONS, payload: step.move }),
+              }),
+            );
+          }
+        }
+        setHandle(h);
+        handleAt.current = id;
+        return h;
+      } catch (e) {
+        setError(e instanceof ConnectError ? e.message : String(e));
+        return null;
+      } finally {
+        setSyncing(false);
+      }
+    },
+    [client, handle, hist],
+  );
+
   const sendMove = useCallback(
     async (payload: Uint8Array) => {
-      if (!handle) return;
+      if (!hist) return;
       setError(null);
       setBusy(true);
       try {
+        const h = await ensureAt(hist.current);
+        if (!h) return;
         const next = await client.applyMove(
           create(ApplyMoveRequestSchema, {
-            handle,
+            handle: h,
             move: create(MoveSchema, { gameId: GameId.MINIONS, payload }),
           }),
         );
         setState(next);
+        setHist((cur) => {
+          if (!cur) return cur;
+          const after = H.push(cur, payload, next);
+          handleAt.current = after.current;
+          return after;
+        });
         setSelected(null);
       } catch (e) {
         setError(e instanceof ConnectError ? e.message : String(e));
@@ -408,7 +522,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
         setBusy(false);
       }
     },
-    [client, handle],
+    [client, hist, ensureAt],
   );
 
   // The engine seat answers one *action* at a time, so this fires once per ply
@@ -419,6 +533,13 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
     // position without committing to it, and a seat that keeps answering would
     // move the game out from under the analysis being read.
     if (analysisOn) return;
+    // Paused is separate from analysis: it stops the seat while leaving the
+    // board, the record and the analyser exactly as they are.
+    if (paused) return;
+    // Only ever play on at the tip of the line being viewed. Parked on an
+    // earlier node, an engine seat would append moves to a position the user
+    // is reading, which is the one thing browsing must not do.
+    if (hist && hist.current !== H.tipOf(hist, hist.current)) return;
     if (state.outcome !== Outcome.IN_PROGRESS) return;
     const mover = seatToMove(state);
     if (mover === "human") return;
@@ -431,6 +552,8 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
     (async () => {
       setThinking(true);
       setError(null);
+      const ac = new AbortController();
+      engineAbort.current = ac;
       await new Promise((r) => setTimeout(r, 60));
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
@@ -444,7 +567,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                   maxMillis: mover === "net" ? 20000 : 1000,
                 }),
               }),
-              { signal: AbortSignal.timeout(30000) },
+              { signal: AbortSignal.any([ac.signal, AbortSignal.timeout(30000)]) },
             )) {
               if (prog.kind.case === "stats") {
                 const st = prog.kind.value;
@@ -460,14 +583,22 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
           } catch (streamErr) {
             if (!chosen) throw streamErr;
           }
+          if (ac.signal.aborted) break;
           if (!chosen) throw new Error("engine returned no move");
           const next = await client.applyMove(
             create(ApplyMoveRequestSchema, { handle, move: chosen }),
             { signal: AbortSignal.timeout(30000) },
           );
           setState(next);
+          setHist((cur) => {
+            if (!cur) return cur;
+            const after = H.push(cur, chosen!.payload, next);
+            handleAt.current = after.current;
+            return after;
+          });
           break;
         } catch (e) {
+          if (ac.signal.aborted) break;
           const cur = await client.getState(handle, { signal: AbortSignal.timeout(8000) }).catch(() => null);
           if (cur && cur.ply > fromPly) {
             setState(cur);
@@ -476,13 +607,14 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
           if (attempt === 2) setError(e instanceof ConnectError ? e.message : String(e));
         }
       }
+      if (engineAbort.current === ac) engineAbort.current = null;
       setThinking(false);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
     // `analysisOn` belongs here: leaving analysis must let the seat resume on
     // the position the game is actually in, and without the dependency the
     // effect would not re-run until something else changed.
-  }, [handle, state, firstSeat, secondSeat, client, analysisOn]);
+  }, [handle, state, firstSeat, secondSeat, client, analysisOn, paused, hist]);
 
   // The board shows the variation when one is being walked, and the game
   // otherwise. Rendering the walked position rather than overlaying arrows on
@@ -498,13 +630,19 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
 
   const runAnalysis = useCallback(
     async (line: Uint8Array[], labels: string[], evalOnly: boolean) => {
-      if (!handle) return;
+      if (!hist) return;
       setAnalysing(true);
       setError(null);
       try {
+        // Analysis is rooted wherever the board is, including an earlier node
+        // or a variation, so the server has to be brought there first. This is
+        // what makes "analyse from any position" work at all: `line` walks
+        // forward from the handle and can never walk back.
+        const h = await ensureAt(hist.current);
+        if (!h) return;
         const res = await client.analyze(
           create(AnalyzeRequestSchema, {
-            handle,
+            handle: h,
             line,
             budget: create(SearchBudgetSchema, { maxVisits: sims }),
             candidates: 0,
@@ -526,7 +664,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
         setAnalysing(false);
       }
     },
-    [client, handle, sims, sigma],
+    [client, hist, ensureAt, sims, sigma],
   );
 
   /** Play a root candidate for real, then re-root the analysis on the result.
@@ -535,16 +673,27 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
    * this advances the game. The re-analysis is a full search, not `eval_only`,
    * because the new position is now the one being studied. */
   const commitTurn = useCallback(
-    async (turn: Uint8Array) => {
-      if (!handle) return;
+    async (turn: Uint8Array, label?: string) => {
+      if (!hist) return;
       setAnalysing(true);
       setError(null);
       try {
+        const h = await ensureAt(hist.current);
+        if (!h) return;
         const next = await client.applyTurn(
-          create(ApplyTurnRequestSchema, { handle, turn }),
+          create(ApplyTurnRequestSchema, { handle: h, turn }),
           { signal: AbortSignal.timeout(30000) },
         );
         setState(next);
+        // Recorded as a `turn` node: committing from the analyser off an
+        // earlier position is exactly how a variation gets made, and the
+        // replay has to know this one needs ApplyTurn rather than ApplyMove.
+        setHist((cur) => {
+          if (!cur) return cur;
+          const after = H.push(cur, turn, next, "turn", label);
+          handleAt.current = after.current;
+          return after;
+        });
         setWalk(null);
         setExpanded(new Set());
         setAnalysis(null);
@@ -558,7 +707,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
         setAnalysing(false);
       }
     },
-    [client, handle],
+    [client, hist, ensureAt],
   );
   const inProgress = state?.outcome === Outcome.IN_PROGRESS;
   const humanTurn = !!state && inProgress && seatToMove(state) === "human" && !busy && !thinking;
@@ -620,6 +769,28 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
         <SeatPicker label={SIDE_NAME[1]} seat={secondSeat} onChange={setSecondSeat} />
         <button onClick={() => void newGame()} disabled={busy}>New game</button>
         {inProgress && <button onClick={endPhase} disabled={!humanTurn}>{endLabel}</button>}
+        {hist && (
+          <span style={{ display: "flex", gap: 2, alignItems: "center" }} title="move through the record">
+            <button onClick={() => goto(hist.root)} disabled={!canBack} title="start">⏮</button>
+            <button onClick={() => goto(H.prevId(hist, hist.current)!)} disabled={!canBack} title="back (←)">◀</button>
+            <button onClick={() => goto(H.nextId(hist, hist.current)!)} disabled={!canFwd} title="forward (→)">▶</button>
+            <button onClick={() => goto(H.tipOf(hist, hist.current))} disabled={!canFwd} title="end of this line">⏭</button>
+          </span>
+        )}
+        {/* Pause is not analysis: the seats stay as they are, the record stays
+            as it is, and an in-flight search is cut off rather than allowed to
+            land the move it was already committed to. */}
+        <button
+          onClick={() => {
+            setPaused((v) => {
+              if (!v) engineAbort.current?.abort();
+              return !v;
+            });
+          }}
+          title={paused ? "let the engine seats play again" : "stop the engine seats where they are"}
+        >
+          {paused ? "▶ resume engine" : "⏸ pause engine"}
+        </button>
         {/* Analysis is a *view*, so leaving it drops the variation and puts the
             real game back on the board — the alternative is a board showing a
             position the game is not in with no obvious way back. */}
@@ -851,6 +1022,65 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                   )}
                 </div>
               )}
+
+              {hist && (
+                <div style={{ marginTop: "0.75rem" }}>
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "baseline",
+                      justifyContent: "space-between",
+                      marginBottom: 4,
+                    }}
+                  >
+                    <strong style={{ fontSize: "0.85rem" }}>Record</strong>
+                    <span style={{ fontSize: "0.75rem", color: "#888" }}>
+                      {syncing ? "syncing…" : atTip ? "at the end" : "viewing history"}
+                    </span>
+                  </div>
+                  <MoveList
+                    hist={hist}
+                    info={(st) => {
+                      const dd = decode(st.payload);
+                      return { turn: dd.turn, side: dd.side };
+                    }}
+                    onGoto={goto}
+                    onPromote={(id) => setHist((cur) => (cur ? H.promote(cur, id) : cur))}
+                    onDrop={(id) => {
+                      const after = H.drop(hist, id);
+                      const n = H.node(after, after.current);
+                      // The handle may have been sitting inside the subtree we
+                      // just removed; forget it so the next use resyncs rather
+                      // than trusting a position the record no longer has.
+                      if (handleAt.current !== null && !after.nodes.has(handleAt.current)) {
+                        handleAt.current = null;
+                      }
+                      setHist(after);
+                      if (n) setState(n.state);
+                    }}
+                    sideFill={SIDE_FILL}
+                  />
+                  {!atTip && (
+                    <div style={{ fontSize: "0.75rem", color: "#7a4ea8", marginTop: 4 }}>
+                      Playing or committing a turn from here starts a variation. Engine
+                      seats stay put until you return to the end of a line.
+                    </div>
+                  )}
+                  <div style={{ marginTop: 6 }}>
+                    <button
+                      onClick={() => {
+                        setAnalysisOn(true);
+                        void runAnalysis([], [], false);
+                      }}
+                      disabled={analysing || syncing || !hist}
+                      style={{ font: "inherit", padding: "0.25rem 0.7rem" }}
+                      title="search this position, wherever it sits in the record"
+                    >
+                      {analysing ? "analysing…" : "analyse this position"}
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
 
@@ -1058,7 +1288,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                     })
                   }
                   onPlay={(line, labels) => void runAnalysis(line, labels, true)}
-                  onCommit={(turn) => void commitTurn(turn)}
+                  onCommit={(turn, label) => void commitTurn(turn, label)}
                   maxDepth={12}
                 />
               ) : (

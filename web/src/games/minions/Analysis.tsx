@@ -193,7 +193,7 @@ export function AnalysisTree({
   /** The sequence of turn encodings from the root down to the clicked edge. */
   onPlay: (line: Uint8Array[], labels: string[]) => void;
   /** Commit a root candidate to the real game. */
-  onCommit: (turn: Uint8Array) => void;
+  onCommit: (turn: Uint8Array, label?: string) => void;
   maxDepth: number;
 }) {
   if (nodes.length === 0) return null;
@@ -234,7 +234,7 @@ export function AnalysisTree({
           expanded={isOpen}
           onToggle={() => onToggle(key)}
           onPlay={() => onPlay(nextLine, nextLabels)}
-          onCommit={depth === 0 ? () => onCommit(edge.turn) : undefined}
+          onCommit={depth === 0 ? () => onCommit(edge.turn, edge.label || "pass") : undefined}
           path={nextLabels.join("  →  ")}
         />,
       );
