@@ -660,9 +660,40 @@ impl MinionsModel {
         full: bool,
         batch_seq: u64,
     ) -> anyhow::Result<Vec<Expansion<MinionsTurns>>> {
+        self.expand_batch_cached(states, k, full, batch_seq, &[], &|n| n, false)
+            .map(|(out, _)| out)
+    }
+
+    /// `expand_batch_mode`, reusing trunk output the caller already holds.
+    ///
+    /// `cached[i]` is `(value, h)` for `states[i]` from an earlier call, in the
+    /// canonical frame this function computes it in; `None` means compute it.
+    /// Rows past `cached.len()` are the caller's padding, which repeats its
+    /// last real row, so they share that row's entry. The trunk runs only over
+    /// the misses, padded to `trunk_rows(misses)` so TensorRT stays on shapes
+    /// it has already built. With nothing cached this is the original single
+    /// trunk call, unchanged.
+    ///
+    /// With `want_fresh`, the second vector holds `(value, h)` for each real row
+    /// the trunk ran on (`None` for hits), for the caller to keep.
+    ///
+    /// Why: a widen request is always for a node expanded earlier, so its trunk
+    /// output was computed then and discarded. Widens are ~60% of requests,
+    /// which made recomputing it 45% of every FLOP self-play spent.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    pub fn expand_batch_cached(
+        &self,
+        states: &[MinionsState],
+        k: usize,
+        full: bool,
+        batch_seq: u64,
+        cached: &[Option<(f32, &[f32])>],
+        trunk_rows: &dyn Fn(usize) -> usize,
+        want_fresh: bool,
+    ) -> anyhow::Result<(Vec<Expansion<MinionsTurns>>, Vec<Option<(f32, Vec<f32>)>>)> {
         let real = states.len();
         if real == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         // Widen to a fixed batch before touching the GPU, so the tensor shape
         // does not follow the caller's live-game count.
@@ -690,24 +721,67 @@ impl MinionsModel {
         let mut rng = ChaCha8Rng::seed_from_u64(self.seed ^ batch_seq.wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let pstride = crate::game::PLANES * NUM_CELLS;
 
-        // ── one trunk forward for every position ──────────────────────────────
-        let t = Instant::now();
-        let mut planes = vec![0f32; g * pstride];
-        for (i, s) in states.iter().enumerate() {
-            for (o, b) in planes[i * pstride..(i + 1) * pstride]
-                .iter_mut()
-                .zip(Minions::to_features(s))
-            {
-                *o = b as f32;
-            }
-        }
-        Phases::add(&self.phases.features_ns, t);
-
-        let t = Instant::now();
-        let tr = self.net.trunk(&planes, g)?;
-        Phases::add(&self.phases.trunk_ns, t);
-        let values = tr.value;
+        // ── trunk, for every position the caller does not already hold ────────
         let hstride = self.net.channels() * NUM_CELLS;
+        let hit = |gi: usize| cached.get(gi.min(cached.len().saturating_sub(1))).copied().flatten();
+        // Features for `rows`, padded to `width` by repeating the last one.
+        let features = |rows: &[usize], width: usize| -> Vec<f32> {
+            let mut planes = vec![0f32; width * pstride];
+            for (j, &gi) in rows.iter().enumerate() {
+                for (o, b) in planes[j * pstride..(j + 1) * pstride]
+                    .iter_mut()
+                    .zip(Minions::to_features(&states[gi]))
+                {
+                    *o = b as f32;
+                }
+            }
+            let n = rows.len();
+            for j in n..width {
+                planes.copy_within((n - 1) * pstride..n * pstride, j * pstride);
+            }
+            planes
+        };
+        let miss: Vec<usize> = (0..g).filter(|&gi| hit(gi).is_none()).collect();
+        let (values, h): (Vec<f32>, Vec<f32>) = if miss.len() == g {
+            let t = Instant::now();
+            let planes = features(&miss, g);
+            Phases::add(&self.phases.features_ns, t);
+            let t = Instant::now();
+            let tr = self.net.trunk(&planes, g)?;
+            Phases::add(&self.phases.trunk_ns, t);
+            (tr.value, tr.h)
+        } else {
+            let mut values = vec![0f32; g];
+            let mut h = vec![0f32; g * hstride];
+            for gi in 0..g {
+                if let Some((v, hc)) = hit(gi) {
+                    values[gi] = v;
+                    h[gi * hstride..(gi + 1) * hstride].copy_from_slice(hc);
+                }
+            }
+            if !miss.is_empty() {
+                let width = trunk_rows(miss.len()).max(miss.len());
+                let t = Instant::now();
+                let planes = features(&miss, width);
+                Phases::add(&self.phases.features_ns, t);
+                let t = Instant::now();
+                let tr = self.net.trunk(&planes, width)?;
+                Phases::add(&self.phases.trunk_ns, t);
+                for (j, &gi) in miss.iter().enumerate() {
+                    values[gi] = tr.value[j];
+                    h[gi * hstride..(gi + 1) * hstride]
+                        .copy_from_slice(&tr.h[j * hstride..(j + 1) * hstride]);
+                }
+            }
+            (values, h)
+        };
+        let n_fresh = if cached.is_empty() { real } else { cached.len().min(real) };
+        let fresh: Vec<Option<(f32, Vec<f32>)>> = (0..n_fresh)
+            .map(|gi| {
+                (want_fresh && hit(gi).is_none())
+                    .then(|| (values[gi], h[gi * hstride..(gi + 1) * hstride].to_vec()))
+            })
+            .collect();
 
         // `k == 0` is a value-only expansion: run the trunk, skip the heads.
         //
@@ -717,7 +791,7 @@ impl MinionsModel {
         // waste after chunking (43.4% of candidates, one per frontier node).
         if k == 0 {
             let out = (0..real).map(|gi| (values.get(gi).copied().unwrap_or(0.0), Vec::new()));
-            return Ok(out.collect());
+            return Ok((out.collect(), fresh));
         }
         let k = k.max(1);
         // Forced exploration keeps its *expected* share even when candidates are
@@ -738,7 +812,7 @@ impl MinionsModel {
         let k_diff = k.saturating_sub(k_rand);
 
         // ── diffusion, batched across every chain of every game ───────────────
-        let per_game_specs = self.sample_declarations_batch(states, &tr.h, k_diff, full, &mut rng)?;
+        let per_game_specs = self.sample_declarations_batch(states, &h, k_diff, full, &mut rng)?;
         let mut per_game: Vec<Vec<(TurnSpec, bool)>> = per_game_specs
             .into_iter()
             .map(|v| v.into_iter().map(|s| (s, false)).collect())
@@ -779,7 +853,7 @@ impl MinionsModel {
             let mut at = 0usize;
             for (gi, list) in specs.iter().enumerate() {
                 let live = LiveMask::of(&states[gi]);
-                let src = &tr.h[gi * hstride..(gi + 1) * hstride];
+                let src = &h[gi * hstride..(gi + 1) * hstride];
                 for (spec, _) in list {
                     Partial::fully_committed(spec, &live)
                         .write_energy_planes(&mut decl[at * dstride..(at + 1) * dstride]);
@@ -839,7 +913,7 @@ impl MinionsModel {
         // Drop the padding: the caller asked about `real` positions and must not
         // see the repeats that kept the tensor shape fixed.
         out.truncate(real);
-        Ok(out)
+        Ok((out, fresh))
     }
 
 }
@@ -876,6 +950,90 @@ mod tests {
                 (observed - fraction).abs() < 0.01,
                 "k={k}: injected {observed:.3} of candidates, wanted {fraction}"
             );
+        }
+    }
+
+    /// A widen served from cached trunk output must be exactly the widen that
+    /// recomputes it: same candidates, same priors, same values, row for row.
+    ///
+    /// The cache is replayed by row, across the rotation that canonicalises
+    /// the second seat and the padding that repeats the last row. Each is a way
+    /// to hand a candidate set the wrong position's features, and a wrong `h`
+    /// still produces plausible candidates -- so compare against the uncached
+    /// path on the same RNG stream, with the cache full and half full (the
+    /// misses then run through a padded trunk call of their own).
+    #[test]
+    fn cached_trunk_output_matches_recomputing_it() {
+        let Some(m) = model(SamplerConfig { k_candidates: 4, seed: 5, ..Default::default() })
+        else {
+            eprintln!("MINIONS_PARITY_DIR unset — skipping");
+            return;
+        };
+        let mut states = Vec::new();
+        let mut st = MinionsState::default();
+        let mut rng = ChaCha8Rng::seed_from_u64(3);
+        while states.len() < 7 && !crate::game::Minions::outcome(&st).is_terminal() {
+            states.push(st.clone());
+            let spec = crate::turn::TurnSpec::random_playout(&st, &mut rng);
+            st = <crate::turn::MinionsTurns as playground_core::sampled_mcts::SampledGame>::apply(&st, &spec);
+        }
+        assert!(
+            states.iter().any(|s| s.side == 0) && states.iter().any(|s| s.side == 1),
+            "need both seats: the second is canonicalised by rotation"
+        );
+
+        // A value-only expansion, keeping what the trunk computed.
+        let none: Vec<Option<(f32, &[f32])>> = vec![None; states.len()];
+        let (exp, fresh) = m.expand_batch_cached(&states, 0, true, 1, &none, &|n| n, true).unwrap();
+        let kept: Vec<(f32, Vec<f32>)> =
+            fresh.into_iter().map(|f| f.expect("every miss is returned")).collect();
+        for (e, (v, _)) in exp.iter().zip(&kept) {
+            assert_eq!(e.0, *v);
+        }
+
+        let want = m.expand_batch_mode(&states, 2, true, 42).unwrap();
+        let all: Vec<Option<(f32, &[f32])>> = kept.iter().map(|(v, h)| Some((*v, &h[..]))).collect();
+        let half: Vec<Option<(f32, &[f32])>> =
+            all.iter().enumerate().map(|(i, c)| if i % 2 == 0 { *c } else { None }).collect();
+        // Rows must be far apart, or a misplaced one could pass unnoticed.
+        let dist = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| (p - q).abs()).fold(0f32, f32::max);
+        for i in 0..kept.len() {
+            for j in i + 1..kept.len() {
+                assert!(dist(&kept[i].1, &kept[j].1) > 1e-2, "rows {i} and {j} are indistinguishable");
+            }
+        }
+
+        // All cached: the heads see bit-identical inputs, so everything matches exactly.
+        let (got, fresh) = m
+            .expand_batch_cached(&states, 2, true, 42, &all, &|n| n.next_multiple_of(4), true)
+            .unwrap();
+        assert!(fresh.iter().all(|f| f.is_none()), "all hits: nothing comes back fresh");
+        assert_eq!(want.len(), got.len());
+        for (i, (w, g)) in want.iter().zip(&got).enumerate() {
+            assert_eq!(w.0, g.0, "row {i} value");
+            assert_eq!(w.1.len(), g.1.len(), "row {i} candidate count");
+            for ((ws, wp, we), (gs, gp, ge)) in w.1.iter().zip(&g.1) {
+                assert!(ws == gs && wp == gp && we == ge, "row {i} candidate differs");
+            }
+        }
+
+        // Half cached: the misses run through a trunk batch of their own, so
+        // they round differently (~1e-7) -- as rows do in production, where
+        // batch composition changes every wave. Hits must still be exact, and a
+        // miss placed on the wrong row would be off by the row distance above.
+        let (got, fresh) = m
+            .expand_batch_cached(&states, 2, true, 42, &half, &|n| n.next_multiple_of(4), true)
+            .unwrap();
+        for (i, (c, f)) in half.iter().zip(&fresh).enumerate() {
+            if c.is_some() {
+                assert!(f.is_none(), "row {i}: a hit must not come back fresh");
+                assert_eq!(got[i].0, kept[i].0, "row {i}: hit value");
+            } else {
+                let (v, h) = f.as_ref().expect("a miss comes back fresh");
+                assert!((v - kept[i].0).abs() < 1e-4, "row {i}: miss value {v} vs {}", kept[i].0);
+                assert!((got[i].0 - kept[i].0).abs() < 1e-4, "row {i}: returned value");
+                assert!(dist(h, &kept[i].1) < 1e-4, "row {i}: miss computed for the wrong position");
+            }
         }
     }
 

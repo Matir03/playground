@@ -30,7 +30,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use playground_core::sampled_mcts::{Search, SampledParams, Step};
+use playground_core::sampled_mcts::{SampledGame, SampledParams, Search, Step};
 use playground_core::{Game, Outcome};
 
 use crate::game::{Minions, MinionsState};
@@ -289,6 +289,12 @@ pub struct Slot {
     turn: u32,
     rng: rand_chacha::ChaCha8Rng,
     alive: bool,
+    /// Trunk output `(value, h)` for positions this slot's current search has
+    /// already evaluated, keyed by `state_key`. A widen request is always for a
+    /// node expanded earlier; without this it re-ran the trunk on a position
+    /// whose output had just been discarded -- ~60% of trunk rows, and 45% of
+    /// the FLOPs self-play spent. Cleared when the search ends, and on reload.
+    trunk_cache: std::collections::HashMap<u128, (f32, Box<[f32]>)>,
 }
 
 /// Play a **pool** of games, batching expansions across whichever ones happen to
@@ -388,6 +394,18 @@ fn drive_pool_worker(
     use rand::{Rng, SeedableRng};
     let pool_size = slots.len().max(1);
     let max_batch = max_batch.max(1).min(pool_size);
+    // Trunk-output cache budget for this worker's slice, in bytes.
+    // `MINIONS_TRUNK_CACHE_MB=0` turns it off; it is read at runtime, like
+    // `MINIONS_SHAPE_Q`, so both arms of an A/B run one binary.
+    let cache_budget: usize = std::env::var("MINIONS_TRUNK_CACHE_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8192)
+        .saturating_mul(1 << 20)
+        / cfg.workers.max(1);
+    let use_cache = cache_budget > 0 && TRUNK_CACHE_USE.load(std::sync::atomic::Ordering::Relaxed);
+    // Slots keep their caches across flush windows, so count what they hold.
+    let mut cache_bytes: usize = slots.iter().map(cache_size).sum();
     let seed = *next_seed;
 
     let start_search = |state: &MinionsState,
@@ -520,6 +538,8 @@ fn drive_pool_worker(
                         break;
                     }
                     Step::Done => {
+                        // The tree this cache described is gone.
+                        cache_bytes = cache_bytes.saturating_sub(cache_drop(&mut slots[i]));
                         if !advance_turn(&mut slots[i], cfg, &start_search, stats) {
                             // Game over: bank it and refill the slot, so the
                             // batch never narrows while work remains.
@@ -547,6 +567,7 @@ fn drive_pool_worker(
                                 turn: opening,
                                 rng,
                                 alive: true,
+                                trunk_cache: Default::default(),
                             };
                         }
                     }
@@ -563,6 +584,11 @@ fn drive_pool_worker(
             continue;
         }
         gathered_either = true;
+        let keys: Vec<u128> = if cache_budget > 0 {
+            states.iter().map(<MinionsTurns as SampledGame>::state_key).collect()
+        } else {
+            Vec::new()
+        };
 
         // Each kind is padded to its own width below; padding the combined list
         // here as well would only clone states nothing reads.
@@ -585,7 +611,9 @@ fn drive_pool_worker(
         // The split is the point: an expansion needs only a value, so it runs
         // the trunk and stops. Only widens — nodes that something is actually
         // descending through — pay for the diffusion and energy heads, which are
-        // ~70% of the loop. The extra trunk call costs ~5%.
+        // ~70% of the loop. A widen's trunk output comes from the slot's cache
+        // when it has one: recomputing it was 51% of GPU time at the
+        // 2026-09-12 profile, not the ~5% this split was designed around.
         let exp_idx: Vec<usize> = (0..real).filter(|&i| !is_widen[i]).collect();
         let wid_idx: Vec<usize> = (0..real).filter(|&i| is_widen[i]).collect();
         stats.req_expand += exp_idx.len() as u64;
@@ -604,11 +632,17 @@ fn drive_pool_worker(
                 st.push(st[n - 1].clone());
             }
             let exp_k = if cfg.pw_chunk > 0 { 0 } else { model.cfg.k_for(want_full) };
-            let r = model.expand_batch_mode(&st, exp_k, want_full, *next_seed)?;
+            let cached = if use_cache { cache_lookup(&*slots, &ids, &keys, &exp_idx) } else { Vec::new() };
+            stats.cache_hits += cached.iter().filter(|c| c.is_some()).count() as u64;
+            let (r, fresh) = model.expand_batch_cached(
+                &st, exp_k, want_full, *next_seed, &cached, &width_for, cache_budget > 0,
+            )?;
+            drop(cached);
             *next_seed = next_seed.wrapping_add(1);
             for (slot, (v, _)) in exp_idx.iter().zip(r) {
                 values[*slot] = v;
             }
+            cache_store(slots, &ids, &keys, &exp_idx, fresh, cache_budget, &mut cache_bytes, stats);
         }
         let mut cands_for: Vec<Option<Vec<(crate::turn::TurnSpec, f32, bool)>>> =
             (0..real).map(|_| None).collect();
@@ -619,11 +653,17 @@ fn drive_pool_worker(
             while st.len() < w {
                 st.push(st[n - 1].clone());
             }
-            let r = model.expand_batch_mode(&st, k_call, want_full, *next_seed)?;
+            let cached = if use_cache { cache_lookup(&*slots, &ids, &keys, &wid_idx) } else { Vec::new() };
+            stats.cache_hits += cached.iter().filter(|c| c.is_some()).count() as u64;
+            let (r, fresh) = model.expand_batch_cached(
+                &st, k_call, want_full, *next_seed, &cached, &width_for, use_cache,
+            )?;
+            drop(cached);
             *next_seed = next_seed.wrapping_add(1);
             for (slot, (_, c)) in wid_idx.iter().zip(r) {
                 cands_for[*slot] = Some(c);
             }
+            cache_store(slots, &ids, &keys, &wid_idx, fresh, cache_budget, &mut cache_bytes, stats);
         }
         for (n, (i, widen)) in ids.into_iter().zip(is_widen).enumerate() {
             if widen {
@@ -635,6 +675,80 @@ fn drive_pool_worker(
         // The next kind is chosen from supply at the top of the loop.
     }
     Ok(out)
+}
+
+/// Whether this flush window reads the trunk cache. `run_loop` sets it per
+/// window; it is only ever false while an in-generation A/B is running (see
+/// `TRUNK_CACHE_AB_FILE`).
+static TRUNK_CACHE_USE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static WINDOWS_RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// While this file exists in the live dir, windows alternate cache off/on in
+/// A B B A order, so a normal generation doubles as a paired benchmark: the
+/// data is exactly production data, and adjacent windows share the box's
+/// thermal state (which drifts ~30%, more than most effects measured here).
+/// Off windows still *store* expansion output and only skip the lookups, so an
+/// on window never starts cold. Delete the file and every window uses it.
+const TRUNK_CACHE_AB_FILE: &str = "trunk_cache_ab";
+
+fn entry_bytes(h_len: usize) -> usize {
+    h_len * 4 + 64
+}
+
+fn cache_size(slot: &Slot) -> usize {
+    slot.trunk_cache.values().map(|(_, h)| entry_bytes(h.len())).sum()
+}
+
+/// Empty a slot's trunk cache, returning the bytes it held.
+fn cache_drop(slot: &mut Slot) -> usize {
+    let b = cache_size(slot);
+    slot.trunk_cache.clear();
+    b
+}
+
+/// Cached trunk output for each request in `idx` (indices into `ids`/`keys`).
+/// Empty when the cache is off, which the sampler reads as "nothing cached".
+fn cache_lookup<'a>(
+    slots: &'a [Slot],
+    ids: &[usize],
+    keys: &[u128],
+    idx: &[usize],
+) -> Vec<Option<(f32, &'a [f32])>> {
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    idx.iter()
+        .map(|&j| slots[ids[j]].trunk_cache.get(&keys[j]).map(|(v, h)| (*v, &h[..])))
+        .collect()
+}
+
+/// Keep the trunk output the sampler just computed, while the budget allows.
+/// Over budget the entry is simply not kept: a miss recomputes, so the budget
+/// bounds memory without ever changing a result.
+#[allow(clippy::too_many_arguments)]
+fn cache_store(
+    slots: &mut [Slot],
+    ids: &[usize],
+    keys: &[u128],
+    idx: &[usize],
+    fresh: Vec<Option<(f32, Vec<f32>)>>,
+    budget: usize,
+    bytes: &mut usize,
+    stats: &mut PoolStats,
+) {
+    for (&j, f) in idx.iter().zip(fresh) {
+        let Some((v, h)) = f else { continue };
+        stats.cache_misses += 1;
+        let b = entry_bytes(h.len());
+        if *bytes + b > budget {
+            stats.cache_full += 1;
+            continue;
+        }
+        if slots[ids[j]].trunk_cache.insert(keys[j], (v, h.into_boxed_slice())).is_none() {
+            *bytes += b;
+        }
+    }
+    stats.cache_peak_bytes = stats.cache_peak_bytes.max(*bytes as u64);
 }
 
 /// Steady-state progress, independent of whether games happen to finish inside
@@ -669,6 +783,13 @@ pub struct PoolStats {
     /// waste in the most expensive phase.
     pub head_real: u64,
     pub head_run: u64,
+    /// Trunk-cache lookups that hit, rows the trunk ran on with the cache on,
+    /// and of those the ones not kept because the budget was full.
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_full: u64,
+    /// Largest cache held, summed over workers.
+    pub cache_peak_bytes: u64,
     pub turns: u64,
     pub games: u64,
 }
@@ -689,6 +810,10 @@ impl PoolStats {
         self.req_widen += o.req_widen;
         self.head_real += o.head_real;
         self.head_run += o.head_run;
+        self.cache_hits += o.cache_hits;
+        self.cache_misses += o.cache_misses;
+        self.cache_full += o.cache_full;
+        self.cache_peak_bytes += o.cache_peak_bytes;
     }
 
     /// Where each wave's requests went, and how much of the generative-head
@@ -701,14 +826,26 @@ impl PoolStats {
         } else {
             100.0 * (1.0 - self.head_real as f64 / self.head_run as f64)
         };
-        format!(
+        let mut s = format!(
             "requests: {:.0}% value-only, {:.0}% candidate  |  head rows {} of {} run ({:.0}% padding)",
             100.0 * self.req_expand as f64 / reqs as f64,
             100.0 * self.req_widen as f64 / reqs as f64,
             self.head_real,
             self.head_run,
             head_waste
-        )
+        );
+        let looked = self.cache_hits + self.cache_misses;
+        if looked > 0 {
+            s += &format!(
+                "  |  trunk cache {:.1}% hit ({} of {}), {} not kept, peak {:.0} MB",
+                100.0 * self.cache_hits as f64 / looked as f64,
+                self.cache_hits,
+                looked,
+                self.cache_full,
+                self.cache_peak_bytes as f64 / (1u64 << 20) as f64
+            );
+        }
+        s
     }
 
     pub fn report(&self, secs: f64) -> String {
@@ -842,6 +979,7 @@ pub fn new_pool(model: &MinionsModel, cfg: &ActorConfig, n: usize, seed: u64) ->
                 turn: opening,
                 rng,
                 alive: true,
+                trunk_cache: Default::default(),
             }
         })
         .collect()
@@ -1248,6 +1386,10 @@ pub fn run_loop(
         }
         let _ = std::fs::remove_file(live.join("actor.paused"));
 
+        let window = WINDOWS_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let ab = live.join(TRUNK_CACHE_AB_FILE).exists();
+        let cache_on = !ab || matches!(window % 4, 1 | 2);
+        TRUNK_CACHE_USE.store(cache_on, std::sync::atomic::Ordering::Relaxed);
         let deadline = Instant::now() + Duration::from_secs(chunk_secs);
         let mut stats = PoolStats::default();
         let t0 = Instant::now();
@@ -1260,6 +1402,15 @@ pub fn run_loop(
         );
         println!("  {}", stats.explore_report());
         println!("  {}", stats.split_report());
+        // Raw counts, so a benchmark can measure fixed work rather than a rate:
+        // throughput swings ~4x over a generation as the pool moves in step.
+        println!(
+            "  window: {} expansions in {:.3}s  cache {}{}",
+            stats.expansions,
+            t0.elapsed().as_secs_f64(),
+            if cache_on { "on" } else { "off" },
+            if ab { " (ab)" } else { "" }
+        );
         if !examples.is_empty() {
             let path = write_chunk(&buffer, chunk_index, &examples)?;
             chunk_index += 1;
@@ -1285,6 +1436,10 @@ pub fn run_loop(
             match crate::net::load_backend(live, &cfg.backend, &cache_dir) {
                 Ok(n) => {
                     model = MinionsModel::new(n, sampler);
+                    // Cached trunk output belongs to the weights that computed it.
+                    for slot in pool.iter_mut() {
+                        slot.trunk_cache.clear();
+                    }
                     last_mtime = mt;
                     println!("reloaded weights from {}", path.display());
                 }
