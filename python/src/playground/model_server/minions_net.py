@@ -479,7 +479,8 @@ class _EnergyGraph(nn.Module):
 
 
 def export_onnx_atomic(net: MinionsNet, out_dir: str) -> None:
-    """Write ``trunk.onnx``, ``diffusion.onnx``, ``energy.onnx`` and ``aux.onnx``.
+    """Write ``trunk.onnx``, ``diffusion.onnx``, ``energy.onnx``, ``aux.onnx``, and
+    fp16-I/O variants of the two heads (see ``onnx_f16io``).
 
     Every axis that varies at run time is dynamic: batch everywhere, and the
     trunk width, so a checkpoint at different ``channels`` still loads. Written
@@ -493,13 +494,6 @@ def export_onnx_atomic(net: MinionsNet, out_dir: str) -> None:
     os.makedirs(out_dir, exist_ok=True)
 
     specs = [
-        (
-            "trunk.onnx",
-            _TrunkGraph(net),
-            (torch.zeros(1, IN_PLANES, N, N, device=dev),),
-            ["planes"],
-            ["h", "value"],
-        ),
         (
             "diffusion.onnx",
             _DiffusionGraph(net),
@@ -521,9 +515,24 @@ def export_onnx_atomic(net: MinionsNet, out_dir: str) -> None:
             ["planes"],
             ["hex", "necro", "logz", "score"],
         ),
+        (
+            "trunk.onnx",
+            _TrunkGraph(net),
+            (torch.zeros(1, IN_PLANES, N, N, device=dev),),
+            ["planes"],
+            ["h", "value"],
+        ),
     ]
+    # Order matters: the actor reloads when `trunk.onnx` changes, so the
+    # trunk goes last. Every head, and its fp16-I/O variant, is already in
+    # place when the reload fires; the trunk used to go first, leaving a
+    # window where a reload paired a new trunk with the old heads.
+    from playground.model_server.onnx_f16io import write_variants
+
     with torch.no_grad():
         for name, mod, args, ins, outs in specs:
+            if name == "trunk.onnx":
+                write_variants(out_dir)
             path = os.path.join(out_dir, name)
             tmp = path + ".tmp"
             torch.onnx.export(

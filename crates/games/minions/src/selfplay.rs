@@ -690,6 +690,8 @@ static WINDOWS_RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// Off windows still *store* expansion output and only skip the lookups, so an
 /// on window never starts cold. Delete the file and every window uses it.
 const TRUNK_CACHE_AB_FILE: &str = "trunk_cache_ab";
+/// The same A B B A switch for the fp16-I/O head graphs (`ort_net::HEAD_F16_USE`).
+const HEAD_F16_AB_FILE: &str = "head_f16_ab";
 
 fn entry_bytes(h_len: usize) -> usize {
     h_len * 4 + 64
@@ -1424,6 +1426,9 @@ pub fn run_loop(
         let ab = live.join(TRUNK_CACHE_AB_FILE).exists();
         let cache_on = !ab || matches!(window % 4, 1 | 2);
         TRUNK_CACHE_USE.store(cache_on, std::sync::atomic::Ordering::Relaxed);
+        let f16_ab = live.join(HEAD_F16_AB_FILE).exists();
+        let f16_on = !f16_ab || matches!(window % 4, 1 | 2);
+        crate::ort_net::HEAD_F16_USE.store(f16_on, std::sync::atomic::Ordering::Relaxed);
         let deadline = Instant::now() + Duration::from_secs(chunk_secs);
         let mut stats = PoolStats::default();
         let t0 = Instant::now();
@@ -1439,11 +1444,13 @@ pub fn run_loop(
         // Raw counts, so a benchmark can measure fixed work rather than a rate:
         // throughput swings ~4x over a generation as the pool moves in step.
         println!(
-            "  window: {} expansions in {:.3}s  cache {}{}",
+            "  window: {} expansions in {:.3}s  cache {}{}  f16 {}{}",
             stats.expansions,
             t0.elapsed().as_secs_f64(),
             if cache_on { "on" } else { "off" },
-            if ab { " (ab)" } else { "" }
+            if ab { " (ab)" } else { "" },
+            if f16_on { "on" } else { "off" },
+            if f16_ab { " (ab)" } else { "" }
         );
         if !examples.is_empty() {
             let path = write_chunk(&buffer, chunk_index, &examples)?;

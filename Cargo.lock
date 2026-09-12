@@ -1576,6 +1576,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "clap",
+ "half",
  "ort",
  "playground-core",
  "playground-engine-server",
@@ -1584,6 +1585,7 @@ dependencies = [
  "rand 0.8.6",
  "rand_chacha 0.3.1",
  "serde_json",
+ "sha2",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1847,6 +1849,7 @@ version = "2.0.0-rc.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7de3af33d24a745ffb8fab904b13478438d1cd52868e6f17735ef6e1f8bf133"
 dependencies = [
+ "half",
  "libloading 0.9.0",
  "ndarray",
  "ort-sys",
