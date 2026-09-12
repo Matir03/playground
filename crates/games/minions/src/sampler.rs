@@ -642,6 +642,25 @@ impl SampledModel<MinionsTurns> for MinionsModel {
     }
 }
 
+/// Trunk output from an `expand_batch_cached` call, for the caller to keep:
+/// `h` for every row of the call (`stride` floats each), and `fresh[i]` =
+/// `Some(value)` for each real row the trunk actually ran on.
+///
+/// One buffer rather than a `Vec` per row: per-row allocations interleaved
+/// with the long-lived cache are what grew glibc's thread arenas to 17 GB
+/// around an 8 GB cache.
+pub struct TrunkRows {
+    pub stride: usize,
+    pub h: Vec<f32>,
+    pub fresh: Vec<Option<f32>>,
+}
+
+impl TrunkRows {
+    pub fn row(&self, i: usize) -> &[f32] {
+        &self.h[i * self.stride..(i + 1) * self.stride]
+    }
+}
+
 impl MinionsModel {
     /// Expand a batch, told explicitly which kind of search it serves and which
     /// RNG stream to draw from.
@@ -674,8 +693,8 @@ impl MinionsModel {
     /// it has already built. With nothing cached this is the original single
     /// trunk call, unchanged.
     ///
-    /// With `want_fresh`, the second vector holds `(value, h)` for each real row
-    /// the trunk ran on (`None` for hits), for the caller to keep.
+    /// With `want_fresh`, the returned `TrunkRows` marks each real row the trunk
+    /// ran on (hits are `None`), with its `h` in the shared buffer.
     ///
     /// Why: a widen request is always for a node expanded earlier, so its trunk
     /// output was computed then and discarded. Widens are ~60% of requests,
@@ -690,10 +709,10 @@ impl MinionsModel {
         cached: &[Option<(f32, &[f32])>],
         trunk_rows: &dyn Fn(usize) -> usize,
         want_fresh: bool,
-    ) -> anyhow::Result<(Vec<Expansion<MinionsTurns>>, Vec<Option<(f32, Vec<f32>)>>)> {
+    ) -> anyhow::Result<(Vec<Expansion<MinionsTurns>>, TrunkRows)> {
         let real = states.len();
         if real == 0 {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((Vec::new(), TrunkRows { stride: 0, h: Vec::new(), fresh: Vec::new() }));
         }
         // Widen to a fixed batch before touching the GPU, so the tensor shape
         // does not follow the caller's live-game count.
@@ -776,12 +795,8 @@ impl MinionsModel {
             (values, h)
         };
         let n_fresh = if cached.is_empty() { real } else { cached.len().min(real) };
-        let fresh: Vec<Option<(f32, Vec<f32>)>> = (0..n_fresh)
-            .map(|gi| {
-                (want_fresh && hit(gi).is_none())
-                    .then(|| (values[gi], h[gi * hstride..(gi + 1) * hstride].to_vec()))
-            })
-            .collect();
+        let fresh: Vec<Option<f32>> =
+            (0..n_fresh).map(|gi| (want_fresh && hit(gi).is_none()).then(|| values[gi])).collect();
 
         // `k == 0` is a value-only expansion: run the trunk, skip the heads.
         //
@@ -791,7 +806,7 @@ impl MinionsModel {
         // waste after chunking (43.4% of candidates, one per frontier node).
         if k == 0 {
             let out = (0..real).map(|gi| (values.get(gi).copied().unwrap_or(0.0), Vec::new()));
-            return Ok((out.collect(), fresh));
+            return Ok((out.collect(), TrunkRows { stride: hstride, h, fresh }));
         }
         let k = k.max(1);
         // Forced exploration keeps its *expected* share even when candidates are
@@ -913,7 +928,7 @@ impl MinionsModel {
         // Drop the padding: the caller asked about `real` positions and must not
         // see the repeats that kept the tensor shape fixed.
         out.truncate(real);
-        Ok((out, fresh))
+        Ok((out, TrunkRows { stride: hstride, h, fresh }))
     }
 
 }
@@ -984,9 +999,13 @@ mod tests {
 
         // A value-only expansion, keeping what the trunk computed.
         let none: Vec<Option<(f32, &[f32])>> = vec![None; states.len()];
-        let (exp, fresh) = m.expand_batch_cached(&states, 0, true, 1, &none, &|n| n, true).unwrap();
-        let kept: Vec<(f32, Vec<f32>)> =
-            fresh.into_iter().map(|f| f.expect("every miss is returned")).collect();
+        let (exp, rows) = m.expand_batch_cached(&states, 0, true, 1, &none, &|n| n, true).unwrap();
+        let kept: Vec<(f32, Vec<f32>)> = rows
+            .fresh
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.expect("every miss is returned"), rows.row(i).to_vec()))
+            .collect();
         for (e, (v, _)) in exp.iter().zip(&kept) {
             assert_eq!(e.0, *v);
         }
@@ -1007,7 +1026,7 @@ mod tests {
         let (got, fresh) = m
             .expand_batch_cached(&states, 2, true, 42, &all, &|n| n.next_multiple_of(4), true)
             .unwrap();
-        assert!(fresh.iter().all(|f| f.is_none()), "all hits: nothing comes back fresh");
+        assert!(fresh.fresh.iter().all(|f| f.is_none()), "all hits: nothing comes back fresh");
         assert_eq!(want.len(), got.len());
         for (i, (w, g)) in want.iter().zip(&got).enumerate() {
             assert_eq!(w.0, g.0, "row {i} value");
@@ -1024,12 +1043,13 @@ mod tests {
         let (got, fresh) = m
             .expand_batch_cached(&states, 2, true, 42, &half, &|n| n.next_multiple_of(4), true)
             .unwrap();
-        for (i, (c, f)) in half.iter().zip(&fresh).enumerate() {
+        for (i, (c, f)) in half.iter().zip(&fresh.fresh).enumerate() {
             if c.is_some() {
                 assert!(f.is_none(), "row {i}: a hit must not come back fresh");
                 assert_eq!(got[i].0, kept[i].0, "row {i}: hit value");
             } else {
-                let (v, h) = f.as_ref().expect("a miss comes back fresh");
+                let v = f.expect("a miss comes back fresh");
+                let h = fresh.row(i);
                 assert!((v - kept[i].0).abs() < 1e-4, "row {i}: miss value {v} vs {}", kept[i].0);
                 assert!((got[i].0 - kept[i].0).abs() < 1e-4, "row {i}: returned value");
                 assert!(dist(h, &kept[i].1) < 1e-4, "row {i}: miss computed for the wrong position");

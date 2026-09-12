@@ -642,7 +642,7 @@ fn drive_pool_worker(
             for (slot, (v, _)) in exp_idx.iter().zip(r) {
                 values[*slot] = v;
             }
-            cache_store(slots, &ids, &keys, &exp_idx, fresh, cache_budget, &mut cache_bytes, stats);
+            cache_store(slots, &ids, &keys, &exp_idx, &fresh, cache_budget, &mut cache_bytes, stats);
         }
         let mut cands_for: Vec<Option<Vec<(crate::turn::TurnSpec, f32, bool)>>> =
             (0..real).map(|_| None).collect();
@@ -663,7 +663,7 @@ fn drive_pool_worker(
             for (slot, (_, c)) in wid_idx.iter().zip(r) {
                 cands_for[*slot] = Some(c);
             }
-            cache_store(slots, &ids, &keys, &wid_idx, fresh, cache_budget, &mut cache_bytes, stats);
+            cache_store(slots, &ids, &keys, &wid_idx, &fresh, cache_budget, &mut cache_bytes, stats);
         }
         for (n, (i, widen)) in ids.into_iter().zip(is_widen).enumerate() {
             if widen {
@@ -699,10 +699,35 @@ fn cache_size(slot: &Slot) -> usize {
     slot.trunk_cache.values().map(|(_, h)| entry_bytes(h.len())).sum()
 }
 
-/// Empty a slot's trunk cache, returning the bytes it held.
+/// Freed cache blocks, reused rather than handed back to the allocator.
+///
+/// Entries are all one size and churn at ~10k/s. Allocating each one
+/// interleaved them with the per-wave multi-MB buffers in glibc's thread
+/// arenas, which grew to 17.2 GB (276 x 64 MB heaps) around an 8 GB cache.
+/// Recycling caps the footprint at the peak live cache, which the budget bounds.
+static BLOCK_POOL: std::sync::Mutex<Vec<Box<[f32]>>> = std::sync::Mutex::new(Vec::new());
+
+fn take_blocks(n: usize) -> Vec<Box<[f32]>> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut pool = BLOCK_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let keep = pool.len().saturating_sub(n);
+    pool.split_off(keep)
+}
+
+fn return_blocks(mut blocks: Vec<Box<[f32]>>) {
+    if !blocks.is_empty() {
+        BLOCK_POOL.lock().unwrap_or_else(|e| e.into_inner()).append(&mut blocks);
+    }
+}
+
+/// Empty a slot's trunk cache into the block pool, returning the bytes it held.
 fn cache_drop(slot: &mut Slot) -> usize {
     let b = cache_size(slot);
-    slot.trunk_cache.clear();
+    if !slot.trunk_cache.is_empty() {
+        return_blocks(slot.trunk_cache.drain().map(|(_, (_, h))| h).collect());
+    }
     b
 }
 
@@ -731,23 +756,32 @@ fn cache_store(
     ids: &[usize],
     keys: &[u128],
     idx: &[usize],
-    fresh: Vec<Option<(f32, Vec<f32>)>>,
+    rows: &crate::sampler::TrunkRows,
     budget: usize,
     bytes: &mut usize,
     stats: &mut PoolStats,
 ) {
-    for (&j, f) in idx.iter().zip(fresh) {
-        let Some((v, h)) = f else { continue };
+    let want = rows.fresh.iter().take(idx.len()).filter(|f| f.is_some()).count();
+    let mut blocks = take_blocks(want);
+    let b = entry_bytes(rows.stride);
+    for (n, &j) in idx.iter().enumerate() {
+        let Some(v) = rows.fresh.get(n).copied().flatten() else { continue };
         stats.cache_misses += 1;
-        let b = entry_bytes(h.len());
         if *bytes + b > budget {
             stats.cache_full += 1;
             continue;
         }
-        if slots[ids[j]].trunk_cache.insert(keys[j], (v, h.into_boxed_slice())).is_none() {
-            *bytes += b;
+        let mut blk = match blocks.pop() {
+            Some(blk) if blk.len() == rows.stride => blk,
+            _ => vec![0f32; rows.stride].into_boxed_slice(),
+        };
+        blk.copy_from_slice(rows.row(n));
+        match slots[ids[j]].trunk_cache.insert(keys[j], (v, blk)) {
+            Some((_, old)) => return_blocks(vec![old]),
+            None => *bytes += b,
         }
     }
+    return_blocks(blocks);
     stats.cache_peak_bytes = stats.cache_peak_bytes.max(*bytes as u64);
 }
 
@@ -1438,7 +1472,7 @@ pub fn run_loop(
                     model = MinionsModel::new(n, sampler);
                     // Cached trunk output belongs to the weights that computed it.
                     for slot in pool.iter_mut() {
-                        slot.trunk_cache.clear();
+                        cache_drop(slot);
                     }
                     last_mtime = mt;
                     println!("reloaded weights from {}", path.display());
