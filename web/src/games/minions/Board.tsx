@@ -50,6 +50,13 @@ import {
 } from "../../gen/playground/engine/engine_pb";
 import { AnalysisTree, KernelMatrix, displayOrder, type SortKey } from "./Analysis";
 
+/** Whose turn a position is in, which is what the record's turn boundaries
+ *  are made of. Module level, so every render shares one function. */
+const turnInfo: H.TurnInfo = (st) => {
+  const dd = decode(st.payload);
+  return { turn: dd.turn, side: dd.side };
+};
+
 // ── Rules mirror ──────────────────────────────────────────────────────────────
 
 const N = 7;
@@ -393,9 +400,12 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
   const goto = useCallback(
     (id: number) => {
       if (!hist) return;
-      const n = H.node(hist, id);
+      // Whole turns are the only places to stop; anything else snaps back to
+      // the start of the turn it sits in.
+      const to = H.isStop(hist, id, turnInfo) ? id : H.turnStart(hist, id, turnInfo);
+      const n = H.node(hist, to);
       if (!n) return;
-      setHist({ ...hist, current: id });
+      setHist({ ...hist, current: to });
       setState(n.state);
       setSelected(null);
       setSpawnUnit(null);
@@ -414,7 +424,8 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA")) return;
       if (!hist) return;
-      const to = e.key === "ArrowLeft" ? H.prevId(hist, hist.current) : H.nextId(hist, hist.current);
+      const to =
+        e.key === "ArrowLeft" ? H.prevId(hist, hist.current, turnInfo) : H.nextId(hist, hist.current, turnInfo);
       if (to === null) return;
       goto(to);
       e.preventDefault();
@@ -424,8 +435,12 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
   }, [hist, goto]);
 
   const atTip = !!hist && hist.current === H.tipOf(hist, hist.current);
-  const canBack = !!hist && H.prevId(hist, hist.current) !== null;
-  const canFwd = !!hist && H.nextId(hist, hist.current) !== null;
+  const canBack = !!hist && H.prevId(hist, hist.current, turnInfo) !== null;
+  const canFwd = !!hist && H.nextId(hist, hist.current, turnInfo) !== null;
+  /** Analysis, and committing a turn from it, start only from a whole turn. A
+   *  tip partway through a turn is where the game is, but no search or net is
+   *  ever asked about a half-played turn. */
+  const canAnalyse = !!hist && H.isBoundary(hist, hist.current, turnInfo);
 
   /** Bring the server to `id`, replaying from a fresh game when it must.
    *
@@ -489,6 +504,11 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
           return after;
         });
         setSelected(null);
+        // One action puts the board partway through a turn, where nothing the
+        // analyser showed applies any more.
+        setAnalysis(null);
+        setWalk(null);
+        setExpanded(new Set());
       } catch (e) {
         setError(e instanceof ConnectError ? e.message : String(e));
       } finally {
@@ -603,7 +623,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
 
   const runAnalysis = useCallback(
     async (line: Uint8Array[], labels: string[], evalOnly: boolean) => {
-      if (!hist) return;
+      if (!hist || !H.isBoundary(hist, hist.current, turnInfo)) return;
       setAnalysing(true);
       setError(null);
       try {
@@ -647,7 +667,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
    * because the new position is now the one being studied. */
   const commitTurn = useCallback(
     async (turn: Uint8Array, label?: string) => {
-      if (!hist) return;
+      if (!hist || !H.isBoundary(hist, hist.current, turnInfo)) return;
       setAnalysing(true);
       setError(null);
       try {
@@ -745,8 +765,8 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
         {hist && (
           <span style={{ display: "flex", gap: 2, alignItems: "center" }} title="move through the record">
             <button onClick={() => goto(hist.root)} disabled={!canBack} title="start">⏮</button>
-            <button onClick={() => goto(H.prevId(hist, hist.current)!)} disabled={!canBack} title="back (←)">◀</button>
-            <button onClick={() => goto(H.nextId(hist, hist.current)!)} disabled={!canFwd} title="forward (→)">▶</button>
+            <button onClick={() => goto(H.prevId(hist, hist.current, turnInfo)!)} disabled={!canBack} title="back one turn (←)">◀</button>
+            <button onClick={() => goto(H.nextId(hist, hist.current, turnInfo)!)} disabled={!canFwd} title="forward one turn (→)">▶</button>
             <button onClick={() => goto(H.tipOf(hist, hist.current))} disabled={!canFwd} title="end of this line">⏭</button>
           </span>
         )}
@@ -1013,14 +1033,19 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                   </div>
                   <MoveList
                     hist={hist}
-                    info={(st) => {
-                      const dd = decode(st.payload);
-                      return { turn: dd.turn, side: dd.side };
-                    }}
+                    info={turnInfo}
                     onGoto={goto}
                     onPromote={(id) => setHist((cur) => (cur ? H.promote(cur, id) : cur))}
                     onDrop={(id) => {
-                      const after = H.drop(hist, id);
+                      const dropped = H.drop(hist, id);
+                      // Dropping a variation can leave `current` on its branch
+                      // point, which may sit partway through a turn.
+                      const after = {
+                        ...dropped,
+                        current: H.isStop(dropped, dropped.current, turnInfo)
+                          ? dropped.current
+                          : H.turnStart(dropped, dropped.current, turnInfo),
+                      };
                       const n = H.node(after, after.current);
                       // The handle may have been sitting inside the subtree we
                       // just removed; forget it so the next use resyncs rather
@@ -1045,9 +1070,13 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                         setAnalysisOn(true);
                         void runAnalysis([], [], false);
                       }}
-                      disabled={analysing || syncing || !hist}
+                      disabled={analysing || syncing || !canAnalyse}
                       style={{ font: "inherit", padding: "0.25rem 0.7rem" }}
-                      title="search this position, wherever it sits in the record"
+                      title={
+                        canAnalyse
+                          ? "search this position, wherever it sits in the record"
+                          : "finish the turn first: analysis starts from whole turns"
+                      }
                     >
                       {analysing ? "analysing…" : "analyse this position"}
                     </button>
@@ -1070,11 +1099,16 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
               >
                 <button
                   onClick={() => void runAnalysis([], [], false)}
-                  disabled={analysing || !handle}
+                  disabled={analysing || !handle || !canAnalyse}
                   style={{ font: "inherit", padding: "0.25rem 0.7rem" }}
                 >
                   {analysing ? "analysing…" : analysis ? "re-analyse" : "analyse"}
                 </button>
+                {!canAnalyse && (
+                  <span style={{ color: "#b08030" }}>
+                    partway through a turn — finish it, or step back (◀), to analyse
+                  </span>
+                )}
                 <label style={{ color: "#999" }}>
                   sims{" "}
                   <input

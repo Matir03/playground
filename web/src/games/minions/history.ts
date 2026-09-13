@@ -21,7 +21,7 @@
  * a node can be named in a URL, a key, or a ref without carrying the subtree.
  */
 
-import type { GameState } from "../../gen/playground/game/game_pb";
+import { type GameState, Outcome } from "../../gen/playground/game/game_pb";
 import { UNITS } from "./units";
 
 export interface HNode {
@@ -157,13 +157,64 @@ export function tipOf(h: History, id: number): number {
   return cur ? cur.id : id;
 }
 
-export function prevId(h: History, id: number): number | null {
-  return h.nodes.get(id)?.parent ?? null;
+// ── turn boundaries ─────────────────────────────────────────────────────────
+//
+// The unit of the record is a whole turn. A position partway through a turn is
+// not a place to stop, look, or analyse from: the search, the nets and the
+// analyser all work in whole TurnSpecs, and a half-played turn is a position
+// none of them is ever asked about. The one exception is the tip of a line
+// whose last turn is still being played, because that is where the game is.
+
+/** Whose turn a position is in; the caller owns decoding. */
+export type TurnInfo = (s: GameState) => { turn: number; side: number };
+
+/** True for the root, a finished game, and the first position of each turn. */
+export function isBoundary(h: History, id: number, info: TurnInfo): boolean {
+  const n = h.nodes.get(id);
+  if (!n) return false;
+  if (n.parent === null || n.kind === "turn") return true;
+  if (n.state.outcome !== Outcome.IN_PROGRESS) return true;
+  const p = h.nodes.get(n.parent);
+  if (!p) return true;
+  const a = info(p.state);
+  const b = info(n.state);
+  return a.turn !== b.turn || a.side !== b.side;
 }
 
-export function nextId(h: History, id: number): number | null {
+/** A position the record lets you stop on: a boundary, or a line's tip. */
+export function isStop(h: History, id: number, info: TurnInfo): boolean {
   const n = h.nodes.get(id);
-  return n && n.children.length ? n.children[0] : null;
+  return !!n && (n.children.length === 0 || isBoundary(h, id, info));
+}
+
+/** The nearest boundary at or above `id`: the start of the turn it sits in. */
+export function turnStart(h: History, id: number, info: TurnInfo): number {
+  let cur: number | null = id;
+  while (cur !== null) {
+    if (isBoundary(h, cur, info)) return cur;
+    cur = h.nodes.get(cur)?.parent ?? null;
+  }
+  return h.root;
+}
+
+/** One turn back: the start of the turn before the one `id` ends, or of the
+ *  turn in progress when `id` is a tip partway through it. */
+export function prevId(h: History, id: number, info: TurnInfo): number | null {
+  const p = h.nodes.get(id)?.parent ?? null;
+  return p === null ? null : turnStart(h, p, info);
+}
+
+/** One turn forward along the main continuation. A line that ends partway
+ *  through a turn stops at its tip. */
+export function nextId(h: History, id: number, info: TurnInfo): number | null {
+  let cur = h.nodes.get(id);
+  while (cur && cur.children.length) {
+    const next = h.nodes.get(cur.children[0]);
+    if (!next) break;
+    if (isBoundary(h, next.id, info)) return next.id;
+    cur = next;
+  }
+  return cur && cur.id !== id ? cur.id : null;
 }
 
 /** Make the variation containing `id` the main line at every branch above it.
