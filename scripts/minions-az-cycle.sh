@@ -72,8 +72,12 @@ CANDIDATES_FAST="${CANDIDATES_FAST:-8}"
 # net is better", and a deeper search reads that off the weights with less noise
 # than the shallow search self-play can afford. Eval has no fast/full split, so
 # EVAL_SIMS applies to every move.
-EVAL_CANDIDATES="${EVAL_CANDIDATES:-24}"
-EVAL_SIMS="${EVAL_SIMS:-800}"
+#
+# 2026-09-12: set to 400 sims / 16 candidates / T=6 by the user -- self-play's
+# sims and candidate count, with a longer diffusion (T=6 vs self-play's 4).
+EVAL_CANDIDATES="${EVAL_CANDIDATES:-16}"
+EVAL_SIMS="${EVAL_SIMS:-400}"
+EVAL_T_STEPS="${EVAL_T_STEPS:-6}"
 RANDOM_FRACTION="${RANDOM_FRACTION:-0.25}"
 # Random openings: N random legal turns before the search takes over, none of
 # them recorded. Keeps the training distribution moving when self-play comes
@@ -282,7 +286,7 @@ while true; do
   "$PYTHON" "$repo/python/minions_eval_loop.py" --live "$LIVE" \
     --engine "$ENGINE" --games "$EVAL_GAMES" --candidates "$EVAL_CANDIDATES" \
     --sims "$EVAL_SIMS" --greedy-games "$GREEDY_GAMES" \
-    --t-steps "$T_STEPS" --promote-threshold "$PROMOTE" --once \
+    --t-steps "$EVAL_T_STEPS" --promote-threshold "$PROMOTE" --once \
     --backend "$BACKEND" --ep "$EP" $FP16_FLAG ${EVAL_MODE[@]+"${EVAL_MODE[@]}"} || {
       # Never let evaluation kill the run. The script is `set -e`, so a bad
       # eval used to take the whole cycle down with it — an unattended run
