@@ -72,8 +72,7 @@ def fit(matches, iters=10000, tol=1e-9, include_greedy=False):
     Returns `{player: elo}` with the earliest rated generation pinned at 0
     (greedy, with `include_greedy`), or `{}` if there is nothing to fit.
     """
-    if not include_greedy:
-        matches = rated(matches)
+    matches = rated(matches) if not include_greedy else [m for m in matches if not self_match(m)]
     # wins[i][j] = fractional games i won against j.
     wins, opponents = {}, {}
     for m in matches:
@@ -169,9 +168,20 @@ def gen_number(p):
     return int(p[3:]) if p.startswith("gen") and p[3:].isdigit() else 1 << 30
 
 
+def self_match(m):
+    """A legacy `gate` row: under the ORT backend the gate's champion seat was
+    `live/best.safetensors`, which `load_seat` resolves to its parent directory
+    -- `live/`, where the learner's newest export sits, i.e. the candidate
+    itself. Every `gate` row is a net playing its own graphs, logged as a
+    result against the champion. Kept in the log, never fitted. Gate matches
+    that really play the champion are logged as `champion` rows."""
+    return m.get("kind") == "gate"
+
+
 def rated(matches):
-    """The rows the fit uses: everything except games against greedy."""
-    return [m for m in matches if GREEDY not in (m["a"], m["b"])]
+    """The rows the fit uses: everything except games against greedy and the
+    legacy self-match `gate` rows."""
+    return [m for m in matches if GREEDY not in (m["a"], m["b"]) and not self_match(m)]
 
 
 def games_played(matches):

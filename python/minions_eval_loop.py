@@ -53,6 +53,20 @@ _LAST_BIDS: tuple[float, float] | None = None
 _LAST_TURNS: tuple[float, float] | None = None
 
 
+def champion_seat(live, best, backend):
+    """The champion as a seat path for `eval-match`, or None if there is none.
+
+    ORT loads the graphs *beside* a checkpoint file, and beside
+    `best.safetensors` are the learner's newest exports -- the candidate. So
+    under ORT the champion is the `best/` directory the promotion writes;
+    passing `best.safetensors` made every gate a candidate playing itself.
+    """
+    if backend == "ort":
+        d = os.path.join(live, "best")
+        return d if os.path.exists(os.path.join(d, "trunk.onnx")) else None
+    return best if os.path.exists(best) else None
+
+
 def ensure_onnx(ckpt: str) -> None:
     """Export a snapshot's graphs next to its checkpoint, if they aren't there.
 
@@ -714,7 +728,7 @@ def main():
             if args.ungated:
                 ungated_step(args, live, scores, scores_path, best, snap, gen, ckpt)
                 continue
-            champion = best if os.path.exists(best) else None
+            champion = champion_seat(live, best, args.backend)
             # Who `champion` actually is, captured before a promotion overwrites
             # it -- the match log needs both players by name.
             champion_gen = scores.get("best_gen") if champion else None
@@ -760,9 +774,11 @@ def main():
                 # lose the gate are rejected here and never pay for the ladder,
                 # so this is free -- those four matches used to run immediately
                 # after the promotion rather than immediately before it.
+                # `champion`, not `gate`: legacy `gate` rows are self-matches
+                # and the fit skips them (`minions_elo.self_match`).
                 match_rows.append({"a": f"gen{gen}", "b": f"gen{champion_gen}",
                                    "games": args.games, "score_a": score,
-                                   "kind": "gate"})
+                                   "kind": "champion"})
                 if score < args.promote_threshold:
                     promoted = False
                 elif args.ladder_games <= 0 or args.ladder_opponents <= 0:
@@ -817,12 +833,13 @@ def main():
             # champions, and `minions_elo.fit` ignores greedy rows, so these
             # games can never move a promotion. The current entry is not in the
             # history yet (it was persisted and popped above), hence the +1.
-            if (promoted and args.greedy_games > 0 and os.path.exists(best)
+            if (promoted and args.greedy_games > 0 and champion_seat(live, best, args.backend)
                     and promotions_since_greedy(scores) + 1 >= args.greedy_every):
               champ_gen = scores.get("best_gen", gen)
               entry["greedy_gen"] = champ_gen
               try:
-                  g, gm, ggs = run_match(args.engine, best, None, args.greedy_games, args.sims,
+                  g, gm, ggs = run_match(args.engine, champion_seat(live, best, args.backend),
+                                    None, args.greedy_games, args.sims,
                                     args.candidates, args.t_steps, args.backend, args.ep,
                                     # Seeded by the measuring generation, not the
                                     # champion's: a champion that survives several
