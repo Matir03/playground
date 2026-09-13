@@ -144,8 +144,9 @@ EVAL_GAMES="${EVAL_GAMES:-40}"
 # self-play and every MEASURE_EVERY-th is rated. 1: the per-generation gate.
 GATE="${GATE:-0}"
 MEASURE_EVERY="${MEASURE_EVERY:-5}"
-# Measurement matches at once: four ladder rungs, the best fp16 net, greedy.
-EVAL_PARALLEL="${EVAL_PARALLEL:-6}"
+# Tournament matches at once, at most. Each eval-match process holds ~2 GB, so
+# on this 23 GB box the eval loop's RAM floor usually binds first.
+EVAL_PARALLEL="${EVAL_PARALLEL:-10}"
 # Games against the greedy yardstick. 12 was too few to read: across generations
 # 13-22 the margin swung between -1.0 and -11.0 with no real trend, which is
 # enough noise to fake both a rally and a collapse — it did, and both were
@@ -258,8 +259,10 @@ while true; do
   "$PYTHON" "$repo/python/minions_watchdog.py" --live "$LIVE" || true
 
   # Ungated by default (GATE=0), as AlphaZero: every generation goes straight
-  # into self-play; every MEASURE_EVERY-th plays the ladder and greedy in
-  # parallel, for tracking only. The gate cost ~18 of every ~51 minutes, and
+  # into self-play. Every MEASURE_EVERY-th ends in a tournament -- the new
+  # generations against each other and the last five champions, 10 games a
+  # pairing, in parallel -- and the run (self-play and the learner) resumes
+  # from the best-rated net, which becomes the champion. The gate cost ~18 of every ~51 minutes, and
   # its head-to-head and ladder verdicts disagreed three generations running.
   #
   # Auto-promotion was tried once before (gens 110-147) and blamed for 180
@@ -268,12 +271,12 @@ while true; do
   # numbers five hours before the gate came back -- so gating was never
   # actually tested. What guards the ungated run now: MAX_EXAMPLES holds three
   # generations, so a weak net's games are a third of the next training set
-  # rather than all of it, and a net that rates --tripwire-elo below the best
-  # fp16 net on two measurements running raises a WARNING.
+  # rather than all of it, and each tournament resumes the run from the best
+  # net it finds, so a bad stretch is undone every MEASURE_EVERY generations.
   #
   # GATE=1 restores the per-generation champion gate.
   if [[ "$GATE" == 0 ]]; then
-    echo "== cycle $gen: promote (ungated; rated every $MEASURE_EVERY) =="
+    echo "== cycle $gen: promote (ungated; tournament every $MEASURE_EVERY) =="
     EVAL_MODE=(--ungated --measure-every "$MEASURE_EVERY" --eval-parallel "$EVAL_PARALLEL")
   else
     echo "== cycle $gen: eval vs champion (gates promotion) =="

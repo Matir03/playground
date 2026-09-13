@@ -7,8 +7,9 @@ Two measurements, deliberately separate (the Hex run's structure):
   when that file exists, so this gate is also what keeps a losing net's games
   out of the replay buffer.
 * **ungated** (``--ungated``, the default in the cycle script) — no gate:
-  every generation goes into self-play, and every ``--measure-every``th plays
-  the ladder and greedy in parallel for tracking. See ``measure``.
+  every generation goes into self-play, and every ``--measure-every``th ends
+  in a tournament, after which the run resumes from the best-rated net. See
+  ``tournament``.
 * **absolute** — against the greedy heuristic in ``solver.rs``, the fixed
   yardstick that does not drift as the ladder climbs. Only run for nets that
   promoted, because it costs a full match and tells us nothing about a net that
@@ -25,9 +26,10 @@ import re
 import shutil
 import sys
 import importlib.util as _ilu
+import itertools
 import subprocess
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 from playground.model_server.minions_net import build_model, export_onnx_atomic
 
@@ -376,156 +378,181 @@ def promote_snapshot(ckpt, live, best):
     os.replace(best + ".tmp", best)
 
 
-def rungs(scores, exclude, n):
-    """The `n` newest rated nets, newest first: measured ungated generations,
-    and every champion of the gated era or crowned since. Unmeasured ungated
-    generations never played a rated game, so they cannot anchor anything."""
+def champions(scores, n):
+    """The `n` most recent champions, newest first: gated-era promotions and
+    nets crowned after a tournament. Ungated promotions are not champions --
+    every generation gets one."""
     out = []
     for r in reversed(scores.get("history", [])):
-        found = []
-        if r.get("measured") or (r.get("promoted") and not r.get("ungated")):
+        found = [r["crowned"]] if r.get("crowned") else []
+        if r.get("promoted") and not r.get("ungated"):
             found.append(r["gen"])
-        if r.get("crowned"):
-            found.append(r["crowned"])
         for g in found:
-            if g != exclude and g not in out:
+            if g not in out:
                 out.append(g)
         if len(out) >= n:
             break
     return out[:n]
 
 
-def wait_for_engines(snap_dir, first, timeout=300, settle=10.0):
-    """Block until the candidate's TensorRT engines exist and have stopped
-    changing, or until `first` -- the match building them -- is done.
+def mem_avail_gb():
+    for line in open("/proc/meminfo"):
+        if line.startswith("MemAvailable:"):
+            return int(line.split()[1]) / 1e6
+    return 0.0
 
-    Every match in a measurement loads the candidate, and its engine cache is
-    one directory with no locking. Matches started together would all build
-    the same engines and write the same files, and one could deserialize a
-    file another is halfway through writing. So the first match builds alone.
+
+def play_all(args, live, pairs, seed0):
+    """Play `pairs` of generations -- `(a, None)` is `a` against greedy -- as
+    parallel `eval-match` processes, `--tournament-games` each. Returns
+    `({pair: result}, seconds)`; failed pairings are left out.
+
+    A net's TensorRT engine cache is one directory with no locking, and a new
+    input shape means building its engines. So a net that has not finished a
+    match yet ("cold") is used by at most one process at a time; once one of
+    its matches finishes it is warm and any number may load it. `pairs` should
+    open with a matching (disjoint pairs) so the first wave builds as many
+    nets' engines at once as it can without sharing any.
+
+    At most `--eval-parallel` run at once, and a new one starts only while
+    MemAvailable exceeds `--eval-min-ram-gb` -- each process holds ~2 GB and
+    grows after launch -- except that one always may, so nothing stalls.
     """
-    cache = os.path.join(snap_dir, "trt_cache")
-    end = time.time() + timeout
-    while time.time() < end and not first.done():
-        engines = glob.glob(os.path.join(cache, "**", "*.engine"), recursive=True)
-        if len(engines) >= 3 and time.time() - max(map(os.path.getmtime, engines)) > settle:
-            return
-        time.sleep(2)
+    nets = {n for p in pairs for n in p if n is not None}
+    ckpt = {n: snapshot_ckpt(live, f"gen{n}") for n in nets}
+    for n in sorted(nets):
+        ensure_onnx(ckpt[n])                    # exports, serially
+    cv = threading.Condition()
+    warm, busy, results = set(), {}, {}
+    pending, state = list(pairs), {"running": 0}
+    t0 = time.time()
+
+    def members(p):
+        return [n for n in p if n is not None]
+
+    def eligible(p):
+        return all(n in warm or busy.get(n, 0) == 0 for n in members(p))
+
+    def play(p, seed):
+        a, b = p
+        try:
+            r = run_match_full(args.engine, ckpt[a], ckpt[b] if b is not None else None,
+                               args.tournament_games, args.sims, args.candidates,
+                               args.t_steps, args.backend, args.ep, args.fp16, seed=seed)
+        except Exception as exc:  # noqa: BLE001
+            r = exc
+        with cv:
+            for n in members(p):
+                busy[n] -= 1
+            state["running"] -= 1
+            if isinstance(r, Exception):
+                err = (getattr(r, "stderr", "") or "").strip()[-200:]
+                print(f"WARNING: gen{a} vs {f'gen{b}' if b is not None else 'greedy'} "
+                      f"failed: {str(r)[:120]} {err}", file=sys.stderr, flush=True)
+            else:
+                results[p] = r
+                warm.update(members(p))
+            cv.notify_all()
+
+    with cv:
+        while pending or state["running"]:
+            pick = None
+            room = state["running"] == 0 or mem_avail_gb() > args.eval_min_ram_gb
+            if state["running"] < max(1, args.eval_parallel) and room:
+                pick = next((p for p in pending if eligible(p)), None)
+            if pick is None:
+                cv.wait(timeout=5)
+                continue
+            pending.remove(pick)
+            for n in members(pick):
+                busy[n] = busy.get(n, 0) + 1
+            state["running"] += 1
+            threading.Thread(target=play, args=(pick, seed0 + pairs.index(pick)),
+                             daemon=True).start()
+            cv.wait(timeout=2)   # let it allocate before the next RAM check
+    return results, time.time() - t0
 
 
-def measure(args, live, scores, gen, ckpt, entry):
-    """Rate an ungated generation against the ladder, and check it on greedy.
+def resume_learner_from(ckpt, live):
+    """Point the learner at `ckpt`: its weights become `latest.safetensors`.
+    The generation counter lives in `<live>/config.json` and is untouched, so
+    numbering carries on and no snapshot is overwritten."""
+    latest = os.path.join(live, "latest.safetensors")
+    shutil.copyfile(ckpt, latest + ".tmp")
+    os.replace(latest + ".tmp", latest)
 
-    Tracking only: nothing here changes which net self-play runs on. The
-    opponents are the newest rated nets (`rungs`, so the last measurement five
-    generations back and the ones before it) plus the best fp16 net. Every
-    match uses `--ladder-games`, greedy included, so the candidate sees one
-    input shape and TensorRT builds one set of engines for it.
 
-    The matches run as parallel processes. Each is 20 games in lockstep --
-    batches far too small to occupy the GPU -- so several at once fill each
-    other's gaps. The first builds the candidate's engines alone
-    (`wait_for_engines`).
+def tournament(args, live, scores, best, gen, last, entry):
+    """The every-`--measure-every` eval, and the champion decision.
 
-    Flags, never acts: a net more than `--tripwire-elo` below the best fp16
-    net on two measurements running gets a WARNING naming the net to roll
-    back to.
+    Every generation since the last tournament plays every other one and each
+    of the last `--champions` champions, `--tournament-games` games a pairing,
+    all in parallel (`play_all`); greedy plays the newest net as a regression
+    check. Then the run resumes from the best-rated fp16 net in the whole
+    record (`ladder_top`) -- self-play *and* the learner -- and that net is
+    the champion the next tournament's generations play. User's rule,
+    2026-09-12: "resume from the best net after each tournament".
     """
     E = elo_mod()
-    matches = E.load_matches(os.path.join(live, "matches.jsonl"))
-    ratings = E.fit(matches)
-    opps = rungs(scores, gen, args.ladder_opponents)
-    top = ladder_top(ratings, E.games_played(matches), live, args.crown_min_games)
-    if top is not None and E.gen_number(top) not in opps + [gen]:
-        opps.append(E.gen_number(top))
-    opps = [o for o in opps if snapshot_ckpt(live, f"gen{o}")]
-    # Exports happen here, serially; nothing below writes a graph.
-    ensure_onnx(ckpt)
-    for o in opps:
-        ensure_onnx(snapshot_ckpt(live, f"gen{o}"))
-    games_dir = os.path.join(live, "games")
-    jobs = [("ladder", o, 50000 + gen * 16 + i,
-             os.path.join(games_dir, f"gen_{gen:04d}_vs_gen{o}.txt") if i == 0 else None)
-            for i, o in enumerate(opps)]
+    lo = last + 1 if last is not None else gen - args.measure_every + 1
+    new = [g for g in range(lo, gen + 1) if snapshot_ckpt(live, f"gen{g}")]
+    champs = [c for c in champions(scores, args.champions)
+              if c not in new and snapshot_ckpt(live, f"gen{c}")]
+    rest = list(itertools.combinations(new, 2)) + [(n, c) for n in new for c in champs]
+    first = list(zip(new, champs))                  # a matching: one process per net
+    pairs = first + [p for p in rest if p not in first]
     if args.greedy_games > 0:
-        jobs.append(("greedy", None, 1000 + gen,
-                     os.path.join(games_dir, f"gen_{gen:04d}_vs_greedy.txt")))
+        pairs.append((gen, None))
+    print(f"  tournament: gen{new[0]}-gen{new[-1]} x champions {champs}: {len(pairs)} "
+          f"matches of {args.tournament_games}, up to {args.eval_parallel} at once", flush=True)
+    results, secs = play_all(args, live, pairs, seed0=70000 + gen * 64)
+    entry["tournament"], entry["tournament_champs"] = new, champs
+    entry["eval_seconds"] = round(secs)
+    print(f"  tournament: {len(results)} of {len(pairs)} matches in {secs:.0f}s")
 
-    def play(job):
-        _, opp, seed, render = job
-        other = snapshot_ckpt(live, f"gen{opp}") if opp is not None else None
-        return run_match_full(args.engine, ckpt, other, args.ladder_games, args.sims,
-                              args.candidates, args.t_steps, args.backend, args.ep,
-                              args.fp16, seed=seed, render_file=render,
-                              render_games=args.render_games)
-
-    t0 = time.time()
-    results = {}
-    with ThreadPoolExecutor(max_workers=max(1, args.eval_parallel)) as ex:
-        futs = []
-        if jobs:
-            futs.append((jobs[0], ex.submit(play, jobs[0])))
-            wait_for_engines(os.path.dirname(ckpt), futs[0][1])
-            print(f"  measure: candidate engines ready after {time.time() - t0:.0f}s; "
-                  f"{len(jobs)} matches, {min(len(jobs), max(1, args.eval_parallel))} at a time")
-            futs += [(j, ex.submit(play, j)) for j in jobs[1:]]
-        for job, fut in futs:
-            try:
-                results[job] = fut.result()
-            except Exception as exc:  # noqa: BLE001
-                err = (getattr(exc, "stderr", "") or "").strip()[-300:]
-                print(f"WARNING: gen {gen}: {job[0]} match vs gen{job[1]} failed: "
-                      f"{str(exc)[:160]} {err}", file=sys.stderr)
-    entry["eval_seconds"] = round(time.time() - t0)
-    print(f"  measure: {len(results)} of {len(jobs)} matches in {entry['eval_seconds']}s")
-
-    rows, ladder = [], {}
-    for (kind, opp, _, _), r in results.items():
-        if kind == "ladder":
-            ladder[f"gen{opp}"] = r["score"]
-            rows.append({"a": f"gen{gen}", "b": f"gen{opp}", "games": args.ladder_games,
-                         "score_a": r["score"], "kind": "ladder"})
-            print(f"  ladder: gen{gen} vs gen{opp}: {r['score']:.3f} over {args.ladder_games}")
-        else:
+    rows = []
+    for (a, b), r in results.items():
+        if b is None:
             entry["vs_greedy"] = r["score"]
             if r["margin"] is not None:
                 entry["vs_greedy_margin"] = round(r["margin"], 3)
-            if r["game_score"] is not None:
-                entry["vs_greedy_score"] = round(r["game_score"], 2)
             if r["turns"] is not None:
                 entry["greedy_turns_win"], entry["greedy_turns_loss"] = r["turns"]
-            rows.append({"a": f"gen{gen}", "b": "greedy", "games": args.ladder_games,
+            rows.append({"a": f"gen{a}", "b": "greedy", "games": args.tournament_games,
                          "score_a": r["score"], "kind": "greedy"})
-    entry["ladder"] = ladder
+        else:
+            rows.append({"a": f"gen{a}", "b": f"gen{b}", "games": args.tournament_games,
+                         "score_a": r["score"], "kind": "tournament"})
     if not rows:
         return
     E.append(live, rows)
     matches = E.load_matches(os.path.join(live, "matches.jsonl"))
-    ratings = E.fit(matches)
-    E.write_ratings(live, ratings, E.games_played(matches), len(matches))
-    mine = ratings.get(f"gen{gen}")
-    if mine is None:
-        return
-    entry["elo"] = round(mine, 1)
-    entry["measured"] = True
-    top = ladder_top(ratings, E.games_played(matches), live, args.crown_min_games)
+    ratings, games = E.fit(matches), None
+    games = E.games_played(matches)
+    E.write_ratings(live, ratings, games, len(matches))
+    if f"gen{gen}" in ratings:
+        entry["elo"] = round(ratings[f"gen{gen}"], 1)
+    for g in sorted(new + champs, key=lambda g: -ratings.get(f"gen{g}", -1e9)):
+        if f"gen{g}" in ratings:
+            print(f"    gen{g} {ratings[f'gen{g}']:6.0f}  {'new' if g in new else 'champion'}")
+    top = ladder_top(ratings, games, live, args.crown_min_games)
     if top is None:
         return
-    deficit = ratings[top] - mine
-    entry["top_gen"], entry["elo_top"] = E.gen_number(top), round(ratings[top], 1)
-    entry["below_top"] = deficit > args.tripwire_elo
-    print(f"  rating: gen{gen} {mine:.0f}; best fp16 net {top} {ratings[top]:.0f} "
-          f"({-deficit:+.0f}) -> {'BELOW' if entry['below_top'] else 'ok'}")
-    prev = next((r for r in reversed(scores.get("history", [])) if r.get("measured")), None)
-    if entry["below_top"] and prev is not None and prev.get("below_top"):
-        print(f"WARNING: gen {gen} rates {deficit:.0f} below {top}: the second measurement "
-              f"running more than {args.tripwire_elo:.0f} under the best fp16 net. "
-              f"Consider rolling self-play back to {top}.")
+    top_gen = E.gen_number(top)
+    entry["crowned"], entry["elo_top"] = top_gen, round(ratings[top], 1)
+    print(f"  rating: tournament through gen{gen}: best fp16 net {top} {ratings[top]:.0f}"
+          f" -> resume from {top}")
+    if top_gen != gen:
+        ck = snapshot_ckpt(live, top)
+        promote_snapshot(ck, live, best)
+        resume_learner_from(ck, live)
+        entry["promoted"] = False
+    scores["best_gen"] = top_gen
 
 
 def ungated_step(args, live, scores, scores_path, best, snap, gen, ckpt):
-    """AlphaZero-style: every generation goes straight into self-play, and
-    every `--measure-every`th is rated for tracking."""
+    """Every generation goes straight into self-play; every `--measure-every`th
+    ends in a `tournament`, and the run resumes from the best net it finds."""
     entry = {"gen": gen, "promoted": True, "ungated": True}
     promote_snapshot(ckpt, live, best)
     scores["best_gen"] = gen
@@ -536,14 +563,14 @@ def ungated_step(args, live, scores, scores_path, best, snap, gen, ckpt):
     json.dump(scores, open(scores_path, "w"), indent=2)
     scores["history"].pop()
     if args.measure_every > 0:
-        last = max((r["gen"] for r in scores.get("history", []) if r.get("measured")),
+        last = max((r["gen"] for r in scores.get("history", []) if r.get("tournament")),
                    default=None)
         due = gen % args.measure_every == 0 if last is None else gen - last >= args.measure_every
         if due:
             try:
-                measure(args, live, scores, gen, ckpt, entry)
+                tournament(args, live, scores, best, gen, last, entry)
             except Exception as exc:  # noqa: BLE001
-                print(f"WARNING: gen {gen}: measurement failed: {exc}", file=sys.stderr)
+                print(f"WARNING: gen {gen}: tournament failed: {exc}", file=sys.stderr)
     metrics = os.path.join(snap, "metrics.json")
     if os.path.exists(metrics):
         keep = ("loss_", "energy_", "decl_", "score_")
@@ -667,13 +694,16 @@ def main():
                     help="promote every generation (AlphaZero-style) and only "
                          "measure every --measure-every generations.")
     ap.add_argument("--measure-every", type=int, default=5,
-                    help="ungated: rate every Nth generation on the ladder and "
-                         "greedy. 0 never measures.")
-    ap.add_argument("--eval-parallel", type=int, default=6,
-                    help="ungated: measurement matches run at once.")
-    ap.add_argument("--tripwire-elo", type=float, default=150.0,
-                    help="ungated: WARN when a measured net rates this far below "
-                         "the best fp16 net twice running.")
+                    help="ungated: a tournament every Nth generation, then resume "
+                         "from the best net. 0 never runs one.")
+    ap.add_argument("--tournament-games", type=int, default=10,
+                    help="ungated: games per tournament pairing.")
+    ap.add_argument("--champions", type=int, default=5,
+                    help="ungated: how many previous champions each new net plays.")
+    ap.add_argument("--eval-parallel", type=int, default=10,
+                    help="ungated: tournament matches run at once, at most.")
+    ap.add_argument("--eval-min-ram-gb", type=float, default=4.0,
+                    help="ungated: start another match only above this MemAvailable.")
     ap.add_argument("--crown-min-games", type=int, default=60,
                     help="rated games a net needs before it can become champion: "
                          "the 40-game gate plus at least one ladder match, so no "
