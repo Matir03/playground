@@ -26,7 +26,9 @@ BLOCKS="${BLOCKS:-8}"
 # eval was ~21% of wall clock (~30% on greedy generations) -- close to the 29%
 # that motivated dropping the gate in the first place. Tripling the generation
 # stretches self-play to ~40 min against a fixed eval cost, putting eval near 8%.
-TARGET_EXAMPLES="${TARGET_EXAMPLES:-250000}"
+#
+# 250000 -> 200000 (user, 2026-09-13), with the buffer at five generations.
+TARGET_EXAMPLES="${TARGET_EXAMPLES:-200000}"
 # Batch sizing, measured on the 7x7 net (ABBA pairs, quiet machine).
 #
 # The heads run at `MAX_BATCH * CANDIDATES` rows, but the *trunk* runs at
@@ -100,13 +102,11 @@ FORCED_VISITS="${FORCED_VISITS:-30}"
 # Non-explore candidates drawn at random to also get a quota, so trustworthy
 # value estimates are not confined to the injected set.
 FORCED_EXTRA="${FORCED_EXTRA:-4}"
-# Three generations. Ungated, a weak net's games go straight into the buffer,
-# and what dilutes them is the generations beside them -- at 250000 (exactly
-# one) the next net would train on nothing else. STEPS is unchanged, so each
-# example is still drawn about once over its life and training costs the same
-# per generation; each batch now mixes three nets' games.
-MAX_EXAMPLES="${MAX_EXAMPLES:-750000}"
-# One generation's worth of samples per generation: 488 * 512 ~= TARGET_EXAMPLES.
+# Five generations: one tournament round of the champion's own games, since
+# only the champion plays self-play between tournaments (SELFPLAY_NET).
+MAX_EXAMPLES="${MAX_EXAMPLES:-1000000}"
+# 488 * 512 = 250k samples per generation -- a quarter of the buffer -- so each
+# example is drawn about 1.25 times over its five-generation life.
 #
 # The learner samples uniformly *from the whole buffer*, not from the newest
 # generation, so what matters is `steps * batch / buffer_size` — the expected
@@ -123,7 +123,8 @@ STEPS="${STEPS:-488}"
 # pruner trims to at most MAX_EXAMPLES, so the buffer can settle just under
 # 250000 and a MIN_SAMPLES of exactly 250000 would wait for data no completed
 # generate phase will ever produce.
-MIN_SAMPLES="${MIN_SAMPLES:-200000}"
+# Must stay below TARGET_EXAMPLES.
+MIN_SAMPLES="${MIN_SAMPLES:-150000}"
 # 512 measured 1.30x the samples/s of 128 (paired ABBA on a cooled, idle GPU:
 # 1273 -> 1657). 1024 was 0.98x of 512, so this is the knee, not a ceiling.
 BATCH="${BATCH:-512}"
@@ -140,10 +141,12 @@ EVAL_LAG="${EVAL_LAG:-5}"
 # while the other losses sit at 0.5-3, so 1.0 would swamp them.
 TB_WEIGHT="${TB_WEIGHT:-0.3}"
 EVAL_GAMES="${EVAL_GAMES:-40}"
-# Promotion mode, see the eval step. 0: ungated, every generation goes into
-# self-play and every MEASURE_EVERY-th is rated. 1: the per-generation gate.
+# Promotion mode, see the eval step. 0: no gate, a tournament every
+# MEASURE_EVERY generations. 1: the per-generation gate.
 GATE="${GATE:-0}"
 MEASURE_EVERY="${MEASURE_EVERY:-5}"
+# Who plays self-play between tournaments: the champion, or each new generation.
+SELFPLAY_NET="${SELFPLAY_NET:-champion}"
 # Tournament matches at once, at most. Each eval-match process holds ~2 GB, so
 # on this 23 GB box the eval loop's RAM floor usually binds first.
 EVAL_PARALLEL="${EVAL_PARALLEL:-10}"
@@ -258,26 +261,23 @@ while true; do
   # <live>/watchdog.jsonl and warns, so the trend is on the record either way.
   "$PYTHON" "$repo/python/minions_watchdog.py" --live "$LIVE" || true
 
-  # Ungated by default (GATE=0), as AlphaZero: every generation goes straight
-  # into self-play. Every MEASURE_EVERY-th ends in a tournament -- the new
-  # generations against each other and the leaderboard's top five, 10 games a
-  # pairing, in parallel -- and the run (self-play and the learner) resumes
-  # from the best-rated net, which becomes the champion. The gate cost ~18 of every ~51 minutes, and
-  # its head-to-head and ladder verdicts disagreed three generations running.
+  # Default (GATE=0): no gate. Self-play runs on the champion alone, so the
+  # buffer (MAX_EXAMPLES, five generations) is the champion's own games. The
+  # learner trains one continuous run from the champion, and every generation
+  # is snapshotted as a candidate. Every MEASURE_EVERY-th generation ends in a
+  # tournament -- the candidates against each other and the leaderboard's top
+  # five, 10 games a pairing, in parallel -- and the best-rated fp16 net
+  # becomes the champion: self-play and the learner both restart from it.
+  # SELFPLAY_NET=newest puts each new generation into self-play instead
+  # (AlphaZero-style), as the run did from gen342 to gen361.
   #
-  # Auto-promotion was tried once before (gens 110-147) and blamed for 180
-  # straight losses to greedy, but a TB buffer and energy-target negatives
-  # landed in the same window, and their revert blamed *them* for the same
-  # numbers five hours before the gate came back -- so gating was never
-  # actually tested. What guards the ungated run now: MAX_EXAMPLES holds three
-  # generations, so a weak net's games are a third of the next training set
-  # rather than all of it, and each tournament resumes the run from the best
-  # net it finds, so a bad stretch is undone every MEASURE_EVERY generations.
-  #
-  # GATE=1 restores the per-generation champion gate.
+  # History: the per-generation gate cost ~24 of every ~51 minutes, and under
+  # ORT it never worked -- its champion seat loaded the candidate's own graphs
+  # (see minions_elo.self_match). GATE=1 restores it, now playing best/.
   if [[ "$GATE" == 0 ]]; then
-    echo "== cycle $gen: promote (ungated; tournament every $MEASURE_EVERY) =="
-    EVAL_MODE=(--ungated --measure-every "$MEASURE_EVERY" --eval-parallel "$EVAL_PARALLEL")
+    echo "== cycle $gen: eval (tournament every $MEASURE_EVERY; self-play on $SELFPLAY_NET) =="
+    EVAL_MODE=(--ungated --measure-every "$MEASURE_EVERY" --eval-parallel "$EVAL_PARALLEL"
+               --self-play-net "$SELFPLAY_NET")
   else
     echo "== cycle $gen: eval vs champion (gates promotion) =="
     EVAL_MODE=()

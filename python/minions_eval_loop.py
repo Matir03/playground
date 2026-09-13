@@ -6,10 +6,11 @@ Two measurements, deliberately separate (the Hex run's structure):
   above ``--promote-threshold``. The actor resolves its weights to ``best.*``
   when that file exists, so this gate is also what keeps a losing net's games
   out of the replay buffer.
-* **ungated** (``--ungated``, the default in the cycle script) — no gate:
-  every generation goes into self-play, and every ``--measure-every``th ends
-  in a tournament, after which the run resumes from the best-rated net. See
-  ``tournament``.
+* **ungated** (``--ungated``, the default in the cycle script) — no gate.
+  Self-play runs on the champion (``--self-play-net champion``) or on each new
+  generation (``newest``); every ``--measure-every``th generation ends in a
+  tournament, after which self-play and the learner restart from the
+  best-rated net. See ``tournament``.
 * **absolute** — against the greedy heuristic in ``solver.rs``, the fixed
   yardstick that does not drift as the ladder climbs. Only run for nets that
   promoted, because it costs a full match and tells us nothing about a net that
@@ -544,20 +545,30 @@ def tournament(args, live, scores, best, gen, last, entry):
     entry["crowned"], entry["elo_top"] = top_gen, round(ratings[top], 1)
     print(f"  rating: tournament through gen{gen}: best fp16 net {top} {ratings[top]:.0f}"
           f" -> resume from {top}")
+    ck = snapshot_ckpt(live, top)
+    # Always: under `--self-play-net champion` the newest generation never
+    # entered self-play, so even a win by `gen` itself has to be copied in.
+    promote_snapshot(ck, live, best)
     if top_gen != gen:
-        ck = snapshot_ckpt(live, top)
-        promote_snapshot(ck, live, best)
         resume_learner_from(ck, live)
-        entry["promoted"] = False
+    entry["promoted"] = top_gen == gen
     scores["best_gen"] = top_gen
 
 
 def ungated_step(args, live, scores, scores_path, best, snap, gen, ckpt):
-    """Every generation goes straight into self-play; every `--measure-every`th
-    ends in a `tournament`, and the run resumes from the best net it finds."""
-    entry = {"gen": gen, "promoted": True, "ungated": True}
-    promote_snapshot(ckpt, live, best)
-    scores["best_gen"] = gen
+    """Record a generation as a candidate; every `--measure-every`th ends in a
+    `tournament`, and the run restarts from the best net it finds.
+
+    `--self-play-net champion` (the user's choice, 2026-09-13): self-play stays
+    on the champion, so the buffer is the champion's own games, and the new
+    generation only waits for the tournament. `newest` puts each generation
+    straight into self-play, AlphaZero-style.
+    """
+    newest = args.self_play_net == "newest"
+    entry = {"gen": gen, "promoted": newest, "ungated": True}
+    if newest:
+        promote_snapshot(ckpt, live, best)
+        scores["best_gen"] = gen
     # Persisted before the slow measurement, as the gate does: a crash there
     # must not leave best.* advanced with scores.json naming the old net.
     scores["history"].append(entry)
@@ -698,6 +709,8 @@ def main():
     ap.add_argument("--measure-every", type=int, default=5,
                     help="ungated: a tournament every Nth generation, then resume "
                          "from the best net. 0 never runs one.")
+    ap.add_argument("--self-play-net", choices=("champion", "newest"), default="champion",
+                    help="ungated: which net plays self-play between tournaments.")
     ap.add_argument("--tournament-games", type=int, default=10,
                     help="ungated: games per tournament pairing.")
     ap.add_argument("--champions", type=int, default=5,
