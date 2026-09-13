@@ -38,11 +38,12 @@ enum Cmd {
         fp16: bool,
         #[arg(long, default_value_t = false)]
         cuda: bool,
-        /// Simulations per turn. A human is waiting, so this is well below the
-        /// 200 self-play uses.
-        #[arg(long, default_value_t = 64)]
+        /// Simulations per turn: the same 400 / 16 candidates the run's eval
+        /// and self-play use (user's choice, 2026-09-13), so the UI plays the
+        /// net at the strength its rating was measured at.
+        #[arg(long, default_value_t = 400)]
         sims: u32,
-        #[arg(long, default_value_t = 12)]
+        #[arg(long, default_value_t = 16)]
         candidates: usize,
         #[arg(long, default_value_t = 4)]
         t_steps: usize,
