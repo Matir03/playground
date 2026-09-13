@@ -179,6 +179,40 @@ pub struct ActorConfig {
     pub backend: crate::net::BackendKind,
 }
 
+impl ActorConfig {
+    /// The parameters of one search -- the only place a real search's
+    /// parameters are built. Self-play calls it for every turn; eval and the
+    /// UI call it with the config self-play recorded (see `search_config`), so
+    /// none of them can search differently by accident.
+    ///
+    /// `full` is playout-cap randomization: a full search produces a policy
+    /// target, a fast one only advances the game.
+    pub fn search_params(&self, sampler: &SamplerConfig, full: bool, seed: u64) -> SampledParams {
+        SampledParams {
+            simulations: if full { self.sims } else { self.fast_sims },
+            c_puct: self.c_puct,
+            k_candidates: sampler.k_for(full),
+            // Fast searches are not training data, so they get no forced
+            // exploration to correct for either.
+            k_forced: if full { self.k_forced } else { 0.0 },
+            // Fast searches produce no training data, so there is nothing to
+            // keep the support of — and no pruning to correct it either.
+            min_explore_visits: if full { self.min_explore_visits } else { 0.0 },
+            // Fast searches buy no forced exploration: they carry no policy
+            // target, and at 100 simulations the quotas would eat the budget.
+            forced_visits: if full { self.forced_visits } else { 0 },
+            forced_extra: self.forced_extra,
+            temp_moves: self.temp_moves,
+            pw_alpha: self.pw_alpha,
+            pw_beta: self.pw_beta,
+            pw_chunk: self.pw_chunk,
+            pw_resume: self.pw_resume,
+            kernel_sigma: self.kernel_sigma,
+            seed,
+        }
+    }
+}
+
 impl Default for ActorConfig {
     fn default() -> Self {
         Self {
@@ -413,28 +447,7 @@ fn drive_pool_worker(
                         rng: &mut rand_chacha::ChaCha8Rng|
      -> (Search<MinionsTurns>, bool) {
         let full = rng.gen_bool(cfg.full_search_prob);
-        let params = SampledParams {
-            simulations: if full { cfg.sims } else { cfg.fast_sims },
-            c_puct: cfg.c_puct,
-            k_candidates: model.cfg.k_for(full),
-            // Fast searches are not training data, so they get no forced
-            // exploration to correct for either.
-            k_forced: if full { cfg.k_forced } else { 0.0 },
-            // Fast searches produce no training data, so there is nothing to
-            // keep the support of — and no pruning to correct it either.
-            min_explore_visits: if full { cfg.min_explore_visits } else { 0.0 },
-            // Fast searches buy no forced exploration: they carry no policy
-            // target, and at 100 simulations the quotas would eat the budget.
-            forced_visits: if full { cfg.forced_visits } else { 0 },
-            forced_extra: cfg.forced_extra,
-            temp_moves: cfg.temp_moves,
-            pw_alpha: cfg.pw_alpha,
-            pw_beta: cfg.pw_beta,
-            pw_chunk: cfg.pw_chunk,
-            pw_resume: cfg.pw_resume,
-            kernel_sigma: cfg.kernel_sigma,
-            seed: seed ^ (turn as u64),
-        };
+        let params = cfg.search_params(&model.cfg, full, seed ^ (turn as u64));
         (Search::new(state.clone(), &params, turn), full)
     };
 
@@ -540,7 +553,7 @@ fn drive_pool_worker(
                     Step::Done => {
                         // The tree this cache described is gone.
                         cache_bytes = cache_bytes.saturating_sub(cache_drop(&mut slots[i]));
-                        if !advance_turn(&mut slots[i], cfg, &start_search, stats) {
+                        if !advance_turn(&mut slots[i], &start_search, stats) {
                             // Game over: bank it and refill the slot, so the
                             // batch never narrows while work remains.
                             out.extend(examples_from(
@@ -599,11 +612,10 @@ fn drive_pool_worker(
         // One `k` for the whole wave keeps the tensor shape fixed — the
         // constraint that killed an earlier overlap scheme, which set TensorRT
         // rebuilding an engine per shape and cost 97% of throughput.
-        let k_call = if cfg.pw_chunk > 0 {
-            cfg.pw_chunk.min(model.cfg.k_for(want_full).max(1))
-        } else {
-            model.cfg.k_for(want_full)
-        };
+        // Request sizes come from the same rule the single-game search uses
+        // (`chunk_k` / `expansion_k`), applied to this wave's kind of search.
+        let wave = cfg.search_params(&model.cfg, want_full, 0);
+        let k_call = playground_core::sampled_mcts::chunk_k(&wave);
         // Two calls, split by what each request actually needs. Both are padded
         // to `max_batch`, so both keep a fixed tensor shape and TensorRT builds
         // one engine apiece.
@@ -631,7 +643,7 @@ fn drive_pool_worker(
             while st.len() < w {
                 st.push(st[n - 1].clone());
             }
-            let exp_k = if cfg.pw_chunk > 0 { 0 } else { model.cfg.k_for(want_full) };
+            let exp_k = playground_core::sampled_mcts::expansion_k(&wave);
             let cached = if use_cache { cache_lookup(&*slots, &ids, &keys, &exp_idx) } else { Vec::new() };
             stats.cache_hits += cached.iter().filter(|c| c.is_some()).count() as u64;
             let (r, fresh) = model.expand_batch_cached(
@@ -987,24 +999,7 @@ pub fn new_pool(model: &MinionsModel, cfg: &ActorConfig, n: usize, seed: u64) ->
             let (state, opening) =
                 random_opening(cfg.random_opening_max, cfg.random_opening_decay, &mut rng);
             let full = rng.gen_bool(cfg.full_search_prob);
-            let params = SampledParams {
-                simulations: if full { cfg.sims } else { cfg.fast_sims },
-                c_puct: cfg.c_puct,
-                k_candidates: model.cfg.k_for(full),
-                k_forced: if full { cfg.k_forced } else { 0.0 },
-                min_explore_visits: if full { cfg.min_explore_visits } else { 0.0 },
-            // Fast searches buy no forced exploration: they carry no policy
-            // target, and at 100 simulations the quotas would eat the budget.
-            forced_visits: if full { cfg.forced_visits } else { 0 },
-            forced_extra: cfg.forced_extra,
-                temp_moves: cfg.temp_moves,
-                pw_alpha: cfg.pw_alpha,
-            pw_beta: cfg.pw_beta,
-            pw_chunk: cfg.pw_chunk,
-            pw_resume: cfg.pw_resume,
-            kernel_sigma: cfg.kernel_sigma,
-                seed: seed ^ i as u64,
-            };
+            let params = cfg.search_params(&model.cfg, full, seed ^ i as u64);
             let search = Search::new(state.clone(), &params, opening);
             // `turn` starts at the opening length: it drives the temperature
             // schedule, and an opening already spent those plies of exploration.
@@ -1031,7 +1026,6 @@ type StartSearch<'a> =
 /// the next search. Returns false when the game is over.
 fn advance_turn(
     slot: &mut Slot,
-    cfg: &ActorConfig,
     start_search: StartSearch,
     stats: &mut PoolStats,
 ) -> bool {
@@ -1039,6 +1033,9 @@ fn advance_turn(
         &mut slot.search,
         Search::new(slot.state.clone(), &SampledParams { simulations: 0, ..Default::default() }, 0),
     );
+    // Taken from the search itself, so the target can only ever subtract the
+    // floor this search actually ran with.
+    let ran_with = *finished.params();
     let result = finished.finish();
     if result.candidates.is_empty() {
         return false;
@@ -1050,13 +1047,7 @@ fn advance_turn(
         // Subtract the floor this search actually granted, not a default one:
         // selection and pruning must agree exactly, or forced visits survive into
         // the target as if they were search's own judgement.
-        let target = result.policy_target_with(&SampledParams {
-            k_forced: cfg.k_forced,
-            min_explore_visits: cfg.min_explore_visits,
-            forced_visits: cfg.forced_visits,
-            forced_extra: cfg.forced_extra,
-            ..Default::default()
-        });
+        let target = result.policy_target_with(&ran_with);
         let scored = policy_record(
             result.candidates.iter().map(|(spec, _)| *spec).zip(target.iter().copied()),
         );
@@ -1377,6 +1368,10 @@ pub fn run_loop(
             cfg.sims, sampler.k_candidates, per_candidate, need
         );
     }
+
+    // Record the search this run uses, so eval and the UI run the same one.
+    // Rewritten on every start, before any game is played.
+    crate::search_config::save(&live.join(crate::search_config::FILE), &cfg, &sampler)?;
 
     println!("waiting for {} …", weights.display());
     while !weights.exists() && !best.exists() {

@@ -39,7 +39,8 @@ static PLAN: Mutex<Option<Plan>> = Mutex::new(None);
 pub struct NetSeatConfig {
     pub dir: PathBuf,
     pub kind: crate::net::BackendKind,
-    pub sims: u32,
+    /// Self-play's recorded search settings (see `search_config`).
+    pub actor: crate::selfplay::ActorConfig,
     pub sampler: SamplerConfig,
 }
 
@@ -98,20 +99,20 @@ fn plan_turn(state: &MinionsState, budget: &SolverBudget) -> anyhow::Result<Sear
     }
     let model = guard.as_ref().expect("model built above");
 
-    let mut params = playground_core::sampled_mcts::SampledParams {
-        k_candidates: cfg.sampler.k_candidates,
-        // Play the argmax, never a temperature sample.
-        //
+    // Self-play's full search, from the settings self-play recorded, with one
+    // deliberate difference: play the argmax, never a temperature sample.
+    //
         // `temp_moves` defaults to 8, so in self-play the first eight plies pick
         // a visit-proportional candidate to explore. Against a human that is
         // just weak play — and because forced exploration puts a *null* turn in
         // the candidate set, sampling could hand back a turn that does nothing
-        // at all. That is exactly what "the net passes on turn 1" was.
+    // at all. That is exactly what "the net passes on turn 1" was.
+    let mut params = playground_core::sampled_mcts::SampledParams {
         temp_moves: 0,
-        ..Default::default()
+        ..cfg.actor.search_params(&cfg.sampler, true, 0)
     };
     // A human is waiting, so honour whatever budget the UI asked for.
-    params.simulations = budget.max_visits.unwrap_or(cfg.sims);
+    params.simulations = budget.max_visits.unwrap_or(cfg.actor.sims);
 
     let result = search::<MinionsTurns, _>(&**model, state.clone(), &params, Minions::ply(state))?;
     // Belt and braces: with `temp_moves: 0` the search already returns the
@@ -214,7 +215,7 @@ mod tests {
         configure(NetSeatConfig {
             dir: dir.into(),
             kind: crate::net::BackendKind::Ort { ep: "trt".into(), fp16: true },
-            sims: 64,
+            actor: crate::selfplay::ActorConfig { sims: 64, ..Default::default() },
             sampler: SamplerConfig { k_candidates: 12, t_steps: 4, ..Default::default() },
         });
         let budget = SolverBudget { max_millis: None, max_visits: None };
@@ -261,7 +262,7 @@ mod tests {
         configure(NetSeatConfig {
             dir: dir.into(),
             kind: crate::net::BackendKind::Ort { ep: "trt".into(), fp16: true },
-            sims: 64,
+            actor: crate::selfplay::ActorConfig { sims: 64, ..Default::default() },
             sampler: SamplerConfig { k_candidates: 12, t_steps: 4, ..Default::default() },
         });
         let budget = SolverBudget { max_millis: None, max_visits: None };
@@ -304,7 +305,7 @@ mod tests {
         configure(NetSeatConfig {
             dir: dir.into(),
             kind: crate::net::BackendKind::Ort { ep: "cuda".into(), fp16: false },
-            sims: 16,
+            actor: crate::selfplay::ActorConfig { sims: 16, ..Default::default() },
             sampler: SamplerConfig { k_candidates: 8, t_steps: 2, ..Default::default() },
         });
 
@@ -583,17 +584,20 @@ fn analyze_inner(
         });
     }
 
+    // Self-play's full search (see `search_config`). A request may change only
+    // the budget, the candidate count and the kernel.
+    let base = cfg.actor.search_params(&cfg.sampler, true, 0);
     let mut params = playground_core::sampled_mcts::SampledParams {
-        k_candidates: candidates.unwrap_or(cfg.sampler.k_candidates),
+        k_candidates: candidates.unwrap_or(base.k_candidates),
         // Analysis reports what the search believes, so it must not sample a
         // move for variety the way early self-play plies do.
         temp_moves: 0,
-        // 0 keeps this identical to the search self-play and eval run. Above 0
-        // the kernel is live and every node exports its matrix.
+        // 0 is what self-play runs. Above 0 the kernel is live and every node
+        // exports its matrix.
         kernel_sigma,
-        ..Default::default()
+        ..base
     };
-    params.simulations = budget.max_visits.unwrap_or(cfg.sims);
+    params.simulations = budget.max_visits.unwrap_or(cfg.actor.sims);
 
     let (result, tree) = playground_core::sampled_mcts::search_analyzed::<MinionsTurns, _>(
         &**model,
@@ -645,6 +649,7 @@ fn analyze_inner(
                         child: e.child,
                         explore: e.explore,
                         forced: e.forced,
+                        draws: e.draws,
                     })
                     .collect(),
                 kernel: n.kernel.clone(),

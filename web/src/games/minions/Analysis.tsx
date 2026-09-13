@@ -30,8 +30,8 @@ function valueColor(v: number): string {
 const chosenVisits = (e: AnalyzeEdge) => e.visits - e.forced;
 
 /** One column template for the header and every row, so they cannot drift:
- *  expand, visits, forced, prior, energy, value, turn, play. */
-const COLUMNS = "1.1rem 3rem 2.8rem 3.9rem 3.6rem 3.6rem 1fr 1.3rem";
+ *  expand, visits, forced, draws, prior, energy, value, turn, play. */
+const COLUMNS = "1.1rem 3rem 2.8rem 2.8rem 3.9rem 3.6rem 3.6rem 1fr 1.3rem";
 
 function sameLine(a: Uint8Array[], b: Uint8Array[]): boolean {
   return (
@@ -151,6 +151,16 @@ function EdgeRow({
         style={{ color: edge.forced > 0 ? "#8a7fb0" : "#555" }}
       >
         {edge.forced > 0 ? edge.forced : "·"}
+      </span>
+
+      {/* Sampler draws that landed on this turn. A node holding fewer
+          candidates than it asked for is one whose draws kept repeating, and
+          this is where that shows. */}
+      <span
+        title={`${edge.draws} sampler draw${edge.draws === 1 ? "" : "s"} produced this turn`}
+        style={{ color: edge.draws > 1 ? "#b08030" : "#555" }}
+      >
+        {edge.draws}
       </span>
 
       <span title="prior probability from the energy head" style={{ color: "#9ab" }}>
@@ -310,6 +320,7 @@ export function AnalysisTree({
         <span />
         <span title="visits PUCT chose">visits</span>
         <span title="visits an exploration floor forced">forced</span>
+        <span title="sampler draws that produced this turn">draws</span>
         <span>prior</span>
         <span>energy</span>
         <span>value</span>

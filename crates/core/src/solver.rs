@@ -96,6 +96,8 @@ pub struct AnalysisEdge {
     pub child: Option<usize>,
     pub explore: bool,
     pub forced: u32,
+    /// Sampler draws merged into this candidate (1 = drawn once).
+    pub draws: u32,
 }
 
 pub struct AnalysisNode {

@@ -214,6 +214,11 @@ message AnalyzeEdge {
   uint32 forced = 8;
   // Human-readable rendering of the whole turn, for the tree view.
   string label = 9;
+  // Sampler draws that produced this candidate: 1 for the draw that created
+  // it, plus every later draw that reached the same position and merged into
+  // it. A node holding fewer candidates than it asked for is one whose draws
+  // kept repeating, and this is where that shows.
+  uint32 draws = 10;
 }
 
 // What the auxiliary heads see. Probabilities, not logits: the sigmoid is

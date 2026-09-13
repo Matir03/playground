@@ -20,6 +20,7 @@ pub mod net;
 pub mod net_seat;
 pub mod ort_net;
 pub mod sampler;
+pub mod search_config;
 pub mod selfplay;
 pub mod solver;
 pub mod turn;

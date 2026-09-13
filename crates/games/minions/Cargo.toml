@@ -27,6 +27,7 @@ tracing-subscriber.workspace = true
 async-trait.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 
 # In-process NN inference, as for hex/amazons: the gRPC model server is ~40x

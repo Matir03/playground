@@ -38,15 +38,12 @@ enum Cmd {
         fp16: bool,
         #[arg(long, default_value_t = false)]
         cuda: bool,
-        /// Simulations per turn: the same 400 / 16 candidates the run's eval
-        /// and self-play use (user's choice, 2026-09-13), so the UI plays the
-        /// net at the strength its rating was measured at.
-        #[arg(long, default_value_t = 400)]
-        sims: u32,
-        #[arg(long, default_value_t = 16)]
-        candidates: usize,
-        #[arg(long, default_value_t = 4)]
-        t_steps: usize,
+        /// Self-play's recorded search (`search.json` in the live dir, written
+        /// by `selfplay-loop`). The net seat and the analyser run exactly this
+        /// search, so the UI shows what self-play does. Required with
+        /// `--net-dir`.
+        #[arg(long)]
+        search_config: Option<String>,
     },
     SelfPlay {
         #[arg(long, default_value = "127.0.0.1:7105")]
@@ -175,6 +172,11 @@ enum Cmd {
         /// alongside expansions because it is the same shape.
         #[arg(long, default_value_t = 1)]
         pw_chunk: usize,
+        /// Write `search.json` for these settings into `--live` and exit
+        /// without playing. Every run writes it on start anyway; this records
+        /// the search without starting self-play, for eval and the UI.
+        #[arg(long)]
+        write_search_config: bool,
         /// Score candidates with the energy head (off = uniform priors).
         #[arg(long)]
         no_energy: bool,
@@ -200,12 +202,11 @@ enum Cmd {
         b: Option<String>,
         #[arg(long, default_value_t = 20)]
         games: u32,
-        #[arg(long, default_value_t = 100)]
-        sims: u32,
-        #[arg(long, default_value_t = 16)]
-        candidates: usize,
-        #[arg(long, default_value_t = 6)]
-        t_steps: usize,
+        /// Self-play's recorded search (`search.json` in the live dir). A match
+        /// runs exactly the search self-play runs, so there is no second set
+        /// of search settings to drift.
+        #[arg(long)]
+        search_config: String,
         #[arg(long, default_value = "candle")]
         backend: String,
         #[arg(long, default_value = "trt")]
@@ -216,9 +217,10 @@ enum Cmd {
         cuda: bool,
         #[arg(long, default_value_t = 0)]
         seed: u64,
-        /// KR-PUCT kernel bandwidth for seat A. 0 = today's flat PUCT search.
-        #[arg(long, default_value_t = 0.0)]
-        kernel_sigma: f32,
+        /// KR-PUCT kernel bandwidth for seat A. Defaults to the recorded
+        /// search's (0 = flat PUCT, which is what self-play runs).
+        #[arg(long)]
+        kernel_sigma: Option<f32>,
         /// Kernel bandwidth for seat B; defaults to A's, so both seats search
         /// the same way unless you ask for the flat-vs-KR comparison.
         #[arg(long)]
@@ -297,12 +299,9 @@ enum Cmd {
     NetGame {
         #[arg(long)]
         live: String,
-        #[arg(long, default_value_t = 100)]
-        sims: u32,
-        #[arg(long, default_value_t = 32)]
-        candidates: usize,
-        #[arg(long, default_value_t = 6)]
-        t_steps: usize,
+        /// Self-play's recorded search (`search.json` in the live dir).
+        #[arg(long)]
+        search_config: String,
         #[arg(long, default_value_t = String::from("candle"))]
         backend: String,
         #[arg(long, default_value_t = String::from("trt"))]
@@ -355,21 +354,29 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Serve { addr, model_uri, net_dir, backend, ep, fp16, cuda, sims, candidates, t_steps } => {
+        Cmd::Serve { addr, model_uri, net_dir, backend, ep, fp16, cuda, search_config } => {
             if let Some(dir) = net_dir {
+                let path = search_config.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--net-dir needs --search-config (the live dir's search.json), so the \
+                         seat searches exactly as self-play does"
+                    )
+                })?;
+                let (actor, sampler) =
+                    minions_engine::search_config::load(std::path::Path::new(&path))?;
                 let kind = minions_engine::net::BackendKind::parse(&backend, &ep, fp16, cuda)?;
-                let sampler = minions_engine::sampler::SamplerConfig {
-                    k_candidates: candidates,
-                    t_steps,
-                    ..Default::default()
-                };
+                eprintln!(
+                    "net seat: {dir} ({backend}/{ep}); search from {path}: {} sims, K={}, T={}, \
+                     random {:.2}, forced {}",
+                    actor.sims, sampler.k_candidates, sampler.t_steps, sampler.random_fraction,
+                    actor.forced_visits
+                );
                 minions_engine::net_seat::configure(minions_engine::net_seat::NetSeatConfig {
                     dir: std::path::PathBuf::from(&dir),
                     kind,
-                    sims,
+                    actor,
                     sampler,
                 });
-                eprintln!("net seat: {dir} ({backend}/{ep}, {sims} sims, K={candidates}, T={t_steps})");
             } else {
                 eprintln!("net seat: not configured (pass --net-dir to enable it)");
             }
@@ -388,7 +395,7 @@ async fn main() -> anyhow::Result<()> {
             candidates, candidates_fast, t_steps, t_steps_fast, random_fraction,
             random_opening_max, random_opening_decay, min_explore_visits,
             forced_visits, forced_extra, workers, no_energy,
-            kernel_sigma, pw_chunk,
+            kernel_sigma, pw_chunk, write_search_config,
             chunk_secs, max_examples,
             max_chunks, target_examples, seed,
         } => {
@@ -409,49 +416,46 @@ async fn main() -> anyhow::Result<()> {
                 seed,
                 ..Default::default()
             };
+            if write_search_config {
+                std::fs::create_dir_all(&live)?;
+                let path = std::path::Path::new(&live).join(minions_engine::search_config::FILE);
+                minions_engine::search_config::save(&path, &actor, &sampler)?;
+                println!("wrote {}", path.display());
+                return Ok(());
+            }
             minions_engine::selfplay::run_loop(
                 &live, actor, sampler, concurrency, max_batch, chunk_secs,
                 max_examples, max_chunks, target_examples, seed,
             )?
         }
         Cmd::EvalMatch {
-            a, b, games, sims, candidates, t_steps, backend, ep, fp16, cuda, seed,
+            a, b, games, search_config, backend, ep, fp16, cuda, seed,
             kernel_sigma, kernel_sigma_b, render_file, render_games,
         } => {
             use minions_engine::eval::{load_seat, run_match, Seat};
-            let sampler = minions_engine::sampler::SamplerConfig {
-                t_steps,
-                // Eval always samples at full quality — there are no fast
-                // searches to economise on, and strength is what we are
-                // measuring.
-                t_steps_fast: t_steps,
-                k_candidates: candidates,
-                k_candidates_fast: candidates,
-                // No random injection and no temperature at eval: we are
-                // measuring strength, not gathering diverse data.
-                random_fraction: 0.0,
-                // Every game advances together, so the live count falls as games
-                // finish. Padding to the full match width keeps one tensor shape
-                // for the whole match instead of letting TensorRT rebuild an
-                // engine each time a game ends.
-                pad_to: games as usize,
-                seed,
-                ..Default::default()
-            };
+            let (actor, mut sampler) =
+                minions_engine::search_config::load(std::path::Path::new(&search_config))?;
+            // Every game advances together, so the live count falls as games
+            // finish. Padding to the full match width keeps one tensor shape
+            // for the whole match instead of letting TensorRT rebuild an
+            // engine each time a game ends.
+            sampler.pad_to = games as usize;
+            sampler.seed = seed;
             let kind = minions_engine::net::BackendKind::parse(&backend, &ep, fp16, cuda)?;
             let sa = load_seat(std::path::Path::new(&a), &kind, sampler)?;
             let sb = match &b {
                 Some(p) => load_seat(std::path::Path::new(p), &kind, sampler)?,
                 None => Seat::Greedy,
             };
+            // Self-play's full search, exactly. The one difference is the move
+            // taken from it: the most-visited turn, never a temperature sample,
+            // because a match measures strength rather than gathering variety.
             let params = playground_core::sampled_mcts::SampledParams {
-                simulations: sims,
-                k_candidates: candidates,
                 temp_moves: 0,
-                seed,
-                ..Default::default()
+                ..actor.search_params(&sampler, true, seed)
             };
-            let sigma = (kernel_sigma, kernel_sigma_b.unwrap_or(kernel_sigma));
+            let sigma_a = kernel_sigma.unwrap_or(actor.kernel_sigma);
+            let sigma = (sigma_a, kernel_sigma_b.unwrap_or(sigma_a));
             let rf = render_file.as_ref().map(std::path::PathBuf::from);
             let render = rf.as_deref().map(|p| (p, render_games));
             let (score, w, l, d, margin, game_score) =
@@ -477,21 +481,14 @@ async fn main() -> anyhow::Result<()> {
             soak::run(threads, secs, !no_verify, !no_oracle, seed, &out)?
         }
         Cmd::NetGame {
-            live, sims, candidates, t_steps, backend, ep, fp16, cuda, seed, opponent, games,
+            live, search_config, backend, ep, fp16, cuda, seed, opponent, games,
         } => {
             use minions_engine::eval::{load_seat, Seat};
             use playground_core::sampled_mcts::{search, SampledParams};
             use playground_core::Game;
-            let sampler = minions_engine::sampler::SamplerConfig {
-                t_steps,
-                t_steps_fast: t_steps,
-                k_candidates: candidates,
-                // Show the policy as it actually plays: no random injection, no
-                // opening temperature.
-                random_fraction: 0.0,
-                seed,
-                ..Default::default()
-            };
+            let (actor, mut sampler) =
+                minions_engine::search_config::load(std::path::Path::new(&search_config))?;
+            sampler.seed = seed;
             let kind = minions_engine::net::BackendKind::parse(&backend, &ep, fp16, cuda)?;
             let seat = load_seat(std::path::Path::new(&live), &kind, sampler)?;
             // Second seat: the net again, or the heuristic. Yellow is the net.
@@ -500,13 +497,8 @@ async fn main() -> anyhow::Result<()> {
                 "net" => load_seat(std::path::Path::new(&live), &kind, sampler)?,
                 path => load_seat(std::path::Path::new(path), &kind, sampler)?,
             };
-            let params = SampledParams {
-                simulations: sims,
-                k_candidates: candidates,
-                temp_moves: 0,
-                seed,
-                ..Default::default()
-            };
+            // Self-play's full search, playing its most-visited turn.
+            let params = SampledParams { temp_moves: 0, ..actor.search_params(&sampler, true, seed) };
             for g in 0..games.max(1) {
             // Alternate colours between games. Minions is not symmetric — the
             // second player is paid START_MONEY_SECOND — so watching one seat

@@ -265,6 +265,7 @@ where
                             child: e.child.map(|c| c as u32),
                             explore: e.explore,
                             forced: e.forced,
+                            draws: e.draws,
                         })
                         .collect(),
                     kernel: n.kernel.clone(),
