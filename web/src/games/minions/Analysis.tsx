@@ -24,9 +24,19 @@ function valueColor(v: number): string {
     : `rgb(${Math.round(196 + 40 * t)},${Math.round(112 + 60 * t)},${Math.round(112 + 60 * t)})`;
 }
 
+/** Visits PUCT chose. `visits` counts every visit, including the ones a floor
+ *  forced; those buy a value estimate and are excluded from the policy target,
+ *  so they are shown in their own column rather than folded in here. */
+const chosenVisits = (e: AnalyzeEdge) => e.visits - e.forced;
+
+/** One column template for the header and every row, so they cannot drift:
+ *  expand, visits, forced, prior, energy, value, turn, play. */
+const COLUMNS = "1.1rem 3rem 2.8rem 3.9rem 3.6rem 3.6rem 1fr 1.3rem";
+
 function sortEdges(edges: AnalyzeEdge[], key: SortKey): AnalyzeEdge[] {
   const e = [...edges];
-  if (key === "visits") e.sort((a, b) => b.visits - a.visits || b.prior - a.prior);
+  if (key === "visits")
+    e.sort((a, b) => chosenVisits(b) - chosenVisits(a) || b.forced - a.forced || b.prior - a.prior);
   else if (key === "prior") e.sort((a, b) => b.prior - a.prior);
   else
     e.sort((a, b) => {
@@ -75,13 +85,16 @@ function EdgeRow({
   onCommit?: () => void;
   path: string;
 }) {
-  const share = node.totalVisits > 0 ? edge.visits / node.totalVisits : 0;
+  // The bar is the share of the visits PUCT chose, which is the policy
+  // target's shape; forced visits would flatten it toward the floor.
+  const chosenTotal = node.edges.reduce((s, e) => s + chosenVisits(e), 0);
+  const share = chosenTotal > 0 ? chosenVisits(edge) / chosenTotal : 0;
   const hasChild = edge.child !== undefined;
   return (
     <div
       style={{
         display: "grid",
-        gridTemplateColumns: "1.1rem 1.3rem 3.4rem 3.9rem 3.6rem 3.6rem 1fr",
+        gridTemplateColumns: COLUMNS,
         gap: "0.35rem",
         alignItems: "center",
         padding: "0.12rem 0.25rem",
@@ -101,35 +114,17 @@ function EdgeRow({
         {hasChild ? (expanded ? "▾" : "▸") : "·"}
       </span>
 
-      {/* Commit the turn to the real game and re-root the analysis here.
-          Only offered at the root: a deeper turn is legal in the variation but
-          not in the position the game is actually in, so playing it would need
-          every turn above it played first — which is what walking the line and
-          playing from there already does, one step at a time. */}
-      {onCommit ? (
-        <span
-          onClick={(e) => {
-            e.stopPropagation();
-            onCommit();
-          }}
-          title="play this turn on the board and re-analyse from there"
-          style={{ cursor: "pointer", color: "#6a9", userSelect: "none" }}
-        >
-          ▶
-        </span>
-      ) : (
-        <span />
-      )}
+      <span title="visits PUCT chose — forced visits excluded; the bar is this edge's share of them">
+        {chosenVisits(edge)}
+      </span>
 
-      <span title="visits, and share of this node's total">
-        {edge.visits}
-        {edge.forced > 0 && (
-          // Visits a floor demanded rather than PUCT choosing. Worth showing:
-          // an edge whose visits are all forced was never actually preferred.
-          <span style={{ color: "#8a7fb0" }} title={`${edge.forced} forced`}>
-            {" "}f{edge.forced}
-          </span>
-        )}
+      {/* Visits a floor demanded rather than PUCT choosing. Worth its own
+          column: an edge whose visits are all forced was never preferred. */}
+      <span
+        title={edge.forced > 0 ? `${edge.forced} visits forced by an exploration floor` : "no forced visits"}
+        style={{ color: edge.forced > 0 ? "#8a7fb0" : "#555" }}
+      >
+        {edge.forced > 0 ? edge.forced : "·"}
       </span>
 
       <span title="prior probability from the energy head" style={{ color: "#9ab" }}>
@@ -169,6 +164,26 @@ function EdgeRow({
         )}
         {edge.label || "pass"}
       </span>
+
+      {/* Commit the turn to the real game and re-root the analysis here.
+          Only offered at the root: a deeper turn is legal in the variation but
+          not in the position the game is actually in, so playing it would need
+          every turn above it played first — which is what walking the line and
+          playing from there already does, one step at a time. */}
+      {onCommit ? (
+        <span
+          onClick={(e) => {
+            e.stopPropagation();
+            onCommit();
+          }}
+          title="play this turn on the board and re-analyse from there"
+          style={{ cursor: "pointer", color: "#6a9", userSelect: "none", textAlign: "right" }}
+        >
+          ▶
+        </span>
+      ) : (
+        <span />
+      )}
     </div>
   );
 }
@@ -208,8 +223,10 @@ export function AnalysisTree({
     // generated, and listing the unvisited ones would bury the searched line in
     // dozens of rows the search never considered — they stay reachable by
     // switching the sort to prior.
+    // An edge visited only by a forced floor counts as looked at: it has a
+    // value estimate, and hiding it would hide what the floor bought.
     const shown = sortEdges(node.edges, sort).filter(
-      (e) => sort === "prior" || e.visits > 0 || depth === 0,
+      (e) => sort === "prior" || e.visits > 0 || e.forced > 0 || depth === 0,
     );
     // Per node, not per tree: each node's candidate set has its own arbitrary
     // offset, so a shift shared across depths would compare incomparable scales.
@@ -251,7 +268,7 @@ export function AnalysisTree({
       <div
         style={{
           display: "grid",
-          gridTemplateColumns: "1.1rem 1.3rem 3.4rem 3.9rem 3.6rem 3.6rem 1fr",
+          gridTemplateColumns: COLUMNS,
           gap: "0.35rem",
           padding: "0.15rem 0.25rem 0.15rem 0.25rem",
           fontSize: "0.7rem",
@@ -262,12 +279,13 @@ export function AnalysisTree({
         }}
       >
         <span />
-        <span />
-        <span>visits</span>
+        <span title="visits PUCT chose">visits</span>
+        <span title="visits an exploration floor forced">forced</span>
         <span>prior</span>
         <span>energy</span>
         <span>value</span>
         <span>turn</span>
+        <span title="play a root turn on the board">play</span>
       </div>
       <div style={{ maxHeight: "26rem", overflowY: "auto" }}>{rows}</div>
       {rows.length === 0 && (
