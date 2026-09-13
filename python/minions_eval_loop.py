@@ -138,7 +138,14 @@ def past_champions(scores, exclude, n):
     match is already logged and better resolved than a ladder match would be, so
     spending games on it again buys nothing.
     """
-    promoted = [r["gen"] for r in scores.get("history", []) if r.get("promoted")]
+    promoted = []
+    for r in scores.get("history", []):
+        # A crowned net became champion at that entry too, without being its
+        # candidate -- see `crown_ladder_top`.
+        if r.get("promoted"):
+            promoted.append(r["gen"])
+        if r.get("crowned"):
+            promoted.append(r["crowned"])
     out = []
     for g in reversed(promoted):
         if g == exclude or g in out:
@@ -192,7 +199,7 @@ def run_ladder_matches(args, live, scores, gen, ckpt, exclude):
 
 def rate_gate(args, live, gen, champion_gen, rows):
     """Second gate: log `rows`, refit every rating, and require the candidate to
-    out-rate the champion.
+    top the ladder -- out-rating the champion is necessary, not sufficient.
 
     Only reached by a candidate that already beat the champion head to head, so
     this costs no games that were not being played anyway -- the ladder used to
@@ -217,10 +224,92 @@ def rate_gate(args, live, gen, champion_gen, rows):
         print(f"gen {gen}: rating gate could not place both nets; "
               f"falling back to the pairwise result", file=sys.stderr)
         return True, ratings, matches
-    ok = mine > theirs + args.promote_elo_margin
+    # The champion need not be the ladder's best (gen339 reigned at 5016 while
+    # gen338 rated 5050), so beating it is not enough. An older net that tops
+    # the ladder instead is crowned by `crown_ladder_top` once the record for
+    # this generation is final.
+    top = ladder_top(ratings, E.games_played(matches), live, args.crown_min_games)
+    ok = top == f"gen{gen}" and mine > theirs + args.promote_elo_margin
+    beside = ("" if top in (None, f"gen{gen}", f"gen{champion_gen}")
+              else f"; ladder top {top} {ratings[top]:.0f}")
     print(f"  rating: gen{gen} {mine:.0f} vs gen{champion_gen} {theirs:.0f} "
-          f"({mine - theirs:+.0f}) -> {'promote' if ok else 'reject'}")
+          f"({mine - theirs:+.0f}){beside} -> {'promote' if ok else 'reject'}")
     return ok, ratings, matches
+
+
+def snapshot_ckpt(live, player):
+    """`gen338` -> its snapshot checkpoint, or None if it is gone.
+
+    Snapshot directories are zero-padded to three digits (`gen001`) and rating
+    keys are not (`gen1`).
+    """
+    n = elo_mod().gen_number(player)
+    if n >= 1 << 30:
+        return None
+    p = os.path.join(live, "snapshots", f"gen{n:03d}", "checkpoint.safetensors")
+    return p if os.path.exists(p) else None
+
+
+def fp16_net(live, player):
+    """Whether `player`'s snapshot graphs carry fp16 edges (gen339 on).
+
+    Only these nets can be champion. The fp32-era nets stay in the fit as
+    rungs -- their games still anchor the rating scale -- but the run does not
+    go back to them.
+    """
+    ckpt = snapshot_ckpt(live, player)
+    trunk = os.path.join(os.path.dirname(ckpt), "trunk.onnx") if ckpt else None
+    if not trunk or not os.path.exists(trunk):
+        return False
+    import onnx
+    edge = onnx.load(trunk).graph.input[0].type.tensor_type.elem_type
+    return edge == onnx.TensorProto.FLOAT16
+
+
+def ladder_top(ratings, games, live, min_games):
+    """The highest-rated net that could take over as champion.
+
+    Only fp16 nets (`fp16_net`) with at least `min_games` rated games behind
+    the number. A candidate that has played only the 40-game gate is rated on
+    one opponent, which is exactly the pairwise result the ladder exists to
+    overrule. Walked best-first, so only the top few graphs are ever opened.
+    """
+    for _, p in sorted(((r, p) for p, r in ratings.items()), reverse=True):
+        if games.get(p, 0) >= min_games and fp16_net(live, p):
+            return p
+    return None
+
+
+def crown_ladder_top(args, live, scores, best, ratings):
+    """Make the ladder's best the champion when it is not already.
+
+    The rating gate promotes a candidate only if it tops the ladder, but the
+    champion can also lose the top spot to an *older* net with no candidate
+    involved: each refit revises old ratings, and a new net's games move its
+    opponents too (gen340 took 1 of 20 from gen338, which lifted gen338 past
+    the reigning gen339). Self-play should run on the best net the record
+    knows of, whichever generation that is. The gate's margin applies, so two
+    nets trading places inside it do not flip the champion back and forth.
+
+    Returns the crowned generation, or None.
+    """
+    E = elo_mod()
+    matches = E.load_matches(os.path.join(live, "matches.jsonl"))
+    top = ladder_top(ratings, E.games_played(matches), live, args.crown_min_games)
+    cur = f"gen{scores.get('best_gen')}"
+    if top is None or top == cur or cur not in ratings:
+        return None
+    if ratings[top] <= ratings[cur] + args.promote_elo_margin:
+        return None
+    ckpt = snapshot_ckpt(live, top)
+    shutil.copyfile(ckpt, best + ".tmp")
+    os.replace(best + ".tmp", best)
+    promote_onnx(ckpt, live)
+    top_gen = E.gen_number(top)
+    print(f"  rating: ladder top {top} {ratings[top]:.0f} over champion {cur} "
+          f"{ratings[cur]:.0f} ({ratings[top] - ratings[cur]:+.0f}) -> crown {top}")
+    scores["best_gen"] = top_gen
+    return top_gen
 
 
 def promotions_since_greedy(scores):
@@ -331,6 +420,10 @@ def main():
                     help="rating points the candidate must exceed the champion "
                          "by once the ladder has been played. 0 is a plain "
                          "`higher rating promotes`.")
+    ap.add_argument("--crown-min-games", type=int, default=60,
+                    help="rated games a net needs before it can become champion: "
+                         "the 40-game gate plus at least one ladder match, so no "
+                         "net takes over on a single opponent's games.")
     ap.add_argument("--greedy-games", type=int, default=12)
     ap.add_argument("--greedy-every", type=int, default=5,
                     help="play greedy once per this many champions. A check "
@@ -548,6 +641,19 @@ def main():
                     # The rating gate has already run by this point, so this is
                     # back to being a diagnostic. Never let it break the ladder.
                     print(f"gen {gen}: elo update failed: {exc}", file=sys.stderr)
+
+            # The ladder's best becomes champion even when it is not this
+            # candidate. Only after a rejection: a promoted candidate topped the
+            # ladder by construction, and the rating-failure fallback has no fit
+            # to consult.
+            if not promoted and ratings:
+                try:
+                    crowned = crown_ladder_top(args, live, scores, best, ratings)
+                    if crowned is not None:
+                        entry["crowned"] = crowned
+                except Exception as exc:  # noqa: BLE001
+                    print(f"WARNING: gen {gen}: crowning the ladder top failed: {exc}",
+                          file=sys.stderr)
 
             entry["promoted"] = promoted
             metrics = os.path.join(snap, "metrics.json")

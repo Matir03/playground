@@ -153,7 +153,8 @@ GREEDY_GAMES="${GREEDY_GAMES:-30}"
 # it sits below parity: a candidate that lost the head-to-head 0.45 has said
 # little over 40 games, and the ladder plus the Bradley-Terry fit over the whole
 # record is a far better judge of it than this number is. Anything that clears
-# this still has to out-rate the champion to be promoted.
+# this still has to top the ladder to be promoted, and when an older net tops
+# it instead, that net is crowned champion (`crown_ladder_top`).
 PROMOTE="${PROMOTE:-0.40}"
 # Inference backend. `ort` with the TensorRT EP and fp16 is the fast path:
 # +73% end to end against the CUDA EP (ABBA pairs, 516->894 and 524->908
