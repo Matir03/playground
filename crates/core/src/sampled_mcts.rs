@@ -104,9 +104,9 @@ pub enum Step<G: SampledGame> {
     /// [`SampledModel::widen_batch`] and feed the candidates to
     /// [`Search::provide_widen`].
     ///
-    /// `fill` is set once the node's proposals have repeated: from then on it
-    /// takes exploration draws only, never another proposal (see
-    /// [`SampledModel::widen_batch`]).
+    /// `fill` is set when the node has made all its sampler draws
+    /// ([`SampledParams::k_draws`]) and is still short: the request is for
+    /// exploration candidates to make up the shortfall, not another proposal.
     NeedWiden { state: G::State, fill: bool },
     /// The search reached an unexpanded node and needs its value and candidates.
     /// Feed them back with [`Search::provide`].
@@ -145,16 +145,15 @@ pub trait SampledModel<G: SampledGame>: Send + Sync {
     /// Up to `k` more candidates for each of `states`, nodes that asked to
     /// widen.
     ///
-    /// `fill[i]` marks a node whose proposals have started repeating. A sharp
-    /// sampler re-draws the positions it already holds, and asking it again
-    /// and again only re-draws them, so such a node is never offered another
-    /// proposal: it gets **exploration draws**, candidates made without the
-    /// learned proposal and flagged explore. A fill that adds nothing new marks
-    /// the node exhausted.
+    /// `fill[i]` marks a node that has made all its sampler draws and holds
+    /// fewer distinct candidates than it earned -- the draws repeated. It gets
+    /// **exploration candidates** instead, made without the learned proposal
+    /// and flagged explore, to fill the shortfall. A fill that adds nothing new
+    /// is retried; after as many misses as the node has earned candidates, the
+    /// node is marked exhausted.
     ///
     /// The default answers proposal widens with `expand_batch` and has no
-    /// exploration source, so a filling node gets nothing and stops -- one
-    /// call later than a repeat used to stop it.
+    /// exploration source, so a fill gets nothing and the node stops short.
     fn widen_batch(
         &self,
         states: &[G::State],
@@ -183,8 +182,17 @@ pub trait SampledModel<G: SampledGame>: Send + Sync {
 pub struct SampledParams {
     pub simulations: u32,
     pub c_puct: f32,
-    /// Candidates drawn per node expansion.
+    /// Candidates a node holds once fully widened (`N`).
     pub k_candidates: usize,
+    /// Sampler draws per node (`D`). A node draws `D` proposals; the distinct
+    /// ones become its candidates, and a shortfall to `k_candidates` is filled
+    /// with exploration candidates (see [`SampledModel::widen_batch`]). The
+    /// sampler is asked exactly `D` times whether or not it repeats itself.
+    ///
+    /// Pro-rated under progressive widening: a node that has earned `n` of its
+    /// `k_candidates` draws `ceil(n * D / k_candidates)` before it fills, so
+    /// the root, which earns them all at once, draws exactly `D`.
+    pub k_draws: usize,
     /// KataGo forced-playout constant; 0 disables forced playouts.
     pub k_forced: f32,
     /// Visits guaranteed to every *explore*-origin root candidate, regardless of
@@ -280,6 +288,7 @@ impl Default for SampledParams {
             simulations: 200,
             c_puct: 1.5,
             k_candidates: 32,
+            k_draws: 32,
             k_forced: 2.0,
             min_explore_visits: 2.0,
             forced_visits: 30,
@@ -344,8 +353,9 @@ struct Entry<G: SampledGame> {
     /// 0 for candidates outside the forced-exploration set.
     forced_quota: u32,
     /// Sampler draws merged into this entry: 1 for the draw that created it,
-    /// plus one for every later draw that reached the same position. The only
-    /// record of why a node holds fewer candidates than it asked for.
+    /// plus one for every later draw that reached the same position. 0 for an
+    /// entry made by a fill, which is not a sampler draw. The record of why a
+    /// node needed filling.
     draws: u32,
 }
 
@@ -366,16 +376,20 @@ impl<G: SampledGame> Entry<G> {
 struct Node<G: SampledGame> {
     state: G::State,
     entries: Vec<Entry<G>>,
-    /// Set when a widen chunk produced nothing new. The sampler can saturate —
-    /// every proposal merging into a candidate already held — and without this
-    /// the node would keep asking for candidates it can never get, spinning the
-    /// search forever. Caught by `chunked_generation_reaches_the_same_root_set`.
+    /// Set when fills have missed as many times as the node has earned
+    /// candidates: the position has run out of distinct ones to offer, and
+    /// without this the node would keep asking for ones it can never get,
+    /// spinning the search forever.
     widen_exhausted: bool,
-    /// Set by the first proposal that repeats a candidate already held. From
-    /// then on the node's widens are exploration fills rather than proposals
-    /// (see [`SampledModel::widen_batch`]); a fill that adds nothing sets
-    /// `widen_exhausted`.
-    fill: bool,
+    /// Sampler draws requested at this node so far -- requested, not returned,
+    /// so a model that proposes nothing still uses them up. Once they reach the
+    /// node's draw target (see [`SampledParams::k_draws`]), a node still short
+    /// of candidates is filled instead.
+    draws: u32,
+    /// Fills that brought nothing new. Random fills repeat themselves well
+    /// before a position runs out of turns, so one miss is not the signal to
+    /// stop; this many, against the node's candidate target, is.
+    fill_misses: u32,
     /// Row-major `k x k` kernel matrix over `entries`, empty when the kernel is
     /// disabled. Built once at expansion: the distances depend only on the
     /// candidates and the state, neither of which changes afterwards, so paying
@@ -592,7 +606,8 @@ fn new_node<G: SampledGame>(state: G::State) -> Node<G> {
         state,
         entries: Vec::new(),
         widen_exhausted: false,
-        fill: false,
+        draws: 0,
+        fill_misses: 0,
         kern: Vec::new(),
         total_n: 0,
         w_sum: 0.0,
@@ -699,6 +714,13 @@ fn earned<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool)
     let n = node.total_n.max(1) as f32;
     let target = (params.pw_beta * n.powf(params.pw_alpha)).ceil() as usize;
     target.clamp(1, k)
+}
+
+/// Sampler draws a node makes before it fills, once it has earned `n`
+/// candidates: `k_draws` pro-rated over the `k_candidates` it can grow to.
+fn draw_target(params: &SampledParams, n: usize) -> u32 {
+    let k = params.k_candidates.max(1);
+    ((n * params.k_draws).div_ceil(k)) as u32
 }
 
 /// Select a child by PUCT, with root-only forced playouts.
@@ -830,8 +852,9 @@ pub struct Search<G: SampledGame> {
     path: Vec<(usize, usize, bool)>,
     /// Node awaiting expansion, if `step` returned `NeedExpansion`.
     pending: Option<usize>,
-    /// Node awaiting more candidates, if `step` returned `NeedWiden`.
-    pending_widen: Option<usize>,
+    /// Node awaiting more candidates, if `step` returned `NeedWiden`, and
+    /// whether the request was a fill.
+    pending_widen: Option<(usize, bool)>,
     /// Where to pick the descent back up after a widen, with `path` intact.
     resume_at: Option<usize>,
 }
@@ -973,17 +996,20 @@ impl<G: SampledGame> Search<G> {
                     return Step::NeedExpansion(self.tree[cur].state.clone());
                 }
                 // Ask for the next chunk before selecting, if this node has
-                // earned more candidates than it holds. The simulation is
+                // earned more candidates than it holds: a sampler draw while it
+                // has draws left, a fill once they are spent. The simulation is
                 // abandoned rather than paused: nothing has been backed up yet,
                 // so re-descending from the root afterwards costs only the
                 // descent, and it keeps `path` from holding indices into a node
                 // whose entries are about to be re-sorted.
-                if self.params.pw_chunk > 0 && !self.tree[cur].widen_exhausted {
+                if !self.tree[cur].widen_exhausted {
                     let held = self.tree[cur].entries.len();
-                    if held < earned(&self.tree[cur], &self.params, cur == 0)
-                        && held < self.params.k_candidates.max(1)
-                    {
-                        self.pending_widen = Some(cur);
+                    let want = earned(&self.tree[cur], &self.params, cur == 0);
+                    let fill = self.tree[cur].draws >= draw_target(&self.params, want);
+                    // Unchunked, every draw came with the expansion, so a fill
+                    // is the only widen there is.
+                    if held < want && (self.params.pw_chunk > 0 || fill) {
+                        self.pending_widen = Some((cur, fill));
                         if self.params.pw_resume {
                             // Keep `path`; the descent continues at `cur` when
                             // the candidate arrives. Sorting this node's entries
@@ -993,10 +1019,7 @@ impl<G: SampledGame> Search<G> {
                         } else {
                             self.path.clear();
                         }
-                        return Step::NeedWiden {
-                            state: self.tree[cur].state.clone(),
-                            fill: self.tree[cur].fill,
-                        };
+                        return Step::NeedWiden { state: self.tree[cur].state.clone(), fill };
                     }
                 }
                 if self.tree[cur].entries.is_empty() {
@@ -1036,12 +1059,10 @@ impl<G: SampledGame> Search<G> {
         // are supposed to concentrate.
         let mut seen: std::collections::HashMap<u128, usize> = Default::default();
         let mut entries: Vec<Entry<G>> = Vec::with_capacity(candidates.len());
-        let mut repeated = false;
         for (mv, p, explore) in candidates {
             let key = G::state_key(&G::apply(&self.tree[cur].state, &mv));
             match seen.get(&key) {
                 Some(&i) => {
-                    repeated = true;
                     entries[i].draws += 1;
                     entries[i].energy = logaddexp(entries[i].energy, p);
                     // A position the model also proposed still deserves its
@@ -1066,6 +1087,13 @@ impl<G: SampledGame> Search<G> {
             }
         }
         renormalise(&mut entries);
+        // More draws than candidates can yield more distinct ones than the node
+        // holds; keep the ones the policy rates highest.
+        let k_max = self.params.k_candidates.max(1);
+        if entries.len() > k_max {
+            entries.truncate(k_max);
+            renormalise(&mut entries);
+        }
         // Quotas are set once, over the node's initial candidate set. Widening
         // appends later; a widened explore candidate is covered by the top-up
         // in `provide_widen`, and widened ordinary candidates are not drawn into
@@ -1075,8 +1103,7 @@ impl<G: SampledGame> Search<G> {
         assign_forced_quotas(&mut entries, &self.params, &mut self.rng);
         self.tree[cur].entries = entries;
         self.tree[cur].expanded = true;
-        // The proposals already repeat, so any widens here are fills.
-        self.tree[cur].fill = repeated;
+        self.tree[cur].draws = expansion_k(&self.params) as u32;
         self.build_kernel(cur);
 
         self.backup(value);
@@ -1127,18 +1154,19 @@ impl<G: SampledGame> Search<G> {
     /// that fragment exactly the visits they should concentrate. Priors are
     /// renormalised over the grown set and the kernel matrix rebuilt.
     ///
-    /// A proposal that repeats (or a proposal widen that brings nothing) turns
-    /// the node to fills; a fill that brings nothing new exhausts it. See
-    /// [`SampledModel::widen_batch`].
+    /// A proposal widen spends the node's draws whatever it brings. A fill that
+    /// brings nothing new is a miss, and the node is exhausted once its misses
+    /// reach the candidates it has earned. See [`SampledParams::k_draws`].
     pub fn provide_widen(&mut self, candidates: Vec<(G::Move, f32, bool)>) {
-        let cur = self.pending_widen.take().expect("provide_widen without a pending widen");
+        let (cur, fill) = self.pending_widen.take().expect("provide_widen without a pending widen");
         let mut seen: std::collections::HashMap<u128, usize> = Default::default();
         for (i, e) in self.tree[cur].entries.iter().enumerate() {
             seen.insert(G::state_key(&G::apply(&self.tree[cur].state, &e.mv)), i);
         }
         let k_max = self.params.k_candidates.max(1);
         let before = self.tree[cur].entries.len();
-        let mut repeated = false;
+        // A fill is not a sampler draw, so it adds to no entry's draw count.
+        let draw = u32::from(!fill);
         for (mv, p, explore) in candidates {
             if self.tree[cur].entries.len() >= k_max {
                 break;
@@ -1146,8 +1174,7 @@ impl<G: SampledGame> Search<G> {
             let key = G::state_key(&G::apply(&self.tree[cur].state, &mv));
             match seen.get(&key) {
                 Some(&i) => {
-                    repeated = true;
-                    self.tree[cur].entries[i].draws += 1;
+                    self.tree[cur].entries[i].draws += draw;
                     self.tree[cur].entries[i].energy =
                         logaddexp(self.tree[cur].entries[i].energy, p);
                     self.tree[cur].entries[i].explore |= explore;
@@ -1164,18 +1191,21 @@ impl<G: SampledGame> Search<G> {
                         explore,
                         forced_n: 0,
                         forced_quota: 0,
-                        draws: 1,
+                        draws: draw,
                     });
                 }
             }
         }
-        let added = self.tree[cur].entries.len() - before;
-        if self.tree[cur].fill {
-            if added == 0 {
-                self.tree[cur].widen_exhausted = true;
+        if fill {
+            if self.tree[cur].entries.len() == before {
+                self.tree[cur].fill_misses += 1;
+                let want = earned(&self.tree[cur], &self.params, cur == 0) as u32;
+                if self.tree[cur].fill_misses >= want {
+                    self.tree[cur].widen_exhausted = true;
+                }
             }
-        } else if repeated || added == 0 {
-            self.tree[cur].fill = true;
+        } else {
+            self.tree[cur].draws += chunk_k(&self.params) as u32;
         }
         // Re-softmax over the grown set. Sorting inside is safe here because a
         // widen abandons its simulation, so no `path` entry indexes this node.
@@ -1313,14 +1343,13 @@ impl<G: SampledGame> Search<G> {
 /// Candidates to request at a node's *first* visit.
 ///
 /// Zero when chunking is on — the node only needs a value, and will ask for a
-/// candidate if something descends through it. With chunking off there is no
-/// widen path at all, so the whole set has to come up front or the node would
-/// never hold anything.
+/// candidate if something descends through it. With chunking off the node's
+/// draws all come up front (`k_draws` of them), and only a fill can follow.
 pub fn expansion_k(params: &SampledParams) -> usize {
     if params.pw_chunk > 0 {
         0
     } else {
-        params.k_candidates
+        params.k_draws
     }
 }
 
@@ -1626,63 +1655,120 @@ mod tests {
         }
     }
 
-    /// After the first repeated proposal a node never asks for another: its
-    /// widens become exploration fills, so a sampler that keeps drawing the
-    /// same turn no longer leaves the root short of candidates.
+    /// A node draws exactly its `D` proposals, however often they repeat, and
+    /// fills the shortfall to `N` with exploration candidates -- for `D` below,
+    /// at and above `N`.
     #[test]
-    fn a_repeated_proposal_turns_the_node_to_exploration_fills() {
+    fn a_node_draws_d_times_then_fills_the_shortfall() {
+        for d in [1usize, 3, 5] {
+            let params = SampledParams {
+                simulations: 60,
+                k_candidates: 3,
+                k_draws: d,
+                pw_chunk: 1,
+                forced_visits: 0,
+                temp_moves: 0,
+                seed: 4,
+                ..Default::default()
+            };
+            let model = Stuck::new(true);
+            let mut search = Search::<Count>::new(CountState { n: 21, side: 1 }, &params, 0);
+            let mut proposals: std::collections::HashMap<usize, usize> = Default::default();
+            loop {
+                match search.step() {
+                    Step::NeedExpansion(st) => {
+                        let (v, c) = model.expand(&st, expansion_k(&params)).unwrap();
+                        search.provide(v, c);
+                    }
+                    Step::NeedWiden { state, fill } => {
+                        let (node, _) = search.pending_widen.expect("a widen names its node");
+                        if !fill {
+                            *proposals.entry(node).or_default() += 1;
+                        }
+                        search.provide_widen(widen(&model, &state, fill, chunk_k(&params)));
+                    }
+                    Step::Done => break,
+                }
+            }
+            assert_eq!(proposals[&0], d, "D={d}: the root must be asked exactly D times");
+            for (node, n) in &proposals {
+                assert!(*n <= d, "D={d}: node {node} was asked {n} times");
+            }
+            let mut held: Vec<(u32, u32, bool)> =
+                search.tree[0].entries.iter().map(|e| (e.mv, e.draws, e.explore)).collect();
+            held.sort();
+            assert_eq!(
+                held,
+                vec![(1, d as u32, false), (2, 0, true), (3, 0, true)],
+                "D={d}: the one distinct proposal (drawn D times) and two fills"
+            );
+        }
+    }
+
+    /// A fill that collides is retried: random fills repeat themselves long
+    /// before a position runs out of turns, so a miss must not leave the node
+    /// short.
+    #[test]
+    fn a_colliding_fill_is_retried() {
+        /// Proposes move 1; fills with 1, 1 (both misses), then 2 and 3, then
+        /// only misses.
+        struct Colliding {
+            fills: std::sync::Mutex<std::collections::VecDeque<u32>>,
+        }
+        impl SampledModel<Count> for Colliding {
+            fn expand(&self, _s: &CountState, k: usize) -> anyhow::Result<Expansion<Count>> {
+                Ok((0.0, if k == 0 { Vec::new() } else { vec![(1, 0.0, false)] }))
+            }
+            fn widen_batch(
+                &self,
+                states: &[CountState],
+                fill: &[bool],
+                k: usize,
+            ) -> anyhow::Result<Vec<Vec<(u32, f32, bool)>>> {
+                Ok(states
+                    .iter()
+                    .zip(fill)
+                    .map(|(s, &f)| {
+                        if !f {
+                            return self.expand(s, k).unwrap().1;
+                        }
+                        let m = self.fills.lock().unwrap().pop_front().unwrap_or(1);
+                        vec![(m, 0.0, true)]
+                    })
+                    .collect())
+            }
+        }
         let params = SampledParams {
-            simulations: 60,
+            simulations: 40,
             k_candidates: 3,
+            k_draws: 3,
             pw_chunk: 1,
             forced_visits: 0,
             temp_moves: 0,
             seed: 4,
             ..Default::default()
         };
-        let model = Stuck::new(true);
+        let model = Colliding { fills: std::sync::Mutex::new([1, 1, 2, 3].into()) };
         let mut search = Search::<Count>::new(CountState { n: 21, side: 1 }, &params, 0);
-        let mut proposals: std::collections::HashMap<usize, u32> = Default::default();
-        loop {
-            match search.step() {
-                Step::NeedExpansion(st) => {
-                    let (v, c) = model.expand(&st, expansion_k(&params)).unwrap();
-                    search.provide(v, c);
-                }
-                Step::NeedWiden { state, fill } => {
-                    let node = search.pending_widen.expect("a widen names its node");
-                    if !fill {
-                        *proposals.entry(node).or_default() += 1;
-                    }
-                    search.provide_widen(widen(&model, &state, fill, chunk_k(&params)));
-                }
-                Step::Done => break,
-            }
-        }
-        // One proposal that lands, one that repeats, then fills only.
-        for (node, n) in &proposals {
-            assert!(*n <= 2, "node {node} was offered {n} proposals; a repeat must end them");
-        }
+        drive(&model, &mut search).unwrap();
         let root = &search.tree[0];
-        assert!(root.fill, "the root's proposals repeated, so it should be filling");
         let mut held: Vec<(u32, u32, bool)> =
             root.entries.iter().map(|e| (e.mv, e.draws, e.explore)).collect();
         held.sort();
-        assert_eq!(
-            held,
-            vec![(1, 2, false), (2, 1, true), (3, 1, true)],
-            "the root should hold the proposal (drawn twice) and two exploration fills"
-        );
+        assert_eq!(held, vec![(1, 3, true), (2, 0, true), (3, 0, true)]);
+        assert_eq!(root.fill_misses, 2);
+        assert!(!root.widen_exhausted, "two misses against a target of three must not exhaust");
     }
 
-    /// With no exploration source, a repeat still ends the node's widening:
-    /// the fill comes back empty and the node is exhausted, rather than asking
+    /// With no exploration source every fill misses, and the node is exhausted
+    /// after as many misses as it has earned candidates, rather than asking
     /// forever.
     #[test]
     fn a_fill_that_adds_nothing_exhausts_the_node() {
         let params = SampledParams {
             simulations: 40,
             k_candidates: 3,
+            k_draws: 3,
             pw_chunk: 1,
             forced_visits: 0,
             temp_moves: 0,
@@ -1695,7 +1781,30 @@ mod tests {
         let root = &search.tree[0];
         assert!(root.widen_exhausted, "an empty fill must exhaust the node");
         let held: Vec<(u32, u32)> = root.entries.iter().map(|e| (e.mv, e.draws)).collect();
-        assert_eq!(held, vec![(1, 2)]);
+        assert_eq!(held, vec![(1, 3)]);
+    }
+
+    /// Unchunked, the draws come with the expansion and a fill follows it.
+    #[test]
+    fn unchunked_draws_are_filled_too() {
+        let params = SampledParams {
+            simulations: 20,
+            k_candidates: 3,
+            k_draws: 4,
+            pw_chunk: 0,
+            forced_visits: 0,
+            temp_moves: 0,
+            seed: 4,
+            ..Default::default()
+        };
+        assert_eq!(expansion_k(&params), 4, "unchunked expansion asks for all D draws");
+        let (_, tree) =
+            search_analyzed::<Count, _>(&Stuck::new(true), CountState { n: 21, side: 1 }, &params, 0)
+                .expect("search");
+        let mut held: Vec<(u32, u32, bool)> =
+            tree[0].edges.iter().map(|e| (e.mv, e.draws, e.explore)).collect();
+        held.sort();
+        assert_eq!(held, vec![(1, 1, false), (2, 0, true), (3, 0, true)]);
     }
 
     /// Quotas topped up for explore candidates that arrive by widening stay
@@ -1707,6 +1816,7 @@ mod tests {
         let params = SampledParams {
             simulations: 60,
             k_candidates: 3,
+            k_draws: 3,
             pw_chunk: 1,
             forced_visits: 30,
             temp_moves: 0,
@@ -2101,6 +2211,7 @@ mod tests {
         let params = SampledParams {
             simulations: 1,
             k_candidates: 4,
+            k_draws: 4,
             pw_chunk: 0,
             forced_visits: 0,
             temp_moves: 0,
@@ -2123,6 +2234,7 @@ mod tests {
         let params = SampledParams {
             simulations: 30,
             k_candidates: 3,
+            k_draws: 3,
             pw_chunk: 0,
             k_forced: 0.0,
             min_explore_visits: 0.0,
@@ -2130,7 +2242,7 @@ mod tests {
             seed: 2,
             ..Default::default()
         };
-        assert_eq!(expansion_k(&params), 3, "unchunked expansion must ask for the whole set");
+        assert_eq!(expansion_k(&params), 3, "unchunked expansion must ask for all its draws");
         let r = search::<Count, _>(&Mock, CountState { n: 21, side: 1 }, &params, 0)
             .expect("search");
         assert!(!r.candidates.is_empty(), "root held no candidates with chunking off");

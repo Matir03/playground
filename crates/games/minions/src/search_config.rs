@@ -41,6 +41,8 @@ struct Recorded {
     kernel_sigma: f32,
     candidates: usize,
     candidates_fast: usize,
+    draws: usize,
+    draws_fast: usize,
     t_steps: usize,
     t_steps_fast: usize,
     random_fraction: f32,
@@ -66,6 +68,8 @@ fn record(a: &ActorConfig, s: &SamplerConfig) -> Recorded {
         kernel_sigma: a.kernel_sigma,
         candidates: s.k_candidates,
         candidates_fast: s.k_candidates_fast,
+        draws: s.k_draws,
+        draws_fast: s.k_draws_fast,
         t_steps: s.t_steps,
         t_steps_fast: s.t_steps_fast,
         random_fraction: s.random_fraction,
@@ -133,6 +137,8 @@ pub fn apply_json(
     actor.kernel_sigma = r.kernel_sigma;
     sampler.k_candidates = r.candidates;
     sampler.k_candidates_fast = r.candidates_fast;
+    sampler.k_draws = r.draws;
+    sampler.k_draws_fast = r.draws_fast;
     sampler.t_steps = r.t_steps;
     sampler.t_steps_fast = r.t_steps_fast;
     sampler.random_fraction = r.random_fraction;

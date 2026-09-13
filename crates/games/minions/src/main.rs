@@ -109,6 +109,14 @@ enum Cmd {
         /// too thin to form a tree, so this is cheaper *and* better shaped.
         #[arg(long, default_value_t = 6)]
         candidates_fast: usize,
+        /// Sampler draws per node: the node is asked for exactly this many
+        /// proposals, and a shortfall of distinct ones against `--candidates`
+        /// is filled with random playouts. Default: `--candidates`.
+        #[arg(long)]
+        draws: Option<usize>,
+        /// Draws per node for fast searches. Default: `--candidates-fast`.
+        #[arg(long)]
+        draws_fast: Option<usize>,
         /// Diffusion rounds. 1 = mean-field; set to a large number for the
         /// exact-density diagnostic mode.
         #[arg(long, default_value_t = 4)]
@@ -397,7 +405,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::SelfplayLoop {
             live, backend, ep, fp16, cuda, concurrency, max_batch, sims, fast_sims,
             full_search_prob,
-            candidates, candidates_fast, t_steps, t_steps_fast, random_fraction,
+            candidates, candidates_fast, draws, draws_fast, t_steps, t_steps_fast, random_fraction,
             random_opening_max, random_opening_decay, min_explore_visits,
             forced_visits, forced_extra, workers, no_energy,
             kernel_sigma, pw_chunk, write_search_config,
@@ -416,6 +424,8 @@ async fn main() -> anyhow::Result<()> {
                 t_steps_fast,
                 k_candidates: candidates,
                 k_candidates_fast: candidates_fast,
+                k_draws: draws.unwrap_or(candidates),
+                k_draws_fast: draws_fast.unwrap_or(candidates_fast),
                 random_fraction,
                 use_energy: !no_energy,
                 seed,

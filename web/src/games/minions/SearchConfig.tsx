@@ -57,7 +57,11 @@ const GROUPS: { title: string; note?: string; fields: [string, string][] }[] = [
     fields: [
       [
         "candidates",
-        "Candidates per node (K). Once a node's proposals repeat, the rest are random playouts. A new K builds a TensorRT engine on first use (slow once).",
+        "Candidates a node holds (N). If its draws give fewer distinct turns, the rest are random playouts. A new N builds a TensorRT engine on first use (slow once).",
+      ],
+      [
+        "draws",
+        "Sampler draws per node (D), all made whether or not they repeat. Interior nodes draw their share as they widen: ceil(n·D/N) once they have earned n candidates.",
       ],
       ["t_steps", "Diffusion rounds per proposal."],
       ["random_fraction", "Share of proposals drawn as random playouts (explore candidates)."],
@@ -71,6 +75,7 @@ const GROUPS: { title: string; note?: string; fields: [string, string][] }[] = [
     fields: [
       ["fast_sims", "Simulations per fast search."],
       ["candidates_fast", "Candidates per node in a fast search."],
+      ["draws_fast", "Sampler draws per node in a fast search."],
       ["t_steps_fast", "Diffusion rounds per proposal in a fast search."],
     ],
   },
@@ -90,6 +95,8 @@ const INTEGER = new Set([
   "pw_chunk",
   "candidates",
   "candidates_fast",
+  "draws",
+  "draws_fast",
   "t_steps",
   "t_steps_fast",
 ]);

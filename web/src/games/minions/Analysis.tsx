@@ -153,14 +153,18 @@ function EdgeRow({
         {edge.forced > 0 ? edge.forced : "·"}
       </span>
 
-      {/* Sampler draws that landed on this turn. A node holding fewer
-          candidates than it asked for is one whose draws kept repeating, and
-          this is where that shows. */}
+      {/* Sampler draws that landed on this turn. A node draws its `draws`
+          setting's worth of proposals; repeats show here, and the shortfall
+          they leave is filled with random playouts, which are no draw at all. */}
       <span
-        title={`${edge.draws} sampler draw${edge.draws === 1 ? "" : "s"} produced this turn`}
-        style={{ color: edge.draws > 1 ? "#b08030" : "#555" }}
+        title={
+          edge.draws === 0
+            ? "a fill: a random playout added because the node's draws left it short of candidates"
+            : `${edge.draws} sampler draw${edge.draws === 1 ? "" : "s"} produced this turn`
+        }
+        style={{ color: edge.draws > 1 ? "#b08030" : edge.draws === 0 ? "#8a7fb0" : "#555" }}
       >
-        {edge.draws}
+        {edge.draws === 0 ? "fill" : edge.draws}
       </span>
 
       <span title="prior probability from the energy head" style={{ color: "#9ab" }}>

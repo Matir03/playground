@@ -192,6 +192,7 @@ impl ActorConfig {
             simulations: if full { self.sims } else { self.fast_sims },
             c_puct: self.c_puct,
             k_candidates: sampler.k_for(full),
+            k_draws: sampler.draws_for(full),
             // Fast searches are not training data, so they get no forced
             // exploration to correct for either.
             k_forced: if full { self.k_forced } else { 0.0 },

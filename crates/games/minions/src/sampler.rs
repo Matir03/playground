@@ -80,6 +80,12 @@ pub struct SamplerConfig {
     /// Nothing in the training target depends on this — fast searches are never
     /// recorded — so the only cost is the strength of the moves actually played.
     pub k_candidates_fast: usize,
+    /// Sampler draws per node (`D`, see `SampledParams::k_draws`): the node is
+    /// asked for exactly this many proposals, and a shortfall of distinct ones
+    /// against `k_candidates` is filled with random playouts.
+    pub k_draws: usize,
+    /// Draws per node for *fast* searches.
+    pub k_draws_fast: usize,
     /// Share of candidates drawn uniformly instead of from the net.
     pub random_fraction: f32,
     /// Softmax temperature on the declaration logits.
@@ -105,6 +111,8 @@ impl Default for SamplerConfig {
             t_steps_fast: 2,
             k_candidates: 12,
             k_candidates_fast: 6,
+            k_draws: 12,
+            k_draws_fast: 6,
             random_fraction: 0.25,
             temperature: 1.0,
             use_energy: true,
@@ -122,6 +130,10 @@ impl SamplerConfig {
     /// `--candidates` alone.
     pub fn k_for(&self, full: bool) -> usize {
         if full { self.k_candidates } else { self.k_candidates_fast.min(self.k_candidates) }
+    }
+
+    pub fn draws_for(&self, full: bool) -> usize {
+        if full { self.k_draws } else { self.k_draws_fast }
     }
 }
 

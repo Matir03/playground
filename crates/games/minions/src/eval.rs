@@ -248,6 +248,9 @@ pub fn match_search(
         t_steps_fast: t_steps,
         k_candidates: candidates,
         k_candidates_fast: candidates,
+        // One draw per candidate slot, any shortfall filled.
+        k_draws: candidates,
+        k_draws_fast: candidates,
         random_fraction: 0.0,
         pad_to,
         seed,
@@ -571,6 +574,8 @@ mod tests {
         let historical = SampledParams {
             simulations: 400,
             k_candidates: 16,
+            // Newer than the rest: one draw per candidate.
+            k_draws: 16,
             temp_moves: 0,
             seed: 9,
             ..Default::default()
