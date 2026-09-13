@@ -6,6 +6,9 @@ Two measurements, deliberately separate (the Hex run's structure):
   above ``--promote-threshold``. The actor resolves its weights to ``best.*``
   when that file exists, so this gate is also what keeps a losing net's games
   out of the replay buffer.
+* **ungated** (``--ungated``, the default in the cycle script) — no gate:
+  every generation goes into self-play, and every ``--measure-every``th plays
+  the ladder and greedy in parallel for tracking. See ``measure``.
 * **absolute** — against the greedy heuristic in ``solver.rs``, the fixed
   yardstick that does not drift as the ladder climbs. Only run for nets that
   promoted, because it costs a full match and tells us nothing about a net that
@@ -24,6 +27,7 @@ import sys
 import importlib.util as _ilu
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from playground.model_server.minions_net import build_model, export_onnx_atomic
 
@@ -69,8 +73,10 @@ def ensure_onnx(ckpt: str) -> None:
     export_onnx_atomic(net, d)
 
 
-def run_match(engine, a, b, games, sims, candidates, t_steps, backend, ep, fp16, seed,
-              render_file=None, render_games=5):
+def run_match_full(engine, a, b, games, sims, candidates, t_steps, backend, ep, fp16, seed,
+                   render_file=None, render_games=5):
+    """One `eval-match`, parsed into a dict. Touches no module state, so several
+    can run at once (see `measure`)."""
     if backend == "ort":
         ensure_onnx(a)
         if b:
@@ -93,13 +99,10 @@ def run_match(engine, a, b, games, sims, candidates, t_steps, backend, ep, fp16,
     # bid pinned to the edge of the range means the value head cannot price a
     # handicap at all, and watching it move inward is how you see that change.
     bids = re.search(r"bids: A (-?[0-9.]+)\s+B (-?[0-9.]+)", proc.stderr or "")
-    global _LAST_BIDS, _LAST_TURNS
-    _LAST_BIDS = (float(bids.group(1)), float(bids.group(2))) if bids else None
     # Mean game length split by verdict, from A's seat. A net that is really
     # pulling ahead should win faster than it loses; lengths that stay equal say
     # the score is decided at the turn cap rather than over the board.
     t = re.search(r"turns: win (-?[0-9.]+)\s+loss (-?[0-9.]+)", proc.stderr or "")
-    _LAST_TURNS = (float(t.group(1)), float(t.group(2))) if t else None
     m = re.search(r"A_score\s+([0-9.]+)", out)
     if not m:
         raise RuntimeError(f"could not parse A_score from:\n{out}")
@@ -109,7 +112,22 @@ def run_match(engine, a, b, games, sims, candidates, t_steps, backend, ep, fp16,
     # Anchored to its own key rather than `A_score`, which is the win rate.
     gs = re.search(r"A_gamescore\s+(-?[0-9.]+)", out)
     game_score = float(gs.group(1)) if gs else None
-    return float(m.group(1)), margin, game_score
+    return {"score": float(m.group(1)), "margin": margin, "game_score": game_score,
+            "bids": (float(bids.group(1)), float(bids.group(2))) if bids else None,
+            "turns": (float(t.group(1)), float(t.group(2))) if t else None}
+
+
+def run_match(engine, a, b, games, sims, candidates, t_steps, backend, ep, fp16, seed,
+              render_file=None, render_games=5):
+    """`run_match_full` for the sequential callers, which read the last match's
+    bids and turn lengths from module state."""
+    r = run_match_full(engine, a, b, games, sims, candidates, t_steps, backend, ep, fp16,
+                       seed, render_file, render_games)
+    global _LAST_BIDS, _LAST_TURNS
+    _LAST_BIDS, _LAST_TURNS = r["bids"], r["turns"]
+    return r["score"], r["margin"], r["game_score"]
+
+
 
 
 _ELO = None
@@ -258,8 +276,13 @@ def fp16_net(live, player):
     go back to them.
     """
     ckpt = snapshot_ckpt(live, player)
-    trunk = os.path.join(os.path.dirname(ckpt), "trunk.onnx") if ckpt else None
-    if not trunk or not os.path.exists(trunk):
+    return bool(ckpt) and fp16_graphs(os.path.dirname(ckpt))
+
+
+def fp16_graphs(d):
+    """Whether the graphs in `d` are the native fp16-edge export."""
+    trunk = os.path.join(d, "trunk.onnx")
+    if not os.path.exists(trunk):
         return False
     import onnx
     edge = onnx.load(trunk).graph.input[0].type.tensor_type.elem_type
@@ -310,6 +333,212 @@ def crown_ladder_top(args, live, scores, best, ratings):
           f"{ratings[cur]:.0f} ({ratings[top] - ratings[cur]:+.0f}) -> crown {top}")
     scores["best_gen"] = top_gen
     return top_gen
+
+
+# `trunk.onnx` last: the actor reloads when its mtime changes.
+GRAPHS = ("diffusion.onnx", "energy.onnx", "aux.onnx", "trunk.onnx")
+
+
+def promote_snapshot(ckpt, live, best):
+    """Make a snapshot the net self-play runs on: weights into `best.safetensors`,
+    graphs into `best/`.
+
+    Copies the snapshot's own graphs when they are the native fp16-edge export,
+    as every snapshot the learner writes now is -- re-exporting would rebuild
+    the same files. Anything else goes through `promote_onnx`.
+    """
+    ensure_onnx(ckpt)
+    d = os.path.dirname(ckpt)
+    best_dir = os.path.join(live, "best")
+    if fp16_graphs(d) and all(os.path.exists(os.path.join(d, g)) for g in GRAPHS):
+        os.makedirs(best_dir, exist_ok=True)
+        for name in ("config.json",) + GRAPHS:
+            tmp = os.path.join(best_dir, name + ".tmp")
+            shutil.copyfile(os.path.join(d, name), tmp)
+            os.replace(tmp, os.path.join(best_dir, name))
+    else:
+        promote_onnx(ckpt, live)
+    shutil.copyfile(ckpt, best + ".tmp")
+    os.replace(best + ".tmp", best)
+
+
+def rungs(scores, exclude, n):
+    """The `n` newest rated nets, newest first: measured ungated generations,
+    and every champion of the gated era or crowned since. Unmeasured ungated
+    generations never played a rated game, so they cannot anchor anything."""
+    out = []
+    for r in reversed(scores.get("history", [])):
+        found = []
+        if r.get("measured") or (r.get("promoted") and not r.get("ungated")):
+            found.append(r["gen"])
+        if r.get("crowned"):
+            found.append(r["crowned"])
+        for g in found:
+            if g != exclude and g not in out:
+                out.append(g)
+        if len(out) >= n:
+            break
+    return out[:n]
+
+
+def wait_for_engines(snap_dir, first, timeout=300, settle=10.0):
+    """Block until the candidate's TensorRT engines exist and have stopped
+    changing, or until `first` -- the match building them -- is done.
+
+    Every match in a measurement loads the candidate, and its engine cache is
+    one directory with no locking. Matches started together would all build
+    the same engines and write the same files, and one could deserialize a
+    file another is halfway through writing. So the first match builds alone.
+    """
+    cache = os.path.join(snap_dir, "trt_cache")
+    end = time.time() + timeout
+    while time.time() < end and not first.done():
+        engines = glob.glob(os.path.join(cache, "**", "*.engine"), recursive=True)
+        if len(engines) >= 3 and time.time() - max(map(os.path.getmtime, engines)) > settle:
+            return
+        time.sleep(2)
+
+
+def measure(args, live, scores, gen, ckpt, entry):
+    """Rate an ungated generation against the ladder, and check it on greedy.
+
+    Tracking only: nothing here changes which net self-play runs on. The
+    opponents are the newest rated nets (`rungs`, so the last measurement five
+    generations back and the ones before it) plus the best fp16 net. Every
+    match uses `--ladder-games`, greedy included, so the candidate sees one
+    input shape and TensorRT builds one set of engines for it.
+
+    The matches run as parallel processes. Each is 20 games in lockstep --
+    batches far too small to occupy the GPU -- so several at once fill each
+    other's gaps. The first builds the candidate's engines alone
+    (`wait_for_engines`).
+
+    Flags, never acts: a net more than `--tripwire-elo` below the best fp16
+    net on two measurements running gets a WARNING naming the net to roll
+    back to.
+    """
+    E = elo_mod()
+    matches = E.load_matches(os.path.join(live, "matches.jsonl"))
+    ratings = E.fit(matches)
+    opps = rungs(scores, gen, args.ladder_opponents)
+    top = ladder_top(ratings, E.games_played(matches), live, args.crown_min_games)
+    if top is not None and E.gen_number(top) not in opps + [gen]:
+        opps.append(E.gen_number(top))
+    opps = [o for o in opps if snapshot_ckpt(live, f"gen{o}")]
+    # Exports happen here, serially; nothing below writes a graph.
+    ensure_onnx(ckpt)
+    for o in opps:
+        ensure_onnx(snapshot_ckpt(live, f"gen{o}"))
+    games_dir = os.path.join(live, "games")
+    jobs = [("ladder", o, 50000 + gen * 16 + i,
+             os.path.join(games_dir, f"gen_{gen:04d}_vs_gen{o}.txt") if i == 0 else None)
+            for i, o in enumerate(opps)]
+    if args.greedy_games > 0:
+        jobs.append(("greedy", None, 1000 + gen,
+                     os.path.join(games_dir, f"gen_{gen:04d}_vs_greedy.txt")))
+
+    def play(job):
+        _, opp, seed, render = job
+        other = snapshot_ckpt(live, f"gen{opp}") if opp is not None else None
+        return run_match_full(args.engine, ckpt, other, args.ladder_games, args.sims,
+                              args.candidates, args.t_steps, args.backend, args.ep,
+                              args.fp16, seed=seed, render_file=render,
+                              render_games=args.render_games)
+
+    t0 = time.time()
+    results = {}
+    with ThreadPoolExecutor(max_workers=max(1, args.eval_parallel)) as ex:
+        futs = []
+        if jobs:
+            futs.append((jobs[0], ex.submit(play, jobs[0])))
+            wait_for_engines(os.path.dirname(ckpt), futs[0][1])
+            print(f"  measure: candidate engines ready after {time.time() - t0:.0f}s; "
+                  f"{len(jobs)} matches, {min(len(jobs), max(1, args.eval_parallel))} at a time")
+            futs += [(j, ex.submit(play, j)) for j in jobs[1:]]
+        for job, fut in futs:
+            try:
+                results[job] = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                err = (getattr(exc, "stderr", "") or "").strip()[-300:]
+                print(f"WARNING: gen {gen}: {job[0]} match vs gen{job[1]} failed: "
+                      f"{str(exc)[:160]} {err}", file=sys.stderr)
+    entry["eval_seconds"] = round(time.time() - t0)
+    print(f"  measure: {len(results)} of {len(jobs)} matches in {entry['eval_seconds']}s")
+
+    rows, ladder = [], {}
+    for (kind, opp, _, _), r in results.items():
+        if kind == "ladder":
+            ladder[f"gen{opp}"] = r["score"]
+            rows.append({"a": f"gen{gen}", "b": f"gen{opp}", "games": args.ladder_games,
+                         "score_a": r["score"], "kind": "ladder"})
+            print(f"  ladder: gen{gen} vs gen{opp}: {r['score']:.3f} over {args.ladder_games}")
+        else:
+            entry["vs_greedy"] = r["score"]
+            if r["margin"] is not None:
+                entry["vs_greedy_margin"] = round(r["margin"], 3)
+            if r["game_score"] is not None:
+                entry["vs_greedy_score"] = round(r["game_score"], 2)
+            if r["turns"] is not None:
+                entry["greedy_turns_win"], entry["greedy_turns_loss"] = r["turns"]
+            rows.append({"a": f"gen{gen}", "b": "greedy", "games": args.ladder_games,
+                         "score_a": r["score"], "kind": "greedy"})
+    entry["ladder"] = ladder
+    if not rows:
+        return
+    E.append(live, rows)
+    matches = E.load_matches(os.path.join(live, "matches.jsonl"))
+    ratings = E.fit(matches)
+    E.write_ratings(live, ratings, E.games_played(matches), len(matches))
+    mine = ratings.get(f"gen{gen}")
+    if mine is None:
+        return
+    entry["elo"] = round(mine, 1)
+    entry["measured"] = True
+    top = ladder_top(ratings, E.games_played(matches), live, args.crown_min_games)
+    if top is None:
+        return
+    deficit = ratings[top] - mine
+    entry["top_gen"], entry["elo_top"] = E.gen_number(top), round(ratings[top], 1)
+    entry["below_top"] = deficit > args.tripwire_elo
+    print(f"  rating: gen{gen} {mine:.0f}; best fp16 net {top} {ratings[top]:.0f} "
+          f"({-deficit:+.0f}) -> {'BELOW' if entry['below_top'] else 'ok'}")
+    prev = next((r for r in reversed(scores.get("history", [])) if r.get("measured")), None)
+    if entry["below_top"] and prev is not None and prev.get("below_top"):
+        print(f"WARNING: gen {gen} rates {deficit:.0f} below {top}: the second measurement "
+              f"running more than {args.tripwire_elo:.0f} under the best fp16 net. "
+              f"Consider rolling self-play back to {top}.")
+
+
+def ungated_step(args, live, scores, scores_path, best, snap, gen, ckpt):
+    """AlphaZero-style: every generation goes straight into self-play, and
+    every `--measure-every`th is rated for tracking."""
+    entry = {"gen": gen, "promoted": True, "ungated": True}
+    promote_snapshot(ckpt, live, best)
+    scores["best_gen"] = gen
+    # Persisted before the slow measurement, as the gate does: a crash there
+    # must not leave best.* advanced with scores.json naming the old net.
+    scores["history"].append(entry)
+    scores["processed_through"] = gen
+    json.dump(scores, open(scores_path, "w"), indent=2)
+    scores["history"].pop()
+    if args.measure_every > 0:
+        last = max((r["gen"] for r in scores.get("history", []) if r.get("measured")),
+                   default=None)
+        due = gen % args.measure_every == 0 if last is None else gen - last >= args.measure_every
+        if due:
+            try:
+                measure(args, live, scores, gen, ckpt, entry)
+            except Exception as exc:  # noqa: BLE001
+                print(f"WARNING: gen {gen}: measurement failed: {exc}", file=sys.stderr)
+    metrics = os.path.join(snap, "metrics.json")
+    if os.path.exists(metrics):
+        keep = ("loss_", "energy_", "decl_", "score_")
+        entry.update({k: v for k, v in json.load(open(metrics)).items()
+                      if k.startswith(keep)})
+    scores["history"].append(entry)
+    scores["processed_through"] = gen
+    json.dump(scores, open(scores_path, "w"), indent=2)
+    print(f"gen {gen}: {entry}")
 
 
 def promotions_since_greedy(scores):
@@ -420,6 +649,17 @@ def main():
                     help="rating points the candidate must exceed the champion "
                          "by once the ladder has been played. 0 is a plain "
                          "`higher rating promotes`.")
+    ap.add_argument("--ungated", action="store_true",
+                    help="promote every generation (AlphaZero-style) and only "
+                         "measure every --measure-every generations.")
+    ap.add_argument("--measure-every", type=int, default=5,
+                    help="ungated: rate every Nth generation on the ladder and "
+                         "greedy. 0 never measures.")
+    ap.add_argument("--eval-parallel", type=int, default=6,
+                    help="ungated: measurement matches run at once.")
+    ap.add_argument("--tripwire-elo", type=float, default=150.0,
+                    help="ungated: WARN when a measured net rates this far below "
+                         "the best fp16 net twice running.")
     ap.add_argument("--crown-min-games", type=int, default=60,
                     help="rated games a net needs before it can become champion: "
                          "the 40-game gate plus at least one ladder match, so no "
@@ -470,6 +710,9 @@ def main():
             gen = int(re.search(r"gen(\d+)", snap).group(1))
             ckpt = os.path.join(snap, "checkpoint.safetensors")
             if not os.path.exists(ckpt):
+                continue
+            if args.ungated:
+                ungated_step(args, live, scores, scores_path, best, snap, gen, ckpt)
                 continue
             champion = best if os.path.exists(best) else None
             # Who `champion` actually is, captured before a promotion overwrites

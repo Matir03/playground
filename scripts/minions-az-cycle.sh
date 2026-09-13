@@ -96,12 +96,13 @@ FORCED_VISITS="${FORCED_VISITS:-30}"
 # Non-explore candidates drawn at random to also get a quota, so trustworthy
 # value estimates are not confined to the injected set.
 FORCED_EXTRA="${FORCED_EXTRA:-4}"
-# Exactly one generation. The retention limit that matters is how many
-# promotions back the oldest data reaches, and at 250000 that is zero: every
-# training step sees only what the current champion just played. The 1M buffer
-# held four generations, so up to three promotions of drift.
-MAX_EXAMPLES="${MAX_EXAMPLES:-250000}"
-# One full pass over the buffer per generation: 488 * 512 ~= MAX_EXAMPLES.
+# Three generations. Ungated, a weak net's games go straight into the buffer,
+# and what dilutes them is the generations beside them -- at 250000 (exactly
+# one) the next net would train on nothing else. STEPS is unchanged, so each
+# example is still drawn about once over its life and training costs the same
+# per generation; each batch now mixes three nets' games.
+MAX_EXAMPLES="${MAX_EXAMPLES:-750000}"
+# One generation's worth of samples per generation: 488 * 512 ~= TARGET_EXAMPLES.
 #
 # The learner samples uniformly *from the whole buffer*, not from the newest
 # generation, so what matters is `steps * batch / buffer_size` — the expected
@@ -135,6 +136,12 @@ EVAL_LAG="${EVAL_LAG:-5}"
 # while the other losses sit at 0.5-3, so 1.0 would swamp them.
 TB_WEIGHT="${TB_WEIGHT:-0.3}"
 EVAL_GAMES="${EVAL_GAMES:-40}"
+# Promotion mode, see the eval step. 0: ungated, every generation goes into
+# self-play and every MEASURE_EVERY-th is rated. 1: the per-generation gate.
+GATE="${GATE:-0}"
+MEASURE_EVERY="${MEASURE_EVERY:-5}"
+# Measurement matches at once: four ladder rungs, the best fp16 net, greedy.
+EVAL_PARALLEL="${EVAL_PARALLEL:-6}"
 # Games against the greedy yardstick. 12 was too few to read: across generations
 # 13-22 the margin swung between -1.0 and -11.0 with no real trend, which is
 # enough noise to fake both a rally and a collapse — it did, and both were
@@ -246,17 +253,28 @@ while true; do
   # <live>/watchdog.jsonl and warns, so the trend is on the record either way.
   "$PYTHON" "$repo/python/minions_watchdog.py" --live "$LIVE" || true
 
-  # Promotion is gated on a match against the reigning champion, every
-  # generation. Auto-promotion was tried and abandoned: with nothing gating the
-  # ladder, forty generations of falling losses produced a net that lost 180
-  # straight games to greedy, because every generation entered self-play
-  # regardless of whether it was actually stronger than the one before it.
+  # Ungated by default (GATE=0), as AlphaZero: every generation goes straight
+  # into self-play; every MEASURE_EVERY-th plays the ladder and greedy in
+  # parallel, for tracking only. The gate cost ~18 of every ~51 minutes, and
+  # its head-to-head and ladder verdicts disagreed three generations running.
   #
-  # The gate's known weakness stands — a 40-game match is noisy, and it will
-  # sometimes reject a generation that was fine. That is the trade being made
-  # deliberately: a rejected good generation costs one cycle, an accepted bad
-  # one poisons the buffer that trains all its successors.
-  echo "== cycle $gen: eval vs champion (gates promotion) =="
+  # Auto-promotion was tried once before (gens 110-147) and blamed for 180
+  # straight losses to greedy, but a TB buffer and energy-target negatives
+  # landed in the same window, and their revert blamed *them* for the same
+  # numbers five hours before the gate came back -- so gating was never
+  # actually tested. What guards the ungated run now: MAX_EXAMPLES holds three
+  # generations, so a weak net's games are a third of the next training set
+  # rather than all of it, and a net that rates --tripwire-elo below the best
+  # fp16 net on two measurements running raises a WARNING.
+  #
+  # GATE=1 restores the per-generation champion gate.
+  if [[ "$GATE" == 0 ]]; then
+    echo "== cycle $gen: promote (ungated; rated every $MEASURE_EVERY) =="
+    EVAL_MODE=(--ungated --measure-every "$MEASURE_EVERY" --eval-parallel "$EVAL_PARALLEL")
+  else
+    echo "== cycle $gen: eval vs champion (gates promotion) =="
+    EVAL_MODE=()
+  fi
   # Greedy is a slow external yardstick, not a rung on the ladder. The eval
   # loop runs it only when the candidate is promoted, so the games are offered
   # unconditionally here and it decides — a schedule in this script would be a
@@ -265,7 +283,7 @@ while true; do
     --engine "$ENGINE" --games "$EVAL_GAMES" --candidates "$EVAL_CANDIDATES" \
     --sims "$EVAL_SIMS" --greedy-games "$GREEDY_GAMES" \
     --t-steps "$T_STEPS" --promote-threshold "$PROMOTE" --once \
-    --backend "$BACKEND" --ep "$EP" $FP16_FLAG || {
+    --backend "$BACKEND" --ep "$EP" $FP16_FLAG ${EVAL_MODE[@]+"${EVAL_MODE[@]}"} || {
       # Never let evaluation kill the run. The script is `set -e`, so a bad
       # eval used to take the whole cycle down with it — an unattended run
       # died at cycle 3 that way, losing the night. A skipped eval means the
