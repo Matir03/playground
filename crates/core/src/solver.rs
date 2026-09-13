@@ -130,13 +130,25 @@ pub struct Analysis {
 /// which at the call site.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AnalysisOptions {
-    /// Candidates per expansion. `None` = the engine's configured default.
+    /// Candidates per expansion. `None` = the engine's configured search.
     pub candidates: Option<usize>,
     /// Skip the search and return only the position's evaluation.
     pub eval_only: bool,
-    /// KR-PUCT kernel bandwidth. 0 = the flat PUCT search that self-play and
-    /// eval actually run, so analysis matches them by default.
-    pub kernel_sigma: f32,
+    /// KR-PUCT kernel bandwidth. `None` = the engine's configured search.
+    pub kernel_sigma: Option<f32>,
+    /// Run the engine's fast search -- the cheaper one self-play plays most
+    /// turns with -- instead of its full one.
+    pub fast: bool,
+}
+
+/// A game's search settings as JSON, for a client to show and edit field by
+/// field without knowing the game.
+#[derive(Clone, Debug)]
+pub struct SearchConfigJson {
+    /// The search in effect.
+    pub current: String,
+    /// The search the engine started with.
+    pub default: String,
 }
 
 /// A game that can report what its net and search see at a position.
@@ -161,5 +173,18 @@ pub trait Analyzable: crate::Game {
     /// replay a variation through `apply` without reimplementing the realizer.
     fn apply_encoded_turn(_state: &Self::State, _turn: &[u8]) -> anyhow::Result<Self::State> {
         anyhow::bail!("this game has no turn encoding")
+    }
+
+    /// The search `analyze` and the engine's seat run. `None` = this game has
+    /// no configurable search.
+    fn search_config() -> Option<anyhow::Result<SearchConfigJson>> {
+        None
+    }
+
+    /// Replace that search (`Some(json)`, every setting given) or restore the
+    /// one the engine started with (`None`), and report the result as
+    /// [`Self::search_config`] does.
+    fn set_search_config(_json: Option<&str>) -> Option<anyhow::Result<SearchConfigJson>> {
+        None
     }
 }

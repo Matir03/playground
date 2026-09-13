@@ -69,9 +69,17 @@ T_STEPS_FAST="${T_STEPS_FAST:-2}"
 # diffusion cost. At FAST_SIMS visits a 32-wide candidate set is spread far too
 # thin to form a tree anyway, so this is cheaper *and* better shaped.
 CANDIDATES_FAST="${CANDIDATES_FAST:-8}"
-# Eval has no search settings of its own (user's call, 2026-09-13): every match
-# runs self-play's full search, read from the search.json the self-play actor
-# writes into the live dir, so the two cannot drift apart.
+# Eval is a *yardstick*, so its search is pinned independently of self-play's.
+# Deliberately stronger than self-play: the question a match answers is "which
+# net is better", and a deeper search reads that off the weights with less noise
+# than the shallow search self-play can afford. Eval has no fast/full split, so
+# EVAL_SIMS applies to every move.
+#
+# 2026-09-12: set to 400 sims / 16 candidates by the user -- self-play's full
+# search budget -- with the same diffusion length as self-play.
+EVAL_CANDIDATES="${EVAL_CANDIDATES:-16}"
+EVAL_SIMS="${EVAL_SIMS:-400}"
+EVAL_T_STEPS="${EVAL_T_STEPS:-$T_STEPS}"
 RANDOM_FRACTION="${RANDOM_FRACTION:-0.25}"
 # Random openings: N random legal turns before the search takes over, none of
 # them recorded. Keeps the training distribution moving when self-play comes
@@ -279,8 +287,9 @@ while true; do
   # unconditionally here and it decides — a schedule in this script would be a
   # second, disagreeing mechanism.
   "$PYTHON" "$repo/python/minions_eval_loop.py" --live "$LIVE" \
-    --engine "$ENGINE" --games "$EVAL_GAMES" --greedy-games "$GREEDY_GAMES" \
-    --promote-threshold "$PROMOTE" --once \
+    --engine "$ENGINE" --games "$EVAL_GAMES" --candidates "$EVAL_CANDIDATES" \
+    --sims "$EVAL_SIMS" --greedy-games "$GREEDY_GAMES" \
+    --t-steps "$EVAL_T_STEPS" --promote-threshold "$PROMOTE" --once \
     --backend "$BACKEND" --ep "$EP" $FP16_FLAG ${EVAL_MODE[@]+"${EVAL_MODE[@]}"} || {
       # Never let evaluation kill the run. The script is `set -e`, so a bad
       # eval used to take the whole cycle down with it — an unattended run

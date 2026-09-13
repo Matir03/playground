@@ -1,13 +1,11 @@
 //! The search self-play runs, recorded once and shared.
 //!
-//! Self-play, eval and the UI used to build their searches separately -- five
-//! copies of the parameter list, each with its own defaults -- and they
-//! drifted: eval drew no random candidates, and the UI seat took
-//! `SampledParams::default()` wholesale. Now the self-play actor writes the
-//! settings it actually runs with to `search.json` in the live dir, and eval
-//! and the UI load that file. Every one of them then builds its search through
-//! `ActorConfig::search_params`, so what the UI shows and what a match measures
-//! is the search that produced the training data.
+//! The self-play actor writes the settings it actually runs with to
+//! `search.json` in the live dir, and the UI's engine (`serve`) starts from
+//! that file, so the UI shows the search that produced the training data. The
+//! UI can then change any of it (`apply_json`) and restore it. Eval keeps
+//! settings of its own (`eval::match_search`). Every search, whatever its
+//! settings, is built through `ActorConfig::search_params`.
 
 use crate::sampler::SamplerConfig;
 use crate::selfplay::ActorConfig;
@@ -96,36 +94,83 @@ pub fn load(path: &Path) -> anyhow::Result<(ActorConfig, SamplerConfig)> {
             path.display()
         )
     })?;
-    let r: Recorded =
-        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-    let actor = ActorConfig {
-        sims: r.sims,
-        fast_sims: r.fast_sims,
-        full_search_prob: r.full_search_prob,
-        c_puct: r.c_puct,
-        k_forced: r.k_forced,
-        min_explore_visits: r.min_explore_visits,
-        forced_visits: r.forced_visits,
-        forced_extra: r.forced_extra,
-        temp_moves: r.temp_moves,
-        pw_alpha: r.pw_alpha,
-        pw_beta: r.pw_beta,
-        pw_chunk: r.pw_chunk,
-        pw_resume: r.pw_resume,
-        kernel_sigma: r.kernel_sigma,
-        ..Default::default()
-    };
-    let sampler = SamplerConfig {
-        k_candidates: r.candidates,
-        k_candidates_fast: r.candidates_fast,
-        t_steps: r.t_steps,
-        t_steps_fast: r.t_steps_fast,
-        random_fraction: r.random_fraction,
-        temperature: r.temperature,
-        use_energy: r.use_energy,
-        ..Default::default()
-    };
+    let (mut actor, mut sampler) = (ActorConfig::default(), SamplerConfig::default());
+    apply_json(&text, &mut actor, &mut sampler)
+        .with_context(|| format!("parsing {}", path.display()))?;
     Ok((actor, sampler))
+}
+
+/// The search `actor` and `sampler` describe, in the file's format.
+pub fn to_json(actor: &ActorConfig, sampler: &SamplerConfig) -> String {
+    serde_json::to_string_pretty(&record(actor, sampler)).expect("numbers and bools serialise")
+}
+
+/// Overwrite the search settings in `actor` and `sampler` with those in
+/// `text`, leaving everything else -- seeds, padding, the backend -- alone.
+///
+/// As strict as the file: every setting must be given and nothing else, and a
+/// value no search can run with is refused by name rather than run.
+pub fn apply_json(
+    text: &str,
+    actor: &mut ActorConfig,
+    sampler: &mut SamplerConfig,
+) -> anyhow::Result<()> {
+    let r: Recorded = serde_json::from_str(text)?;
+    validate(&r)?;
+    actor.sims = r.sims;
+    actor.fast_sims = r.fast_sims;
+    actor.full_search_prob = r.full_search_prob;
+    actor.c_puct = r.c_puct;
+    actor.k_forced = r.k_forced;
+    actor.min_explore_visits = r.min_explore_visits;
+    actor.forced_visits = r.forced_visits;
+    actor.forced_extra = r.forced_extra;
+    actor.temp_moves = r.temp_moves;
+    actor.pw_alpha = r.pw_alpha;
+    actor.pw_beta = r.pw_beta;
+    actor.pw_chunk = r.pw_chunk;
+    actor.pw_resume = r.pw_resume;
+    actor.kernel_sigma = r.kernel_sigma;
+    sampler.k_candidates = r.candidates;
+    sampler.k_candidates_fast = r.candidates_fast;
+    sampler.t_steps = r.t_steps;
+    sampler.t_steps_fast = r.t_steps_fast;
+    sampler.random_fraction = r.random_fraction;
+    sampler.temperature = r.temperature;
+    sampler.use_energy = r.use_energy;
+    Ok(())
+}
+
+fn validate(r: &Recorded) -> anyhow::Result<()> {
+    for (name, v) in [
+        ("sims", r.sims as usize),
+        ("fast_sims", r.fast_sims as usize),
+        ("candidates", r.candidates),
+        ("candidates_fast", r.candidates_fast),
+        ("t_steps", r.t_steps),
+        ("t_steps_fast", r.t_steps_fast),
+    ] {
+        anyhow::ensure!(v > 0, "{name} must be at least 1");
+    }
+    for (name, v) in [("full_search_prob", r.full_search_prob as f32), ("random_fraction", r.random_fraction)] {
+        anyhow::ensure!((0.0..=1.0).contains(&v), "{name} must be within [0, 1], got {v}");
+    }
+    for (name, v) in [
+        ("c_puct", r.c_puct),
+        ("k_forced", r.k_forced),
+        ("min_explore_visits", r.min_explore_visits),
+        ("pw_alpha", r.pw_alpha),
+        ("kernel_sigma", r.kernel_sigma),
+    ] {
+        anyhow::ensure!(v.is_finite() && v >= 0.0, "{name} must be a number >= 0, got {v}");
+    }
+    anyhow::ensure!(r.pw_beta.is_finite(), "pw_beta must be a number");
+    anyhow::ensure!(
+        r.temperature.is_finite() && r.temperature > 0.0,
+        "temperature must be above 0, got {}",
+        r.temperature
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -175,5 +220,24 @@ mod tests {
         std::fs::write(&path, v.to_string()).unwrap();
         assert!(load(&path).is_err(), "a search.json without random_fraction loaded");
         std::fs::remove_file(&path).ok();
+    }
+
+    /// The UI edits the search in place: applying settings must leave what is
+    /// not a setting alone, and refuse a value no search can run with.
+    #[test]
+    fn applying_settings_keeps_the_rest_and_refuses_bad_values() {
+        let mut actor = ActorConfig { workers: 7, ..Default::default() };
+        let mut sampler = SamplerConfig { seed: 99, pad_to: 12, ..Default::default() };
+        let mut v = serde_json::to_value(record(&actor, &sampler)).unwrap();
+        v["sims"] = 123.into();
+        v["random_fraction"] = 0.5.into();
+        apply_json(&v.to_string(), &mut actor, &mut sampler).unwrap();
+        assert_eq!((actor.sims, sampler.random_fraction), (123, 0.5));
+        assert_eq!((actor.workers, sampler.seed, sampler.pad_to), (7, 99, 12));
+
+        v["random_fraction"] = 1.5.into();
+        let err = apply_json(&v.to_string(), &mut actor, &mut sampler).unwrap_err();
+        assert!(err.to_string().contains("random_fraction"), "{err}");
+        assert_eq!(sampler.random_fraction, 0.5, "a refused apply must change nothing");
     }
 }

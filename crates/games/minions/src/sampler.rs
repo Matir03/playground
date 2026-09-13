@@ -621,7 +621,26 @@ impl MinionsModel {
     }
 }
 
-impl SampledModel<MinionsTurns> for MinionsModel {
+/// The model as one kind of self-play search calls it.
+///
+/// `full` is the self-play pool's `want_full`: it picks the diffusion depth
+/// (`t_steps` or `t_steps_fast`) and whether random candidates are mixed in. A
+/// search driven through the `SampledModel` trait has no such argument, so
+/// this carries it. `MinionsModel`'s own impl is the full search.
+pub struct AsSearch<'a> {
+    pub model: &'a MinionsModel,
+    pub full: bool,
+}
+
+impl AsSearch<'_> {
+    /// A fresh stream per call. Still reproducible for a given `cfg.seed`: the
+    /// sequence of expansions is what varies, not the starting entropy.
+    fn next_seq(&self) -> u64 {
+        self.model.expand_seq.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+impl SampledModel<MinionsTurns> for AsSearch<'_> {
     /// Expand many positions at once: one trunk forward for all of them, one
     /// diffusion forward per round across every chain of every game, and one
     /// energy forward over every candidate of every game.
@@ -630,10 +649,7 @@ impl SampledModel<MinionsTurns> for MinionsModel {
         states: &[MinionsState],
         k: usize,
     ) -> anyhow::Result<Vec<Expansion<MinionsTurns>>> {
-        // A fresh stream per call. Still reproducible for a given `cfg.seed`:
-        // the sequence of expansions is what varies, not the starting entropy.
-        let seq = self.expand_seq.fetch_add(1, Ordering::Relaxed);
-        self.expand_batch_mode(states, k, true, seq)
+        self.model.expand_batch_mode(states, k, self.full, self.next_seq())
     }
 
     fn expand(&self, state: &MinionsState, k: usize) -> anyhow::Result<Expansion<MinionsTurns>> {
@@ -641,6 +657,42 @@ impl SampledModel<MinionsTurns> for MinionsModel {
             .expand_batch(std::slice::from_ref(state), k)?
             .pop()
             .expect("one state in, one expansion out"))
+    }
+
+    /// Proposals and fills in one call, as the self-play pool makes it.
+    fn widen_batch(
+        &self,
+        states: &[MinionsState],
+        fill: &[bool],
+        k: usize,
+    ) -> anyhow::Result<Vec<Vec<(TurnSpec, f32, bool)>>> {
+        let (out, _) = self.model.expand_batch_cached(
+            states, k, self.full, self.next_seq(), &[], &|n| n, false, fill,
+        )?;
+        Ok(out.into_iter().map(|(_, c)| c).collect())
+    }
+}
+
+impl SampledModel<MinionsTurns> for MinionsModel {
+    fn expand_batch(
+        &self,
+        states: &[MinionsState],
+        k: usize,
+    ) -> anyhow::Result<Vec<Expansion<MinionsTurns>>> {
+        AsSearch { model: self, full: true }.expand_batch(states, k)
+    }
+
+    fn expand(&self, state: &MinionsState, k: usize) -> anyhow::Result<Expansion<MinionsTurns>> {
+        AsSearch { model: self, full: true }.expand(state, k)
+    }
+
+    fn widen_batch(
+        &self,
+        states: &[MinionsState],
+        fill: &[bool],
+        k: usize,
+    ) -> anyhow::Result<Vec<Vec<(TurnSpec, f32, bool)>>> {
+        AsSearch { model: self, full: true }.widen_batch(states, fill, k)
     }
 }
 
@@ -681,7 +733,7 @@ impl MinionsModel {
         full: bool,
         batch_seq: u64,
     ) -> anyhow::Result<Vec<Expansion<MinionsTurns>>> {
-        self.expand_batch_cached(states, k, full, batch_seq, &[], &|n| n, false)
+        self.expand_batch_cached(states, k, full, batch_seq, &[], &|n| n, false, &[])
             .map(|(out, _)| out)
     }
 
@@ -701,6 +753,11 @@ impl MinionsModel {
     /// Why: a widen request is always for a node expanded earlier, so its trunk
     /// output was computed then and discarded. Widens are ~60% of requests,
     /// which made recomputing it 45% of every FLOP self-play spent.
+    ///
+    /// `fill[i]` marks a widen for a node whose proposals have repeated (see
+    /// `SampledModel::widen_batch`): its row gets `k` random playouts, all
+    /// explore, and none of its diffusion draws. Those draws are still made,
+    /// so the batch keeps its shape. Rows past `fill.len()` are proposals.
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     pub fn expand_batch_cached(
         &self,
@@ -711,6 +768,7 @@ impl MinionsModel {
         cached: &[Option<(f32, &[f16])>],
         trunk_rows: &dyn Fn(usize) -> usize,
         want_fresh: bool,
+        fill: &[bool],
     ) -> anyhow::Result<(Vec<Expansion<MinionsTurns>>, TrunkRows)> {
         let real = states.len();
         if real == 0 {
@@ -846,6 +904,15 @@ impl MinionsModel {
         // depend on the sampler being any good.
         let t_play = Instant::now();
         for (gi, decls) in per_game.iter_mut().enumerate() {
+            if fill.get(gi).copied().unwrap_or(false) {
+                // A fill: this node's proposals already repeat, so it takes
+                // exploration draws only.
+                decls.clear();
+                for _ in 0..k {
+                    decls.push((TurnSpec::random_playout(&states[gi], &mut rng), true));
+                }
+                continue;
+            }
             for _ in 0..k_rand {
                 decls.push((TurnSpec::random_playout(&states[gi], &mut rng), true));
             }
@@ -970,6 +1037,32 @@ mod tests {
         }
     }
 
+    /// A fill row gets exploration draws only, every candidate flagged explore,
+    /// while the proposal rows of the same call are untouched by it.
+    #[test]
+    fn fill_rows_draw_only_exploration() {
+        let Some(m) = model(SamplerConfig {
+            k_candidates: 4,
+            random_fraction: 0.0,
+            seed: 5,
+            ..Default::default()
+        }) else {
+            eprintln!("MINIONS_PARITY_DIR unset — skipping");
+            return;
+        };
+        let states = vec![MinionsState::default(); 2];
+        let (out, _) =
+            m.expand_batch_cached(&states, 4, true, 3, &[], &|n| n, false, &[false, true]).unwrap();
+        assert!(
+            !out[0].1.is_empty() && out[0].1.iter().all(|c| !c.2),
+            "with random_fraction 0 a proposal row holds no explore candidates"
+        );
+        assert!(
+            !out[1].1.is_empty() && out[1].1.iter().all(|c| c.2),
+            "a fill row holds exploration draws only"
+        );
+    }
+
     /// A widen served from cached trunk output must be exactly the widen that
     /// recomputes it: same candidates, same priors, same values, row for row.
     ///
@@ -1001,7 +1094,7 @@ mod tests {
 
         // A value-only expansion, keeping what the trunk computed.
         let none: Vec<Option<(f32, &[f16])>> = vec![None; states.len()];
-        let (exp, rows) = m.expand_batch_cached(&states, 0, true, 1, &none, &|n| n, true).unwrap();
+        let (exp, rows) = m.expand_batch_cached(&states, 0, true, 1, &none, &|n| n, true, &[]).unwrap();
         let kept: Vec<(f32, Vec<f16>)> = rows
             .fresh
             .iter()
@@ -1028,7 +1121,7 @@ mod tests {
 
         // All cached: the heads see bit-identical inputs, so everything matches exactly.
         let (got, fresh) = m
-            .expand_batch_cached(&states, 2, true, 42, &all, &|n| n.next_multiple_of(4), true)
+            .expand_batch_cached(&states, 2, true, 42, &all, &|n| n.next_multiple_of(4), true, &[])
             .unwrap();
         assert!(fresh.fresh.iter().all(|f| f.is_none()), "all hits: nothing comes back fresh");
         assert_eq!(want.len(), got.len());
@@ -1046,7 +1139,7 @@ mod tests {
         // do in production, where batch composition changes every wave. Hits
         // must still be exact; a miss on the wrong row would be off by >0.1.
         let (got, fresh) = m
-            .expand_batch_cached(&states, 2, true, 42, &half, &|n| n.next_multiple_of(4), true)
+            .expand_batch_cached(&states, 2, true, 42, &half, &|n| n.next_multiple_of(4), true, &[])
             .unwrap();
         for (i, (c, f)) in half.iter().zip(&fresh.fresh).enumerate() {
             if c.is_some() {

@@ -495,6 +495,9 @@ fn drive_pool_worker(
         // the same shape, so they share one batch — which is the whole point,
         // since it lets a wave cover more nodes instead of over-serving few.
         let mut is_widen: Vec<bool> = Vec::with_capacity(max_batch);
+        // Per request: a widen for a node whose proposals have repeated, which
+        // takes exploration draws instead (`SampledModel::widen_batch`).
+        let mut fills: Vec<bool> = Vec::with_capacity(max_batch);
         let mut scanned = 0usize;
         // Each kind gets its own fixed width, and the two sum to `max_batch`.
         // Padding both to the full width — which is what a single width forces —
@@ -542,12 +545,14 @@ fn drive_pool_worker(
                         ids.push(i);
                         states.push(st);
                         is_widen.push(false);
+                        fills.push(false);
                         break;
                     }
-                    Step::NeedWiden(st) => {
+                    Step::NeedWiden { state, fill } => {
                         ids.push(i);
-                        states.push(st);
+                        states.push(state);
                         is_widen.push(true);
+                        fills.push(fill);
                         break;
                     }
                     Step::Done => {
@@ -647,7 +652,7 @@ fn drive_pool_worker(
             let cached = if use_cache { cache_lookup(&*slots, &ids, &keys, &exp_idx) } else { Vec::new() };
             stats.cache_hits += cached.iter().filter(|c| c.is_some()).count() as u64;
             let (r, fresh) = model.expand_batch_cached(
-                &st, exp_k, want_full, *next_seed, &cached, &width_for, cache_budget > 0,
+                &st, exp_k, want_full, *next_seed, &cached, &width_for, cache_budget > 0, &[],
             )?;
             drop(cached);
             *next_seed = next_seed.wrapping_add(1);
@@ -667,8 +672,10 @@ fn drive_pool_worker(
             }
             let cached = if use_cache { cache_lookup(&*slots, &ids, &keys, &wid_idx) } else { Vec::new() };
             stats.cache_hits += cached.iter().filter(|c| c.is_some()).count() as u64;
+            // Padding rows are proposals; their output is dropped either way.
+            let fill: Vec<bool> = wid_idx.iter().map(|&i| fills[i]).collect();
             let (r, fresh) = model.expand_batch_cached(
-                &st, k_call, want_full, *next_seed, &cached, &width_for, use_cache,
+                &st, k_call, want_full, *next_seed, &cached, &width_for, use_cache, &fill,
             )?;
             drop(cached);
             *next_seed = next_seed.wrapping_add(1);

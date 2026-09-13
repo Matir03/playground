@@ -90,7 +90,7 @@ def ensure_onnx(ckpt: str) -> None:
     export_onnx_atomic(net, d)
 
 
-def run_match_full(engine, a, b, games, search_config, backend, ep, fp16, seed,
+def run_match_full(engine, a, b, games, sims, candidates, t_steps, backend, ep, fp16, seed,
                    render_file=None, render_games=5):
     """One `eval-match`, parsed into a dict. Touches no module state, so several
     can run at once (see `measure`)."""
@@ -98,10 +98,8 @@ def run_match_full(engine, a, b, games, search_config, backend, ep, fp16, seed,
         ensure_onnx(a)
         if b:
             ensure_onnx(b)
-    # The search is self-play's recorded one (search.json), never settings of
-    # eval's own, so a match measures the nets under the search that trains them.
-    cmd = [engine, "eval-match", "--a", a, "--games", str(games),
-           "--search-config", search_config, "--seed", str(seed),
+    cmd = [engine, "eval-match", "--a", a, "--games", str(games), "--sims", str(sims),
+           "--candidates", str(candidates), "--t-steps", str(t_steps), "--seed", str(seed),
            "--backend", backend, "--ep", ep]
     if b:
         cmd += ["--b", b]
@@ -136,11 +134,11 @@ def run_match_full(engine, a, b, games, search_config, backend, ep, fp16, seed,
             "turns": (float(t.group(1)), float(t.group(2))) if t else None}
 
 
-def run_match(engine, a, b, games, search_config, backend, ep, fp16, seed,
+def run_match(engine, a, b, games, sims, candidates, t_steps, backend, ep, fp16, seed,
               render_file=None, render_games=5):
     """`run_match_full` for the sequential callers, which read the last match's
     bids and turn lengths from module state."""
-    r = run_match_full(engine, a, b, games, search_config, backend, ep, fp16,
+    r = run_match_full(engine, a, b, games, sims, candidates, t_steps, backend, ep, fp16,
                        seed, render_file, render_games)
     global _LAST_BIDS, _LAST_TURNS
     _LAST_BIDS, _LAST_TURNS = r["bids"], r["turns"]
@@ -219,7 +217,7 @@ def run_ladder_matches(args, live, scores, gen, ckpt, exclude):
         try:
             sc, _, _ = run_match(
                 args.engine, ckpt, other,
-                args.ladder_games, args.search_config,
+                args.ladder_games, args.sims, args.candidates, args.t_steps,
                 args.backend, args.ep, args.fp16,
                 # Distinct per opponent and per measuring generation, so repeat
                 # pairings are independent samples rather than replays.
@@ -440,8 +438,8 @@ def play_all(args, live, pairs, seed0):
         a, b = p
         try:
             r = run_match_full(args.engine, ckpt[a], ckpt[b] if b is not None else None,
-                               args.tournament_games, args.search_config,
-                               args.backend, args.ep, args.fp16, seed=seed)
+                               args.tournament_games, args.sims, args.candidates,
+                               args.t_steps, args.backend, args.ep, args.fp16, seed=seed)
         except Exception as exc:  # noqa: BLE001
             r = exc
         with cv:
@@ -648,8 +646,8 @@ def run_diagnostic(args, live, scores, scores_path) -> None:
             break
     if past and os.path.exists(past):
         score, margin, gscore = run_match(
-            args.engine, ckpt, past, args.games, args.search_config,
-            args.backend, args.ep, args.fp16, seed=gen,
+            args.engine, ckpt, past, args.games, args.sims, args.candidates,
+            args.t_steps, args.backend, args.ep, args.fp16, seed=gen,
             render_file=os.path.join(games_dir, f"gen_{gen:04d}_vs_lag{args.lag}.txt"),
             render_games=args.render_games)
         entry[f"vs_gen_minus_{args.lag}"] = score
@@ -665,8 +663,8 @@ def run_diagnostic(args, live, scores, scores_path) -> None:
     # ...and against greedy, the fixed external yardstick.
     try:
         g, gm, ggs = run_match(
-            args.engine, ckpt, None, args.greedy_games, args.search_config,
-            args.backend, args.ep, args.fp16, seed=1000 + gen,
+            args.engine, ckpt, None, args.greedy_games, args.sims, args.candidates,
+            args.t_steps, args.backend, args.ep, args.fp16, seed=1000 + gen,
             render_file=os.path.join(games_dir, f"gen_{gen:04d}_vs_greedy.txt"),
             render_games=args.render_games)
         entry["vs_greedy"] = g
@@ -693,10 +691,9 @@ def main():
     ap.add_argument("--live", required=True)
     ap.add_argument("--engine", default="./target/release/minions-engine")
     ap.add_argument("--games", type=int, default=40)
-    # No search settings of eval's own: every match runs the search self-play
-    # recorded, so the nets are measured under the search that trains them.
-    ap.add_argument("--search-config", default=None,
-                    help="self-play's search.json (default: <live>/search.json)")
+    ap.add_argument("--sims", type=int, default=100)
+    ap.add_argument("--candidates", type=int, default=16)
+    ap.add_argument("--t-steps", type=int, default=6)
     ap.add_argument("--promote-threshold", type=float, default=0.40,
                     help="score against the reigning champion needed to reach "
                          "the ladder. A pre-filter that keeps hopeless "
@@ -753,11 +750,6 @@ def main():
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--period", type=int, default=120)
     args = ap.parse_args()
-    if args.search_config is None:
-        args.search_config = os.path.join(args.live, "search.json")
-    if not os.path.exists(args.search_config):
-        raise SystemExit(f"{args.search_config} is missing: self-play writes it on start "
-                         "(or run `minions-engine selfplay-loop --write-search-config`)")
 
     live = args.live
     scores_path = os.path.join(live, "scores.json")
@@ -804,8 +796,8 @@ def main():
             else:
                 games_dir = os.path.join(live, "games")
                 render_file = os.path.join(games_dir, f"gen_{gen:04d}_vs_champion.txt")
-                score, margin, gscore = run_match(args.engine, ckpt, champion, args.games,
-                                          args.search_config, args.backend, args.ep,
+                score, margin, gscore = run_match(args.engine, ckpt, champion, args.games, args.sims,
+                                          args.candidates, args.t_steps, args.backend, args.ep,
                                           args.fp16, seed=gen,
                                           render_file=render_file,
                                           render_games=args.render_games)
@@ -893,8 +885,8 @@ def main():
               entry["greedy_gen"] = champ_gen
               try:
                   g, gm, ggs = run_match(args.engine, champion_seat(live, best, args.backend),
-                                    None, args.greedy_games,
-                                    args.search_config, args.backend, args.ep,
+                                    None, args.greedy_games, args.sims,
+                                    args.candidates, args.t_steps, args.backend, args.ep,
                                     # Seeded by the measuring generation, not the
                                     # champion's: a champion that survives several
                                     # gates gets re-measured, and reusing its own

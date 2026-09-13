@@ -226,6 +226,42 @@ fn pick_many(
     }
 }
 
+/// Eval's search: settings of its own, built by the code self-play uses.
+///
+/// A match keeps the configuration it has always had -- no random candidates,
+/// full-depth diffusion on every turn, `SampledParams`' defaults for the rest,
+/// and the most-visited turn played -- but goes through
+/// `ActorConfig::search_params` like every other search, so a change to how a
+/// search is built reaches eval too.
+///
+/// `pad_to` pads every batch to the match width, so the live count falling as
+/// games finish does not set TensorRT rebuilding an engine per shape.
+pub fn match_search(
+    sims: u32,
+    candidates: usize,
+    t_steps: usize,
+    pad_to: usize,
+    seed: u64,
+) -> (SamplerConfig, SampledParams) {
+    let sampler = SamplerConfig {
+        t_steps,
+        t_steps_fast: t_steps,
+        k_candidates: candidates,
+        k_candidates_fast: candidates,
+        random_fraction: 0.0,
+        pad_to,
+        seed,
+        ..Default::default()
+    };
+    let actor = crate::selfplay::ActorConfig {
+        sims,
+        temp_moves: 0,
+        pw_resume: false,
+        ..Default::default()
+    };
+    (sampler, actor.search_params(&sampler, true, seed))
+}
+
 /// `render` is `(path, count)`: write a full turn-by-turn transcript of the
 /// first `count` games to `path`.
 ///
@@ -526,6 +562,24 @@ pub fn load_seat(
 mod tests {
     use super::*;
     use crate::turn::{NO_MOVE, TARGET_STAY};
+
+    /// Building eval's search through `search_params` must not change it: the
+    /// match is the one eval ran before the builder was shared.
+    #[test]
+    fn match_search_is_evals_historical_search() {
+        let (sampler, params) = match_search(400, 16, 4, 40, 9);
+        let historical = SampledParams {
+            simulations: 400,
+            k_candidates: 16,
+            temp_moves: 0,
+            seed: 9,
+            ..Default::default()
+        };
+        assert_eq!(format!("{params:?}"), format!("{historical:?}"));
+        assert_eq!(sampler.random_fraction, 0.0, "eval draws no random candidates");
+        assert_eq!((sampler.t_steps, sampler.t_steps_fast), (4, 4));
+        assert_eq!((sampler.k_candidates, sampler.pad_to, sampler.seed), (16, 40, 9));
+    }
 
     /// The higher bidder claimed yellow was stronger, so they get yellow.
     ///

@@ -34,6 +34,11 @@ static CONFIG: Mutex<Option<NetSeatConfig>> = Mutex::new(None);
 static MODEL: Mutex<Option<Box<MinionsModel>>> = Mutex::new(None);
 /// The turn currently being handed out, one action at a time.
 static PLAN: Mutex<Option<Plan>> = Mutex::new(None);
+/// The search `serve` started with, as JSON: what the UI's reset restores.
+static DEFAULT: Mutex<Option<String>> = Mutex::new(None);
+/// Searches run, so each draws its own RNG stream (temperature picks and
+/// forced-quota draws) the way self-play's do.
+static SEARCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Clone)]
 pub struct NetSeatConfig {
@@ -76,9 +81,57 @@ pub fn configure(mut cfg: NetSeatConfig) {
 }
 
 fn configure_inner(cfg: NetSeatConfig) {
+    *DEFAULT.lock().unwrap() = Some(crate::search_config::to_json(&cfg.actor, &cfg.sampler));
     *CONFIG.lock().unwrap() = Some(cfg);
     *MODEL.lock().unwrap() = None;
     *PLAN.lock().unwrap() = None;
+}
+
+fn search_seed(cfg: &NetSeatConfig) -> u64 {
+    let n = SEARCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    cfg.sampler.seed ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+fn current_search() -> anyhow::Result<playground_core::SearchConfigJson> {
+    let cfg = CONFIG.lock().unwrap().clone().ok_or_else(|| anyhow::anyhow!("no net configured"))?;
+    let default =
+        DEFAULT.lock().unwrap().clone().ok_or_else(|| anyhow::anyhow!("no starting search recorded"))?;
+    Ok(playground_core::SearchConfigJson {
+        current: crate::search_config::to_json(&cfg.actor, &cfg.sampler),
+        default,
+    })
+}
+
+/// Replace the search the seat and analysis run, or restore the one `serve`
+/// started with. It applies from the next search on: a loaded model keeps its
+/// weights and takes the new sampler settings, and the seat's planned turn is
+/// dropped so it re-plans under them.
+fn set_search(json: Option<&str>) -> anyhow::Result<playground_core::SearchConfigJson> {
+    // MODEL before CONFIG, the order analysis holds them in (`aux_for` reads
+    // CONFIG with the model held), so the two cannot deadlock.
+    let mut model = MODEL.lock().unwrap();
+    {
+        let mut guard = CONFIG.lock().unwrap();
+        let cfg = guard.as_mut().ok_or_else(|| anyhow::anyhow!("no net configured"))?;
+        let text = match json {
+            Some(t) => t.to_owned(),
+            None => DEFAULT
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("no starting search recorded"))?,
+        };
+        let (mut actor, mut sampler) = (cfg.actor.clone(), cfg.sampler);
+        crate::search_config::apply_json(&text, &mut actor, &mut sampler)?;
+        cfg.actor = actor;
+        cfg.sampler = sampler;
+        if let Some(m) = model.as_mut() {
+            m.cfg = sampler;
+        }
+    }
+    *PLAN.lock().unwrap() = None;
+    drop(model);
+    current_search()
 }
 
 pub fn is_configured() -> bool {
@@ -99,30 +152,25 @@ fn plan_turn(state: &MinionsState, budget: &SolverBudget) -> anyhow::Result<Sear
     }
     let model = guard.as_ref().expect("model built above");
 
-    // Self-play's full search, from the settings self-play recorded, with one
-    // deliberate difference: play the argmax, never a temperature sample.
+    // Self-play's full search under the engine's current settings -- the ones
+    // self-play recorded unless the UI changed them -- and its move choice,
+    // temperature included: for the first `temp_moves` plies the turn is a
+    // pick in proportion to chosen visits, exactly as in self-play. Set
+    // `temp_moves` to 0 for the most-visited turn every time.
     //
-        // `temp_moves` defaults to 8, so in self-play the first eight plies pick
-        // a visit-proportional candidate to explore. Against a human that is
-        // just weak play — and because forced exploration puts a *null* turn in
-        // the candidate set, sampling could hand back a turn that does nothing
-    // at all. That is exactly what "the net passes on turn 1" was.
-    let mut params = playground_core::sampled_mcts::SampledParams {
-        temp_moves: 0,
-        ..cfg.actor.search_params(&cfg.sampler, true, 0)
-    };
-    // A human is waiting, so honour whatever budget the UI asked for.
-    params.simulations = budget.max_visits.unwrap_or(cfg.actor.sims);
+    // (Sampling once handed back a null turn -- "the net passes on turn 1" --
+    // because it counted forced visits. It counts chosen visits only now.)
+    let mut params = cfg.actor.search_params(&cfg.sampler, true, search_seed(&cfg));
+    if let Some(v) = budget.max_visits {
+        params.simulations = v;
+    }
 
     let result = search::<MinionsTurns, _>(&**model, state.clone(), &params, Minions::ply(state))?;
-    // Belt and braces: with `temp_moves: 0` the search already returns the
-    // most-visited candidate, but pick it explicitly so a future default cannot
-    // quietly reintroduce sampled play here. Falling back to `TurnSpec::default()`
-    // would be a null turn, so an empty candidate set is an error instead.
+    // Falling back to `TurnSpec::default()` would be a null turn, so an empty
+    // candidate set is an error instead.
     let spec: TurnSpec = result
         .candidates
-        .iter()
-        .max_by_key(|(_, visits)| *visits)
+        .get(result.chosen)
         .map(|(s, _)| *s)
         .ok_or_else(|| anyhow::anyhow!("search returned no candidates"))?;
 
@@ -259,10 +307,12 @@ mod tests {
             eprintln!("MINIONS_ORT_DIR unset — skipping opening-turn test");
             return;
         };
+        // The most-visited turn: the seat now follows the configured
+        // temperature, as self-play does, and this is about the argmax.
         configure(NetSeatConfig {
             dir: dir.into(),
             kind: crate::net::BackendKind::Ort { ep: "trt".into(), fp16: true },
-            actor: crate::selfplay::ActorConfig { sims: 64, ..Default::default() },
+            actor: crate::selfplay::ActorConfig { sims: 64, temp_moves: 0, ..Default::default() },
             sampler: SamplerConfig { k_candidates: 12, t_steps: 4, ..Default::default() },
         });
         let budget = SolverBudget { max_millis: None, max_visits: None };
@@ -548,6 +598,14 @@ impl playground_core::Analyzable for Minions {
     fn apply_encoded_turn(state: &MinionsState, turn: &[u8]) -> anyhow::Result<MinionsState> {
         Ok(realize(state, &decode_turn(turn)?).next)
     }
+
+    fn search_config() -> Option<anyhow::Result<playground_core::SearchConfigJson>> {
+        is_configured().then(current_search)
+    }
+
+    fn set_search_config(json: Option<&str>) -> Option<anyhow::Result<playground_core::SearchConfigJson>> {
+        is_configured().then(|| set_search(json))
+    }
 }
 
 fn analyze_inner(
@@ -555,7 +613,7 @@ fn analyze_inner(
     budget: SolverBudget,
     opts: playground_core::AnalysisOptions,
 ) -> anyhow::Result<playground_core::Analysis> {
-    let playground_core::AnalysisOptions { candidates, eval_only, kernel_sigma } = opts;
+    let playground_core::AnalysisOptions { candidates, eval_only, kernel_sigma, fast } = opts;
     let cfg = CONFIG.lock().unwrap().clone().ok_or_else(|| anyhow::anyhow!("no net configured"))?;
 
     let mut guard = MODEL.lock().unwrap();
@@ -584,23 +642,25 @@ fn analyze_inner(
         });
     }
 
-    // Self-play's full search (see `search_config`). A request may change only
-    // the budget, the candidate count and the kernel.
-    let base = cfg.actor.search_params(&cfg.sampler, true, 0);
+    // One of self-play's two searches, under the engine's current settings
+    // (see `search_config`), with the model called as the self-play pool
+    // calls it for that kind. `chosen` is the turn self-play would play here,
+    // temperature included. A request may still override the budget, the
+    // candidate count and the kernel.
+    let full = !fast;
+    let base = cfg.actor.search_params(&cfg.sampler, full, search_seed(&cfg));
     let mut params = playground_core::sampled_mcts::SampledParams {
         k_candidates: candidates.unwrap_or(base.k_candidates),
-        // Analysis reports what the search believes, so it must not sample a
-        // move for variety the way early self-play plies do.
-        temp_moves: 0,
-        // 0 is what self-play runs. Above 0 the kernel is live and every node
-        // exports its matrix.
-        kernel_sigma,
+        // Above 0 the kernel is live and every node exports its matrix.
+        kernel_sigma: kernel_sigma.unwrap_or(base.kernel_sigma),
         ..base
     };
-    params.simulations = budget.max_visits.unwrap_or(cfg.actor.sims);
+    if let Some(v) = budget.max_visits {
+        params.simulations = v;
+    }
 
     let (result, tree) = playground_core::sampled_mcts::search_analyzed::<MinionsTurns, _>(
-        &**model,
+        &crate::sampler::AsSearch { model: &**model, full },
         state.clone(),
         &params,
         Minions::ply(state),

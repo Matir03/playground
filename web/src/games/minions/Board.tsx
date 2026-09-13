@@ -49,6 +49,7 @@ import {
   type AnalyzeResponse,
 } from "../../gen/playground/engine/engine_pb";
 import { AnalysisTree, KernelMatrix, displayOrder, type SortKey } from "./Analysis";
+import { SearchConfigPanel } from "./SearchConfig";
 
 /** Whose turn a position is in, which is what the record's turn boundaries
  *  are made of. Module level, so every render shares one function. */
@@ -327,17 +328,15 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
   // game — the engine applies it to a copy and the board just renders what
   // comes back.
   const [analysisOn, setAnalysisOn] = useState(false);
-  // KR-PUCT bandwidth for analysis only. 0 is the flat PUCT search that
-  // self-play and eval actually run, so the default view is the real search;
-  // raising it is an experiment you opt into, and it makes every node export
-  // its kernel matrix.
-  const [sigma, setSigma] = useState(0);
+  // Which of self-play's two searches to analyse with. Both run under the
+  // engine's search config (the panel in the analysis view), which starts as
+  // self-play's recorded search.
+  const [fast, setFast] = useState(false);
   const [analysis, setAnalysis] = useState<AnalyzeResponse | null>(null);
   const [analysing, setAnalysing] = useState(false);
   const [walk, setWalk] = useState<{ line: Uint8Array[]; labels: string[]; at: AnalyzeResponse } | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [sort, setSort] = useState<SortKey>("visits");
-  const [sims, setSims] = useState(400);
   const [overlay, setOverlay] = useState<"none" | "hex0" | "hex1">("none");
 
   /** Attack phase: the selected piece. Spawn phase: the unit picked to place. */
@@ -417,7 +416,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
   );
 
   /** Arrow keys walk the record. Skipped while a text field has focus, so the
-   *  sims and sigma inputs still take arrow keys as arrow keys. */
+   *  search config's inputs still take arrow keys as arrow keys. */
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
@@ -637,10 +636,10 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
           create(AnalyzeRequestSchema, {
             handle: h,
             line,
-            budget: create(SearchBudgetSchema, { maxVisits: sims }),
-            candidates: 0,
+            // No budget, candidate count or kernel of its own: the engine's
+            // search config decides all of them.
             evalOnly,
-            kernelSigma: sigma,
+            fast,
           }),
           { signal: AbortSignal.timeout(120000) },
         );
@@ -657,7 +656,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
         setAnalysing(false);
       }
     },
-    [client, hist, ensureAt, sims, sigma],
+    [client, hist, ensureAt, fast],
   );
 
   /** Play a root candidate for real, then re-root the analysis on the result.
@@ -1113,32 +1112,19 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                     partway through a turn — finish it, or step back (◀), to analyse
                   </span>
                 )}
-                <label style={{ color: "#999" }}>
-                  sims{" "}
-                  <input
-                    type="number"
-                    min={16}
-                    max={20000}
-                    step={100}
-                    value={sims}
-                    onChange={(e) => setSims(Math.max(16, Number(e.target.value) || 16))}
-                    style={{ width: "5rem", font: "inherit" }}
-                  />
-                </label>
                 <label
                   style={{ color: "#999" }}
-                  title="KR-PUCT kernel bandwidth. 0 = the flat PUCT search self-play and eval run. Above 0, candidates pool visits and values with nearby turns, and the influence matrix below becomes populated."
+                  title="Self-play searches a turn with its full search at full_search_prob and with its fast one otherwise. Both run under the search config below."
                 >
-                  σ{" "}
-                  <input
-                    type="number"
-                    min={0}
-                    max={5}
-                    step={0.05}
-                    value={sigma}
-                    onChange={(e) => setSigma(Math.max(0, Number(e.target.value) || 0))}
-                    style={{ width: "4rem", font: "inherit" }}
-                  />
+                  search{" "}
+                  <select
+                    value={fast ? "fast" : "full"}
+                    onChange={(e) => setFast(e.target.value === "fast")}
+                    style={{ font: "inherit" }}
+                  >
+                    <option value="full">full</option>
+                    <option value="fast">fast</option>
+                  </select>
                 </label>
                 <label style={{ color: "#999" }}>
                   sort{" "}
@@ -1161,6 +1147,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                   </select>
                 </label>
               </div>
+              <SearchConfigPanel client={client} />
 
               {/* The position on the board, and what the nets say about it. The
                   value is always from *that* position's side to move, so it
@@ -1270,16 +1257,17 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
               )}
 
               {analysis && analysis.nodes.length > 0 && (
-                sigma > 0 ? (
+                analysis.nodes[0].kernel.length > 0 ? (
                   <KernelMatrix
                     node={analysis.nodes[0]}
                     order={displayOrder(analysis.nodes[0], sort)}
                   />
                 ) : (
                   <div style={{ color: "#666", fontSize: "0.72rem", marginBottom: "0.45rem" }}>
-                    kernel off (σ = 0) — candidates are scored independently, as in
-                    self-play and eval. Raise σ to pool statistics across similar
-                    turns and see the influence matrix.
+                    kernel off (kernel_sigma = 0) — candidates are scored
+                    independently, as in self-play. Raise kernel_sigma in the search
+                    config to pool statistics across similar turns and see the
+                    influence matrix.
                   </div>
                 )
               )}

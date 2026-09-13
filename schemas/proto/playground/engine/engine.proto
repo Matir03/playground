@@ -27,6 +27,13 @@ service EngineService {
   // an analysis view plays a line it likes and re-roots on the result.
   rpc ApplyTurn(ApplyTurnRequest) returns (playground.game.GameState);
 
+  // The search analysis and the engine's net seat run, every setting by name,
+  // alongside the one the engine started with (self-play's recorded search).
+  // JSON because the settings are the game's own, not a message per game.
+  rpc GetSearchConfig(GetSearchConfigRequest) returns (SearchConfig);
+  // Replace that search, or restore the one the engine started with.
+  rpc SetSearchConfig(SetSearchConfigRequest) returns (SearchConfig);
+
   // Health / capabilities
   rpc Health(HealthRequest) returns (HealthResponse);
 }
@@ -163,18 +170,20 @@ message AnalyzeRequest {
   // without the client reconstructing the realizer.
   repeated bytes line = 2;
   SearchBudget budget = 3;
-  // 0 = the engine's configured default.
+  // 0 = the engine's configured search.
   uint32 candidates = 4;
   // Skip the search and return only the position's evaluation. Walking a
   // variation asks for this on every click; a full search per click would make
   // the tree unusable to click through.
   bool eval_only = 5;
-  // KR-PUCT kernel bandwidth. 0 (the default) is the flat PUCT search that
-  // self-play and eval run, so analysis matches the real search unless you
-  // deliberately ask otherwise. Above 0, candidates pool visits and values with
-  // their neighbours under `move_distance`, and `AnalyzeNode.kernel` comes back
+  // KR-PUCT kernel bandwidth. 0 = the engine's configured search (see
+  // GetSearchConfig). Above 0, candidates pool visits and values with their
+  // neighbours under `move_distance`, and `AnalyzeNode.kernel` comes back
   // populated.
   float kernel_sigma = 6;
+  // Run the engine's fast search -- the cheaper one self-play plays most turns
+  // with -- instead of its full one.
+  bool fast = 7;
 }
 
 // A node of the search tree, flattened. `nodes[0]` is the root.
@@ -257,6 +266,23 @@ message AnalyzeResponse {
   repeated AnalyzeNode nodes = 4;
   // Index into `nodes[0].edges` of the move the search would play.
   optional uint32 chosen = 5;
+}
+
+message GetSearchConfigRequest {}
+
+message SetSearchConfigRequest {
+  // Every setting, spelled as `SearchConfig.json` spells them. Ignored with
+  // `reset`.
+  string json = 1;
+  // Restore the search the engine started with.
+  bool reset = 2;
+}
+
+message SearchConfig {
+  // The search in effect.
+  string json = 1;
+  // The search the engine started with.
+  string default_json = 2;
 }
 
 message HealthRequest {}

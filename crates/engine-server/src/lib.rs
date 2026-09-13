@@ -183,6 +183,32 @@ where
         Ok(Response::new(state_to_proto::<G>(&next)))
     }
 
+    /// The search analysis and the seat run. See `Analyzable::search_config`.
+    async fn get_search_config(
+        &self,
+        _req: Request<GetSearchConfigRequest>,
+    ) -> Result<Response<SearchConfig>, Status> {
+        let c = G::search_config()
+            .ok_or_else(|| Status::failed_precondition("this engine has no configurable search"))?
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(SearchConfig { json: c.current, default_json: c.default }))
+    }
+
+    /// Replace the search, or restore the one the engine started with. A
+    /// setting the game refuses is the caller's error, so it comes back as an
+    /// invalid argument naming the setting.
+    async fn set_search_config(
+        &self,
+        req: Request<SetSearchConfigRequest>,
+    ) -> Result<Response<SearchConfig>, Status> {
+        let inner = req.into_inner();
+        let json = (!inner.reset).then_some(inner.json.as_str());
+        let c = G::set_search_config(json)
+            .ok_or_else(|| Status::failed_precondition("this engine has no configurable search"))?
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        Ok(Response::new(SearchConfig { json: c.current, default_json: c.default }))
+    }
+
     /// Run the net and the search on a position and report what they saw.
     ///
     /// Deliberately does not touch the handle's stored state: the point of an
@@ -221,7 +247,8 @@ where
         let opts = playground_core::AnalysisOptions {
             candidates: (inner.candidates > 0).then_some(inner.candidates as usize),
             eval_only: inner.eval_only,
-            kernel_sigma: inner.kernel_sigma,
+            kernel_sigma: (inner.kernel_sigma > 0.0).then_some(inner.kernel_sigma),
+            fast: inner.fast,
         };
 
         let analysis = G::analyze(&state, budget, opts)

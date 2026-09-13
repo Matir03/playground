@@ -202,11 +202,14 @@ enum Cmd {
         b: Option<String>,
         #[arg(long, default_value_t = 20)]
         games: u32,
-        /// Self-play's recorded search (`search.json` in the live dir). A match
-        /// runs exactly the search self-play runs, so there is no second set
-        /// of search settings to drift.
-        #[arg(long)]
-        search_config: String,
+        /// Eval's search settings are its own (see `eval::match_search`); the
+        /// search that runs them is self-play's.
+        #[arg(long, default_value_t = 100)]
+        sims: u32,
+        #[arg(long, default_value_t = 16)]
+        candidates: usize,
+        #[arg(long, default_value_t = 6)]
+        t_steps: usize,
         #[arg(long, default_value = "candle")]
         backend: String,
         #[arg(long, default_value = "trt")]
@@ -217,10 +220,9 @@ enum Cmd {
         cuda: bool,
         #[arg(long, default_value_t = 0)]
         seed: u64,
-        /// KR-PUCT kernel bandwidth for seat A. Defaults to the recorded
-        /// search's (0 = flat PUCT, which is what self-play runs).
-        #[arg(long)]
-        kernel_sigma: Option<f32>,
+        /// KR-PUCT kernel bandwidth for seat A. 0 = today's flat PUCT search.
+        #[arg(long, default_value_t = 0.0)]
+        kernel_sigma: f32,
         /// Kernel bandwidth for seat B; defaults to A's, so both seats search
         /// the same way unless you ask for the flat-vs-KR comparison.
         #[arg(long)]
@@ -299,9 +301,12 @@ enum Cmd {
     NetGame {
         #[arg(long)]
         live: String,
-        /// Self-play's recorded search (`search.json` in the live dir).
-        #[arg(long)]
-        search_config: String,
+        #[arg(long, default_value_t = 100)]
+        sims: u32,
+        #[arg(long, default_value_t = 32)]
+        candidates: usize,
+        #[arg(long, default_value_t = 6)]
+        t_steps: usize,
         #[arg(long, default_value_t = String::from("candle"))]
         backend: String,
         #[arg(long, default_value_t = String::from("trt"))]
@@ -429,33 +434,22 @@ async fn main() -> anyhow::Result<()> {
             )?
         }
         Cmd::EvalMatch {
-            a, b, games, search_config, backend, ep, fp16, cuda, seed,
+            a, b, games, sims, candidates, t_steps, backend, ep, fp16, cuda, seed,
             kernel_sigma, kernel_sigma_b, render_file, render_games,
         } => {
-            use minions_engine::eval::{load_seat, run_match, Seat};
-            let (actor, mut sampler) =
-                minions_engine::search_config::load(std::path::Path::new(&search_config))?;
+            use minions_engine::eval::{load_seat, match_search, run_match, Seat};
             // Every game advances together, so the live count falls as games
             // finish. Padding to the full match width keeps one tensor shape
             // for the whole match instead of letting TensorRT rebuild an
             // engine each time a game ends.
-            sampler.pad_to = games as usize;
-            sampler.seed = seed;
+            let (sampler, params) = match_search(sims, candidates, t_steps, games as usize, seed);
             let kind = minions_engine::net::BackendKind::parse(&backend, &ep, fp16, cuda)?;
             let sa = load_seat(std::path::Path::new(&a), &kind, sampler)?;
             let sb = match &b {
                 Some(p) => load_seat(std::path::Path::new(p), &kind, sampler)?,
                 None => Seat::Greedy,
             };
-            // Self-play's full search, exactly. The one difference is the move
-            // taken from it: the most-visited turn, never a temperature sample,
-            // because a match measures strength rather than gathering variety.
-            let params = playground_core::sampled_mcts::SampledParams {
-                temp_moves: 0,
-                ..actor.search_params(&sampler, true, seed)
-            };
-            let sigma_a = kernel_sigma.unwrap_or(actor.kernel_sigma);
-            let sigma = (sigma_a, kernel_sigma_b.unwrap_or(sigma_a));
+            let sigma = (kernel_sigma, kernel_sigma_b.unwrap_or(kernel_sigma));
             let rf = render_file.as_ref().map(std::path::PathBuf::from);
             let render = rf.as_deref().map(|p| (p, render_games));
             let (score, w, l, d, margin, game_score) =
@@ -481,14 +475,14 @@ async fn main() -> anyhow::Result<()> {
             soak::run(threads, secs, !no_verify, !no_oracle, seed, &out)?
         }
         Cmd::NetGame {
-            live, search_config, backend, ep, fp16, cuda, seed, opponent, games,
+            live, sims, candidates, t_steps, backend, ep, fp16, cuda, seed, opponent, games,
         } => {
-            use minions_engine::eval::{load_seat, Seat};
-            use playground_core::sampled_mcts::{search, SampledParams};
+            use minions_engine::eval::{load_seat, match_search, Seat};
+            use playground_core::sampled_mcts::search;
             use playground_core::Game;
-            let (actor, mut sampler) =
-                minions_engine::search_config::load(std::path::Path::new(&search_config))?;
-            sampler.seed = seed;
+            // Eval's search: the policy as it plays, no random candidates and
+            // the most-visited turn.
+            let (sampler, params) = match_search(sims, candidates, t_steps, 0, seed);
             let kind = minions_engine::net::BackendKind::parse(&backend, &ep, fp16, cuda)?;
             let seat = load_seat(std::path::Path::new(&live), &kind, sampler)?;
             // Second seat: the net again, or the heuristic. Yellow is the net.
@@ -497,8 +491,6 @@ async fn main() -> anyhow::Result<()> {
                 "net" => load_seat(std::path::Path::new(&live), &kind, sampler)?,
                 path => load_seat(std::path::Path::new(path), &kind, sampler)?,
             };
-            // Self-play's full search, playing its most-visited turn.
-            let params = SampledParams { temp_moves: 0, ..actor.search_params(&sampler, true, seed) };
             for g in 0..games.max(1) {
             // Alternate colours between games. Minions is not symmetric — the
             // second player is paid START_MONEY_SECOND — so watching one seat
