@@ -73,11 +73,11 @@ CANDIDATES_FAST="${CANDIDATES_FAST:-8}"
 # than the shallow search self-play can afford. Eval has no fast/full split, so
 # EVAL_SIMS applies to every move.
 #
-# 2026-09-12: set to 400 sims / 16 candidates / T=6 by the user -- self-play's
-# sims and candidate count, with a longer diffusion (T=6 vs self-play's 4).
+# 2026-09-12: set to 400 sims / 16 candidates by the user -- self-play's full
+# search budget -- with the same diffusion length as self-play.
 EVAL_CANDIDATES="${EVAL_CANDIDATES:-16}"
 EVAL_SIMS="${EVAL_SIMS:-400}"
-EVAL_T_STEPS="${EVAL_T_STEPS:-6}"
+EVAL_T_STEPS="${EVAL_T_STEPS:-$T_STEPS}"
 RANDOM_FRACTION="${RANDOM_FRACTION:-0.25}"
 # Random openings: N random legal turns before the search takes over, none of
 # them recorded. Keeps the training distribution moving when self-play comes
