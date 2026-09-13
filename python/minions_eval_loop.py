@@ -378,21 +378,21 @@ def promote_snapshot(ckpt, live, best):
     os.replace(best + ".tmp", best)
 
 
-def champions(scores, n):
-    """The `n` most recent champions, newest first: gated-era promotions and
-    nets crowned after a tournament. Ungated promotions are not champions --
-    every generation gets one."""
+def leaderboard(ratings, games, live, n, exclude, min_games):
+    """The `n` best-rated nets on the current leaderboard, best first -- what
+    the user means by "the previous champions". Any net with a snapshot and at
+    least `min_games` rated games, fp32-era nets included; only the champion
+    itself has to be fp16 (`ladder_top`)."""
+    E = elo_mod()
     out = []
-    for r in reversed(scores.get("history", [])):
-        found = [r["crowned"]] if r.get("crowned") else []
-        if r.get("promoted") and not r.get("ungated"):
-            found.append(r["gen"])
-        for g in found:
-            if g not in out:
-                out.append(g)
+    for _, p in sorted(((r, p) for p, r in ratings.items()), reverse=True):
+        g = E.gen_number(p)
+        if g in exclude or games.get(p, 0) < min_games or not snapshot_ckpt(live, p):
+            continue
+        out.append(g)
         if len(out) >= n:
             break
-    return out[:n]
+    return out
 
 
 def mem_avail_gb():
@@ -486,18 +486,20 @@ def tournament(args, live, scores, best, gen, last, entry):
     """The every-`--measure-every` eval, and the champion decision.
 
     Every generation since the last tournament plays every other one and each
-    of the last `--champions` champions, `--tournament-games` games a pairing,
-    all in parallel (`play_all`); greedy plays the newest net as a regression
-    check. Then the run resumes from the best-rated fp16 net in the whole
-    record (`ladder_top`) -- self-play *and* the learner -- and that net is
-    the champion the next tournament's generations play. User's rule,
-    2026-09-12: "resume from the best net after each tournament".
+    of the `--champions` best-rated nets on the current leaderboard
+    (`leaderboard`), `--tournament-games` games a pairing, all in parallel
+    (`play_all`); greedy plays the newest net as a regression check. Then the
+    run resumes from the best-rated fp16 net in the whole record
+    (`ladder_top`) -- self-play *and* the learner. User's rules, 2026-09-12:
+    "resume from the best net after each tournament", and the previous
+    champions are "the 5 prev best rated nets on the current leaderboard".
     """
     E = elo_mod()
     lo = last + 1 if last is not None else gen - args.measure_every + 1
     new = [g for g in range(lo, gen + 1) if snapshot_ckpt(live, f"gen{g}")]
-    champs = [c for c in champions(scores, args.champions)
-              if c not in new and snapshot_ckpt(live, f"gen{c}")]
+    matches = E.load_matches(os.path.join(live, "matches.jsonl"))
+    champs = leaderboard(E.fit(matches), E.games_played(matches), live, args.champions,
+                         new, args.crown_min_games)
     rest = list(itertools.combinations(new, 2)) + [(n, c) for n in new for c in champs]
     first = list(zip(new, champs))                  # a matching: one process per net
     pairs = first + [p for p in rest if p not in first]
@@ -699,7 +701,8 @@ def main():
     ap.add_argument("--tournament-games", type=int, default=10,
                     help="ungated: games per tournament pairing.")
     ap.add_argument("--champions", type=int, default=5,
-                    help="ungated: how many previous champions each new net plays.")
+                    help="ungated: how many of the leaderboard's best-rated nets each "
+                         "new net plays.")
     ap.add_argument("--eval-parallel", type=int, default=10,
                     help="ungated: tournament matches run at once, at most.")
     ap.add_argument("--eval-min-ram-gb", type=float, default=4.0,

@@ -260,7 +260,7 @@ while true; do
 
   # Ungated by default (GATE=0), as AlphaZero: every generation goes straight
   # into self-play. Every MEASURE_EVERY-th ends in a tournament -- the new
-  # generations against each other and the last five champions, 10 games a
+  # generations against each other and the leaderboard's top five, 10 games a
   # pairing, in parallel -- and the run (self-play and the learner) resumes
   # from the best-rated net, which becomes the champion. The gate cost ~18 of every ~51 minutes, and
   # its head-to-head and ladder verdicts disagreed three generations running.
