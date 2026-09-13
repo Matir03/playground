@@ -75,7 +75,10 @@ export function App() {
   const game = GAMES.find((g) => g.id === selected) ?? null;
 
   return (
-    <main style={{ fontFamily: "system-ui, sans-serif", padding: "2rem", maxWidth: 720 }}>
+    // Wider while a game is open: a board with an analysis panel beside it
+    // does not fit in 720px, and wrapping the panel underneath puts the board
+    // off screen exactly when the panel is driving it.
+    <main style={{ fontFamily: "system-ui, sans-serif", padding: "2rem", maxWidth: game == null ? 720 : 1400 }}>
       {game == null ? (
         <Menu healths={healths} onPick={setSelected} />
       ) : (
@@ -148,7 +151,7 @@ function GameView({
         ← Menu
       </button>
       <h1 style={{ marginTop: 0, marginBottom: "0.5rem" }}>{game.label}</h1>
-      <p style={{ marginTop: 0, color: "#555" }}>
+      <p style={{ marginTop: 0, color: "#555", maxWidth: 720 }}>
         {game.blurb} <Health h={health} />
       </p>
       {health.status === "error" || !client ? (

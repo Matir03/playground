@@ -873,6 +873,10 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
               flexWrap: "wrap",
               alignItems: "flex-start",
               flex: "0 1 auto",
+              // Bounded, or the side panel's long lines (a whole turn in the
+              // record) set the group's max-content width to the whole page
+              // and push the analysis panel underneath anyway.
+              maxWidth: 720,
             }}
           >
             <svg width={SVG_W} height={SVG_H} style={{ background: "#20242b", borderRadius: 8, flex: "0 0 auto" }}>
@@ -1295,6 +1299,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                     })
                   }
                   onPlay={(line, labels) => void runAnalysis(line, labels, true)}
+                  shown={walk?.line}
                   onCommit={(turn, label) => void commitTurn(turn, label)}
                   maxDepth={12}
                 />

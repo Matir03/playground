@@ -33,6 +33,13 @@ const chosenVisits = (e: AnalyzeEdge) => e.visits - e.forced;
  *  expand, visits, forced, prior, energy, value, turn, play. */
 const COLUMNS = "1.1rem 3rem 2.8rem 3.9rem 3.6rem 3.6rem 1fr 1.3rem";
 
+function sameLine(a: Uint8Array[], b: Uint8Array[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every((x, i) => x.length === b[i].length && x.every((v, j) => v === b[i][j]))
+  );
+}
+
 function sortEdges(edges: AnalyzeEdge[], key: SortKey): AnalyzeEdge[] {
   const e = [...edges];
   if (key === "visits")
@@ -66,6 +73,7 @@ function EdgeRow({
   onPlay,
   onCommit,
   path,
+  onBoard,
 }: {
   edge: AnalyzeEdge;
   node: AnalyzeNode;
@@ -84,6 +92,8 @@ function EdgeRow({
   /** Absent below the root: only a root candidate is legal in the real game. */
   onCommit?: () => void;
   path: string;
+  /** This row's line is the one on the board. */
+  onBoard: boolean;
 }) {
   // The bar is the share of the visits PUCT chose, which is the policy
   // target's shape; forced visits would flatten it toward the floor.
@@ -91,12 +101,17 @@ function EdgeRow({
   const share = chosenTotal > 0 ? chosenVisits(edge) / chosenTotal : 0;
   const hasChild = edge.child !== undefined;
   return (
+    // The whole row shows its line on the board, not just the label: clicking
+    // through the tree anywhere should move the board with it.
     <div
+      onClick={onPlay}
       style={{
         display: "grid",
         gridTemplateColumns: COLUMNS,
         gap: "0.35rem",
         alignItems: "center",
+        cursor: "pointer",
+        boxShadow: onBoard ? "inset 0 0 0 1px #e0a72c" : undefined,
         padding: "0.12rem 0.25rem",
         paddingLeft: `${0.25 + depth * 0.85}rem`,
         fontSize: "0.78rem",
@@ -107,8 +122,19 @@ function EdgeRow({
       }}
     >
       <span
-        onClick={hasChild ? onToggle : undefined}
-        title={hasChild ? (expanded ? "collapse" : "expand") : "not expanded by the search"}
+        onClick={
+          hasChild
+            ? (e) => {
+                // Opening a line also shows it: exploring the tree and looking
+                // at the board are one action. Stopped here so the row's own
+                // handler does not show it a second time.
+                e.stopPropagation();
+                onToggle();
+                onPlay();
+              }
+            : undefined
+        }
+        title={hasChild ? (expanded ? "collapse" : "expand, and show this line on the board") : "not expanded by the search"}
         style={{ cursor: hasChild ? "pointer" : "default", color: hasChild ? "#bbb" : "#555", userSelect: "none" }}
       >
         {hasChild ? (expanded ? "▾" : "▸") : "·"}
@@ -146,11 +172,10 @@ function EdgeRow({
       </span>
 
       <span
-        onClick={onPlay}
-        title={`${path}\n\nclick to play this line on the board`}
+        title={`${path}\n\nclick the row to show this line on the board`}
         style={{
-          cursor: "pointer",
-          color: chosen ? "#e0a72c" : "#ccc",
+          color: onBoard || chosen ? "#e0a72c" : "#ccc",
+          fontWeight: onBoard ? 600 : 400,
           whiteSpace: "nowrap",
           overflow: "hidden",
           textOverflow: "ellipsis",
@@ -197,6 +222,7 @@ export function AnalysisTree({
   onPlay,
   onCommit,
   maxDepth,
+  shown,
 }: {
   nodes: AnalyzeNode[];
   chosen?: number;
@@ -210,6 +236,8 @@ export function AnalysisTree({
   /** Commit a root candidate to the real game. */
   onCommit: (turn: Uint8Array, label?: string) => void;
   maxDepth: number;
+  /** The line currently on the board, so its row can be marked. */
+  shown?: Uint8Array[];
 }) {
   if (nodes.length === 0) return null;
 
@@ -225,7 +253,7 @@ export function AnalysisTree({
     // switching the sort to prior.
     // An edge visited only by a forced floor counts as looked at: it has a
     // value estimate, and hiding it would hide what the floor bought.
-    const shown = sortEdges(node.edges, sort).filter(
+    const listed = sortEdges(node.edges, sort).filter(
       (e) => sort === "prior" || e.visits > 0 || e.forced > 0 || depth === 0,
     );
     // Per node, not per tree: each node's candidate set has its own arbitrary
@@ -234,7 +262,7 @@ export function AnalysisTree({
       (m, e) => (Number.isFinite(e.energy) && e.energy > m ? e.energy : m),
       -Infinity,
     );
-    for (const edge of shown) {
+    for (const edge of listed) {
       const ei = node.edges.indexOf(edge);
       const key = `${nodeIdx}:${ei}`;
       const isOpen = expanded.has(key);
@@ -253,6 +281,7 @@ export function AnalysisTree({
           onPlay={() => onPlay(nextLine, nextLabels)}
           onCommit={depth === 0 ? () => onCommit(edge.turn, edge.label || "pass") : undefined}
           path={nextLabels.join("  →  ")}
+          onBoard={!!shown && sameLine(nextLine, shown)}
         />,
       );
       if (isOpen && edge.child !== undefined) {
