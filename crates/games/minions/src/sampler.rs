@@ -1796,6 +1796,308 @@ mod tests {
     }
 }
 
+/// Diagnostic, run by hand: what the diffusion depth `T` does to proposals.
+///
+/// Positions come from 32 games the net plays against itself, each turn drawn
+/// from its own candidates in proportion to `exp f`. At every third turn each
+/// `T` draws 16 declarations per position from the same trunk features, and the
+/// report compares them on what the realizer and the net's own heads say:
+/// distinct turns; realization fidelity -- declared moves, kills and spawns that
+/// actually happen, which is where two correlated variables committed
+/// independently show up; the best energy and best one-turn value among the
+/// draws; and how often a `T`'s draws contain the best turn of every `T`'s draws
+/// pooled. `T = 100` commits one variable per round: exact any-order
+/// autoregressive sampling.
+///
+/// `MINIONS_SWEEP_DIR=<absolute net dir> cargo test --release t_sweep --
+/// --ignored --nocapture`
+#[cfg(test)]
+mod t_sweep {
+    use super::*;
+    use crate::net::TrunkOut;
+    use crate::turn::ENERGY_PLANES;
+    use playground_core::SampledGame;
+    use std::collections::HashSet;
+
+    const GAMES: usize = 32;
+    const K: usize = 16;
+    const TS: [usize; 4] = [4, 8, 16, 100];
+
+    /// One `T`'s draws at one position.
+    #[derive(Default, Clone)]
+    struct Probe {
+        /// Each distinct resulting position: (key, energy, one-turn value).
+        distinct: Vec<(Vec<u8>, f32, f32)>,
+        /// Declared / done moves, kills, spawns, summed over the draws.
+        fid: [u32; 6],
+    }
+
+    fn trunk_of(m: &MinionsModel, canon: &[MinionsState]) -> TrunkOut {
+        let pstride = crate::game::PLANES * NUM_CELLS;
+        let mut planes = vec![0f32; canon.len() * pstride];
+        for (i, s) in canon.iter().enumerate() {
+            for (o, b) in planes[i * pstride..(i + 1) * pstride]
+                .iter_mut()
+                .zip(Minions::to_features(s))
+            {
+                *o = b as f32;
+            }
+        }
+        m.net.trunk(&planes, canon.len()).unwrap()
+    }
+
+    fn score(
+        m: &MinionsModel,
+        canon: &[MinionsState],
+        h: &[f16],
+        decls: &[Vec<TurnSpec>],
+    ) -> Vec<Probe> {
+        let hstride = m.net.channels() * NUM_CELLS;
+        let dstride = ENERGY_PLANES * NUM_CELLS;
+        let mut probes = vec![Probe::default(); canon.len()];
+        let mut rows: Vec<(usize, TurnSpec, MinionsState)> = Vec::new();
+        for (i, (s, ds)) in canon.iter().zip(decls).enumerate() {
+            let mut seen = HashSet::new();
+            for d in ds {
+                let r = realize(s, d);
+                let f = &r.fidelity;
+                let add = [
+                    f.declared_moves,
+                    f.done_moves,
+                    f.declared_kills,
+                    f.done_kills,
+                    f.declared_spawns,
+                    f.done_spawns,
+                ];
+                for (slot, v) in probes[i].fid.iter_mut().zip(add) {
+                    *slot += v;
+                }
+                if seen.insert(Minions::encode_state(&r.next)) {
+                    rows.push((i, r.spec, r.next));
+                }
+            }
+        }
+        // Energies and one-turn values in batches of the sampler's own shape.
+        let batch = GAMES * K;
+        for part in rows.chunks(batch) {
+            let mut decl = vec![0f32; batch * dstride];
+            let mut h_b = Vec::with_capacity(batch * hstride);
+            for (j, (i, spec, _)) in part.iter().enumerate() {
+                Partial::fully_committed(spec, &LiveMask::of(&canon[*i]))
+                    .write_energy_planes(&mut decl[j * dstride..(j + 1) * dstride]);
+                h_b.extend_from_slice(&h[i * hstride..(i + 1) * hstride]);
+            }
+            h_b.resize(batch * hstride, f16::ZERO);
+            let e = m.net.energy(&h_b, &decl, batch).unwrap();
+            let next: Vec<MinionsState> = (0..batch)
+                .map(|j| part[j.min(part.len() - 1)].2.canonical())
+                .collect();
+            let tr = trunk_of(m, &next);
+            for (j, (i, _, nx)) in part.iter().enumerate() {
+                let v = MinionsTurns::terminal_value(nx).unwrap_or(tr.value[j]);
+                let v = if nx.side != canon[*i].side { -v } else { v };
+                probes[*i]
+                    .distinct
+                    .push((Minions::encode_state(nx), e[j], v));
+            }
+        }
+        probes
+    }
+
+    #[test]
+    #[ignore]
+    fn t_sweep() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("MINIONS_SWEEP_DIR").expect("MINIONS_SWEEP_DIR=<absolute net dir>"),
+        );
+        let cache = dir.join("trt_cache").to_string_lossy().into_owned();
+        let net = crate::ort_net::OrtNet::new(&dir, "trt", true, &cache).unwrap();
+        let mut m = MinionsModel::new(
+            Box::new(net),
+            SamplerConfig {
+                t_steps: 4,
+                t_steps_fast: 4,
+                k_candidates: K,
+                k_candidates_fast: K,
+                k_draws: K,
+                k_draws_fast: K,
+                random_fraction: 0.0,
+                pad_to: GAMES,
+                seed: 7,
+                ..Default::default()
+            },
+        );
+
+        // ── positions: the net against itself, turns drawn by exp f ──────────
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let mut games: Vec<MinionsState> = (0..GAMES)
+            .map(|g| MinionsState::with_bid(g as i16 % 7))
+            .collect();
+        let mut pool: Vec<MinionsState> = Vec::new();
+        for turn in 0..45u64 {
+            let live: Vec<usize> = (0..GAMES)
+                .filter(|&g| !Minions::outcome(&games[g]).is_terminal())
+                .collect();
+            if live.is_empty() {
+                break;
+            }
+            let states: Vec<MinionsState> = live.iter().map(|&g| games[g].clone()).collect();
+            if turn % 3 == 1 {
+                pool.extend(states.iter().cloned());
+            }
+            let exps = m.expand_batch_mode(&states, K, true, turn).unwrap();
+            for (&g, (_, cands)) in live.iter().zip(exps) {
+                let spec = if cands.is_empty() {
+                    TurnSpec::empty()
+                } else {
+                    let mx = cands.iter().map(|c| c.1).fold(f32::NEG_INFINITY, f32::max);
+                    let w: Vec<f64> = cands.iter().map(|c| f64::from(c.1 - mx).exp()).collect();
+                    let mut r = rng.gen::<f64>() * w.iter().sum::<f64>();
+                    let mut pick = cands.len() - 1;
+                    for (i, wi) in w.iter().enumerate() {
+                        if r < *wi {
+                            pick = i;
+                            break;
+                        }
+                        r -= wi;
+                    }
+                    cands[pick].0
+                };
+                let next = realize(&games[g], &spec).next;
+                games[g] = if Minions::encode_state(&next) == Minions::encode_state(&games[g]) {
+                    realize(&games[g], &TurnSpec::empty()).next
+                } else {
+                    next
+                };
+            }
+        }
+
+        // ── every T on the same positions and trunk features ─────────────────
+        let mut probes: Vec<Vec<Probe>> = vec![Vec::new(); TS.len()];
+        let mut secs = vec![0f64; TS.len()];
+        let mut batches = 0;
+        for chunk in pool.chunks(GAMES) {
+            let n = chunk.len();
+            let canon: Vec<MinionsState> = (0..GAMES)
+                .map(|i| chunk[i.min(n - 1)].canonical())
+                .collect();
+            let h = trunk_of(&m, &canon).h;
+            for (ti, &t) in TS.iter().enumerate() {
+                m.cfg.t_steps = t;
+                let clk = Instant::now();
+                let decls = m
+                    .sample_declarations_batch(&canon, &h, K, true, &mut rng)
+                    .unwrap();
+                secs[ti] += clk.elapsed().as_secs_f64();
+                probes[ti].extend(score(&m, &canon[..n], &h, &decls[..n]));
+            }
+            batches += 1;
+        }
+
+        // ── report ───────────────────────────────────────────────────────────
+        let npos = probes[0].len();
+        println!("{npos} positions from {GAMES} games, {K} draws per position per T");
+        let best = |key: fn(&(Vec<u8>, f32, f32)) -> f32| -> Vec<(Vec<u8>, f32)> {
+            (0..npos)
+                .map(|i| {
+                    probes
+                        .iter()
+                        .flat_map(|p| p[i].distinct.iter())
+                        .map(|d| (d.0.clone(), key(d)))
+                        .fold((Vec::new(), f32::NEG_INFINITY), |a, b| {
+                            if b.1 > a.1 {
+                                b
+                            } else {
+                                a
+                            }
+                        })
+                })
+                .collect()
+        };
+        let best_e = best(|d| d.1);
+        let best_v = best(|d| d.2);
+        for (ti, &t) in TS.iter().enumerate() {
+            let p = &probes[ti];
+            let mean = |f: &dyn Fn(usize) -> f64| (0..npos).map(f).sum::<f64>() / npos as f64;
+            let top = |i: usize, key: fn(&(Vec<u8>, f32, f32)) -> f32| {
+                p[i].distinct
+                    .iter()
+                    .map(key)
+                    .fold(f32::NEG_INFINITY, f32::max)
+            };
+            let has = |i: usize, want: &[(Vec<u8>, f32)]| {
+                f64::from(u8::from(p[i].distinct.iter().any(|d| d.0 == want[i].0)))
+            };
+            let mut fid = [0u64; 6];
+            for q in p {
+                for (a, b) in fid.iter_mut().zip(q.fid) {
+                    *a += u64::from(b);
+                }
+            }
+            let rate = |d: u64, n: u64| n as f64 / d.max(1) as f64;
+            println!(
+                "T={t:>3}: {:4.1} distinct | done/declared moves {:.3} kills {:.3} spawns \
+                 {:.3} | energy: best-of-draws gap {:.2} nats, has pooled best {:.2} | \
+                 one-turn value: best-of-draws {:+.3} (gap {:.3}), mean {:+.3}, has pooled \
+                 best {:.2} | sampling {:.0} ms per {GAMES}x{K}",
+                mean(&|i| p[i].distinct.len() as f64),
+                rate(fid[0], fid[1]),
+                rate(fid[2], fid[3]),
+                rate(fid[4], fid[5]),
+                mean(&|i| f64::from(best_e[i].1 - top(i, |d| d.1))),
+                mean(&|i| has(i, &best_e)),
+                mean(&|i| f64::from(top(i, |d| d.2))),
+                mean(&|i| f64::from(best_v[i].1 - top(i, |d| d.2))),
+                mean(&|i| {
+                    let d = &p[i].distinct;
+                    d.iter().map(|x| f64::from(x.2)).sum::<f64>() / d.len().max(1) as f64
+                }),
+                mean(&|i| has(i, &best_v)),
+                secs[ti] * 1e3 / f64::from(batches),
+            );
+        }
+
+        // ── per-call latency at the shapes the strategies would run at ───────
+        let hstride = m.net.channels() * NUM_CELLS;
+        let pstride = crate::game::PLANES * NUM_CELLS;
+        let time = |f: &dyn Fn()| {
+            f();
+            let clk = Instant::now();
+            for _ in 0..50 {
+                f();
+            }
+            clk.elapsed().as_secs_f64() / 50.0 * 1e3
+        };
+        let s0 = Minions::initial_state();
+        let feat: Vec<f32> = Minions::to_features(&s0)
+            .iter()
+            .map(|&b| b as f32)
+            .collect();
+        let h1 = m.net.trunk(&feat, 1).unwrap().h;
+        for rows in [GAMES, GAMES * K] {
+            let planes: Vec<f32> = (0..rows).flat_map(|_| feat.iter().copied()).collect();
+            let h_b: Vec<f16> = (0..rows)
+                .flat_map(|_| h1[..hstride].iter().copied())
+                .collect();
+            let decl = vec![0f32; rows * DECL_PLANES * NUM_CELLS];
+            let edecl = vec![0f32; rows * ENERGY_PLANES * NUM_CELLS];
+            let _ = pstride;
+            println!(
+                "per call at {rows} rows: trunk {:.2} ms, diffusion step {:.2} ms, energy {:.2} ms",
+                time(&|| {
+                    m.net.trunk(&planes, rows).unwrap();
+                }),
+                time(&|| {
+                    m.net.diffusion(&h_b, &decl, rows).unwrap();
+                }),
+                time(&|| {
+                    m.net.energy(&h_b, &edecl, rows).unwrap();
+                }),
+            );
+        }
+    }
+}
+
 /// Paired CPU microbenchmark for [`commit_round`], kept out of the default test
 /// run (`--ignored`) because it is a timing measurement, not an assertion.
 ///

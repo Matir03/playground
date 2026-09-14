@@ -223,6 +223,10 @@ enum Cmd {
         candidates: usize,
         #[arg(long, default_value_t = 6)]
         t_steps: usize,
+        /// Diffusion rounds for seat B; defaults to A's. Set it to play one net
+        /// against itself at two sampler depths.
+        #[arg(long)]
+        t_steps_b: Option<usize>,
         #[arg(long, default_value = "candle")]
         backend: String,
         #[arg(long, default_value = "trt")]
@@ -512,6 +516,7 @@ async fn main() -> anyhow::Result<()> {
             sims,
             candidates,
             t_steps,
+            t_steps_b,
             backend,
             ep,
             fp16,
@@ -530,8 +535,14 @@ async fn main() -> anyhow::Result<()> {
             let (sampler, params) = match_search(sims, candidates, t_steps, games as usize, seed);
             let kind = minions_engine::net::BackendKind::parse(&backend, &ep, fp16, cuda)?;
             let sa = load_seat(std::path::Path::new(&a), &kind, sampler)?;
+            let tb = t_steps_b.unwrap_or(t_steps);
+            let sampler_b = minions_engine::sampler::SamplerConfig {
+                t_steps: tb,
+                t_steps_fast: tb,
+                ..sampler
+            };
             let sb = match &b {
-                Some(p) => load_seat(std::path::Path::new(p), &kind, sampler)?,
+                Some(p) => load_seat(std::path::Path::new(p), &kind, sampler_b)?,
                 None => Seat::Greedy,
             };
             let sigma = (kernel_sigma, kernel_sigma_b.unwrap_or(kernel_sigma));
