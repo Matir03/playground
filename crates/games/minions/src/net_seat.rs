@@ -18,11 +18,12 @@
 //! model server, which cannot represent a turn-level net. This path loads the
 //! ONNX/safetensors weights in-process, exactly as self-play does.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use playground_core::{sampled_mcts::search, Game, SearchOutcome, SolverBudget};
+use playground_core::sampled_mcts::{drive, search, Search, TreeNode};
+use playground_core::{Game, SearchOutcome, SolverBudget};
 
 use crate::game::{Minions, MinionsMove, MinionsState};
 use crate::sampler::{MinionsModel, SamplerConfig};
@@ -39,6 +40,27 @@ static DEFAULT: Mutex<Option<String>> = Mutex::new(None);
 /// Searches run, so each draws its own RNG stream (temperature picks and
 /// forced-quota draws) the way self-play's do.
 static SEARCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Analysis sessions: searches kept alive between requests, so a reader can
+/// step one, force visits down lines of their choosing, and add turns of their
+/// own. Few, least recently used out first: each holds a whole tree.
+static SESSIONS: Mutex<Option<Sessions>> = Mutex::new(None);
+const MAX_SESSIONS: usize = 8;
+
+#[derive(Default)]
+struct Sessions {
+    next: u64,
+    clock: u64,
+    live: HashMap<u64, Session>,
+}
+
+struct Session {
+    root: MinionsState,
+    search: Search<MinionsTurns>,
+    /// Which of self-play's searches this is: every expansion and widen the
+    /// session makes calls the model the way that search does.
+    full: bool,
+    used: u64,
+}
 
 #[derive(Clone)]
 pub struct NetSeatConfig {
@@ -250,6 +272,50 @@ pub fn choose(
 mod tests {
     use super::*;
     use playground_core::Solver;
+
+    /// A turn played action by action becomes a turn the tree can hold: its
+    /// declaration realizes to the position returned, which is where the
+    /// actions led unless `differs` says otherwise, and half a turn or an
+    /// illegal action is refused.
+    #[test]
+    fn a_played_turn_becomes_a_tree_turn() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let enc = |s: &MinionsState| Minions::encode_state(s);
+        let live = |s: &MinionsState| Minions::outcome(s) == playground_core::Outcome::InProgress;
+        let mut from = Minions::initial_state();
+        let (mut turns, mut exact) = (0, 0);
+        while turns < 40 && live(&from) {
+            let mut cur = from.clone();
+            let mut moves = Vec::new();
+            while cur.side == from.side && live(&cur) {
+                let legal = Minions::legal_moves(&cur);
+                let mv = legal[rng.gen_range(0..legal.len())].clone();
+                moves.push(Minions::encode_move(&mv));
+                cur = Minions::apply(&cur, &mv);
+            }
+            let (spec, next, differs) = turn_from_moves(&from, &moves).unwrap();
+            assert_eq!(enc(&realize(&from, &spec).next), enc(&next));
+            if !differs {
+                exact += 1;
+                assert_eq!(enc(&next), enc(&cur));
+            }
+            assert!(
+                turn_from_moves(&from, &moves[..moves.len() - 1]).is_err(),
+                "the last action is what ended the turn"
+            );
+            turns += 1;
+            from = next;
+        }
+        assert!(
+            turns >= 10 && exact > 0,
+            "{turns} turns, {exact} read back exactly"
+        );
+        assert!(
+            turn_from_moves(&from, &[vec![9, 9, 9]]).is_err(),
+            "not a move"
+        );
+    }
 
     /// Is the value head emitting NaN, or is the NaN made during backup?
     #[test]
@@ -707,6 +773,273 @@ impl playground_core::Analyzable for Minions {
     ) -> Option<anyhow::Result<playground_core::SearchConfigJson>> {
         is_configured().then(|| set_search(json))
     }
+
+    fn session(
+        op: playground_core::SessionOp<MinionsState>,
+    ) -> Option<anyhow::Result<playground_core::SessionResult<MinionsState>>> {
+        is_configured().then(|| session_inner(op))
+    }
+}
+
+/// The seat's model, loaded on first use. Takes the held guard, so callers keep
+/// the MODEL-before-CONFIG lock order `set_search` relies on.
+fn ensure_model<'a>(
+    guard: &'a mut Option<Box<MinionsModel>>,
+    cfg: &NetSeatConfig,
+) -> anyhow::Result<&'a MinionsModel> {
+    if guard.is_none() {
+        match crate::eval::load_seat(&cfg.dir, &cfg.kind, cfg.sampler.clone())? {
+            crate::eval::Seat::Net(m) => *guard = Some(m),
+            crate::eval::Seat::Greedy => anyhow::bail!("load_seat returned the greedy seat"),
+        }
+    }
+    Ok(guard.as_deref().expect("model built above"))
+}
+
+fn session_inner(
+    op: playground_core::SessionOp<MinionsState>,
+) -> anyhow::Result<playground_core::SessionResult<MinionsState>> {
+    use playground_core::sampled_mcts::SampledModel;
+    use playground_core::SessionOp;
+    let cfg = CONFIG
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("no net configured"))?;
+    // MODEL, then SESSIONS: one order everywhere, so the two cannot deadlock.
+    let mut guard = MODEL.lock().unwrap();
+    let model = ensure_model(&mut guard, &cfg)?;
+    let mut sessions = SESSIONS.lock().unwrap();
+    let store = sessions.get_or_insert_with(Sessions::default);
+    store.clock += 1;
+    let now = store.clock;
+    let mut added = None;
+    let mut note = None;
+
+    let id = match op {
+        SessionOp::Start {
+            root,
+            simulations,
+            fast,
+        } => {
+            let full = !fast;
+            let params = cfg
+                .actor
+                .search_params(&cfg.sampler, full, search_seed(&cfg));
+            let mut search = Search::new(root.clone(), &params, Minions::ply(&root));
+            search.set_remaining(if simulations == 0 {
+                params.simulations
+            } else {
+                simulations
+            });
+            drive(&crate::sampler::AsSearch { model, full }, &mut search)?;
+            if store.live.len() >= MAX_SESSIONS {
+                let oldest = store
+                    .live
+                    .iter()
+                    .min_by_key(|(_, s)| s.used)
+                    .map(|(k, _)| *k);
+                if let Some(k) = oldest {
+                    store.live.remove(&k);
+                }
+            }
+            store.next += 1;
+            let session = Session {
+                root,
+                search,
+                full,
+                used: now,
+            };
+            store.live.insert(store.next, session);
+            store.next
+        }
+        SessionOp::Step { id, simulations } => {
+            let s = session_mut(store, id)?;
+            s.search.add_simulations(simulations);
+            drive(
+                &crate::sampler::AsSearch {
+                    model,
+                    full: s.full,
+                },
+                &mut s.search,
+            )?;
+            id
+        }
+        SessionOp::Force { id, line } => {
+            let s = session_mut(store, id)?;
+            let specs = line
+                .iter()
+                .map(|b| decode_turn(b))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let entries = s.search.resolve_line(&specs)?;
+            s.search.force_line(&entries)?;
+            drive(
+                &crate::sampler::AsSearch {
+                    model,
+                    full: s.full,
+                },
+                &mut s.search,
+            )?;
+            id
+        }
+        SessionOp::Add { id, at, moves } => {
+            let s = session_mut(store, id)?;
+            let specs = at
+                .iter()
+                .map(|b| decode_turn(b))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let node = s.search.node_at(&s.search.resolve_line(&specs)?)?;
+            let from = s.search.state_of(node).clone();
+            let (spec, next, differs) = turn_from_moves(&from, &moves)?;
+            let (_, energy) = model.score_turns(&from, &[spec])?;
+            let v = match <MinionsTurns as playground_core::SampledGame>::terminal_value(&next) {
+                Some(v) => v,
+                None => model.expand(&next, 0)?.0,
+            };
+            // From the side to move at `from`, as every edge value is.
+            let eval = if next.side != from.side { -v } else { v };
+            let (i, new) = s.search.add_candidate(node, spec, energy[0], Some(eval))?;
+            // The entry as the tree holds it: when the turn merged into an
+            // existing candidate, that candidate's encoding, not this one's.
+            added = Some(encode_turn(s.search.candidate(node, i)));
+            note = match (new, differs) {
+                (false, _) => Some(
+                    "that turn reaches a position the node already holds, so it is that candidate"
+                        .to_string(),
+                ),
+                (true, true) => Some(
+                    "added as the realizer reads it, which differs from how it was played: a \
+                     purchase with no spawn, or damage that kills nothing, is not part of a turn"
+                        .to_string(),
+                ),
+                (true, false) => None,
+            };
+            id
+        }
+    };
+
+    let s = session_mut(store, id)?;
+    s.used = now;
+    let tree = s.search.export_tree();
+    Ok(playground_core::SessionResult {
+        id,
+        root: s.root.clone(),
+        analysis: playground_core::Analysis {
+            value: s.search.root_value(),
+            aux: aux_for(&s.root),
+            nodes: analysis_nodes(&s.root, &tree),
+            chosen: (!tree[0].edges.is_empty()).then(|| s.search.chosen()),
+        },
+        added,
+        note,
+    })
+}
+
+fn session_mut(store: &mut Sessions, id: u64) -> anyhow::Result<&mut Session> {
+    store
+        .live
+        .get_mut(&id)
+        .ok_or_else(|| anyhow::anyhow!("analysis session {id} has expired; start a new one"))
+}
+
+/// The turn a sequence of atomic moves plays from `from`, as the search holds
+/// turns: the declaration `TurnSpec::from_play` reads back, realized. Also the
+/// position that reaches, and whether it differs from where the moves
+/// themselves led -- a purchase without a spawn, or damage that kills nothing,
+/// is not part of any declaration.
+fn turn_from_moves(
+    from: &MinionsState,
+    moves: &[Vec<u8>],
+) -> anyhow::Result<(TurnSpec, MinionsState, bool)> {
+    let played = moves
+        .iter()
+        .map(|b| Minions::decode_move(b))
+        .collect::<anyhow::Result<Vec<MinionsMove>>>()?;
+    let in_turn = |s: &MinionsState| {
+        s.side == from.side && Minions::outcome(s) == playground_core::Outcome::InProgress
+    };
+    let mut cur = from.clone();
+    for (i, mv) in played.iter().enumerate() {
+        anyhow::ensure!(
+            in_turn(&cur),
+            "action {} comes after the turn has ended",
+            i + 1
+        );
+        let legal = Minions::legal_moves(&cur)
+            .iter()
+            .any(|m| Minions::encode_move(m) == Minions::encode_move(mv));
+        anyhow::ensure!(legal, "action {} ({mv}) is not legal there", i + 1);
+        cur = Minions::apply(&cur, mv);
+    }
+    anyhow::ensure!(
+        !in_turn(&cur),
+        "the turn is not finished: end it before adding it"
+    );
+    let mut queue = played.iter().copied();
+    let spec = TurnSpec::from_play(from, |_| queue.next());
+    let r = realize(from, &spec);
+    let differs = Minions::encode_state(&r.next) != Minions::encode_state(&cur);
+    Ok((r.spec, r.next, differs))
+}
+
+/// The flattened tree as the analysis view reads it: every edge labelled with
+/// the actions its turn realizes to, from the position it is played in.
+fn analysis_nodes(
+    root: &MinionsState,
+    tree: &[TreeNode<MinionsTurns>],
+) -> Vec<playground_core::AnalysisNode> {
+    // Labels need the state each turn is played from, so walk the tree
+    // alongside the states rather than labelling from the root throughout.
+    let mut states: Vec<Option<MinionsState>> = vec![None; tree.len()];
+    states[0] = Some(root.clone());
+    for i in 0..tree.len() {
+        let here = match &states[i] {
+            Some(s) => s.clone(),
+            // Unreachable in a well-formed tree; skip rather than panic on one.
+            None => continue,
+        };
+        for e in &tree[i].edges {
+            if let Some(c) = e.child {
+                if c < states.len() && states[c].is_none() {
+                    states[c] = Some(realize(&here, &e.mv).next);
+                }
+            }
+        }
+    }
+
+    tree.iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let here = states[i].clone().unwrap_or_else(|| root.clone());
+            playground_core::AnalysisNode {
+                parent: n.parent,
+                total_visits: n.total_visits,
+                value: n.value,
+                terminal: n.terminal,
+                term_value: n.term_value,
+                prior_value: n.nn_value,
+                edges: n
+                    .edges
+                    .iter()
+                    .map(|e| playground_core::AnalysisEdge {
+                        mv: encode_turn(&e.mv),
+                        label: label_turn(&here, &e.mv),
+                        prior: e.prior,
+                        energy: e.energy,
+                        visits: e.visits,
+                        value: e.value,
+                        child: e.child,
+                        explore: e.explore,
+                        forced: e.forced,
+                        draws: e.draws,
+                        prior_value: e.prior_value,
+                        manual: e.manual,
+                    })
+                    .collect(),
+                kernel: n.kernel.clone(),
+            }
+        })
+        .collect()
 }
 
 fn analyze_inner(
@@ -727,13 +1060,7 @@ fn analyze_inner(
         .ok_or_else(|| anyhow::anyhow!("no net configured"))?;
 
     let mut guard = MODEL.lock().unwrap();
-    if guard.is_none() {
-        match crate::eval::load_seat(&cfg.dir, &cfg.kind, cfg.sampler.clone())? {
-            crate::eval::Seat::Net(m) => *guard = Some(m),
-            crate::eval::Seat::Greedy => anyhow::bail!("load_seat returned the greedy seat"),
-        }
-    }
-    let model = guard.as_ref().expect("model built above");
+    let model = ensure_model(&mut guard, &cfg)?;
 
     let aux = aux_for(state);
 
@@ -772,65 +1099,13 @@ fn analyze_inner(
     }
 
     let (result, tree) = playground_core::sampled_mcts::search_analyzed::<MinionsTurns, _>(
-        &crate::sampler::AsSearch {
-            model: &**model,
-            full,
-        },
+        &crate::sampler::AsSearch { model, full },
         state.clone(),
         &params,
         Minions::ply(state),
     )?;
 
-    // Labels need the state each turn is played from, so walk the tree
-    // alongside the states rather than labelling from the root throughout.
-    let mut states: Vec<Option<MinionsState>> = vec![None; tree.len()];
-    states[0] = Some(state.clone());
-    for i in 0..tree.len() {
-        let here = match &states[i] {
-            Some(s) => s.clone(),
-            // Unreachable in a well-formed tree; skip rather than panic on one.
-            None => continue,
-        };
-        for e in &tree[i].edges {
-            if let Some(c) = e.child {
-                if c < states.len() && states[c].is_none() {
-                    states[c] = Some(realize(&here, &e.mv).next);
-                }
-            }
-        }
-    }
-
-    let nodes = tree
-        .iter()
-        .enumerate()
-        .map(|(i, n)| {
-            let here = states[i].clone().unwrap_or_else(|| state.clone());
-            playground_core::AnalysisNode {
-                parent: n.parent,
-                total_visits: n.total_visits,
-                value: n.value,
-                terminal: n.terminal,
-                term_value: n.term_value,
-                edges: n
-                    .edges
-                    .iter()
-                    .map(|e| playground_core::AnalysisEdge {
-                        mv: encode_turn(&e.mv),
-                        label: label_turn(&here, &e.mv),
-                        prior: e.prior,
-                        energy: e.energy,
-                        visits: e.visits,
-                        value: e.value,
-                        child: e.child,
-                        explore: e.explore,
-                        forced: e.forced,
-                        draws: e.draws,
-                    })
-                    .collect(),
-                kernel: n.kernel.clone(),
-            }
-        })
-        .collect();
+    let nodes = analysis_nodes(state, &tree);
 
     Ok(playground_core::Analysis {
         value: result.value,

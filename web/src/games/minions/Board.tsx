@@ -47,8 +47,21 @@ import {
   AnalyzeRequestSchema,
   ApplyTurnRequestSchema,
   type AnalyzeResponse,
+  SessionRequestSchema,
+  type SessionRequest,
+  type SessionResponse,
+  ForceVisitSchema,
+  AddChildSchema,
 } from "../../gen/playground/engine/engine_pb";
-import { AnalysisTree, KernelMatrix, displayOrder, type SortKey } from "./Analysis";
+import {
+  AnalysisTree,
+  KernelMatrix,
+  displayOrder,
+  lineKeys,
+  nodeAt,
+  sameTurn,
+  type SortKey,
+} from "./Analysis";
 import { SearchConfigPanel } from "./SearchConfig";
 
 /** Whose turn a position is in, which is what the record's turn boundaries
@@ -303,6 +316,18 @@ const HEX_POINTS = Array.from({ length: 6 }, (_, k) => {
   return `${(R * Math.cos(a)).toFixed(2)},${(R * Math.sin(a)).toFixed(2)}`;
 }).join(" ");
 
+/** A turn being played out on the board to add to the analysis tree. Its moves
+ *  go to a scratch game started from `start`, never to the real one. */
+interface Compose {
+  handle: GameHandle;
+  start: GameState;
+  state: GameState;
+  moves: Uint8Array[];
+  /** The line to the node the turn is added under; empty = the root. */
+  at: Uint8Array[];
+  atLabels: string[];
+}
+
 export function MinionsBoard({ client }: { client: Client<typeof EngineService> }) {
   const [handle, setHandle] = useState<GameHandle | null>(null);
   const [state, setState] = useState<GameState | null>(null);
@@ -332,7 +357,14 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
   // engine's search config (the panel in the analysis view), which starts as
   // self-play's recorded search.
   const [fast, setFast] = useState(false);
-  const [analysis, setAnalysis] = useState<AnalyzeResponse | null>(null);
+  // The search is a session the engine keeps, so it can be stepped a few
+  // simulations at a time, steered down lines, and given turns by hand; every
+  // request hands back the whole tree, which replaces the one shown.
+  const [session, setSession] = useState<{ id: bigint; res: AnalyzeResponse } | null>(null);
+  const analysis = session?.res ?? null;
+  /** What the engine said about the last session request, when anything. */
+  const [note, setNote] = useState<string | null>(null);
+  const [compose, setCompose] = useState<Compose | null>(null);
   const [analysing, setAnalysing] = useState(false);
   const [walk, setWalk] = useState<{ line: Uint8Array[]; labels: string[]; at: AnalyzeResponse } | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -408,8 +440,9 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
       setState(n.state);
       setSelected(null);
       setSpawnUnit(null);
+      setCompose(null);
       setWalk(null);
-      setAnalysis(null);
+      setSession(null);
       setExpanded(new Set());
     },
     [hist],
@@ -505,7 +538,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
         setSelected(null);
         // One action puts the board partway through a turn, where nothing the
         // analyser showed applies any more.
-        setAnalysis(null);
+        setSession(null);
         setWalk(null);
         setExpanded(new Set());
       } catch (e) {
@@ -612,44 +645,48 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
   // otherwise. Rendering the walked position rather than overlaying arrows on
   // the real one is the whole point of analysis mode: you see the position the
   // numbers describe.
-  const shownState = walk?.at.state ?? state;
+  const shownState = compose?.state ?? walk?.at.state ?? state;
   const d = useMemo(() => (shownState ? decode(shownState.payload) : null), [shownState]);
 
-  /** Aux for whatever position is on the board. */
-  const aux = (walk?.at ?? analysis)?.aux;
-  /** Value for the position on the board, from its side to move. */
-  const shownValue = (walk?.at ?? analysis)?.value;
+  /** Aux for whatever position is on the board; none for a turn being composed,
+   *  which no net has seen. */
+  const aux = compose ? undefined : (walk?.at ?? analysis)?.aux;
+  /** The session's node for the position on the board, when it has one. */
+  const shownNode = analysis ? nodeAt(analysis.nodes, walk?.line ?? []) : undefined;
+  const nodeInfo = shownNode === undefined ? undefined : analysis?.nodes[shownNode];
+  /** The value head here, before any search. */
+  const netValue = nodeInfo?.priorValue ?? walk?.at.value;
+  /** The search's value here: at the root, what the search reports (candidates
+   *  weighted by the visits PUCT chose); down a line, the node's mean. */
+  const searchValue = walk
+    ? nodeInfo && nodeInfo.totalVisits > 0
+      ? nodeInfo.value
+      : undefined
+    : analysis?.value;
+  /** Turns can be added only where the tree has an evaluated node. */
+  const canAddHere = !!nodeInfo && nodeInfo.priorValue !== undefined && !nodeInfo.terminal;
 
-  const runAnalysis = useCallback(
-    async (line: Uint8Array[], labels: string[], evalOnly: boolean) => {
+  /** Put a variation on the board: the position after `line`, and what the
+   *  nets say about it. Never searches -- the tree comes from the session. */
+  const showLine = useCallback(
+    async (line: Uint8Array[], labels: string[]) => {
       if (!hist || !H.isBoundary(hist, hist.current, turnInfo)) return;
+      if (line.length === 0) {
+        setWalk(null);
+        return;
+      }
       setAnalysing(true);
       setError(null);
       try {
-        // Analysis is rooted wherever the board is, including an earlier node
-        // or a variation, so the server has to be brought there first. This is
-        // what makes "analyse from any position" work at all: `line` walks
-        // forward from the handle and can never walk back.
+        // `line` walks forward from the handle, which is where the session is
+        // rooted.
         const h = await ensureAt(hist.current);
         if (!h) return;
         const res = await client.analyze(
-          create(AnalyzeRequestSchema, {
-            handle: h,
-            line,
-            // No budget, candidate count or kernel of its own: the engine's
-            // search config decides all of them.
-            evalOnly,
-            fast,
-          }),
+          create(AnalyzeRequestSchema, { handle: h, line, evalOnly: true, fast }),
           { signal: AbortSignal.timeout(120000) },
         );
-        if (line.length === 0) {
-          setAnalysis(res);
-          setWalk(null);
-          setExpanded(new Set());
-        } else {
-          setWalk({ line, labels, at: res });
-        }
+        setWalk({ line, labels, at: res });
       } catch (err) {
         setError(err instanceof ConnectError ? err.message : String(err));
       } finally {
@@ -658,6 +695,168 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
     },
     [client, hist, ensureAt, fast],
   );
+
+  /** Start a session on the position the record is at. `simulations` 0 runs
+   *  the configured budget; 1 only expands the root, for running by hand. */
+  const startSession = useCallback(
+    async (simulations: number) => {
+      if (!hist || !H.isBoundary(hist, hist.current, turnInfo)) return;
+      setAnalysing(true);
+      setError(null);
+      setNote(null);
+      setCompose(null);
+      try {
+        // Rooted wherever the board is, including an earlier node or a
+        // variation, so the server has to be brought there first.
+        const h = await ensureAt(hist.current);
+        if (!h) return;
+        const res = await client.session(
+          // No budget, candidate count or kernel of its own: the engine's
+          // search config decides all of them.
+          create(SessionRequestSchema, { handle: h, fast, op: { case: "simulations", value: simulations } }),
+          { signal: AbortSignal.timeout(300000) },
+        );
+        setSession(res.analysis ? { id: res.session, res: res.analysis } : null);
+        setWalk(null);
+        setExpanded(new Set());
+      } catch (err) {
+        setError(err instanceof ConnectError ? err.message : String(err));
+      } finally {
+        setAnalysing(false);
+      }
+    },
+    [client, hist, ensureAt, fast],
+  );
+
+  /** One request to the running session. */
+  const sessionOp = useCallback(
+    async (op: SessionRequest["op"]): Promise<SessionResponse | null> => {
+      if (!session) return null;
+      setAnalysing(true);
+      setError(null);
+      try {
+        const res = await client.session(
+          create(SessionRequestSchema, { session: session.id, op }),
+          { signal: AbortSignal.timeout(300000) },
+        );
+        if (res.analysis) setSession({ id: res.session, res: res.analysis });
+        setNote(res.note || null);
+        return res;
+      } catch (err) {
+        setError(err instanceof ConnectError ? err.message : String(err));
+        return null;
+      } finally {
+        setAnalysing(false);
+      }
+    },
+    [client, session],
+  );
+
+  const step = (n: number) => void sessionOp({ case: "simulations", value: n });
+  const forceVisit = (line: Uint8Array[]) =>
+    void sessionOp({ case: "force", value: create(ForceVisitSchema, { line }) });
+
+  /** Start playing a turn on the board, to add under the node on the board. */
+  const startCompose = useCallback(async () => {
+    const start = walk?.at.state ?? analysis?.state;
+    if (!session || !start) return;
+    setError(null);
+    setNote(null);
+    setBusy(true);
+    try {
+      // A scratch game from the position on the board: the engine checks each
+      // action as it is played, and the real game never sees them.
+      const h = await client.newGame(
+        create(NewGameRequestSchema, { gameId: GameId.MINIONS, initialState: start }),
+      );
+      const st = await client.getState(h);
+      setCompose({ handle: h, start: st, state: st, moves: [], at: walk?.line ?? [], atLabels: walk?.labels ?? [] });
+      setSelected(null);
+      setSpawnUnit(null);
+    } catch (err) {
+      setError(err instanceof ConnectError ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }, [client, session, analysis, walk]);
+
+  const composeMove = useCallback(
+    async (payload: Uint8Array) => {
+      if (!compose) return;
+      setError(null);
+      setBusy(true);
+      try {
+        const next = await client.applyMove(
+          create(ApplyMoveRequestSchema, {
+            handle: compose.handle,
+            move: create(MoveSchema, { gameId: GameId.MINIONS, payload }),
+          }),
+        );
+        setCompose((c) => c && { ...c, state: next, moves: [...c.moves, payload] });
+        setSelected(null);
+      } catch (err) {
+        setError(err instanceof ConnectError ? err.message : String(err));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [client, compose],
+  );
+
+  /** Take back the composed turn's last action: the engine cannot rewind a
+   *  game, so this is a fresh scratch game replayed without it. */
+  const composeUndo = useCallback(async () => {
+    if (!compose || compose.moves.length === 0) return;
+    setError(null);
+    setBusy(true);
+    try {
+      const moves = compose.moves.slice(0, -1);
+      const h = await client.newGame(
+        create(NewGameRequestSchema, { gameId: GameId.MINIONS, initialState: compose.start }),
+      );
+      let st = compose.start;
+      for (const payload of moves) {
+        st = await client.applyMove(
+          create(ApplyMoveRequestSchema, {
+            handle: h,
+            move: create(MoveSchema, { gameId: GameId.MINIONS, payload }),
+          }),
+        );
+      }
+      setCompose({ ...compose, handle: h, state: st, moves });
+      setSelected(null);
+    } catch (err) {
+      setError(err instanceof ConnectError ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }, [client, compose]);
+
+  // A composed turn goes into the tree the moment it ends -- the side to move
+  // changes, or the game does -- and the board then shows where it leads, with
+  // the tree opened down to it.
+  useEffect(() => {
+    if (!compose || compose.moves.length === 0) return;
+    const ended =
+      decode(compose.state.payload).side !== decode(compose.start.payload).side ||
+      compose.state.outcome !== Outcome.IN_PROGRESS;
+    if (!ended) return;
+    const c = compose;
+    setCompose(null);
+    void (async () => {
+      const res = await sessionOp({
+        case: "add",
+        value: create(AddChildSchema, { at: c.at, moves: c.moves }),
+      });
+      const added = res?.added;
+      const nodes = res?.analysis?.nodes;
+      if (!added || !nodes) return;
+      const parent = nodeAt(nodes, c.at);
+      const edge = parent === undefined ? undefined : nodes[parent].edges.find((e) => sameTurn(e.turn, added));
+      setExpanded((prev) => new Set([...prev, ...lineKeys(nodes, c.at)]));
+      void showLine([...c.at, added], [...c.atLabels, edge?.label || "pass"]);
+    })();
+  }, [compose, sessionOp, showLine]);
 
   /** Play a root candidate for real, then re-root the analysis on the result.
    *
@@ -688,7 +887,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
         });
         setWalk(null);
         setExpanded(new Set());
-        setAnalysis(null);
+        setSession(null);
         // The engine seat stays suspended while analysis is on, so this does
         // not hand the game to it — the new position simply becomes the root.
         setSelected(null);
@@ -703,6 +902,13 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
   );
   const inProgress = state?.outcome === Outcome.IN_PROGRESS;
   const humanTurn = !!state && inProgress && seatToMove(state) === "human" && !busy && !thinking;
+  /** Whether the position on the board is still being played. */
+  const boardLive = compose ? compose.state.outcome === Outcome.IN_PROGRESS : inProgress;
+  /** Board clicks play: into the composed turn while composing, and into the
+   *  game on a human's turn -- but not while a variation is on the board, which
+   *  is not the position the game is in. */
+  const canAct = compose ? boardLive && !busy : humanTurn && !walk;
+  const act = (payload: Uint8Array) => void (compose ? composeMove(payload) : sendMove(payload));
 
   // Highlights for the current selection.
   const moveSet = useMemo(
@@ -730,25 +936,25 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
   }, [spawnUnit, spawnHeld]);
 
   const onCell = (i: number) => {
-    if (!humanTurn || !d) return;
+    if (!canAct || !d) return;
     if (d.phase === PHASE_ATTACK) {
       if (moveSet.has(i) && selected != null) {
-        void sendMove(new Uint8Array([0, selected, i]));
+        act(new Uint8Array([0, selected, i]));
         return;
       }
       if (attackSet.has(i) && selected != null) {
-        void sendMove(new Uint8Array([1, selected, i]));
+        act(new Uint8Array([1, selected, i]));
         return;
       }
       const c = d.cells[i];
       setSelected(c !== 0 && pieceSide(c) === d.side ? i : null);
     } else if (spawnUnit != null && spawnSet.has(i)) {
-      void sendMove(new Uint8Array([3, spawnUnit, i]));
+      act(new Uint8Array([3, spawnUnit, i]));
     }
   };
 
-  const endPhase = () => void sendMove(new Uint8Array([4]));
-  const buy = (u: number) => void sendMove(new Uint8Array([2, u]));
+  const endPhase = () => act(new Uint8Array([4]));
+  const buy = (u: number) => act(new Uint8Array([2, u]));
 
   const me = d?.side ?? 0;
   const endLabel =
@@ -760,7 +966,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
         <SeatPicker label={SIDE_NAME[0]} seat={firstSeat} onChange={setFirstSeat} />
         <SeatPicker label={SIDE_NAME[1]} seat={secondSeat} onChange={setSecondSeat} />
         <button onClick={() => void newGame()} disabled={busy}>New game</button>
-        {inProgress && <button onClick={endPhase} disabled={!humanTurn}>{endLabel}</button>}
+        {boardLive && <button onClick={endPhase} disabled={!canAct}>{endLabel}</button>}
         {hist && (
           <span style={{ display: "flex", gap: 2, alignItems: "center" }} title="move through the record">
             <button onClick={() => goto(hist.root)} disabled={!canBack} title="start">⏮</button>
@@ -790,8 +996,10 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
           onClick={() => {
             setAnalysisOn((on) => {
               if (on) {
+                setCompose(null);
+                setNote(null);
                 setWalk(null);
-                setAnalysis(null);
+                setSession(null);
                 setExpanded(new Set());
               }
               return !on;
@@ -930,7 +1138,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                     {c !== 0 && <Piece cell={c} pstate={d.pstate[i]} />}
                     {isMove && <circle r={5} fill="rgba(120,220,140,0.85)" style={{ pointerEvents: "none" }} />}
                     {isSpawn && <circle r={5} fill="rgba(150,230,170,0.9)" style={{ pointerEvents: "none" }} />}
-                    {humanTurn && (
+                    {canAct && (
                       <polygon points={HEX_POINTS} fill="transparent" style={{ cursor: "pointer" }} onClick={() => onCell(i)} />
                     )}
                   </g>
@@ -971,7 +1179,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                 </div>
               ))}
 
-              {inProgress && d.phase !== PHASE_ATTACK && (
+              {boardLive && d.phase !== PHASE_ATTACK && (
                 <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: "0.5rem 0.65rem" }}>
                   <strong>Spawn phase</strong>
                   <div style={{ color: "#666", margin: "2px 0 6px" }}>
@@ -984,12 +1192,12 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                     const affordable = d.money[me] >= def.cost;
                     return (
                       <div key={u} style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 4 }}>
-                        <button onClick={() => buy(u)} disabled={!humanTurn || !affordable} style={{ width: 52 }}>
+                        <button onClick={() => buy(u)} disabled={!canAct || !affordable} style={{ width: 52 }}>
                           ${def.cost}
                         </button>
                         <button
                           onClick={() => setSpawnUnit(spawnUnit === u ? null : u)}
-                          disabled={!humanTurn || held === 0}
+                          disabled={!canAct || held === 0}
                           style={{
                             flex: 1,
                             textAlign: "left",
@@ -1005,7 +1213,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                 </div>
               )}
 
-              {inProgress && d.phase === PHASE_ATTACK && (
+              {boardLive && d.phase === PHASE_ATTACK && (
                 <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: "0.5rem 0.65rem", color: "#666" }}>
                   <strong style={{ color: "#222" }}>Attack phase</strong>
                   <div style={{ marginTop: 2 }}>
@@ -1071,7 +1279,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                     <button
                       onClick={() => {
                         setAnalysisOn(true);
-                        void runAnalysis([], [], false);
+                        void startSession(0);
                       }}
                       disabled={analysing || syncing || !canAnalyse}
                       style={{ font: "inherit", padding: "0.25rem 0.7rem" }}
@@ -1101,12 +1309,42 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                 }}
               >
                 <button
-                  onClick={() => void runAnalysis([], [], false)}
-                  disabled={analysing || !handle || !canAnalyse}
+                  onClick={() => void startSession(0)}
+                  disabled={analysing || !handle || !canAnalyse || !!compose}
                   style={{ font: "inherit", padding: "0.25rem 0.7rem" }}
+                  title="search this position with the configured budget"
                 >
                   {analysing ? "analysing…" : analysis ? "re-analyse" : "analyse"}
                 </button>
+                <button
+                  onClick={() => void startSession(1)}
+                  disabled={analysing || !handle || !canAnalyse || !!compose}
+                  title="start a search that has only expanded the root, to run by hand"
+                >
+                  from 1 sim
+                </button>
+                {session && (
+                  <span style={{ display: "flex", gap: 2 }} title="run more simulations of this search">
+                    {[1, 10, 100].map((n) => (
+                      <button key={n} onClick={() => step(n)} disabled={analysing || !!compose}>
+                        +{n}
+                      </button>
+                    ))}
+                  </span>
+                )}
+                {session && (
+                  <button
+                    onClick={() => void startCompose()}
+                    disabled={analysing || busy || !!compose || !canAddHere}
+                    title={
+                      canAddHere
+                        ? "play a turn on the board and add it to this position's candidates"
+                        : "this position has no evaluated node in the tree: force a visit through its turn first (+1 on its row)"
+                    }
+                  >
+                    add a turn here
+                  </button>
+                )}
                 {!canAnalyse && (
                   <span style={{ color: "#b08030" }}>
                     partway through a turn — finish it, or step back (◀), to analyse
@@ -1149,16 +1387,63 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
               </div>
               <SearchConfigPanel client={client} />
 
+              {compose && (
+                <div
+                  style={{
+                    border: "1px solid #6a9",
+                    borderRadius: 6,
+                    padding: "0.35rem 0.55rem",
+                    marginBottom: "0.45rem",
+                    color: "#bbb",
+                    display: "flex",
+                    gap: "0.5rem",
+                    alignItems: "center",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <span style={{ flex: "1 1 16rem" }}>
+                    Adding a turn under{" "}
+                    <strong style={{ color: "#e0a72c" }}>
+                      {compose.atLabels.length > 0 ? compose.atLabels[compose.atLabels.length - 1] : "the root"}
+                    </strong>
+                    : play it on the board. It goes into the tree when the turn ends.{" "}
+                    <span style={{ color: "#777" }}>
+                      {compose.moves.length} action{compose.moves.length === 1 ? "" : "s"} so far
+                    </span>
+                  </span>
+                  <button onClick={() => void composeUndo()} disabled={busy || compose.moves.length === 0}>
+                    undo
+                  </button>
+                  <button onClick={() => setCompose(null)} disabled={busy}>
+                    cancel
+                  </button>
+                </div>
+              )}
+              {note && <div style={{ color: "#b08030", marginBottom: "0.45rem" }}>{note}</div>}
+
               {/* The position on the board, and what the nets say about it. The
                   value is always from *that* position's side to move, so it
                   flips sign down a variation — labelling the side avoids
                   reading a sign flip as a swing. */}
               {(analysis || walk) && (
                 <div style={{ marginBottom: "0.45rem", color: "#bbb" }}>
-                  {shownValue !== undefined && d && (
+                  {!compose && d && (netValue !== undefined || searchValue !== undefined) && (
                     <span>
-                      value{" "}
-                      <strong style={{ color: SIDE_FILL[d.side] }}>{shownValue.toFixed(3)}</strong>{" "}
+                      <span title="the value head at this position, before any search">
+                        net{" "}
+                        <strong style={{ color: SIDE_FILL[d.side] }}>{netValue?.toFixed(3) ?? "—"}</strong>
+                      </span>
+                      <span style={{ color: "#555" }}> · </span>
+                      <span
+                        title={
+                          walk
+                            ? "the search's mean value over this node's visits"
+                            : "the search's value of the root: its candidates' values weighted by the visits PUCT chose"
+                        }
+                      >
+                        search{" "}
+                        <strong style={{ color: SIDE_FILL[d.side] }}>{searchValue?.toFixed(3) ?? "—"}</strong>
+                      </span>{" "}
                       <span style={{ color: "#777" }}>for {SIDE_NAME[d.side]}</span>
                     </span>
                   )}
@@ -1240,7 +1525,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                       <span style={{ color: "#555" }}>→</span>{" "}
                       <span
                         onClick={() =>
-                          void runAnalysis(walk.line.slice(0, i + 1), walk.labels.slice(0, i + 1), true)
+                          void showLine(walk.line.slice(0, i + 1), walk.labels.slice(0, i + 1))
                         }
                         style={{
                           cursor: "pointer",
@@ -1286,7 +1571,8 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                       return next;
                     })
                   }
-                  onPlay={(line, labels) => void runAnalysis(line, labels, true)}
+                  onPlay={(line, labels) => void showLine(line, labels)}
+                  onForce={session && !compose ? forceVisit : undefined}
                   shown={walk?.line}
                   onCommit={(turn, label) => void commitTurn(turn, label)}
                   maxDepth={12}

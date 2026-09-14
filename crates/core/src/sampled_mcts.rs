@@ -359,6 +359,13 @@ struct Entry<G: SampledGame> {
     /// entry made by a fill, which is not a sampler draw. The record of why a
     /// node needed filling.
     draws: u32,
+    /// Put here by hand (`Search::add_candidate`) rather than by the model.
+    manual: bool,
+    /// Value-head estimate of where this entry leads, from this node's side to
+    /// move, for an entry whose child node does not exist yet. Only a
+    /// hand-added candidate has one: the search learns a child's value by
+    /// expanding it, but a reader adding a turn wants to see it at once.
+    eval: Option<f32>,
 }
 
 impl<G: SampledGame> Entry<G> {
@@ -407,6 +414,9 @@ struct Node<G: SampledGame> {
     expanded: bool,
     terminal: bool,
     term_v: f32,
+    /// The value head at this position, from its side to move: what its
+    /// expansion backed up. `None` until expanded.
+    nn_value: Option<f32>,
 }
 
 /// Recompute every entry's prior as `softmax` over the node's energies.
@@ -620,6 +630,7 @@ fn new_node<G: SampledGame>(state: G::State) -> Node<G> {
         draws: 0,
         draw_misses: 0,
         fill_misses: 0,
+        nn_value: None,
         kern: Vec::new(),
         total_n: 0,
         w_sum: 0.0,
@@ -879,6 +890,9 @@ pub struct Search<G: SampledGame> {
     /// `(node, entry)`: the candidate a widen just added to an interior node,
     /// which the resumed descent visits next.
     visit_new: Option<(usize, usize)>,
+    /// Entry indices, root first, the next simulation must descend through
+    /// before PUCT takes over: a visit forced by hand (`force_line`).
+    forced_line: std::collections::VecDeque<usize>,
 }
 
 /// One candidate edge, flattened for inspection.
@@ -904,6 +918,13 @@ pub struct TreeEdge<G: SampledGame> {
     /// Sampler draws merged into this candidate: 1 for the draw that created
     /// it, plus each later draw that reached the same position.
     pub draws: u32,
+    /// The value head's estimate of the position this edge leads to, from the
+    /// side to move at the *parent* -- what the edge's first visit backed up,
+    /// before any search below it. `value` is the search's mean over every
+    /// visit. `None` until the child has been evaluated.
+    pub prior_value: Option<f32>,
+    /// Added by hand ([`Search::add_candidate`]) rather than by the model.
+    pub manual: bool,
 }
 
 /// A node of the search tree, flattened for inspection.
@@ -914,6 +935,8 @@ pub struct TreeNode<G: SampledGame> {
     pub value: Option<f32>,
     pub terminal: bool,
     pub term_value: f32,
+    /// The value head here, from the side to move here. `None` until expanded.
+    pub nn_value: Option<f32>,
     pub edges: Vec<TreeEdge<G>>,
     /// Row-major `k x k` KR-PUCT kernel over `edges`, in `edges` order, or
     /// empty when the kernel is off (`kernel_sigma == 0`). Entry `(i, j)` is
@@ -955,6 +978,7 @@ impl<G: SampledGame> Search<G> {
                     },
                     total_visits: node.total_n,
                     value: (node.total_n > 0).then(|| node.w_sum / node.total_n as f32),
+                    nn_value: node.nn_value,
                     terminal: node.terminal,
                     term_value: node.term_v,
                     edges: node
@@ -968,10 +992,12 @@ impl<G: SampledGame> Search<G> {
                             energy: e.energy,
                             visits: e.n,
                             value: (e.n > 0).then(|| e.w / e.n as f32),
+                            prior_value: self.prior_value(node, e),
                             child: (e.child >= 0).then_some(e.child as usize),
                             explore: e.explore,
                             forced: e.forced_n,
                             draws: e.draws,
+                            manual: e.manual,
                         })
                         .collect(),
                     kernel: node.kern.clone(),
@@ -979,6 +1005,237 @@ impl<G: SampledGame> Search<G> {
             })
             .collect()
     }
+    /// The value head's estimate of where `e` leads, from `node`'s side to
+    /// move: the child's own evaluation, flipped across a change of side, or a
+    /// hand-added entry's `eval` while it has no child yet.
+    fn prior_value(&self, node: &Node<G>, e: &Entry<G>) -> Option<f32> {
+        if e.child < 0 {
+            return e.eval;
+        }
+        let child = &self.tree[e.child as usize];
+        let v = if child.terminal {
+            child.term_v
+        } else {
+            child.nn_value?
+        };
+        Some(if G::to_move(&node.state) != G::to_move(&child.state) {
+            -v
+        } else {
+            v
+        })
+    }
+
+    /// Allow `n` more simulations; the next [`drive`] runs exactly those. How
+    /// an analysis session steps a search a few simulations at a time.
+    pub fn add_simulations(&mut self, n: u32) {
+        self.sims_left += n;
+    }
+
+    /// Replace the remaining budget. `params.simulations` keeps the configured
+    /// one, which the forced-visit quotas are sized against, so a search
+    /// started with a single simulation still searches like the configured
+    /// one as it is stepped.
+    pub fn set_remaining(&mut self, n: u32) {
+        self.sims_left = n;
+    }
+
+    /// The node reached from the root through `entries`, one entry index per
+    /// level.
+    pub fn node_at(&self, entries: &[usize]) -> anyhow::Result<usize> {
+        let mut cur = 0usize;
+        for (depth, &i) in entries.iter().enumerate() {
+            let e = self.tree[cur]
+                .entries
+                .get(i)
+                .ok_or_else(|| anyhow::anyhow!("depth {depth}: the node has no candidate {i}"))?;
+            anyhow::ensure!(
+                e.child >= 0,
+                "depth {depth}: that turn has never been visited, so there is no node for it yet"
+            );
+            cur = e.child as usize;
+        }
+        Ok(cur)
+    }
+
+    /// Entry indices for a line of moves from the root, matched by the position
+    /// each reaches -- the key candidates are merged by -- so the caller needs
+    /// no knowledge of how entries are ordered. The last move need only be a
+    /// candidate; every earlier one must lead to an existing node.
+    pub fn resolve_line(&self, line: &[G::Move]) -> anyhow::Result<Vec<usize>> {
+        let mut cur = 0usize;
+        let mut out = Vec::with_capacity(line.len());
+        for (depth, mv) in line.iter().enumerate() {
+            let node = &self.tree[cur];
+            let key = G::state_key(&G::apply(&node.state, mv));
+            let i = node
+                .entries
+                .iter()
+                .position(|e| G::state_key(&G::apply(&node.state, &e.mv)) == key)
+                .ok_or_else(|| anyhow::anyhow!("depth {depth}: not a candidate of that node"))?;
+            out.push(i);
+            if depth + 1 < line.len() {
+                let child = node.entries[i].child;
+                anyhow::ensure!(
+                    child >= 0,
+                    "depth {depth}: that turn has never been visited, so there is no node for it yet"
+                );
+                cur = child as usize;
+            }
+        }
+        Ok(out)
+    }
+
+    /// The position at `node`.
+    pub fn state_of(&self, node: usize) -> &G::State {
+        &self.tree[node].state
+    }
+
+    /// The move of `node`'s candidate `i`.
+    pub fn candidate(&self, node: usize, i: usize) -> &G::Move {
+        &self.tree[node].entries[i].mv
+    }
+
+    /// Make the next simulation descend through `entries` (root first) and
+    /// continue by PUCT below the last one, adding that simulation to the
+    /// budget. Every edge on the line counts as a forced visit: like the
+    /// quotas, it buys a value estimate without looking like a choice PUCT made.
+    pub fn force_line(&mut self, entries: &[usize]) -> anyhow::Result<()> {
+        let (&last, above) = entries
+            .split_last()
+            .ok_or_else(|| anyhow::anyhow!("an empty line forces nothing"))?;
+        anyhow::ensure!(self.tree[0].expanded, "the root has not been expanded yet");
+        let parent = self.node_at(above)?;
+        anyhow::ensure!(
+            last < self.tree[parent].entries.len(),
+            "the node has no candidate {last}"
+        );
+        self.forced_line = entries.iter().copied().collect();
+        self.sims_left += 1;
+        Ok(())
+    }
+
+    /// Add `mv` to `node`'s candidates by hand, with energy `energy` and the
+    /// value head's estimate `eval` of where it leads (from `node`'s side to
+    /// move). Priors are renormalised over the grown set, as a widen does.
+    ///
+    /// Returns the entry's index and whether it is new: a move reaching a
+    /// position the node already holds *is* that candidate, not a second one.
+    pub fn add_candidate(
+        &mut self,
+        node: usize,
+        mv: G::Move,
+        energy: f32,
+        eval: Option<f32>,
+    ) -> anyhow::Result<(usize, bool)> {
+        anyhow::ensure!(node < self.tree.len(), "no node {node}");
+        anyhow::ensure!(
+            self.tree[node].expanded,
+            "that position has not been evaluated yet: visit it first"
+        );
+        anyhow::ensure!(!self.tree[node].terminal, "the game is over there");
+        let state = self.tree[node].state.clone();
+        let key = G::state_key(&G::apply(&state, &mv));
+        let find = |entries: &[Entry<G>]| {
+            entries
+                .iter()
+                .position(|e| G::state_key(&G::apply(&state, &e.mv)) == key)
+        };
+        if let Some(i) = find(&self.tree[node].entries) {
+            return Ok((i, false));
+        }
+        self.tree[node].entries.push(Entry {
+            mv,
+            energy,
+            p: 0.0,
+            n: 0,
+            w: 0.0,
+            child: -1,
+            explore: false,
+            forced_n: 0,
+            forced_quota: 0,
+            draws: 0,
+            manual: true,
+            eval,
+        });
+        renormalise(&mut self.tree[node].entries);
+        // Every prior moved, so the visited mass FPU reads must be re-summed.
+        let nd = &mut self.tree[node];
+        nd.visited_p = nd.entries.iter().filter(|e| e.n > 0).map(|e| e.p).sum();
+        self.build_kernel(node);
+        let i = find(&self.tree[node].entries).expect("just added");
+        Ok((i, true))
+    }
+
+    /// The root's value as `finish` reports it.
+    ///
+    /// Each candidate's value weighted by its *chosen* visits, not its raw
+    /// ones. Each candidate's own `q` still uses every visit it received --
+    /// the forced ones were spent measuring it and are good evidence -- but
+    /// the position's value is a statement about what search concluded, and
+    /// a plain `w_sum / total_n` lets a quota spent proving a move is bad
+    /// drag the position's evaluation down with it. At a 100-simulation
+    /// budget with one 30-visit quota that was enough to report a won
+    /// position at 0.36, which `an_immediate_win_is_taken` caught.
+    pub fn root_value(&self) -> f64 {
+        let root = &self.tree[0];
+        let eff_n: u32 = root.entries.iter().map(|e| e.n_eff()).sum();
+        if eff_n > 0 {
+            let acc: f64 = root
+                .entries
+                .iter()
+                .filter(|e| e.n > 0)
+                .map(|e| e.n_eff() as f64 * (e.w as f64 / e.n as f64))
+                .sum();
+            acc / eff_n as f64
+        } else if root.total_n > 0 {
+            // Every visit was forced -- only at budgets below the quota total.
+            root.w_sum as f64 / root.total_n as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// What `finish` would play now, without finishing: the same rule on a
+    /// copy of the RNG, so asking twice gives the same answer.
+    pub fn chosen(&self) -> usize {
+        self.pick(&mut self.rng.clone())
+    }
+
+    /// Play on *chosen* visits, the same counts the policy target is built
+    /// from. Forced visits are bought, not preferred, and a candidate given a
+    /// 30-visit quota would otherwise win the argmax outright at small budgets
+    /// purely because we insisted on measuring it -- which is exactly what
+    /// `an_immediate_win_is_taken` caught.
+    fn pick(&self, rng: &mut ChaCha8Rng) -> usize {
+        let eff: Vec<u32> = self.tree[0].entries.iter().map(|e| e.n_eff()).collect();
+        if eff.is_empty() {
+            0
+        } else if self.ply < self.params.temp_moves {
+            // Opening plies: sample proportional to visits, for self-play diversity.
+            let total: u32 = eff.iter().sum();
+            if total == 0 {
+                rng.gen_range(0..eff.len())
+            } else {
+                let mut r = rng.gen_range(0..total);
+                let mut pick = eff.len() - 1;
+                for (i, n) in eff.iter().enumerate() {
+                    if r < *n {
+                        pick = i;
+                        break;
+                    }
+                    r -= *n;
+                }
+                pick
+            }
+        } else {
+            eff.iter()
+                .enumerate()
+                .max_by_key(|(_, n)| **n)
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        }
+    }
+
     pub fn new(root: G::State, params: &SampledParams, ply: u32) -> Self {
         Self {
             tree: vec![new_node::<G>(root)],
@@ -992,6 +1249,7 @@ impl<G: SampledGame> Search<G> {
             pending_widen: None,
             resume_at: None,
             visit_new: None,
+            forced_line: Default::default(),
         }
     }
 
@@ -1025,6 +1283,13 @@ impl<G: SampledGame> Search<G> {
                 // candidates and had visited one.
                 let (pick, forced) = match self.visit_new.take() {
                     Some((node, entry)) if node == cur => (entry, false),
+                    // A visit forced by hand (`force_line`) goes where it was
+                    // told, widening nothing on the way: the reader is asking
+                    // about this line, not about more candidates.
+                    None if !self.forced_line.is_empty() => {
+                        let pick = self.forced_line.pop_front().expect("checked non-empty");
+                        (pick, true)
+                    }
                     _ => {
                         // Ask for the next chunk before selecting, if this node
                         // has earned more candidates than it holds: a sampler
@@ -1080,6 +1345,9 @@ impl<G: SampledGame> Search<G> {
             };
             self.backup(value);
             self.sims_left -= 1;
+            // A forced line belongs to one simulation, even one that ended
+            // (at a terminal) before using all of it.
+            self.forced_line.clear();
         }
         Step::Done
     }
@@ -1120,6 +1388,8 @@ impl<G: SampledGame> Search<G> {
                         forced_n: 0,
                         forced_quota: 0,
                         draws: 1,
+                        manual: false,
+                        eval: None,
                     });
                 }
             }
@@ -1141,11 +1411,13 @@ impl<G: SampledGame> Search<G> {
         assign_forced_quotas(&mut entries, &self.params, &mut self.rng);
         self.tree[cur].entries = entries;
         self.tree[cur].expanded = true;
+        self.tree[cur].nn_value = Some(value);
         self.tree[cur].draws = expansion_k(&self.params) as u32;
         self.build_kernel(cur);
 
         self.backup(value);
         self.sims_left -= 1;
+        self.forced_line.clear();
     }
 
     /// Negamax backup along the descent path. `value` is from the leaf's side.
@@ -1236,6 +1508,8 @@ impl<G: SampledGame> Search<G> {
                         forced_n: 0,
                         forced_quota: 0,
                         draws: draw,
+                        manual: false,
+                        eval: None,
                     });
                 }
             }
@@ -1320,7 +1594,7 @@ impl<G: SampledGame> Search<G> {
         self.tree[node].kern = kern;
     }
 
-    pub fn finish(mut self) -> SampledSearchResult<G> {
+    pub fn finish(self) -> SampledSearchResult<G> {
         let mut stats = SearchStats::default();
         for node in self.tree.iter() {
             if !node.expanded {
@@ -1338,62 +1612,8 @@ impl<G: SampledGame> Search<G> {
         let priors: Vec<f32> = root.entries.iter().map(|e| e.p).collect();
         let explore: Vec<bool> = root.entries.iter().map(|e| e.explore).collect();
         let forced: Vec<u32> = root.entries.iter().map(|e| e.forced_n).collect();
-        // Weight each candidate's value by its *chosen* visits, not its raw
-        // ones. Each candidate's own `q` still uses every visit it received --
-        // the forced ones were spent measuring it and are good evidence -- but
-        // the position's value is a statement about what search concluded, and
-        // a plain `w_sum / total_n` lets a quota spent proving a move is bad
-        // drag the position's evaluation down with it. At a 100-simulation
-        // budget with one 30-visit quota that was enough to report a won
-        // position at 0.36, which `an_immediate_win_is_taken` caught.
-        let eff_n: u32 = root.entries.iter().map(|e| e.n_eff()).sum();
-        let value = if eff_n > 0 {
-            let acc: f64 = root
-                .entries
-                .iter()
-                .filter(|e| e.n > 0)
-                .map(|e| e.n_eff() as f64 * (e.w as f64 / e.n as f64))
-                .sum();
-            acc / eff_n as f64
-        } else if root.total_n > 0 {
-            // Every visit was forced -- only at budgets below the quota total.
-            root.w_sum as f64 / root.total_n as f64
-        } else {
-            0.0
-        };
-
-        // Play on *chosen* visits, the same counts the policy target is built
-        // from. Forced visits are bought, not preferred, and a candidate given a
-        // 30-visit quota would otherwise win the argmax outright at small
-        // budgets purely because we insisted on measuring it -- which is exactly
-        // what `an_immediate_win_is_taken` caught.
-        let eff: Vec<u32> = root.entries.iter().map(|e| e.n_eff()).collect();
-        let chosen = if candidates.is_empty() {
-            0
-        } else if self.ply < self.params.temp_moves {
-            // Opening plies: sample proportional to visits, for self-play diversity.
-            let total: u32 = eff.iter().sum();
-            if total == 0 {
-                self.rng.gen_range(0..candidates.len())
-            } else {
-                let mut r = self.rng.gen_range(0..total);
-                let mut pick = candidates.len() - 1;
-                for (i, n) in eff.iter().enumerate() {
-                    if r < *n {
-                        pick = i;
-                        break;
-                    }
-                    r -= *n;
-                }
-                pick
-            }
-        } else {
-            eff.iter()
-                .enumerate()
-                .max_by_key(|(_, n)| **n)
-                .map(|(i, _)| i)
-                .unwrap_or(0)
-        };
+        let value = self.root_value();
+        let chosen = self.pick(&mut self.rng.clone());
         SampledSearchResult {
             candidates,
             priors,
@@ -1447,7 +1667,10 @@ pub fn search<G: SampledGame, M: SampledModel<G>>(
 /// Serve one search's requests from `model` until it is done: the single
 /// place a lone search's expansions and widens are answered, so `search` and
 /// `search_analyzed` cannot drift apart.
-fn drive<G: SampledGame, M: SampledModel<G>>(model: &M, s: &mut Search<G>) -> anyhow::Result<()> {
+pub fn drive<G: SampledGame, M: SampledModel<G>>(
+    model: &M,
+    s: &mut Search<G>,
+) -> anyhow::Result<()> {
     let params = *s.params();
     loop {
         match s.step() {
@@ -1890,6 +2113,180 @@ mod tests {
         }
     }
 
+    /// Running a search a few simulations at a time builds exactly the tree
+    /// running it in one go does: a session's stepping is only a pause.
+    #[test]
+    fn stepping_a_search_matches_running_it_at_once() {
+        let params = SampledParams {
+            simulations: 60,
+            k_candidates: 3,
+            k_draws: 3,
+            pw_chunk: 1,
+            temp_moves: 0,
+            seed: 12,
+            ..Default::default()
+        };
+        let root = CountState { n: 21, side: 1 };
+        let mut whole = Search::<Count>::new(root.clone(), &params, 0);
+        drive(&Mock, &mut whole).unwrap();
+        let mut stepped = Search::<Count>::new(root, &params, 0);
+        stepped.set_remaining(0);
+        for n in [1u32, 1, 5, 13, 40] {
+            stepped.add_simulations(n);
+            drive(&Mock, &mut stepped).unwrap();
+        }
+        let shape = |s: &Search<Count>| {
+            s.export_tree()
+                .iter()
+                .map(|n| {
+                    n.edges
+                        .iter()
+                        .map(|e| (e.mv, e.visits, e.forced))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&whole), shape(&stepped));
+        assert_eq!(whole.chosen(), stepped.chosen());
+    }
+
+    /// A forced line is descended exactly, one simulation, and every edge on
+    /// it counts the visit as forced.
+    #[test]
+    fn a_forced_line_is_descended_and_counted_as_forced() {
+        let params = SampledParams {
+            simulations: 40,
+            k_candidates: 3,
+            k_draws: 3,
+            pw_chunk: 0,
+            forced_visits: 0,
+            k_forced: 0.0,
+            min_explore_visits: 0.0,
+            temp_moves: 0,
+            seed: 3,
+            ..Default::default()
+        };
+        let mut s = Search::<Count>::new(CountState { n: 21, side: 1 }, &params, 0);
+        drive(&Mock, &mut s).unwrap();
+        let before = s.export_tree();
+        // The least-visited root candidate -- PUCT's last choice -- and its
+        // child's first candidate.
+        let (i, e) = before[0]
+            .edges
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, e)| e.visits)
+            .unwrap();
+        let child = e.child.expect("the root sweep visits every candidate");
+        assert!(
+            !before[child].edges.is_empty(),
+            "unchunked: a visited node holds its set"
+        );
+        s.force_line(&[i, 0]).unwrap();
+        drive(&Mock, &mut s).unwrap();
+        let after = s.export_tree();
+        assert_eq!(
+            after[0].total_visits,
+            before[0].total_visits + 1,
+            "one simulation"
+        );
+        assert_eq!(after[0].edges[i].visits, before[0].edges[i].visits + 1);
+        assert_eq!(after[0].edges[i].forced, before[0].edges[i].forced + 1);
+        assert_eq!(
+            after[child].edges[0].forced,
+            before[child].edges[0].forced + 1
+        );
+        assert!(s.force_line(&[]).is_err());
+        assert!(
+            s.force_line(&[99]).is_err(),
+            "a candidate the root does not have"
+        );
+    }
+
+    /// A hand-added candidate joins its node with its own energy and value,
+    /// priors renormalised over the grown set, and a move reaching a position
+    /// the node already holds is that candidate. `prior_value` is the value
+    /// head's opinion of a child, kept apart from the search's mean and
+    /// oriented to the parent's side.
+    #[test]
+    fn hand_added_candidates_carry_energy_and_value() {
+        /// Proposes move 1 only; its value is `n / 100` for the side to move.
+        struct Valued;
+        impl SampledModel<Count> for Valued {
+            fn expand(&self, s: &CountState, k: usize) -> anyhow::Result<Expansion<Count>> {
+                let cands = if k == 0 {
+                    Vec::new()
+                } else {
+                    vec![(1u32, 0.0, false)]
+                };
+                Ok((s.n as f32 / 100.0, cands))
+            }
+            fn widen_batch(
+                &self,
+                states: &[CountState],
+                fill: &[bool],
+                _k: usize,
+            ) -> anyhow::Result<Vec<Vec<(u32, f32, bool)>>> {
+                Ok(fill
+                    .iter()
+                    .take(states.len())
+                    .map(|&f| {
+                        if f {
+                            Vec::new()
+                        } else {
+                            vec![(1u32, 0.0, false)]
+                        }
+                    })
+                    .collect())
+            }
+        }
+        let params = SampledParams {
+            simulations: 12,
+            k_candidates: 3,
+            k_draws: 3,
+            pw_chunk: 1,
+            forced_visits: 0,
+            temp_moves: 0,
+            seed: 2,
+            ..Default::default()
+        };
+        let mut s = Search::<Count>::new(CountState { n: 21, side: 1 }, &params, 0);
+        drive(&Valued, &mut s).unwrap();
+        let t = s.export_tree();
+        assert_eq!(t[0].edges.len(), 1, "the model only knows move 1");
+        // The visited child's prior value: the value head there, 20/100,
+        // flipped if the side to move changed.
+        let one = &t[0].edges[0];
+        let child = one.child.expect("move 1 was visited");
+        let flip = Count::to_move(s.state_of(0)) != Count::to_move(s.state_of(child));
+        assert_eq!(one.prior_value, Some(if flip { -0.20 } else { 0.20 }));
+        assert_eq!(t[child].nn_value, Some(0.20));
+
+        let (i, new) = s.add_candidate(0, 2, 5.0, Some(0.25)).unwrap();
+        assert!(new);
+        let t = s.export_tree();
+        let e = &t[0].edges[i];
+        assert!(e.manual && e.mv == 2 && e.visits == 0 && e.child.is_none());
+        assert_eq!(
+            e.prior_value,
+            Some(0.25),
+            "before any visit, the value given"
+        );
+        let sum: f32 = t[0].edges.iter().map(|e| e.prior).sum();
+        assert!((sum - 1.0).abs() < 1e-5, "priors renormalised: {sum}");
+        assert!(
+            t[0].edges.iter().all(|x| x.prior <= e.prior),
+            "energy 5 leads"
+        );
+
+        let (again, new) = s.add_candidate(0, 2, 0.0, None).unwrap();
+        assert!(!new && again == i, "same position: the same candidate");
+        // And the search can then visit it.
+        s.force_line(&[i]).unwrap();
+        drive(&Valued, &mut s).unwrap();
+        assert_eq!(s.export_tree()[0].edges[i].visits, 1);
+    }
+
     /// A fill that collides is retried: random fills repeat themselves long
     /// before a position runs out of turns, so a miss must not leave the node
     /// short.
@@ -2208,6 +2605,8 @@ mod tests {
                 forced_n: 0,
                 forced_quota: 0,
                 draws: 1,
+                manual: false,
+                eval: None,
             })
             .collect();
 
@@ -2269,6 +2668,8 @@ mod tests {
                     forced_n: 0,
                     forced_quota: 0,
                     draws: 1,
+                    manual: false,
+                    eval: None,
                 })
                 .collect();
             let mut prev = 0usize;
@@ -3189,6 +3590,8 @@ mod forced_quota_tests {
             forced_n: 0,
             forced_quota: 0,
             draws: 1,
+            manual: false,
+            eval: None,
         }
     }
 

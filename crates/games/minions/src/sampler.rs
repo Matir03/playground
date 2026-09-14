@@ -682,6 +682,58 @@ impl MinionsModel {
     ///
     /// Kept as a named function rather than inlined so the invariant has
     /// somewhere to live: whatever the head emits reaches the search unscaled.
+    /// The value at `state` and the energy of each of `specs` there, scored as
+    /// an expansion scores its candidates -- for turns that came from anywhere
+    /// but the sampler, like a reader adding one by hand. Same canonical frame
+    /// and graphs as `expand_batch_cached`, and rows padded to a multiple of
+    /// the trunk batch so a single turn reuses the engine a widen builds.
+    pub fn score_turns(
+        &self,
+        state: &MinionsState,
+        specs: &[TurnSpec],
+    ) -> anyhow::Result<(f32, Vec<f32>)> {
+        let flipped = state.side == 1;
+        let canon = state.canonical();
+        let g = self.cfg.pad_to.max(1);
+        let pstride = crate::game::PLANES * NUM_CELLS;
+        let mut planes = vec![0f32; g * pstride];
+        for (o, b) in planes[..pstride]
+            .iter_mut()
+            .zip(Minions::to_features(&canon))
+        {
+            *o = b as f32;
+        }
+        for j in 1..g {
+            planes.copy_within(0..pstride, j * pstride);
+        }
+        let tr = self.net.trunk(&planes, g)?;
+        let value = tr.value[0];
+        if specs.is_empty() {
+            return Ok((value, Vec::new()));
+        }
+        if !self.cfg.use_energy {
+            // What the expansion path hands the search with the head off.
+            return Ok((value, vec![1.0; specs.len()]));
+        }
+        let hstride = self.net.channels() * NUM_CELLS;
+        let dstride = crate::turn::ENERGY_PLANES * NUM_CELLS;
+        let live = LiveMask::of(&canon);
+        let rows = g * specs.len().div_ceil(g);
+        let mut decl = vec![0f32; rows * dstride];
+        for (at, spec) in specs.iter().enumerate() {
+            let c = if flipped { spec.rotated() } else { *spec };
+            Partial::fully_committed(&c, &live)
+                .write_energy_planes(&mut decl[at * dstride..(at + 1) * dstride]);
+        }
+        let mut h_b = Vec::with_capacity(rows * hstride);
+        for _ in 0..rows {
+            h_b.extend_from_slice(&tr.h[..hstride]);
+        }
+        let mut e = self.net.energy(&h_b, &decl, rows)?;
+        e.truncate(specs.len());
+        Ok((value, self.priors_from(&e)))
+    }
+
     fn priors_from(&self, energies: &[f32]) -> Vec<f32> {
         energies.to_vec()
     }

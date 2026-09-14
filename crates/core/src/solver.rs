@@ -98,6 +98,13 @@ pub struct AnalysisEdge {
     pub forced: u32,
     /// Sampler draws merged into this candidate (1 = drawn once).
     pub draws: u32,
+    /// The value head's estimate of the position this turn leads to, from the
+    /// side to move at the parent: what the edge's first visit backed up,
+    /// before any search below it. `value` is the search's mean over every
+    /// visit. `None` until the child has been evaluated.
+    pub prior_value: Option<f32>,
+    /// Added by hand in an analysis session rather than proposed by the model.
+    pub manual: bool,
 }
 
 pub struct AnalysisNode {
@@ -106,6 +113,9 @@ pub struct AnalysisNode {
     pub value: Option<f32>,
     pub terminal: bool,
     pub term_value: f32,
+    /// The value head here, from the side to move here -- `value` is the
+    /// search's mean over the node's visits. `None` until expanded.
+    pub prior_value: Option<f32>,
     pub edges: Vec<AnalysisEdge>,
     /// Row-major `k x k` KR-PUCT kernel over `edges`, empty when the kernel is
     /// off. `(i, j)` is how much of `j`'s statistics `i` borrows in selection.
@@ -151,6 +161,45 @@ pub struct SearchConfigJson {
     pub default: String,
 }
 
+/// One request to a persistent analysis session: a search kept alive between
+/// calls, so a reader can run it a few simulations at a time, force visits
+/// down lines of their choosing, and add turns of their own. See
+/// [`Analyzable::session`].
+pub enum SessionOp<S> {
+    /// Start a session on `root`. `simulations == 0` runs the configured
+    /// budget; 1 expands the root and stops.
+    Start {
+        root: S,
+        simulations: u32,
+        fast: bool,
+    },
+    /// Run `simulations` more.
+    Step { id: u64, simulations: u32 },
+    /// One simulation forced down `line` -- turn encodings from the session
+    /// root, the last being the edge to force through -- with PUCT below it.
+    Force { id: u64, line: Vec<Vec<u8>> },
+    /// Add the whole turn `moves` -- the game's own move encodings, played from
+    /// the node `at` reaches (turn encodings from the root; empty = the root)
+    /// -- to that node's candidates.
+    Add {
+        id: u64,
+        at: Vec<Vec<u8>>,
+        moves: Vec<Vec<u8>>,
+    },
+}
+
+/// What a session looks like after a [`SessionOp`].
+pub struct SessionResult<S> {
+    pub id: u64,
+    /// Where every line in `analysis` starts.
+    pub root: S,
+    pub analysis: Analysis,
+    /// After an `Add`: the turn as it now sits in the tree.
+    pub added: Option<Vec<u8>>,
+    /// Anything the reader should know about the request.
+    pub note: Option<String>,
+}
+
 /// A game that can report what its net and search see at a position.
 ///
 /// Separate from [`Solver`] because analysing is not choosing: the point is to
@@ -185,6 +234,12 @@ pub trait Analyzable: crate::Game {
     /// one the engine started with (`None`), and report the result as
     /// [`Self::search_config`] does.
     fn set_search_config(_json: Option<&str>) -> Option<anyhow::Result<SearchConfigJson>> {
+        None
+    }
+
+    /// Start, step, steer or add to a persistent analysis session. `None` =
+    /// this game has none.
+    fn session(_op: SessionOp<Self::State>) -> Option<anyhow::Result<SessionResult<Self::State>>> {
         None
     }
 }

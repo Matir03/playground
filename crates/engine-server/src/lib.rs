@@ -63,6 +63,58 @@ fn state_to_proto<G: Game>(state: &G::State) -> GameState {
     }
 }
 
+/// An analysis of `state`, for the wire. Shared by one-shot analysis and
+/// sessions, so the two cannot disagree about what a field means.
+fn analysis_to_proto<G: Game>(
+    state: &G::State,
+    analysis: playground_core::Analysis,
+) -> AnalyzeResponse {
+    AnalyzeResponse {
+        state: Some(state_to_proto::<G>(state)),
+        value: analysis.value,
+        aux: analysis.aux.map(|a| AnalyzeAux {
+            hex_control_mover: a.hex_control[0].iter().map(|x| *x as f64).collect(),
+            hex_control_opponent: a.hex_control[1].iter().map(|x| *x as f64).collect(),
+            necro_hazard_mover: a.necro_hazard[0].iter().map(|x| *x as f64).collect(),
+            necro_hazard_opponent: a.necro_hazard[1].iter().map(|x| *x as f64).collect(),
+            log_z: a.log_z as f64,
+            score: a.score as f64,
+        }),
+        nodes: analysis
+            .nodes
+            .iter()
+            .map(|n| AnalyzeNode {
+                parent: n.parent.map(|p| p as u32),
+                total_visits: n.total_visits,
+                value: n.value.map(|v| v as f64),
+                terminal: n.terminal,
+                term_value: n.term_value as f64,
+                edges: n
+                    .edges
+                    .iter()
+                    .map(|e| AnalyzeEdge {
+                        turn: e.mv.clone().into(),
+                        label: e.label.clone(),
+                        prior: e.prior as f64,
+                        energy: e.energy as f64,
+                        visits: e.visits,
+                        value: e.value.map(|v| v as f64),
+                        child: e.child.map(|c| c as u32),
+                        explore: e.explore,
+                        forced: e.forced,
+                        draws: e.draws,
+                        prior_value: e.prior_value.map(|v| v as f64),
+                        manual: e.manual,
+                    })
+                    .collect(),
+                kernel: n.kernel.clone(),
+                prior_value: n.prior_value.map(|v| v as f64),
+            })
+            .collect(),
+        chosen: analysis.chosen.map(|c| c as u32),
+    }
+}
+
 // ── Server struct ─────────────────────────────────────────────────────────────
 
 pub struct EngineServer<G, M>
@@ -271,46 +323,79 @@ where
             })?
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        Ok(Response::new(AnalyzeResponse {
-            state: Some(state_to_proto::<G>(&state)),
-            value: analysis.value,
-            aux: analysis.aux.map(|a| AnalyzeAux {
-                hex_control_mover: a.hex_control[0].iter().map(|x| *x as f64).collect(),
-                hex_control_opponent: a.hex_control[1].iter().map(|x| *x as f64).collect(),
-                necro_hazard_mover: a.necro_hazard[0].iter().map(|x| *x as f64).collect(),
-                necro_hazard_opponent: a.necro_hazard[1].iter().map(|x| *x as f64).collect(),
-                log_z: a.log_z as f64,
-                score: a.score as f64,
-            }),
-            nodes: analysis
-                .nodes
-                .iter()
-                .map(|n| AnalyzeNode {
-                    parent: n.parent.map(|p| p as u32),
-                    total_visits: n.total_visits,
-                    value: n.value.map(|v| v as f64),
-                    terminal: n.terminal,
-                    term_value: n.term_value as f64,
-                    edges: n
-                        .edges
-                        .iter()
-                        .map(|e| AnalyzeEdge {
-                            turn: e.mv.clone().into(),
-                            label: e.label.clone(),
-                            prior: e.prior as f64,
-                            energy: e.energy as f64,
-                            visits: e.visits,
-                            value: e.value.map(|v| v as f64),
-                            child: e.child.map(|c| c as u32),
-                            explore: e.explore,
-                            forced: e.forced,
-                            draws: e.draws,
-                        })
-                        .collect(),
-                    kernel: n.kernel.clone(),
-                })
-                .collect(),
-            chosen: analysis.chosen.map(|c| c as u32),
+        Ok(Response::new(analysis_to_proto::<G>(&state, analysis)))
+    }
+
+    /// A persistent analysis session: start one on the handle's position, or
+    /// step, force or add to one already running. See `Analyzable::session`.
+    async fn session(
+        &self,
+        req: Request<SessionRequest>,
+    ) -> Result<Response<SessionResponse>, Status> {
+        use playground_core::SessionOp;
+        use session_request::Op;
+        let inner = req.into_inner();
+        let op = if inner.session == 0 {
+            let handle = inner
+                .handle
+                .ok_or_else(|| Status::invalid_argument("session: starting one needs a handle"))?;
+            let mut state = {
+                let games = self.games.read().await;
+                let bytes = games
+                    .get(&handle.handle_id)
+                    .ok_or_else(|| Status::not_found("session: unknown handle"))?;
+                G::decode_state(bytes).map_err(|e| Status::internal(e.to_string()))?
+            };
+            for (i, turn) in inner.line.iter().enumerate() {
+                state = G::apply_encoded_turn(&state, turn).map_err(|e| {
+                    Status::invalid_argument(format!("session: line[{i}] does not apply: {e}"))
+                })?;
+            }
+            let simulations = match inner.op {
+                Some(Op::Simulations(n)) => n,
+                None => 0,
+                Some(_) => {
+                    return Err(Status::invalid_argument(
+                        "session: start a session before forcing or adding to it",
+                    ))
+                }
+            };
+            SessionOp::Start {
+                root: state,
+                simulations,
+                fast: inner.fast,
+            }
+        } else {
+            let id = inner.session;
+            let owned = |v: &[_]| {
+                v.iter()
+                    .map(|b: &_| AsRef::<[u8]>::as_ref(b).to_vec())
+                    .collect()
+            };
+            match inner.op {
+                Some(Op::Simulations(n)) => SessionOp::Step { id, simulations: n },
+                None => SessionOp::Step { id, simulations: 0 },
+                Some(Op::Force(f)) => SessionOp::Force {
+                    id,
+                    line: owned(&f.line),
+                },
+                Some(Op::Add(a)) => SessionOp::Add {
+                    id,
+                    at: owned(&a.at),
+                    moves: owned(&a.moves),
+                },
+            }
+        };
+        let res = G::session(op)
+            .ok_or_else(|| {
+                Status::failed_precondition("session: this engine has no analysable net configured")
+            })?
+            .map_err(|e| Status::invalid_argument(format!("session: {e}")))?;
+        Ok(Response::new(SessionResponse {
+            session: res.id,
+            analysis: Some(analysis_to_proto::<G>(&res.root, res.analysis)),
+            added: res.added.map(Into::into),
+            note: res.note.unwrap_or_default(),
         }))
     }
 

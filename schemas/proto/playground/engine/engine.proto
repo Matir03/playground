@@ -34,6 +34,11 @@ service EngineService {
   // Replace that search, or restore the one the engine started with.
   rpc SetSearchConfig(SetSearchConfigRequest) returns (SearchConfig);
 
+  // A persistent analysis session: a search kept alive between calls, so a
+  // reader can run it a few simulations at a time, force visits down lines of
+  // their choosing, and add turns of their own. `session = 0` starts one.
+  rpc Session(SessionRequest) returns (SessionResponse);
+
   // Health / capabilities
   rpc Health(HealthRequest) returns (HealthResponse);
 }
@@ -201,6 +206,10 @@ message AnalyzeNode {
   // the kernel is off, which is the default. Entry `(i, j)` is the weight with
   // which candidate `i` borrows candidate `j`'s statistics during selection.
   repeated float kernel = 7;
+  // The value head here, from the side to move here: what the node's expansion
+  // backed up. `value` is the search's mean over the node's visits. Absent
+  // until the node has been expanded.
+  optional double prior_value = 8;
 }
 
 message AnalyzeEdge {
@@ -228,6 +237,13 @@ message AnalyzeEdge {
   // it. A node holding fewer candidates than it asked for is one whose draws
   // kept repeating, and this is where that shows.
   uint32 draws = 10;
+  // The value head's estimate of the position this turn leads to, from the
+  // side to move at the parent: what the edge's first visit backed up, before
+  // any search below it. `value` is the search's mean over every visit. Absent
+  // until the child has been evaluated.
+  optional double prior_value = 11;
+  // Added by hand in an analysis session rather than proposed by the model.
+  bool manual = 12;
 }
 
 // What the auxiliary heads see. Probabilities, not logits: the sigmoid is
@@ -266,6 +282,48 @@ message AnalyzeResponse {
   repeated AnalyzeNode nodes = 4;
   // Index into `nodes[0].edges` of the move the search would play.
   optional uint32 chosen = 5;
+}
+
+message SessionRequest {
+  // 0 = start a new session on the handle's position after `line`.
+  uint64 session = 1;
+  // Starting only.
+  playground.game.GameHandle handle = 2;
+  repeated bytes line = 3;
+  bool fast = 4;
+  oneof op {
+    // Run this many simulations. Starting: 0 = the configured budget, 1 =
+    // expand the root and stop.
+    uint32 simulations = 5;
+    ForceVisit force = 6;
+    AddChild add = 7;
+  }
+}
+
+// One simulation forced down `line` -- turn encodings from the session root,
+// the last being the edge to force through -- with PUCT below it. Every edge
+// on the line counts the visit as forced.
+message ForceVisit {
+  repeated bytes line = 1;
+}
+
+// Add a turn to the node `at` reaches (turn encodings from the session root;
+// empty = the root). `moves` are `playground.game.Move` payloads played from
+// that node, making one whole turn.
+message AddChild {
+  repeated bytes at = 1;
+  repeated bytes moves = 2;
+}
+
+message SessionResponse {
+  uint64 session = 1;
+  // The session's tree, rooted at the session's root.
+  AnalyzeResponse analysis = 2;
+  // After an AddChild: the turn as it now sits in the tree -- the realizer's
+  // reading of what was played.
+  optional bytes added = 3;
+  // Anything the reader should know about the request.
+  string note = 4;
 }
 
 message GetSearchConfigRequest {}

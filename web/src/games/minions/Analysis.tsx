@@ -30,14 +30,48 @@ function valueColor(v: number): string {
 const chosenVisits = (e: AnalyzeEdge) => e.visits - e.forced;
 
 /** One column template for the header and every row, so they cannot drift:
- *  expand, visits, forced, draws, prior, energy, value, turn, play. */
-const COLUMNS = "1.1rem 3rem 2.8rem 2.8rem 3.9rem 3.6rem 3.6rem 1fr 1.3rem";
+ *  expand, visits, forced, draws, prior, energy, net, search, turn, force, play. */
+const COLUMNS = "1.1rem 3rem 2.8rem 2.8rem 3.9rem 3.6rem 3.6rem 3.6rem 1fr 1.6rem 1.3rem";
+
+export const sameTurn = (a: Uint8Array, b: Uint8Array) =>
+  a.length === b.length && a.every((v, j) => v === b[j]);
 
 function sameLine(a: Uint8Array[], b: Uint8Array[]): boolean {
-  return (
-    a.length === b.length &&
-    a.every((x, i) => x.length === b[i].length && x.every((v, j) => v === b[i][j]))
-  );
+  return a.length === b.length && a.every((x, i) => sameTurn(x, b[i]));
+}
+
+/** An edge's key in the `expanded` set. By child node, not by position in the
+ *  node's list: a widen or a hand-added turn re-sorts a node's candidates, and
+ *  a positional key would then open a different row. Each child node has one
+ *  parent edge, so this is as unique as the position was. */
+const expandKey = (e: AnalyzeEdge, nodeIdx: number, ei: number) =>
+  e.child !== undefined ? `c${e.child}` : `${nodeIdx}:${ei}`;
+
+/** The node `line` (turn encodings from the root) reaches, or undefined when a
+ *  turn on it has no node yet. */
+export function nodeAt(nodes: AnalyzeNode[], line: Uint8Array[]): number | undefined {
+  if (!nodes[0]) return undefined;
+  let cur = 0;
+  for (const t of line) {
+    const e = nodes[cur].edges.find((x) => sameTurn(x.turn, t));
+    if (e?.child === undefined) return undefined;
+    cur = e.child;
+  }
+  return cur;
+}
+
+/** The `expanded` keys that open every edge along `line`. */
+export function lineKeys(nodes: AnalyzeNode[], line: Uint8Array[]): string[] {
+  const out: string[] = [];
+  let cur = 0;
+  for (const t of line) {
+    const ei = nodes[cur]?.edges.findIndex((x) => sameTurn(x.turn, t)) ?? -1;
+    const e = ei >= 0 ? nodes[cur].edges[ei] : undefined;
+    if (e?.child === undefined) break;
+    out.push(expandKey(e, cur, ei));
+    cur = e.child;
+  }
+  return out;
 }
 
 function sortEdges(edges: AnalyzeEdge[], key: SortKey): AnalyzeEdge[] {
@@ -72,6 +106,7 @@ function EdgeRow({
   onToggle,
   onPlay,
   onCommit,
+  onForce,
   path,
   onBoard,
 }: {
@@ -91,6 +126,8 @@ function EdgeRow({
   onPlay: () => void;
   /** Absent below the root: only a root candidate is legal in the real game. */
   onCommit?: () => void;
+  /** Force one simulation through this edge. Absent without a session. */
+  onForce?: () => void;
   path: string;
   /** This row's line is the one on the board. */
   onBoard: boolean;
@@ -158,13 +195,17 @@ function EdgeRow({
           they leave is filled with random playouts, which are no draw at all. */}
       <span
         title={
-          edge.draws === 0
-            ? "a fill: a random playout added because the node's draws left it short of candidates"
-            : `${edge.draws} sampler draw${edge.draws === 1 ? "" : "s"} produced this turn`
+          edge.manual
+            ? "added by hand: played on the board in this session"
+            : edge.draws === 0
+              ? "a fill: a random playout added because the node's draws left it short of candidates"
+              : `${edge.draws} sampler draw${edge.draws === 1 ? "" : "s"} produced this turn`
         }
-        style={{ color: edge.draws > 1 ? "#b08030" : edge.draws === 0 ? "#8a7fb0" : "#555" }}
+        style={{
+          color: edge.manual ? "#6a9" : edge.draws > 1 ? "#b08030" : edge.draws === 0 ? "#8a7fb0" : "#555",
+        }}
       >
-        {edge.draws === 0 ? "fill" : edge.draws}
+        {edge.manual ? "user" : edge.draws === 0 ? "fill" : edge.draws}
       </span>
 
       <span title="prior probability from the energy head" style={{ color: "#9ab" }}>
@@ -178,8 +219,26 @@ function EdgeRow({
         {Number.isFinite(edge.energy) ? (edge.energy - energyRef).toFixed(2) : "−∞"}
       </span>
 
+      {/* Two values, both from the side to move at this node: what the value
+          head says about where the turn leads, before any search below it,
+          and what the search makes of it after all its visits. */}
       <span
-        title={edge.value === undefined ? "never visited" : "mean value over this edge's visits"}
+        title={
+          edge.priorValue === undefined
+            ? "not evaluated yet"
+            : "net: the value head at the position this turn leads to, before any search below it"
+        }
+        style={{ color: edge.priorValue === undefined ? "#555" : valueColor(edge.priorValue) }}
+      >
+        {edge.priorValue === undefined ? "—" : edge.priorValue.toFixed(3)}
+      </span>
+
+      <span
+        title={
+          edge.value === undefined
+            ? "never visited"
+            : `search: mean value over this edge's ${edge.visits} visit${edge.visits === 1 ? "" : "s"}`
+        }
         style={{ color: edge.value === undefined ? "#555" : valueColor(edge.value) }}
       >
         {edge.value === undefined ? "—" : edge.value.toFixed(3)}
@@ -203,6 +262,21 @@ function EdgeRow({
         )}
         {edge.label || "pass"}
       </span>
+
+      {onForce ? (
+        <span
+          onClick={(e) => {
+            e.stopPropagation();
+            onForce();
+          }}
+          title="force one simulation through this turn, PUCT below it; counted as a forced visit"
+          style={{ cursor: "pointer", color: "#8a7fb0", userSelect: "none", textAlign: "center" }}
+        >
+          +1
+        </span>
+      ) : (
+        <span />
+      )}
 
       {/* Commit the turn to the real game and re-root the analysis here.
           Only offered at the root: a deeper turn is legal in the variation but
@@ -235,20 +309,23 @@ export function AnalysisTree({
   onToggle,
   onPlay,
   onCommit,
+  onForce,
   maxDepth,
   shown,
 }: {
   nodes: AnalyzeNode[];
   chosen?: number;
   sort: SortKey;
-  /** Keys are `"nodeIndex:edgeIndex"`, so an edge expands independently of any
-   *  other edge that happens to reach the same child. */
+  /** Keys from `expandKey`: by child node, so they survive a node's
+   *  candidates being re-sorted. */
   expanded: Set<string>;
   onToggle: (key: string) => void;
   /** The sequence of turn encodings from the root down to the clicked edge. */
   onPlay: (line: Uint8Array[], labels: string[]) => void;
   /** Commit a root candidate to the real game. */
   onCommit: (turn: Uint8Array, label?: string) => void;
+  /** Force one simulation down the line to an edge. Absent without a session. */
+  onForce?: (line: Uint8Array[]) => void;
   maxDepth: number;
   /** The line currently on the board, so its row can be marked. */
   shown?: Uint8Array[];
@@ -272,7 +349,7 @@ export function AnalysisTree({
     );
     for (const edge of listed) {
       const ei = node.edges.indexOf(edge);
-      const key = `${nodeIdx}:${ei}`;
+      const key = expandKey(edge, nodeIdx, ei);
       const isOpen = expanded.has(key);
       const nextLine = [...line, edge.turn];
       const nextLabels = [...labels, edge.label || "pass"];
@@ -288,6 +365,7 @@ export function AnalysisTree({
           onToggle={() => onToggle(key)}
           onPlay={() => onPlay(nextLine, nextLabels)}
           onCommit={depth === 0 ? () => onCommit(edge.turn, edge.label || "pass") : undefined}
+          onForce={onForce ? () => onForce(nextLine) : undefined}
           path={nextLabels.join("  →  ")}
           onBoard={!!shown && sameLine(nextLine, shown)}
         />,
@@ -321,8 +399,10 @@ export function AnalysisTree({
         <span title="sampler draws that produced this turn">draws</span>
         <span>prior</span>
         <span>energy</span>
-        <span>value</span>
+        <span title="the value head where the turn leads, before any search below it">net</span>
+        <span title="the search's mean value over the turn's visits">search</span>
         <span>turn</span>
+        <span title="force one simulation through the turn">force</span>
         <span title="play a root turn on the board">play</span>
       </div>
       <div style={{ maxHeight: "26rem", overflowY: "auto" }}>{rows}</div>

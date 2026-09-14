@@ -24,5 +24,5 @@ pub use sampled_mcts::{
 };
 pub use solver::{
     Analysis, AnalysisAux, AnalysisEdge, AnalysisNode, AnalysisOptions, Analyzable,
-    SearchConfigJson, SearchOutcome, Solver, SolverBudget,
+    SearchConfigJson, SearchOutcome, SessionOp, SessionResult, Solver, SolverBudget,
 };
