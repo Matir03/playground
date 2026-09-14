@@ -253,23 +253,6 @@ pub struct SampledParams {
     /// That coupling matters: with a small chunk the wave must cover
     /// proportionally more nodes, or the batch shrinks and the GPU starves.
     pub pw_chunk: usize,
-    /// Resume the descent where it paused after a widen, instead of discarding
-    /// it and re-descending from the root.
-    ///
-    /// The widen decision depends only on the node's own visit and held counts,
-    /// never on the candidate that comes back — so nothing about the answer
-    /// invalidates the path taken to get there. Discarding it throws away a
-    /// descent per widen and leaves the new candidate unselected until some
-    /// later simulation happens to arrive at the same node.
-    ///
-    /// **Measured to be worth nothing** (ABBA at batch 768: -4.6% / -0.3% /
-    /// +0.0%, never positive), so it defaults off. The reasoning was right and
-    /// the conclusion still wrong: the discarded descent is CPU work, and CPU is
-    /// ~4-6% of the loop once the generative heads stop dominating, so there is
-    /// nothing left to reclaim. It also does not reduce generation — the same
-    /// widens happen either way; resuming only changes when the candidate is
-    /// first selectable.
-    pub pw_resume: bool,
     /// KR-PUCT kernel bandwidth over `SampledGame::move_distance`. Candidates
     /// within roughly this distance share visit counts and values, which is the
     /// point: with ~16 visits per root child, per-candidate value estimates are
@@ -297,7 +280,6 @@ impl Default for SampledParams {
             pw_alpha: 0.5,
             pw_beta: 2.0,
             pw_chunk: 1,
-            pw_resume: false,
             kernel_sigma: 0.0,
             seed: 0,
         }
@@ -847,8 +829,7 @@ pub struct Search<G: SampledGame> {
     nodes: u64,
     /// (node, entry, forced) for each edge descended through in the current
     /// simulation. `forced` rides along to `backup` instead of being tallied
-    /// at selection: a descent abandoned for a widen is never backed up, and a
-    /// tally taken at selection would still have charged it.
+    /// at selection, so a quota is only charged for a visit that is backed up.
     path: Vec<(usize, usize, bool)>,
     /// Node awaiting expansion, if `step` returned `NeedExpansion`.
     pending: Option<usize>,
@@ -857,6 +838,9 @@ pub struct Search<G: SampledGame> {
     pending_widen: Option<(usize, bool)>,
     /// Where to pick the descent back up after a widen, with `path` intact.
     resume_at: Option<usize>,
+    /// `(node, entry)`: the candidate a widen just added to an interior node,
+    /// which the resumed descent visits next.
+    visit_new: Option<(usize, usize)>,
 }
 
 /// One candidate edge, flattened for inspection.
@@ -973,6 +957,7 @@ impl<G: SampledGame> Search<G> {
             pending: None,
             pending_widen: None,
             resume_at: None,
+            visit_new: None,
         }
     }
 
@@ -995,42 +980,48 @@ impl<G: SampledGame> Search<G> {
                     self.pending = Some(cur);
                     return Step::NeedExpansion(self.tree[cur].state.clone());
                 }
-                // Ask for the next chunk before selecting, if this node has
-                // earned more candidates than it holds: a sampler draw while it
-                // has draws left, a fill once they are spent. The simulation is
-                // abandoned rather than paused: nothing has been backed up yet,
-                // so re-descending from the root afterwards costs only the
-                // descent, and it keeps `path` from holding indices into a node
-                // whose entries are about to be re-sorted.
-                if !self.tree[cur].widen_exhausted {
-                    let held = self.tree[cur].entries.len();
-                    let want = earned(&self.tree[cur], &self.params, cur == 0);
-                    let fill = self.tree[cur].draws >= draw_target(&self.params, want);
-                    // Unchunked, every draw came with the expansion, so a fill
-                    // is the only widen there is.
-                    if held < want && (self.params.pw_chunk > 0 || fill) {
-                        self.pending_widen = Some((cur, fill));
-                        if self.params.pw_resume {
-                            // Keep `path`; the descent continues at `cur` when
-                            // the candidate arrives. Sorting this node's entries
-                            // in `provide_widen` stays safe because `cur`'s own
-                            // edge is not in `path` yet — only its ancestors'.
-                            self.resume_at = Some(cur);
-                        } else {
-                            self.path.clear();
+                // The candidate a widen just added is where this simulation goes
+                // next: widening is the visit, not the promise of one. Left to
+                // PUCT, a new candidate starts at the first-play value, below
+                // the child already being searched, and at a small `c_puct` it
+                // was never tried at all -- nodes of 200 visits held 16
+                // candidates and had visited one.
+                let (pick, forced) = match self.visit_new.take() {
+                    Some((node, entry)) if node == cur => (entry, false),
+                    _ => {
+                        // Ask for the next chunk before selecting, if this node
+                        // has earned more candidates than it holds: a sampler
+                        // draw while it has draws left, a fill once they are
+                        // spent. The descent pauses here and resumes when the
+                        // candidates arrive, so a draw that repeats is retried
+                        // by the same simulation.
+                        if !self.tree[cur].widen_exhausted {
+                            let held = self.tree[cur].entries.len();
+                            let want = earned(&self.tree[cur], &self.params, cur == 0);
+                            let fill = self.tree[cur].draws >= draw_target(&self.params, want);
+                            // Unchunked, every draw came with the expansion, so
+                            // a fill is the only widen there is.
+                            if held < want && (self.params.pw_chunk > 0 || fill) {
+                                self.pending_widen = Some((cur, fill));
+                                // `path` is kept. Sorting this node's entries in
+                                // `provide_widen` stays safe because `cur`'s own
+                                // edge is not in `path` yet -- only its
+                                // ancestors'.
+                                self.resume_at = Some(cur);
+                                return Step::NeedWiden { state: self.tree[cur].state.clone(), fill };
+                            }
                         }
-                        return Step::NeedWiden { state: self.tree[cur].state.clone(), fill };
+                        if self.tree[cur].entries.is_empty() {
+                            // Genuinely nothing to play: either the model
+                            // proposed nothing, or widening is exhausted. Score
+                            // on value alone.
+                            break 0.0;
+                        }
+                        select(&self.tree[cur], &self.params, cur == 0)
                     }
-                }
-                if self.tree[cur].entries.is_empty() {
-                    // Genuinely nothing to play: either the model proposed
-                    // nothing, or widening is exhausted. Score on value alone.
-                    break 0.0;
-                }
-                let (pick, forced) = select(&self.tree[cur], &self.params, cur == 0);
-                // Tallied in `backup`, with the visit itself. This descent may
-                // yet be abandoned for a widen further down, and counting here
-                // charged the quota for visits that never happened.
+                };
+                // Tallied in `backup`, with the visit itself, so a quota is
+                // only ever charged for a visit that happened.
                 self.path.push((cur, pick, forced));
                 let child = self.tree[cur].entries[pick].child;
                 if child >= 0 {
@@ -1167,6 +1158,7 @@ impl<G: SampledGame> Search<G> {
         let before = self.tree[cur].entries.len();
         // A fill is not a sampler draw, so it adds to no entry's draw count.
         let draw = u32::from(!fill);
+        let mut added: Vec<u128> = Vec::new();
         for (mv, p, explore) in candidates {
             if self.tree[cur].entries.len() >= k_max {
                 break;
@@ -1181,6 +1173,7 @@ impl<G: SampledGame> Search<G> {
                 }
                 None => {
                     seen.insert(key, self.tree[cur].entries.len());
+                    added.push(key);
                     self.tree[cur].entries.push(Entry {
                         mv,
                         energy: p,
@@ -1207,9 +1200,21 @@ impl<G: SampledGame> Search<G> {
         } else {
             self.tree[cur].draws += chunk_k(&self.params) as u32;
         }
-        // Re-softmax over the grown set. Sorting inside is safe here because a
-        // widen abandons its simulation, so no `path` entry indexes this node.
+        // Re-softmax over the grown set. Sorting inside is safe here because the
+        // paused descent's `path` holds only this node's ancestors' edges.
         renormalise(&mut self.tree[cur].entries);
+        // The resumed descent visits what arrived -- the highest-prior new
+        // candidate, if a chunk brought several. The root is exempt: it fills
+        // its whole set before its first visit and then sweeps every candidate
+        // once (see `select`), which gives each its visit anyway.
+        if cur != 0 && !added.is_empty() {
+            let state = &self.tree[cur].state;
+            self.visit_new = self.tree[cur]
+                .entries
+                .iter()
+                .position(|e| added.contains(&G::state_key(&G::apply(state, &e.mv))))
+                .map(|i| (cur, i));
+        }
         // Top up only: an explore candidate that arrived by widening still needs
         // a value estimate, but the random extras were drawn over the initial
         // set and are not redrawn (see `provide`). Within the same budget as
@@ -2088,42 +2093,116 @@ mod tests {
     /// the sort would silently repoint it at a different move.
     #[test]
     fn resuming_after_a_widen_keeps_the_tree_consistent() {
-        for resume in [false, true] {
-            let params = SampledParams {
-                simulations: 120,
-                k_candidates: 3,
-                pw_chunk: 1,
-                pw_resume: resume,
-                k_forced: 0.0,
-                min_explore_visits: 0.0,
-                temp_moves: 0,
-                seed: 9,
-                ..Default::default()
-            };
-            let r = search::<Count, _>(&Mock, CountState { n: 5, side: 1 }, &params, 0)
-                .expect("search");
-            let total: u32 = r.candidates.iter().map(|(_, n)| *n).sum();
-            assert!(
-                total <= params.simulations,
-                "resume={resume}: root visits {total} exceed the simulation budget"
-            );
-            assert!(total > 0, "resume={resume}: no visits recorded at all");
-            assert_eq!(
-                r.candidates[r.chosen].0, 1,
-                "resume={resume}: should leave a multiple of four"
-            );
+        let params = SampledParams {
+            simulations: 120,
+            k_candidates: 3,
+            pw_chunk: 1,
+            k_forced: 0.0,
+            min_explore_visits: 0.0,
+            temp_moves: 0,
+            seed: 9,
+            ..Default::default()
+        };
+        let r = search::<Count, _>(&Mock, CountState { n: 5, side: 1 }, &params, 0)
+            .expect("search");
+        let total: u32 = r.candidates.iter().map(|(_, n)| *n).sum();
+        assert!(total <= params.simulations, "root visits {total} exceed the simulation budget");
+        assert!(total > 0, "no visits recorded at all");
+        assert_eq!(r.candidates[r.chosen].0, 1, "should leave a multiple of four");
+    }
+
+    /// A candidate a widen adds to an interior node is visited by the very
+    /// simulation that asked for it, whatever PUCT would have said. At
+    /// `c_puct = 0` PUCT alone never leaves the first child it tries, so
+    /// without this every interior node ends with one visited candidate.
+    #[test]
+    fn a_widened_candidate_is_visited_by_the_widening_simulation() {
+        /// One distinct candidate per call, cycling through the legal moves.
+        struct Cycle {
+            cursor: std::sync::atomic::AtomicUsize,
+        }
+        impl SampledModel<Count> for Cycle {
+            fn expand(&self, s: &CountState, k: usize) -> anyhow::Result<Expansion<Count>> {
+                let moves: Vec<u32> = (1..=3u32).filter(|m| *m <= s.n).collect();
+                let start = self.cursor.fetch_add(k, std::sync::atomic::Ordering::Relaxed);
+                Ok((0.0, (0..k).map(|i| (moves[(start + i) % moves.len()], 0.0, false)).collect()))
+            }
+        }
+        let params = SampledParams {
+            simulations: 200,
+            k_candidates: 3,
+            k_draws: 3,
+            pw_chunk: 1,
+            c_puct: 0.0,
+            k_forced: 0.0,
+            min_explore_visits: 0.0,
+            forced_visits: 0,
+            temp_moves: 0,
+            seed: 6,
+            ..Default::default()
+        };
+        let model = Cycle { cursor: std::sync::atomic::AtomicUsize::new(0) };
+        let keys = |s: &Search<Count>, node: usize| -> Vec<u128> {
+            let st = &s.tree[node].state;
+            s.tree[node].entries.iter().map(|e| Count::state_key(&Count::apply(st, &e.mv))).collect()
+        };
+        let mut search = Search::<Count>::new(CountState { n: 21, side: 1 }, &params, 0);
+        let mut checked = 0;
+        loop {
+            match search.step() {
+                Step::NeedExpansion(st) => {
+                    let (v, c) = model.expand(&st, expansion_k(&params)).unwrap();
+                    search.provide(v, c);
+                }
+                Step::NeedWiden { state, fill } => {
+                    let (node, _) = search.pending_widen.expect("a widen names its node");
+                    let before = keys(&search, node);
+                    search.provide_widen(widen(&model, &state, fill, chunk_k(&params)));
+                    let new: Vec<u128> =
+                        keys(&search, node).into_iter().filter(|k| !before.contains(k)).collect();
+                    let leads_to_terminal = search.tree[node].entries.iter().any(|e| {
+                        let next = Count::apply(&search.tree[node].state, &e.mv);
+                        new.contains(&Count::state_key(&next)) && Count::terminal_value(&next).is_some()
+                    });
+                    if node == 0 || new.is_empty() || leads_to_terminal {
+                        continue;
+                    }
+                    // The simulation's next request is the new candidate's
+                    // expansion: it descended straight into it.
+                    match search.step() {
+                        Step::NeedExpansion(st) => {
+                            assert!(
+                                new.contains(&Count::state_key(&st)),
+                                "node {node}: the widening simulation went somewhere else"
+                            );
+                            checked += 1;
+                            let (v, c) = model.expand(&st, expansion_k(&params)).unwrap();
+                            search.provide(v, c);
+                        }
+                        _ => panic!("node {node}: the widening simulation did not visit its new candidate"),
+                    }
+                }
+                Step::Done => break,
+            }
+        }
+        assert!(checked > 10, "only {checked} interior widens checked");
+        for (i, node) in search.tree.iter().enumerate().skip(1) {
+            for e in &node.entries {
+                assert!(e.n >= 1, "node {i}: a candidate the search widened to was never visited");
+            }
         }
     }
 
     /// A forced visit is tallied when the visit is backed up, not when the edge
-    /// is selected. A descent abandoned for a widen is never backed up, so a
-    /// tally taken at selection charged the quota for visits that never
-    /// happened -- the analysis view showed 30 forced against 10 real visits.
+    /// is selected. A descent used to be abandoned for a widen and never backed
+    /// up, so a tally taken at selection charged the quota for visits that
+    /// never happened -- the analysis view showed 30 forced against 10 real
+    /// visits. Descents now pause instead, but the tally stays at backup.
     #[test]
     fn forced_visits_are_counted_only_for_visits_that_happen() {
         /// One candidate per call, like the real sampler at `pw_chunk = 1`, so
-        /// interior nodes widen again and again -- and every widen abandons the
-        /// descent that asked for it. Flagged explore, so every root candidate
+        /// interior nodes widen again and again, each widen pausing the descent
+        /// that asked for it. Flagged explore, so every root candidate
         /// holds a forced quota. (`Mock` hands over a whole node at once, which
         /// widens each node only once and hides the bug.)
         struct OneAtATime {
@@ -2136,69 +2215,66 @@ mod tests {
                 Ok((0.0, (0..k).map(|i| (moves[(start + i) % moves.len()], 0.0, true)).collect()))
             }
         }
-        for resume in [false, true] {
-            let params = SampledParams {
-                simulations: 300,
-                k_candidates: 3,
-                pw_chunk: 1,
-                pw_resume: resume,
-                forced_visits: 30,
-                temp_moves: 0,
-                seed: 5,
-                ..Default::default()
-            };
-            let model = OneAtATime { cursor: std::sync::atomic::AtomicUsize::new(0) };
+        let params = SampledParams {
+            simulations: 300,
+            k_candidates: 3,
+            pw_chunk: 1,
+            forced_visits: 30,
+            temp_moves: 0,
+            seed: 5,
+            ..Default::default()
+        };
+        let model = OneAtATime { cursor: std::sync::atomic::AtomicUsize::new(0) };
 
-            // Step by step, because final totals hide it: PUCT's own visits to
-            // a candidate cover a few phantom forced ones. Between two `step`
-            // calls each forced tally must arrive with its visit, so no root
-            // entry's forced count may rise by more than its visit count. An
-            // abandoned forced pick used to raise the first without the second.
-            let mut search = Search::<Count>::new(CountState { n: 21, side: 1 }, &params, 0);
-            let mut widens = 0;
-            loop {
-                let before: Vec<(u32, u32)> =
-                    search.tree[0].entries.iter().map(|e| (e.n, e.forced_n)).collect();
-                let step = search.step();
-                for (i, &(n0, f0)) in before.iter().enumerate() {
-                    let e = &search.tree[0].entries[i];
-                    assert!(
-                        e.forced_n - f0 <= e.n - n0,
-                        "resume={resume}: root entry {i} gained {} forced but only {} visits",
-                        e.forced_n - f0,
-                        e.n - n0
-                    );
-                }
-                match step {
-                    Step::NeedExpansion(st) => {
-                        let (v, c) = model.expand(&st, expansion_k(&params)).unwrap();
-                        search.provide(v, c);
-                    }
-                    Step::NeedWiden { state, fill } => {
-                        widens += 1;
-                        search.provide_widen(widen(&model, &state, fill, chunk_k(&params)));
-                    }
-                    Step::Done => break,
-                }
+        // Step by step, because final totals hide it: PUCT's own visits to
+        // a candidate cover a few phantom forced ones. Between two `step`
+        // calls each forced tally must arrive with its visit, so no root
+        // entry's forced count may rise by more than its visit count. An
+        // abandoned forced pick used to raise the first without the second.
+        let mut search = Search::<Count>::new(CountState { n: 21, side: 1 }, &params, 0);
+        let mut widens = 0;
+        loop {
+            let before: Vec<(u32, u32)> =
+                search.tree[0].entries.iter().map(|e| (e.n, e.forced_n)).collect();
+            let step = search.step();
+            for (i, &(n0, f0)) in before.iter().enumerate() {
+                let e = &search.tree[0].entries[i];
+                assert!(
+                    e.forced_n - f0 <= e.n - n0,
+                    "root entry {i} gained {} forced but only {} visits",
+                    e.forced_n - f0,
+                    e.n - n0
+                );
             }
-            assert!(widens > 50, "resume={resume}: only {widens} widens -- the test is not exercising them");
-
-            let tree = search.export_tree();
-            for (i, node) in tree.iter().enumerate() {
-                for (j, e) in node.edges.iter().enumerate() {
-                    assert!(
-                        e.forced <= e.visits,
-                        "resume={resume}: node {i} edge {j} has {} forced of {} visits",
-                        e.forced,
-                        e.visits
-                    );
-                    assert!(
-                        e.forced <= params.forced_visits,
-                        "resume={resume}: node {i} edge {j} has {} forced, over the {} quota",
-                        e.forced,
-                        params.forced_visits
-                    );
+            match step {
+                Step::NeedExpansion(st) => {
+                    let (v, c) = model.expand(&st, expansion_k(&params)).unwrap();
+                    search.provide(v, c);
                 }
+                Step::NeedWiden { state, fill } => {
+                    widens += 1;
+                    search.provide_widen(widen(&model, &state, fill, chunk_k(&params)));
+                }
+                Step::Done => break,
+            }
+        }
+        assert!(widens > 50, "only {widens} widens -- the test is not exercising them");
+
+        let tree = search.export_tree();
+        for (i, node) in tree.iter().enumerate() {
+            for (j, e) in node.edges.iter().enumerate() {
+                assert!(
+                    e.forced <= e.visits,
+                    "node {i} edge {j} has {} forced of {} visits",
+                    e.forced,
+                    e.visits
+                );
+                assert!(
+                    e.forced <= params.forced_visits,
+                    "node {i} edge {j} has {} forced, over the {} quota",
+                    e.forced,
+                    params.forced_visits
+                );
             }
         }
     }

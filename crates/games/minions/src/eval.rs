@@ -259,7 +259,6 @@ pub fn match_search(
     let actor = crate::selfplay::ActorConfig {
         sims,
         temp_moves: 0,
-        pw_resume: false,
         ..Default::default()
     };
     (sampler, actor.search_params(&sampler, true, seed))

@@ -138,8 +138,6 @@ pub struct ActorConfig {
     /// Candidates per model call. 1 matches the one-per-visit widening rate;
     /// 0 disables chunking.
     pub pw_chunk: usize,
-    /// Resume a paused descent after a widen rather than re-descending.
-    pub pw_resume: bool,
     pub fast_sims: u32,
     /// Probability a turn gets the full search — only full searches produce a
     /// policy target (KataGo's playout-cap randomization).
@@ -207,7 +205,6 @@ impl ActorConfig {
             pw_alpha: self.pw_alpha,
             pw_beta: self.pw_beta,
             pw_chunk: self.pw_chunk,
-            pw_resume: self.pw_resume,
             kernel_sigma: self.kernel_sigma,
             seed,
         }
@@ -230,14 +227,6 @@ impl Default for ActorConfig {
             pw_alpha: 0.5,
             pw_beta: 2.0,
             pw_chunk: 1,
-            // Env-switchable so both arms run from one binary in a paired
-            // benchmark; comparing across rebuilds separates the arms in time,
-            // which is exactly what this box's thermal drift punishes.
-            pw_resume: std::env::var("MINIONS_WIDEN_RESUME")
-                .ok()
-                .and_then(|v| v.parse::<u8>().ok())
-                .map(|v| v != 0)
-                .unwrap_or(false),
             random_opening_max: 22,
             // Chosen so the truncated geometric on 0..=22 has mean 7.5 — a
             // quarter of `MAX_TURNS`, deep enough to reach genuinely mid-game

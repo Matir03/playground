@@ -49,7 +49,6 @@ const GROUPS: { title: string; note?: string; fields: [string, string][] }[] = [
       ["pw_chunk", "Candidates generated per widen. 0 = the whole set at once when a node expands."],
       ["pw_alpha", "Interior nodes hold ceil(pw_beta · n^pw_alpha) candidates after n visits."],
       ["pw_beta", "See pw_alpha. ≤ 0 disables widening."],
-      ["pw_resume", "Resume the descent after a widen instead of restarting it from the root."],
     ],
   },
   {
