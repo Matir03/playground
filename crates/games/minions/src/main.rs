@@ -230,6 +230,13 @@ enum Cmd {
         /// Candidates (and draws) per node for seat B; defaults to A's.
         #[arg(long)]
         candidates_b: Option<usize>,
+        /// Simulations per turn for seat B; defaults to A's (`--sims`).
+        #[arg(long)]
+        sims_b: Option<u32>,
+        /// Both seats: no forced visits, no explore quotas and no random
+        /// fills -- every candidate is a sampler draw, chosen by plain PUCT.
+        #[arg(long)]
+        no_explore: bool,
         #[arg(long, default_value = "candle")]
         backend: String,
         #[arg(long, default_value = "trt")]
@@ -521,6 +528,8 @@ async fn main() -> anyhow::Result<()> {
             t_steps,
             t_steps_b,
             candidates_b,
+            sims_b,
+            no_explore,
             backend,
             ep,
             fp16,
@@ -554,11 +563,32 @@ async fn main() -> anyhow::Result<()> {
                 Some(p) => load_seat(std::path::Path::new(p), &kind, sampler_b)?,
                 None => Seat::Greedy,
             };
-            let sigma = (kernel_sigma, kernel_sigma_b.unwrap_or(kernel_sigma));
+            use playground_core::sampled_mcts::SampledParams;
+            let params = if no_explore {
+                SampledParams {
+                    k_forced: 0.0,
+                    min_explore_visits: 0.0,
+                    forced_visits: 0,
+                    forced_extra: 0,
+                    fills: false,
+                    ..params
+                }
+            } else {
+                params
+            };
+            let pa = SampledParams {
+                kernel_sigma,
+                ..params
+            };
+            let pb = SampledParams {
+                simulations: sims_b.unwrap_or(sims),
+                kernel_sigma: kernel_sigma_b.unwrap_or(kernel_sigma),
+                ..params
+            };
             let rf = render_file.as_ref().map(std::path::PathBuf::from);
             let render = rf.as_deref().map(|p| (p, render_games));
             let (score, w, l, d, margin, game_score) =
-                run_match(&sa, &sb, games, &params, sigma, render)?;
+                run_match(&sa, &sb, games, (&pa, &pb), render)?;
             println!("A_wins {w} B_wins {l} draws {d}");
             println!("A_score {score:.4}");
             // Mean net-worth margin from A's seat. Reported alongside the score

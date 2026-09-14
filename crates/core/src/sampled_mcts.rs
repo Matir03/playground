@@ -212,6 +212,10 @@ pub struct SampledParams {
     /// the node's whole budget. The root is exempt: it draws its `D` once per
     /// search, before any visit.
     pub draw_retries: u32,
+    /// Fill a node's shortfall with exploration candidates (random playouts)
+    /// once its draws are spent. Off, the node keeps only what its sampler
+    /// draws brought and stops widening there.
+    pub fills: bool,
     /// KataGo forced-playout constant; 0 disables forced playouts.
     pub k_forced: f32,
     /// Visits guaranteed to every *explore*-origin root candidate, regardless of
@@ -292,6 +296,7 @@ impl Default for SampledParams {
             k_candidates: 32,
             k_draws: 32,
             draw_retries: 3,
+            fills: true,
             k_forced: 2.0,
             min_explore_visits: 2.0,
             forced_visits: 30,
@@ -1228,9 +1233,13 @@ impl<G: SampledGame> Search<G> {
                 pick
             }
         } else {
+            // Ties go to the earlier entry, which is the higher prior (entries
+            // are kept sorted by energy). `max_by_key` alone returns the *last*
+            // maximum, so at small budgets -- most root children on one visit
+            // each -- it played the lowest-rated of them.
             eff.iter()
                 .enumerate()
-                .max_by_key(|(_, n)| **n)
+                .max_by(|(i, a), (j, b)| a.cmp(b).then(j.cmp(i)))
                 .map(|(i, _)| i)
                 .unwrap_or(0)
         }
@@ -1307,7 +1316,10 @@ impl<G: SampledGame> Search<G> {
                                 || (cur != 0 && retries > 0 && node.draw_misses >= retries);
                             // Unchunked, every draw came with the expansion, so
                             // a fill is the only widen there is.
-                            if held < want && (self.params.pw_chunk > 0 || fill) {
+                            if held < want && fill && !self.params.fills {
+                                // No fills: the node keeps what its draws brought.
+                                self.tree[cur].widen_exhausted = true;
+                            } else if held < want && (self.params.pw_chunk > 0 || fill) {
                                 self.pending_widen = Some((cur, fill));
                                 // `path` is kept. Sorting this node's entries in
                                 // `provide_widen` stays safe because `cur`'s own
@@ -2030,6 +2042,64 @@ mod tests {
                 "D={d}: the one distinct proposal (drawn D times) and two fills"
             );
         }
+    }
+
+    /// With `fills` off a node never asks for a fill: once its draws are spent
+    /// it keeps what they brought, and the search still runs to the end.
+    #[test]
+    fn without_fills_a_node_keeps_only_its_draws() {
+        let params = SampledParams {
+            simulations: 60,
+            k_candidates: 3,
+            k_draws: 3,
+            pw_chunk: 1,
+            fills: false,
+            forced_visits: 0,
+            temp_moves: 0,
+            seed: 4,
+            ..Default::default()
+        };
+        let model = Stuck::new(true);
+        let mut search = Search::<Count>::new(CountState { n: 21, side: 1 }, &params, 0);
+        loop {
+            match search.step() {
+                Step::NeedExpansion(st) => {
+                    let (v, c) = model.expand(&st, expansion_k(&params)).unwrap();
+                    search.provide(v, c);
+                }
+                Step::NeedWiden { state, fill } => {
+                    assert!(!fill, "a fill was requested with fills off");
+                    search.provide_widen(widen(&model, &state, fill, chunk_k(&params)));
+                }
+                Step::Done => break,
+            }
+        }
+        let held: Vec<u32> = search.tree[0].entries.iter().map(|e| e.mv).collect();
+        assert_eq!(held, vec![1], "the root holds its one distinct draw only");
+    }
+
+    /// A tie on visits goes to the higher prior. At small budgets most root
+    /// children hold one visit each, so the tie decides the move.
+    #[test]
+    fn visit_ties_go_to_the_higher_prior() {
+        let params = SampledParams {
+            simulations: 1,
+            temp_moves: 0,
+            ..Default::default()
+        };
+        let mut search = Search::<Count>::new(CountState { n: 21, side: 1 }, &params, 0);
+        let Step::NeedExpansion(_) = search.step() else {
+            panic!("the first step expands the root");
+        };
+        search.provide(0.0, vec![(3, 0.0, false), (1, 2.0, false), (2, 1.0, false)]);
+        for e in search.tree[0].entries.iter_mut() {
+            e.n = 1;
+        }
+        let pick = search.chosen();
+        assert_eq!(
+            search.tree[0].entries[pick].mv, 1,
+            "the highest-energy child"
+        );
     }
 
     /// At an interior node, a draw that keeps repeating is retried

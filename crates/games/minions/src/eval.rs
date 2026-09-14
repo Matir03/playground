@@ -289,10 +289,12 @@ pub fn run_match(
     a: &Seat,
     b: &Seat,
     games: u32,
-    params: &SampledParams,
-    sigma: (f32, f32),
+    params: (&SampledParams, &SampledParams),
     render: Option<(&std::path::Path, u32)>,
 ) -> anyhow::Result<(f64, u32, u32, u32, f64, f64)> {
+    // Each seat searches with its own params (sims, kernel, exploration); the
+    // match's seed is A's.
+    let (params_a, params_b) = params;
     use std::io::Write as _;
     let mut sink: Option<std::io::BufWriter<std::fs::File>> = match render {
         Some((path, n)) if n > 0 => {
@@ -319,20 +321,8 @@ pub fn run_match(
     // a match is no longer decided by who happens to sit where.
     // Each seat prices its handicap with the search it will actually play with,
     // or the bid measures a net the match never uses.
-    let a_bid = bid_of(
-        a,
-        &SampledParams {
-            kernel_sigma: sigma.0,
-            ..*params
-        },
-    )?;
-    let b_bid = bid_of(
-        b,
-        &SampledParams {
-            kernel_sigma: sigma.1,
-            ..*params
-        },
-    )?;
+    let a_bid = bid_of(a, params_a)?;
+    let b_bid = bid_of(b, params_b)?;
     // Plain numbers so the eval loop can parse them; "none" for a seat that
     // declines (it has no value function to price a handicap with).
     let show = |b: Option<f64>| b.map_or("none".to_string(), |v| format!("{v:.3}"));
@@ -356,7 +346,7 @@ pub fn run_match(
             // Alternate which side's bid is treated as "A's" so a systematic
             // error in one seat's valuation cannot hand it the good side.
             let mut r =
-                ChaCha8Rng::seed_from_u64(params.seed ^ (g as u64).wrapping_mul(0x51_7C_C1_B7));
+                ChaCha8Rng::seed_from_u64(params_a.seed ^ (g as u64).wrapping_mul(0x51_7C_C1_B7));
             let (bid, a_yellow) = match (a_bid, b_bid) {
                 (Some(x), Some(y)) => {
                     if g % 2 == 0 {
@@ -427,9 +417,8 @@ pub fn run_match(
             let seat = if want_a { a } else { b };
             let states: Vec<MinionsState> = idxs.iter().map(|&i| live[i].state.clone()).collect();
             let plies: Vec<u32> = idxs.iter().map(|&i| live[i].state.turn as u32).collect();
-            let mut p = *params;
-            p.kernel_sigma = if want_a { sigma.0 } else { sigma.1 };
-            p.seed = params.seed ^ ((round as u64) << 32) ^ u64::from(want_a);
+            let mut p = if want_a { *params_a } else { *params_b };
+            p.seed = params_a.seed ^ ((round as u64) << 32) ^ u64::from(want_a);
             let (specs, st) = pick_many(seat, &states, &plies, &p)?;
             search_stats.merge(&st);
 

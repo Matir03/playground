@@ -195,6 +195,7 @@ impl ActorConfig {
             k_candidates: sampler.k_for(full),
             k_draws: sampler.draws_for(full),
             draw_retries: self.draw_retries,
+            fills: true,
             // Fast searches are not training data, so they get no forced
             // exploration to correct for either.
             k_forced: if full { self.k_forced } else { 0.0 },
