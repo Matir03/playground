@@ -372,7 +372,16 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Serve { addr, model_uri, net_dir, backend, ep, fp16, cuda, search_config } => {
+        Cmd::Serve {
+            addr,
+            model_uri,
+            net_dir,
+            backend,
+            ep,
+            fp16,
+            cuda,
+            search_config,
+        } => {
             if let Some(dir) = net_dir {
                 let path = search_config.ok_or_else(|| {
                     anyhow::anyhow!(
@@ -386,7 +395,10 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!(
                     "net seat: {dir} ({backend}/{ep}); search from {path}: {} sims, K={}, T={}, \
                      random {:.2}, forced {}",
-                    actor.sims, sampler.k_candidates, sampler.t_steps, sampler.random_fraction,
+                    actor.sims,
+                    sampler.k_candidates,
+                    sampler.t_steps,
+                    sampler.random_fraction,
                     actor.forced_visits
                 );
                 minions_engine::net_seat::configure(minions_engine::net_seat::NetSeatConfig {
@@ -402,26 +414,63 @@ async fn main() -> anyhow::Result<()> {
             let models = std::collections::HashMap::from([("nn".to_string(), model)]);
             playground_engine_server::run::<Minions, _>(addr, models).await?;
         }
-        Cmd::SelfPlay { addr, model_uri, .. } => {
+        Cmd::SelfPlay {
+            addr, model_uri, ..
+        } => {
             let model = RemoteModelClient::<Minions>::connect(&model_uri).await?;
             let models = std::collections::HashMap::from([("nn".to_string(), model)]);
             playground_engine_server::run::<Minions, _>(addr, models).await?;
         }
         Cmd::SelfplayLoop {
-            live, backend, ep, fp16, cuda, concurrency, max_batch, sims, fast_sims,
+            live,
+            backend,
+            ep,
+            fp16,
+            cuda,
+            concurrency,
+            max_batch,
+            sims,
+            fast_sims,
             full_search_prob,
-            candidates, candidates_fast, draws, draws_fast, t_steps, t_steps_fast, random_fraction,
-            random_opening_max, random_opening_decay, min_explore_visits,
-            forced_visits, forced_extra, workers, no_energy,
-            kernel_sigma, pw_chunk, draw_retries, write_search_config,
-            chunk_secs, max_examples,
-            max_chunks, target_examples, seed,
+            candidates,
+            candidates_fast,
+            draws,
+            draws_fast,
+            t_steps,
+            t_steps_fast,
+            random_fraction,
+            random_opening_max,
+            random_opening_decay,
+            min_explore_visits,
+            forced_visits,
+            forced_extra,
+            workers,
+            no_energy,
+            kernel_sigma,
+            pw_chunk,
+            draw_retries,
+            write_search_config,
+            chunk_secs,
+            max_examples,
+            max_chunks,
+            target_examples,
+            seed,
         } => {
             let kind = minions_engine::net::BackendKind::parse(&backend, &ep, fp16, cuda)?;
             let actor = minions_engine::selfplay::ActorConfig {
-                sims, fast_sims, full_search_prob, backend: kind, min_explore_visits,
-                forced_visits, forced_extra, workers,
-                random_opening_max, random_opening_decay, kernel_sigma, pw_chunk, draw_retries,
+                sims,
+                fast_sims,
+                full_search_prob,
+                backend: kind,
+                min_explore_visits,
+                forced_visits,
+                forced_extra,
+                workers,
+                random_opening_max,
+                random_opening_decay,
+                kernel_sigma,
+                pw_chunk,
+                draw_retries,
                 ..Default::default()
             };
             let sampler = minions_engine::sampler::SamplerConfig {
@@ -444,13 +493,34 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
             minions_engine::selfplay::run_loop(
-                &live, actor, sampler, concurrency, max_batch, chunk_secs,
-                max_examples, max_chunks, target_examples, seed,
+                &live,
+                actor,
+                sampler,
+                concurrency,
+                max_batch,
+                chunk_secs,
+                max_examples,
+                max_chunks,
+                target_examples,
+                seed,
             )?
         }
         Cmd::EvalMatch {
-            a, b, games, sims, candidates, t_steps, backend, ep, fp16, cuda, seed,
-            kernel_sigma, kernel_sigma_b, render_file, render_games,
+            a,
+            b,
+            games,
+            sims,
+            candidates,
+            t_steps,
+            backend,
+            ep,
+            fp16,
+            cuda,
+            seed,
+            kernel_sigma,
+            kernel_sigma_b,
+            render_file,
+            render_games,
         } => {
             use minions_engine::eval::{load_seat, match_search, run_match, Seat};
             // Every game advances together, so the live count falls as games
@@ -482,15 +552,40 @@ async fn main() -> anyhow::Result<()> {
             // the same key would be matched by its regex instead.
             println!("A_gamescore {game_score:.3}");
         }
-        Cmd::Bench { live, backend, ep, fp16, cuda, candidates, t_steps, secs, sweep } => {
-            bench(&live, &backend, &ep, fp16, cuda, candidates, t_steps, secs, sweep)?
-        }
+        Cmd::Bench {
+            live,
+            backend,
+            ep,
+            fp16,
+            cuda,
+            candidates,
+            t_steps,
+            secs,
+            sweep,
+        } => bench(
+            &live, &backend, &ep, fp16, cuda, candidates, t_steps, secs, sweep,
+        )?,
         Cmd::DumpValidation { out, cases, seed } => dump_validation(&out, cases, seed)?,
-        Cmd::Soak { threads, secs, no_verify, no_oracle, seed, out } => {
-            soak::run(threads, secs, !no_verify, !no_oracle, seed, &out)?
-        }
+        Cmd::Soak {
+            threads,
+            secs,
+            no_verify,
+            no_oracle,
+            seed,
+            out,
+        } => soak::run(threads, secs, !no_verify, !no_oracle, seed, &out)?,
         Cmd::NetGame {
-            live, sims, candidates, t_steps, backend, ep, fp16, cuda, seed, opponent, games,
+            live,
+            sims,
+            candidates,
+            t_steps,
+            backend,
+            ep,
+            fp16,
+            cuda,
+            seed,
+            opponent,
+            games,
         } => {
             use minions_engine::eval::{load_seat, match_search, Seat};
             use playground_core::sampled_mcts::search;
@@ -507,56 +602,86 @@ async fn main() -> anyhow::Result<()> {
                 path => load_seat(std::path::Path::new(path), &kind, sampler)?,
             };
             for g in 0..games.max(1) {
-            // Alternate colours between games. Minions is not symmetric — the
-            // second player is paid START_MONEY_SECOND — so watching one seat
-            // only would show half the policy's habits.
-            let a_yellow = g % 2 == 0;
-            println!("\n===== game {} of {games}  ({} is yellow) =====",
-                g + 1, if a_yellow { "A" } else { "B" });
-            let mut params = params;
-            params.seed = seed ^ ((g as u64) << 24);
-            let mut state = Minions::initial_state();
-            println!("{}", state.render());
-            let mut turn = 0u32;
-            while !Minions::outcome(&state).is_terminal() {
-                // Yellow (side 0) is the net; the opponent takes blue.
-                let actor = if (state.side == 0) == a_yellow { &seat } else { &foe };
-                let spec = match actor {
-                    Seat::Net(m) => {
-                        let r = search::<minions_engine::turn::MinionsTurns, _>(
-                            &**m, state.clone(), &params, turn,
-                        )?;
-                        r.candidates.get(r.chosen).map(|(s, _)| *s).unwrap_or_default()
-                    }
-                    Seat::Greedy => minions_engine::turn::TurnSpec::from_play(&state, |st| {
-                        if Minions::outcome(st).is_terminal() {
-                            return None;
-                        }
-                        Some(<Minions as playground_core::Solver>::choose_move(st).best_move)
-                    }),
-                };
-                let r = minions_engine::turn::realize(&state, &spec);
-                state = r.next;
-                turn += 1;
-                let nw = [
-                    minions_engine::game::net_worth(&state, 0),
-                    minions_engine::game::net_worth(&state, 1),
-                ];
+                // Alternate colours between games. Minions is not symmetric — the
+                // second player is paid START_MONEY_SECOND — so watching one seat
+                // only would show half the policy's habits.
+                let a_yellow = g % 2 == 0;
                 println!(
-                    "turn {turn}  gold {:?}  net worth {nw:?}  actions {}",
-                    state.money,
-                    r.actions.len()
+                    "\n===== game {} of {games}  ({} is yellow) =====",
+                    g + 1,
+                    if a_yellow { "A" } else { "B" }
                 );
+                let mut params = params;
+                params.seed = seed ^ ((g as u64) << 24);
+                let mut state = Minions::initial_state();
                 println!("{}", state.render());
-            }
-            println!("outcome: {:?} after {} turns", Minions::outcome(&state), state.turn);
+                let mut turn = 0u32;
+                while !Minions::outcome(&state).is_terminal() {
+                    // Yellow (side 0) is the net; the opponent takes blue.
+                    let actor = if (state.side == 0) == a_yellow {
+                        &seat
+                    } else {
+                        &foe
+                    };
+                    let spec = match actor {
+                        Seat::Net(m) => {
+                            let r = search::<minions_engine::turn::MinionsTurns, _>(
+                                &**m,
+                                state.clone(),
+                                &params,
+                                turn,
+                            )?;
+                            r.candidates
+                                .get(r.chosen)
+                                .map(|(s, _)| *s)
+                                .unwrap_or_default()
+                        }
+                        Seat::Greedy => minions_engine::turn::TurnSpec::from_play(&state, |st| {
+                            if Minions::outcome(st).is_terminal() {
+                                return None;
+                            }
+                            Some(<Minions as playground_core::Solver>::choose_move(st).best_move)
+                        }),
+                    };
+                    let r = minions_engine::turn::realize(&state, &spec);
+                    state = r.next;
+                    turn += 1;
+                    let nw = [
+                        minions_engine::game::net_worth(&state, 0),
+                        minions_engine::game::net_worth(&state, 1),
+                    ];
+                    println!(
+                        "turn {turn}  gold {:?}  net worth {nw:?}  actions {}",
+                        state.money,
+                        r.actions.len()
+                    );
+                    println!("{}", state.render());
+                }
+                println!(
+                    "outcome: {:?} after {} turns",
+                    Minions::outcome(&state),
+                    state.turn
+                );
             }
         }
-        Cmd::BenchBind { live, ep, fp16, rows, steps, reps } => {
+        Cmd::BenchBind {
+            live,
+            ep,
+            fp16,
+            rows,
+            steps,
+            reps,
+        } => {
             let dir = std::path::Path::new(&live);
             let cache = dir.join("trt_cache");
             minions_engine::ort_net::bench_binding(
-                dir, &ep, fp16, cache.to_str().unwrap(), rows, steps, reps,
+                dir,
+                &ep,
+                fp16,
+                cache.to_str().unwrap(),
+                rows,
+                steps,
+                reps,
             )?;
         }
         Cmd::GreedyGame { games, verbose } => greedy_games(games, verbose),
@@ -593,7 +718,10 @@ fn greedy_games(games: u32, verbose: bool) {
             println!("{}", state.render());
         }
     }
-    println!("first {} / second {} / draw {}", tally[0], tally[1], tally[2]);
+    println!(
+        "first {} / second {} / draw {}",
+        tally[0], tally[1], tally[2]
+    );
 }
 
 /// Emit the cross-implementation validation bundle. See `python/minions_validate.py`.
@@ -629,7 +757,10 @@ fn dump_validation(out: &str, cases: usize, seed: u64) -> anyhow::Result<()> {
             TurnSpec::random_plausible(&state, &mut rng)
         };
         let live = LiveMask::of(&state);
-        let mut p = Partial { spec, committed: [0; NUM_CELLS] };
+        let mut p = Partial {
+            spec,
+            committed: [0; NUM_CELLS],
+        };
         // Commit a varying fraction, including none and all.
         let frac = i as f64 / (cases.max(2) - 1) as f64;
         for (c, bit) in [C_MOVE, C_TARGET, C_SPAWN].into_iter().enumerate() {
@@ -647,9 +778,11 @@ fn dump_validation(out: &str, cases: usize, seed: u64) -> anyhow::Result<()> {
         let mut buf = vec![0f32; DECL_PLANES * NUM_CELLS];
         p.write_planes(&mut buf);
         let mut live_bytes = vec![0u8; NUM_CELLS];
-        for (cells, bit) in
-            [(live.moves, C_MOVE), (live.targets, C_TARGET), (live.spawns, C_SPAWN)]
-        {
+        for (cells, bit) in [
+            (live.moves, C_MOVE),
+            (live.targets, C_TARGET),
+            (live.spawns, C_SPAWN),
+        ] {
             for cell in minions_engine::bitboard::cells(cells) {
                 live_bytes[cell as usize] |= bit;
             }
@@ -706,10 +839,17 @@ fn bench(
     println!("loading {kind:?} from {live} ...");
     let t0 = Instant::now();
     let net = load_backend(live_path, &kind, &cache)?;
-    println!("loaded in {:.1}s (channels {})", t0.elapsed().as_secs_f64(), net.channels());
+    println!(
+        "loaded in {:.1}s (channels {})",
+        t0.elapsed().as_secs_f64(),
+        net.channels()
+    );
 
     let state = Minions::initial_state();
-    let planes: Vec<f32> = Minions::to_features(&state).iter().map(|&b| b as f32).collect();
+    let planes: Vec<f32> = Minions::to_features(&state)
+        .iter()
+        .map(|&b| b as f32)
+        .collect();
     let live_mask = LiveMask::of(&state);
     let mut rng = <rand_chacha::ChaCha8Rng as rand::SeedableRng>::seed_from_u64(1);
     let stride = DECL_PLANES * NUM_CELLS;
@@ -743,15 +883,17 @@ fn bench(
         // batch looks "big enough". This is the measurement that says how much
         // batching across concurrent games is worth.
         println!("\nbatch sweep (throughput per item; higher is better):");
-        println!("  {:>6}  {:>12}  {:>12}  {:>12}", "batch", "trunk/s", "diffusion/s", "energy/s");
+        println!(
+            "  {:>6}  {:>12}  {:>12}  {:>12}",
+            "batch", "trunk/s", "diffusion/s", "energy/s"
+        );
         for &b in &[1usize, 2, 4, 8, 16, 32, 64, 128, 256, 512] {
             let planes_b = repeat_trunk(&planes, b);
             let h_b = repeat_trunk(&tr.h, b);
             let mut decl_b = vec![0f32; b * stride];
             for i in 0..b {
                 let src = (i % k) * stride;
-                decl_b[i * stride..(i + 1) * stride]
-                    .copy_from_slice(&decl[src..src + stride]);
+                decl_b[i * stride..(i + 1) * stride].copy_from_slice(&decl[src..src + stride]);
             }
             let rate = |f: &dyn Fn() -> anyhow::Result<()>| -> anyhow::Result<f64> {
                 f()?;

@@ -65,7 +65,11 @@ impl Seat {
         match self {
             Seat::Net(m) => {
                 let r = search::<MinionsTurns, _>(&**m, state.clone(), params, turn)?;
-                let spec = r.candidates.get(r.chosen).map(|(s, _)| *s).unwrap_or_default();
+                let spec = r
+                    .candidates
+                    .get(r.chosen)
+                    .map(|(s, _)| *s)
+                    .unwrap_or_default();
                 Ok((spec, r.stats))
             }
             // Replay the heuristic's atomic choices and read back what it did as
@@ -147,7 +151,11 @@ fn bid_value(seat: &Seat, params: &SampledParams) -> anyhow::Result<f64> {
     }
     let vb = value_at(b)?;
     let span = va - vb;
-    let frac = if span > 1e-9 { (va / span).clamp(0.0, 1.0) } else { 0.5 };
+    let frac = if span > 1e-9 {
+        (va / span).clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
     Ok(a as f64 + frac)
 }
 
@@ -204,7 +212,10 @@ fn pick_many(
                 .into_iter()
                 .map(|r| {
                     stats.merge(&r.stats);
-                    r.candidates.get(r.chosen).map(|(s, _)| *s).unwrap_or_default()
+                    r.candidates
+                        .get(r.chosen)
+                        .map(|(s, _)| *s)
+                        .unwrap_or_default()
                 })
                 .collect();
             Ok((specs, stats))
@@ -306,8 +317,20 @@ pub fn run_match(
     // a match is no longer decided by who happens to sit where.
     // Each seat prices its handicap with the search it will actually play with,
     // or the bid measures a net the match never uses.
-    let a_bid = bid_of(a, &SampledParams { kernel_sigma: sigma.0, ..*params })?;
-    let b_bid = bid_of(b, &SampledParams { kernel_sigma: sigma.1, ..*params })?;
+    let a_bid = bid_of(
+        a,
+        &SampledParams {
+            kernel_sigma: sigma.0,
+            ..*params
+        },
+    )?;
+    let b_bid = bid_of(
+        b,
+        &SampledParams {
+            kernel_sigma: sigma.1,
+            ..*params
+        },
+    )?;
     // Plain numbers so the eval loop can parse them; "none" for a seat that
     // declines (it has no value function to price a handicap with).
     let show = |b: Option<f64>| b.map_or("none".to_string(), |v| format!("{v:.3}"));
@@ -366,7 +389,11 @@ pub fn run_match(
                 l.log,
                 "\n===== game {} of {render_games}  |  A is {}  |  handicap {} =====\n{}\n",
                 l.g + 1,
-                if l.a_first { "yellow (moves first)" } else { "blue" },
+                if l.a_first {
+                    "yellow (moves first)"
+                } else {
+                    "blue"
+                },
                 l.bid,
                 l.state.render()
             );
@@ -389,9 +416,7 @@ pub fn run_match(
             let idxs: Vec<usize> = live
                 .iter()
                 .enumerate()
-                .filter(|(_, l)| {
-                    !l.done && ((l.state.side == 0) == l.a_first) == want_a
-                })
+                .filter(|(_, l)| !l.done && ((l.state.side == 0) == l.a_first) == want_a)
                 .map(|(i, _)| i)
                 .collect();
             if idxs.is_empty() {
@@ -411,12 +436,12 @@ pub fn run_match(
                 let next = realize(&prev_state, &spec).next;
                 // A declaration that changes nothing would loop forever; end
                 // the turn regardless.
-                live[i].state = if Minions::encode_state(&next) == Minions::encode_state(&prev_state)
-                {
-                    realize(&prev_state, &TurnSpec::empty()).next
-                } else {
-                    next
-                };
+                live[i].state =
+                    if Minions::encode_state(&next) == Minions::encode_state(&prev_state) {
+                        realize(&prev_state, &TurnSpec::empty()).next
+                    } else {
+                        next
+                    };
                 if sink.is_some() && live[i].g < render_games {
                     use std::fmt::Write as _;
                     let r = realize(&prev_state, &spec);
@@ -425,8 +450,11 @@ pub fn run_match(
                         crate::game::net_worth(&live[i].state, 0),
                         crate::game::net_worth(&live[i].state, 1),
                     );
-                    let (turn, money, board) =
-                        (live[i].state.turn, live[i].state.money, live[i].state.render());
+                    let (turn, money, board) = (
+                        live[i].state.turn,
+                        live[i].state.money,
+                        live[i].state.render(),
+                    );
                     let _ = write!(
                         live[i].log,
                         "turn {turn} by {mover}  gold {money:?}  net worth [{nw0}, {nw1}]  \
@@ -552,7 +580,11 @@ pub fn load_seat(
     let net: Box<dyn crate::net::Backend> = match kind {
         crate::net::BackendKind::Candle { cuda } => Box::new(LocalNet::load(path, *cuda)?),
         crate::net::BackendKind::Ort { ep, fp16 } => {
-            let dir = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
+            let dir = if path.is_dir() {
+                path
+            } else {
+                path.parent().unwrap_or(path)
+            };
             let cache = dir.join("trt_cache").to_string_lossy().into_owned();
             Box::new(crate::ort_net::OrtNet::new(dir, ep, *fp16, &cache)?)
         }
@@ -580,9 +612,15 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(format!("{params:?}"), format!("{historical:?}"));
-        assert_eq!(sampler.random_fraction, 0.0, "eval draws no random candidates");
+        assert_eq!(
+            sampler.random_fraction, 0.0,
+            "eval draws no random candidates"
+        );
         assert_eq!((sampler.t_steps, sampler.t_steps_fast), (4, 4));
-        assert_eq!((sampler.k_candidates, sampler.pad_to, sampler.seed), (16, 40, 9));
+        assert_eq!(
+            (sampler.k_candidates, sampler.pad_to, sampler.seed),
+            (16, 40, 9)
+        );
     }
 
     /// The higher bidder claimed yellow was stronger, so they get yellow.
@@ -615,13 +653,19 @@ mod tests {
         let n = 4000;
         for _ in 0..n {
             let (bid, _) = settle_bids(3.5, 4.0, &mut rng);
-            assert!(bid == 3 || bid == 4, "rounding must stay adjacent, got {bid}");
+            assert!(
+                bid == 3 || bid == 4,
+                "rounding must stay adjacent, got {bid}"
+            );
             if bid == 4 {
                 ups += 1;
             }
         }
         let frac = ups as f64 / n as f64;
-        assert!((frac - 0.75).abs() < 0.03, "expected ~0.75 rounded up, got {frac:.3}");
+        assert!(
+            (frac - 0.75).abs() < 0.03,
+            "expected ~0.75 rounded up, got {frac:.3}"
+        );
     }
 
     /// Bids outside the expressible range are clamped, not extrapolated.
@@ -646,7 +690,10 @@ mod tests {
     #[test]
     fn a_seat_without_a_value_function_declines_to_bid() {
         let params = SampledParams::default();
-        assert_eq!(bid_of(&Seat::Greedy, &params).expect("greedy answers"), None);
+        assert_eq!(
+            bid_of(&Seat::Greedy, &params).expect("greedy answers"),
+            None
+        );
     }
 
     /// The greedy seat must actually play its turn.
@@ -665,7 +712,9 @@ mod tests {
             if Minions::outcome(&state).is_terminal() {
                 break;
             }
-            let (spec, _) = Seat::Greedy.pick(&state, &params, turn).expect("greedy picks");
+            let (spec, _) = Seat::Greedy
+                .pick(&state, &params, turn)
+                .expect("greedy picks");
             moved += spec.moves.iter().filter(|&&m| m != NO_MOVE).count() as u32;
             spawned += spec.spawns.iter().filter(|&&x| x != 0).count() as u32;
             let next = realize(&state, &spec).next;
@@ -677,7 +726,10 @@ mod tests {
             state = next;
         }
         assert!(moved > 0, "greedy never declared a move");
-        assert!(spawned > 0, "greedy never declared a spawn — its purchases are lost");
+        assert!(
+            spawned > 0,
+            "greedy never declared a spawn — its purchases are lost"
+        );
     }
 
     /// And what it declares has to survive realization, or the seat is still
@@ -691,7 +743,9 @@ mod tests {
             if Minions::outcome(&state).is_terminal() {
                 break;
             }
-            let (spec, _) = Seat::Greedy.pick(&state, &params, turn).expect("greedy picks");
+            let (spec, _) = Seat::Greedy
+                .pick(&state, &params, turn)
+                .expect("greedy picks");
             let r = realize(&state, &spec);
             declared += r.fidelity.declared_moves;
             done += r.fidelity.done_moves;
@@ -700,6 +754,9 @@ mod tests {
         }
         assert!(declared > 0);
         let f = done as f64 / declared as f64;
-        assert!(f > 0.9, "greedy move fidelity {f:.3} — the seat loses what it chose");
+        assert!(
+            f > 0.9,
+            "greedy move fidelity {f:.3} — the seat loses what it chose"
+        );
     }
 }

@@ -38,7 +38,9 @@ fn objective_distance(state: &MinionsState, side: u8, cell: u8) -> u32 {
         let is_target = if IS_GRAVEYARD[i as usize] {
             state.piece_at(i).is_none_or(|(s, _)| s != side)
         } else {
-            state.piece_at(i).is_some_and(|(s, u)| s != side && u.stats().necromancer)
+            state
+                .piece_at(i)
+                .is_some_and(|(s, u)| s != side && u.stats().necromancer)
         };
         if is_target {
             best = best.min(dist(cell, i));
@@ -55,7 +57,11 @@ fn attack_effect(state: &MinionsState, from: u8, to: u8) -> (u8, bool, bool) {
     let (damage, bounce) = match att.stats().attack {
         Attack::Damage(d) => (d, false),
         Attack::Unsummon => {
-            if def_stats.persistent { (1, false) } else { (0, true) }
+            if def_stats.persistent {
+                (1, false)
+            } else {
+                (0, true)
+            }
         }
     };
     let kills = !bounce && state.damage_on(to) + damage >= def_stats.defense;
@@ -132,26 +138,35 @@ fn evaluate(state: &MinionsState) -> f64 {
             if u.stats().necromancer {
                 continue; // both are alive, or the game is already over
             }
-            material += if s == side { unit_value(u) } else { -unit_value(u) };
+            material += if s == side {
+                unit_value(u)
+            } else {
+                -unit_value(u)
+            };
         }
     }
     let territory =
         5 * (state.graveyards_held(side) as i32 - state.graveyards_held(1 - side) as i32);
-    let treasury =
-        (state.money[side as usize] as i32 - state.money[1 - side as usize] as i32) / 2;
+    let treasury = (state.money[side as usize] as i32 - state.money[1 - side as usize] as i32) / 2;
     ((material + territory + treasury) as f64 / 200.0).tanh()
 }
 
 pub fn greedy_move(state: &MinionsState) -> SearchOutcome<MinionsMove> {
     let legal = Minions::legal_moves(state);
-    assert!(!legal.is_empty(), "greedy_move called on a terminal position");
+    assert!(
+        !legal.is_empty(),
+        "greedy_move called on a terminal position"
+    );
 
     // Buying only makes sense if there is somewhere to put the unit; without
     // this the bot would bank money it can never spend.
     let spawn_room = if state.phase == PHASE_ATTACK {
         0
     } else {
-        let held: u32 = state.reinforcements[state.side as usize].iter().map(|&n| n as u32).sum();
+        let held: u32 = state.reinforcements[state.side as usize]
+            .iter()
+            .map(|&n| n as u32)
+            .sum();
         (state.spawn_cells(state.side).len() as u32).saturating_sub(held)
     };
 

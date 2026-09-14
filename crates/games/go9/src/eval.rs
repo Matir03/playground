@@ -39,9 +39,14 @@ impl Evaluator for MatchEval<'_> {
     fn eval(&self, state: &Go9State) -> anyhow::Result<EvalOut> {
         RESP.with(|(tx, rx)| {
             self.req_tx
-                .send(Req { is_a: self.is_a, state: state.clone(), resp: tx.clone() })
+                .send(Req {
+                    is_a: self.is_a,
+                    state: state.clone(),
+                    resp: tx.clone(),
+                })
                 .map_err(|_| anyhow::anyhow!("match server gone"))?;
-            rx.recv().map_err(|_| anyhow::anyhow!("match response dropped"))
+            rx.recv()
+                .map_err(|_| anyhow::anyhow!("match response dropped"))
         })
     }
 }
@@ -65,7 +70,11 @@ fn server_loop(rx: Receiver<Req>, a: &LocalModel, b: &LocalModel, max_batch: usi
         let mut a_idx = vec![];
         let mut b_idx = vec![];
         for (i, r) in batch.iter().enumerate() {
-            if r.is_a { a_idx.push(i) } else { b_idx.push(i) }
+            if r.is_a {
+                a_idx.push(i)
+            } else {
+                b_idx.push(i)
+            }
         }
         let mut out: Vec<Option<EvalOut>> = (0..batch.len()).map(|_| None).collect();
         for (model, idxs) in [(a, &a_idx), (b, &b_idx)] {
@@ -73,7 +82,9 @@ fn server_loop(rx: Receiver<Req>, a: &LocalModel, b: &LocalModel, max_batch: usi
                 continue;
             }
             let states: Vec<&Go9State> = idxs.iter().map(|&i| &batch[i].state).collect();
-            let res = model.policy_value_batch(&states).expect("match forward failed");
+            let res = model
+                .policy_value_batch(&states)
+                .expect("match forward failed");
             for (slot, r) in idxs.iter().zip(res) {
                 out[*slot] = Some(r);
             }
@@ -123,7 +134,11 @@ fn play_one(req_tx: &Sender<Req>, a_is_black: bool, p: &Params, seed: u64) -> f3
         let eval = MatchEval { req_tx, is_a };
         let (counts, _v, _n, _s) = run_mcts(&eval, &state, p, &mut rng).expect("mcts");
         // Sample the opening for game diversity, then play the net's best move.
-        let a = if ply < p.temp_moves { sample(&counts, &mut rng) } else { argmax(&counts) };
+        let a = if ply < p.temp_moves {
+            sample(&counts, &mut rng)
+        } else {
+            argmax(&counts)
+        };
         let mv = action_to_move(a);
         state = Go9::apply(&state, &mv);
         ply += 1;
@@ -134,8 +149,20 @@ fn play_one(req_tx: &Sender<Req>, a_is_black: bool, p: &Params, seed: u64) -> f3
     };
     let a_color = if a_is_black { 1 } else { 2 };
     match outcome {
-        Outcome::FirstWins => if a_color == 1 { 1.0 } else { 0.0 },
-        Outcome::SecondWins => if a_color == 2 { 1.0 } else { 0.0 },
+        Outcome::FirstWins => {
+            if a_color == 1 {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        Outcome::SecondWins => {
+            if a_color == 2 {
+                1.0
+            } else {
+                0.0
+            }
+        }
         _ => 0.5,
     }
 }
@@ -177,7 +204,12 @@ pub fn run_match(
                 if idx >= games {
                     break;
                 }
-                let s = play_one(&req_tx, idx % 2 == 0, params, base_seed.wrapping_add(idx as u64));
+                let s = play_one(
+                    &req_tx,
+                    idx % 2 == 0,
+                    params,
+                    base_seed.wrapping_add(idx as u64),
+                );
                 score_x2.fetch_add((s * 2.0) as u64, Ordering::Relaxed);
             });
         }
@@ -185,6 +217,9 @@ pub fn run_match(
     });
 
     let a_score = score_x2.load(Ordering::Relaxed) as f64 / (2.0 * games as f64);
-    println!("A_score {a_score:.4}  ({games} games, {:.1}s)", t0.elapsed().as_secs_f64());
+    println!(
+        "A_score {a_score:.4}  ({games} games, {:.1}s)",
+        t0.elapsed().as_secs_f64()
+    );
     Ok(a_score)
 }

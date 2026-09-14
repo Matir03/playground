@@ -108,8 +108,20 @@ impl Node {
 /// Value for the side to move at a finished position (+1 win / -1 loss / 0 draw).
 fn outcome_to_value(o: Outcome, to_move: u8) -> f32 {
     match o {
-        Outcome::FirstWins => if to_move == 1 { 1.0 } else { -1.0 },
-        Outcome::SecondWins => if to_move == 2 { 1.0 } else { -1.0 },
+        Outcome::FirstWins => {
+            if to_move == 1 {
+                1.0
+            } else {
+                -1.0
+            }
+        }
+        Outcome::SecondWins => {
+            if to_move == 2 {
+                1.0
+            } else {
+                -1.0
+            }
+        }
         _ => 0.0,
     }
 }
@@ -132,8 +144,10 @@ fn expand(arena: &mut Vec<Node>, idx: usize, eval: &impl Evaluator) -> anyhow::R
         return Ok(tv);
     }
     let (v, probs) = eval.eval(&arena[idx].state)?;
-    let legal: Vec<usize> =
-        Go9::legal_moves(&arena[idx].state).iter().map(move_to_action).collect();
+    let legal: Vec<usize> = Go9::legal_moves(&arena[idx].state)
+        .iter()
+        .map(move_to_action)
+        .collect();
     let s: f32 = legal.iter().map(|&a| probs[a]).sum::<f32>().max(1e-12);
     let node = &mut arena[idx];
     for &a in &legal {
@@ -171,7 +185,11 @@ fn select(node: &Node, c_puct: f32) -> usize {
         if !node.legal[a] {
             continue;
         }
-        let q = if node.n[a] > 0 { node.w[a] / node.n[a] as f32 } else { fpu };
+        let q = if node.n[a] > 0 {
+            node.w[a] / node.n[a] as f32
+        } else {
+            fpu
+        };
         let u = c_puct * node.p[a] * sqrt_total / (1 + node.n[a]) as f32;
         let score = q + u;
         if score > best_score {
@@ -281,8 +299,11 @@ pub fn run_mcts(
     let nodes = arena.len() as u32;
     let root = &arena[0];
     let total_n: u32 = root.n.iter().sum();
-    let root_value =
-        if total_n > 0 { root.w.iter().sum::<f32>() / total_n as f32 } else { 0.0 };
+    let root_value = if total_n > 0 {
+        root.w.iter().sum::<f32>() / total_n as f32
+    } else {
+        0.0
+    };
     // Policy counts exclude ε-greedy forced-random visits, so the target/move
     // reflect only what the search (PUCT) genuinely preferred.
     let mut policy_counts = [0u32; ACTIONS];
@@ -337,7 +358,10 @@ impl playground_core::batch_search::BatchGame for Go9 {
     /// ply/pass count so a position transposed across games/moves is a cache hit;
     /// includes the ko board since it changes the legal set (cached with the eval).
     fn hash_key(state: &Go9State) -> u128 {
-        let mut h = state.black.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(31)
+        let mut h = state
+            .black
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .rotate_left(31)
             ^ state.white.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
         h ^= state.to_move as u128;
         if let Some((pb, pw)) = state.prev {
@@ -443,7 +467,13 @@ pub fn self_play_game(
     let mut examples = Vec::with_capacity(moves.len());
     for (i, (policy, a, to_move)) in moves.into_iter().enumerate() {
         let z = match winner {
-            Some(w) => if w == to_move { 1.0 } else { -1.0 },
+            Some(w) => {
+                if w == to_move {
+                    1.0
+                } else {
+                    -1.0
+                }
+            }
             None => 0.0,
         };
         examples.push(Example {
@@ -467,7 +497,10 @@ fn sample_categorical(probs: &[f32; ACTIONS], rng: &mut impl Rng) -> usize {
             return a;
         }
     }
-    (0..ACTIONS).rev().find(|&a| probs[a] > 0.0).unwrap_or(ACTIONS - 1)
+    (0..ACTIONS)
+        .rev()
+        .find(|&a| probs[a] > 0.0)
+        .unwrap_or(ACTIONS - 1)
 }
 
 fn argmax(counts: &[u32; ACTIONS]) -> usize {

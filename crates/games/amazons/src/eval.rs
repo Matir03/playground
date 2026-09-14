@@ -48,15 +48,18 @@ pub fn run_match(
         resign_threshold: 0.0,
         resign_consecutive: 0,
         resign_playout_frac: 0.0,
-            forced_playout_k: 0.0,
-            full_search_prob: 0.0,
-            fast_node_budget: 0,
-            random_opening_max: 0,
-            random_opening_decay: 1.0,
+        forced_playout_k: 0.0,
+        full_search_prob: 0.0,
+        fast_node_budget: 0,
+        random_opening_max: 0,
+        random_opening_decay: 1.0,
     };
     let t0 = Instant::now();
     let a_score =
         batch_search::run_eval_moves::<Amazons>(&a, &b, games, sp, threads, max_batch, base_seed);
-    println!("A_score {a_score:.4}  ({games} games, {:.1}s)", t0.elapsed().as_secs_f64());
+    println!(
+        "A_score {a_score:.4}  ({games} games, {:.1}s)",
+        t0.elapsed().as_secs_f64()
+    );
     Ok(a_score)
 }

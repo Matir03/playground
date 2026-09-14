@@ -43,7 +43,7 @@ use rand_chacha::ChaCha8Rng;
 
 use crate::bitboard::{self, bit, Bb, FULL};
 use crate::game::{Minions, MinionsState};
-use crate::map::{NUM_CELLS, NO_CELL};
+use crate::map::{NO_CELL, NUM_CELLS};
 use crate::net::{Backend, DECL_LOGITS};
 use crate::turn::{
     realize, LiveMask, MinionsTurns, Partial, TurnSpec, C_MOVE, C_SPAWN, C_TARGET, DECL_PLANES,
@@ -129,11 +129,19 @@ impl SamplerConfig {
     /// than a full one would be backwards, and is easy to reach by lowering
     /// `--candidates` alone.
     pub fn k_for(&self, full: bool) -> usize {
-        if full { self.k_candidates } else { self.k_candidates_fast.min(self.k_candidates) }
+        if full {
+            self.k_candidates
+        } else {
+            self.k_candidates_fast.min(self.k_candidates)
+        }
     }
 
     pub fn draws_for(&self, full: bool) -> usize {
-        if full { self.k_draws } else { self.k_draws_fast }
+        if full {
+            self.k_draws
+        } else {
+            self.k_draws_fast
+        }
     }
 }
 
@@ -226,20 +234,39 @@ fn commit_round(
             // Offset 0 is "stay" and never claims a hex.
             v == 0 || (d != NO_CELL && !bitboard::has(taken, d))
         };
-        consider(chain, cell, C_MOVE, OFF_MOVES, N_OFFSETS, allow, logits, temp, picks, rng);
+        consider(
+            chain, cell, C_MOVE, OFF_MOVES, N_OFFSETS, allow, logits, temp, picks, rng,
+        );
     }
     for cell in bitboard::cells(cx.live.targets) {
         let opts = cx.target_opts[cell as usize];
         let allow = |v: usize| opts & (1 << v) != 0;
-        consider(chain, cell, C_TARGET, OFF_TARGETS, N_TARGETS, allow, logits, temp, picks, rng);
+        consider(
+            chain,
+            cell,
+            C_TARGET,
+            OFF_TARGETS,
+            N_TARGETS,
+            allow,
+            logits,
+            temp,
+            picks,
+            rng,
+        );
     }
     for cell in bitboard::cells(cx.live.spawns) {
         let so = cx.spawn_opts;
         let allow = |v: usize| so & (1 << v) != 0;
-        consider(chain, cell, C_SPAWN, OFF_SPAWNS, N_SPAWNS, allow, logits, temp, picks, rng);
+        consider(
+            chain, cell, C_SPAWN, OFF_SPAWNS, N_SPAWNS, allow, logits, temp, picks, rng,
+        );
     }
 
-    let already = chain.committed.iter().map(|c| c.count_ones() as usize).sum::<usize>();
+    let already = chain
+        .committed
+        .iter()
+        .map(|c| c.count_ones() as usize)
+        .sum::<usize>();
     let take = want.saturating_sub(already).max(1).min(picks.len());
     // Commit a *uniformly random* subset, not the most confident ones.
     //
@@ -334,17 +361,30 @@ impl Phases {
     pub fn report(&self) -> String {
         let g = |c: &AtomicU64| c.load(Ordering::Relaxed) as f64 / 1e6;
         let (f, t, w, d, c, r, e, p) = (
-            g(&self.features_ns), g(&self.trunk_ns), g(&self.decl_write_ns),
-            g(&self.diffusion_ns), g(&self.commit_ns), g(&self.realize_ns),
-            g(&self.energy_ns), g(&self.playout_ns),
+            g(&self.features_ns),
+            g(&self.trunk_ns),
+            g(&self.decl_write_ns),
+            g(&self.diffusion_ns),
+            g(&self.commit_ns),
+            g(&self.realize_ns),
+            g(&self.energy_ns),
+            g(&self.playout_ns),
         );
         let total = (f + t + w + d + c + r + e + p).max(1e-9);
         let pct = |x: f64| 100.0 * x / total;
         format!(
             "features {:.0}% trunk {:.0}% decl-write {:.0}% diffusion {:.0}% \
 commit {:.0}% realize {:.0}% playout {:.0}% energy {:.0}%  (GPU {:.0}%, CPU {:.0}%)",
-            pct(f), pct(t), pct(w), pct(d), pct(c), pct(r), pct(p), pct(e),
-            pct(t + d + e), pct(f + w + c + r + p),
+            pct(f),
+            pct(t),
+            pct(w),
+            pct(d),
+            pct(c),
+            pct(r),
+            pct(p),
+            pct(e),
+            pct(t + d + e),
+            pct(f + w + c + r + p),
         )
     }
 }
@@ -379,7 +419,13 @@ pub struct MinionsModel {
 impl MinionsModel {
     pub fn new(net: Box<dyn Backend>, cfg: SamplerConfig) -> Self {
         let seed = cfg.seed;
-        Self { net, cfg, phases: Phases::default(), seed, expand_seq: AtomicU64::new(0) }
+        Self {
+            net,
+            cfg,
+            phases: Phases::default(),
+            seed,
+            expand_seq: AtomicU64::new(0),
+        }
     }
 
     /// Legal move offsets per cell, as a 64-bit mask over [`crate::turn::OFFSETS`].
@@ -392,7 +438,9 @@ impl MinionsModel {
         let ground = FULL & !enemy;
         let mut out = vec![0u64; NUM_CELLS];
         for c in bitboard::cells(live.moves) {
-            let Some((_, unit)) = state.piece_at(c) else { continue };
+            let Some((_, unit)) = state.piece_at(c) else {
+                continue;
+            };
             let st = unit.stats();
             let pass = if st.flying { FULL } else { ground };
             // Empty *or* friendly-occupied: a hex whose occupant is itself
@@ -417,7 +465,9 @@ impl MinionsModel {
     fn target_options(state: &MinionsState, live: &LiveMask) -> Vec<u8> {
         let mut out = vec![0u8; NUM_CELLS];
         for c in bitboard::cells(live.targets) {
-            let Some((_, unit)) = state.piece_at(c) else { continue };
+            let Some((_, unit)) = state.piece_at(c) else {
+                continue;
+            };
             let mut m = 0b011; // stay, kill
             if !unit.stats().persistent {
                 m |= 1 << TARGET_UNSUMMON;
@@ -507,7 +557,12 @@ impl MinionsModel {
             }
         }
         let mut decl = vec![0f32; rows * stride];
-        let steps = if full { self.cfg.t_steps } else { self.cfg.t_steps_fast }.max(1);
+        let steps = if full {
+            self.cfg.t_steps
+        } else {
+            self.cfg.t_steps_fast
+        }
+        .max(1);
 
         // Serial within a batch, on purpose.
         //
@@ -578,7 +633,6 @@ impl MinionsModel {
             .pop()
             .unwrap_or_default())
     }
-
 }
 
 impl MinionsModel {
@@ -661,7 +715,8 @@ impl SampledModel<MinionsTurns> for AsSearch<'_> {
         states: &[MinionsState],
         k: usize,
     ) -> anyhow::Result<Vec<Expansion<MinionsTurns>>> {
-        self.model.expand_batch_mode(states, k, self.full, self.next_seq())
+        self.model
+            .expand_batch_mode(states, k, self.full, self.next_seq())
     }
 
     fn expand(&self, state: &MinionsState, k: usize) -> anyhow::Result<Expansion<MinionsTurns>> {
@@ -679,7 +734,14 @@ impl SampledModel<MinionsTurns> for AsSearch<'_> {
         k: usize,
     ) -> anyhow::Result<Vec<Vec<(TurnSpec, f32, bool)>>> {
         let (out, _) = self.model.expand_batch_cached(
-            states, k, self.full, self.next_seq(), &[], &|n| n, false, fill,
+            states,
+            k,
+            self.full,
+            self.next_seq(),
+            &[],
+            &|n| n,
+            false,
+            fill,
         )?;
         Ok(out.into_iter().map(|(_, c)| c).collect())
     }
@@ -691,11 +753,19 @@ impl SampledModel<MinionsTurns> for MinionsModel {
         states: &[MinionsState],
         k: usize,
     ) -> anyhow::Result<Vec<Expansion<MinionsTurns>>> {
-        AsSearch { model: self, full: true }.expand_batch(states, k)
+        AsSearch {
+            model: self,
+            full: true,
+        }
+        .expand_batch(states, k)
     }
 
     fn expand(&self, state: &MinionsState, k: usize) -> anyhow::Result<Expansion<MinionsTurns>> {
-        AsSearch { model: self, full: true }.expand(state, k)
+        AsSearch {
+            model: self,
+            full: true,
+        }
+        .expand(state, k)
     }
 
     fn widen_batch(
@@ -704,7 +774,11 @@ impl SampledModel<MinionsTurns> for MinionsModel {
         fill: &[bool],
         k: usize,
     ) -> anyhow::Result<Vec<Vec<(TurnSpec, f32, bool)>>> {
-        AsSearch { model: self, full: true }.widen_batch(states, fill, k)
+        AsSearch {
+            model: self,
+            full: true,
+        }
+        .widen_batch(states, fill, k)
     }
 }
 
@@ -784,7 +858,14 @@ impl MinionsModel {
     ) -> anyhow::Result<(Vec<Expansion<MinionsTurns>>, TrunkRows)> {
         let real = states.len();
         if real == 0 {
-            return Ok((Vec::new(), TrunkRows { stride: 0, h: Vec::new(), fresh: Vec::new() }));
+            return Ok((
+                Vec::new(),
+                TrunkRows {
+                    stride: 0,
+                    h: Vec::new(),
+                    fresh: Vec::new(),
+                },
+            ));
         }
         // Widen to a fixed batch before touching the GPU, so the tensor shape
         // does not follow the caller's live-game count.
@@ -809,12 +890,18 @@ impl MinionsModel {
         let flipped: Vec<bool> = states.iter().map(|s| s.side == 1).collect();
         let canon: Vec<MinionsState> = states.iter().map(|s| s.canonical()).collect();
         let states: &[MinionsState] = &canon;
-        let mut rng = ChaCha8Rng::seed_from_u64(self.seed ^ batch_seq.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let mut rng =
+            ChaCha8Rng::seed_from_u64(self.seed ^ batch_seq.wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let pstride = crate::game::PLANES * NUM_CELLS;
 
         // ── trunk, for every position the caller does not already hold ────────
         let hstride = self.net.channels() * NUM_CELLS;
-        let hit = |gi: usize| cached.get(gi.min(cached.len().saturating_sub(1))).copied().flatten();
+        let hit = |gi: usize| {
+            cached
+                .get(gi.min(cached.len().saturating_sub(1)))
+                .copied()
+                .flatten()
+        };
         // Features for `rows`, padded to `width` by repeating the last one.
         let features = |rows: &[usize], width: usize| -> Vec<f32> {
             let mut planes = vec![0f32; width * pstride];
@@ -866,9 +953,14 @@ impl MinionsModel {
             }
             (values, h)
         };
-        let n_fresh = if cached.is_empty() { real } else { cached.len().min(real) };
-        let fresh: Vec<Option<f32>> =
-            (0..n_fresh).map(|gi| (want_fresh && hit(gi).is_none()).then(|| values[gi])).collect();
+        let n_fresh = if cached.is_empty() {
+            real
+        } else {
+            cached.len().min(real)
+        };
+        let fresh: Vec<Option<f32>> = (0..n_fresh)
+            .map(|gi| (want_fresh && hit(gi).is_none()).then(|| values[gi]))
+            .collect();
 
         // `k == 0` is a value-only expansion: run the trunk, skip the heads.
         //
@@ -878,7 +970,14 @@ impl MinionsModel {
         // waste after chunking (43.4% of candidates, one per frontier node).
         if k == 0 {
             let out = (0..real).map(|gi| (values.get(gi).copied().unwrap_or(0.0), Vec::new()));
-            return Ok((out.collect(), TrunkRows { stride: hstride, h, fresh }));
+            return Ok((
+                out.collect(),
+                TrunkRows {
+                    stride: hstride,
+                    h,
+                    fresh,
+                },
+            ));
         }
         let k = k.max(1);
         // Forced exploration keeps its *expected* share even when candidates are
@@ -891,7 +990,11 @@ impl MinionsModel {
         let k_rand = if full {
             let want = (k as f32) * self.cfg.random_fraction;
             let floor = want.floor();
-            let extra = if rng.gen::<f32>() < (want - floor) { 1 } else { 0 };
+            let extra = if rng.gen::<f32>() < (want - floor) {
+                1
+            } else {
+                0
+            };
             floor as usize + extra
         } else {
             0
@@ -1009,9 +1112,15 @@ impl MinionsModel {
         // Drop the padding: the caller asked about `real` positions and must not
         // see the repeats that kept the tensor shape fixed.
         out.truncate(real);
-        Ok((out, TrunkRows { stride: hstride, h, fresh }))
+        Ok((
+            out,
+            TrunkRows {
+                stride: hstride,
+                h,
+                fresh,
+            },
+        ))
     }
-
 }
 
 #[cfg(test)]
@@ -1038,7 +1147,11 @@ mod tests {
             for _ in 0..trials {
                 let want = (k as f32) * fraction;
                 let floor = want.floor();
-                let extra = if rng.gen::<f32>() < (want - floor) { 1 } else { 0 };
+                let extra = if rng.gen::<f32>() < (want - floor) {
+                    1
+                } else {
+                    0
+                };
                 total += floor as usize + extra;
             }
             let observed = total as f32 / (trials * k) as f32;
@@ -1063,8 +1176,9 @@ mod tests {
             return;
         };
         let states = vec![MinionsState::default(); 2];
-        let (out, _) =
-            m.expand_batch_cached(&states, 4, true, 3, &[], &|n| n, false, &[false, true]).unwrap();
+        let (out, _) = m
+            .expand_batch_cached(&states, 4, true, 3, &[], &|n| n, false, &[false, true])
+            .unwrap();
         assert!(
             !out[0].1.is_empty() && out[0].1.iter().all(|c| !c.2),
             "with random_fraction 0 a proposal row holds no explore candidates"
@@ -1086,8 +1200,11 @@ mod tests {
     /// misses then run through a padded trunk call of their own).
     #[test]
     fn cached_trunk_output_matches_recomputing_it() {
-        let Some(m) = model(SamplerConfig { k_candidates: 4, seed: 5, ..Default::default() })
-        else {
+        let Some(m) = model(SamplerConfig {
+            k_candidates: 4,
+            seed: 5,
+            ..Default::default()
+        }) else {
             eprintln!("MINIONS_PARITY_DIR unset — skipping");
             return;
         };
@@ -1097,7 +1214,9 @@ mod tests {
         while states.len() < 7 && !crate::game::Minions::outcome(&st).is_terminal() {
             states.push(st.clone());
             let spec = crate::turn::TurnSpec::random_playout(&st, &mut rng);
-            st = <crate::turn::MinionsTurns as playground_core::sampled_mcts::SampledGame>::apply(&st, &spec);
+            st = <crate::turn::MinionsTurns as playground_core::sampled_mcts::SampledGame>::apply(
+                &st, &spec,
+            );
         }
         assert!(
             states.iter().any(|s| s.side == 0) && states.iter().any(|s| s.side == 1),
@@ -1106,7 +1225,9 @@ mod tests {
 
         // A value-only expansion, keeping what the trunk computed.
         let none: Vec<Option<(f32, &[f16])>> = vec![None; states.len()];
-        let (exp, rows) = m.expand_batch_cached(&states, 0, true, 1, &none, &|n| n, true, &[]).unwrap();
+        let (exp, rows) = m
+            .expand_batch_cached(&states, 0, true, 1, &none, &|n| n, true, &[])
+            .unwrap();
         let kept: Vec<(f32, Vec<f16>)> = rows
             .fresh
             .iter()
@@ -1118,30 +1239,55 @@ mod tests {
         }
 
         let want = m.expand_batch_mode(&states, 2, true, 42).unwrap();
-        let all: Vec<Option<(f32, &[f16])>> = kept.iter().map(|(v, h)| Some((*v, &h[..]))).collect();
-        let half: Vec<Option<(f32, &[f16])>> =
-            all.iter().enumerate().map(|(i, c)| if i % 2 == 0 { *c } else { None }).collect();
+        let all: Vec<Option<(f32, &[f16])>> =
+            kept.iter().map(|(v, h)| Some((*v, &h[..]))).collect();
+        let half: Vec<Option<(f32, &[f16])>> = all
+            .iter()
+            .enumerate()
+            .map(|(i, c)| if i % 2 == 0 { *c } else { None })
+            .collect();
         // Rows must be far apart, or a misplaced one could pass unnoticed.
         let dist = |x: &[f16], y: &[f16]| {
-            x.iter().zip(y).map(|(p, q)| (p.to_f32() - q.to_f32()).abs()).fold(0f32, f32::max)
+            x.iter()
+                .zip(y)
+                .map(|(p, q)| (p.to_f32() - q.to_f32()).abs())
+                .fold(0f32, f32::max)
         };
         for i in 0..kept.len() {
             for j in i + 1..kept.len() {
-                assert!(dist(&kept[i].1, &kept[j].1) > 0.1, "rows {i} and {j} are indistinguishable");
+                assert!(
+                    dist(&kept[i].1, &kept[j].1) > 0.1,
+                    "rows {i} and {j} are indistinguishable"
+                );
             }
         }
 
         // All cached: the heads see bit-identical inputs, so everything matches exactly.
         let (got, fresh) = m
-            .expand_batch_cached(&states, 2, true, 42, &all, &|n| n.next_multiple_of(4), true, &[])
+            .expand_batch_cached(
+                &states,
+                2,
+                true,
+                42,
+                &all,
+                &|n| n.next_multiple_of(4),
+                true,
+                &[],
+            )
             .unwrap();
-        assert!(fresh.fresh.iter().all(|f| f.is_none()), "all hits: nothing comes back fresh");
+        assert!(
+            fresh.fresh.iter().all(|f| f.is_none()),
+            "all hits: nothing comes back fresh"
+        );
         assert_eq!(want.len(), got.len());
         for (i, (w, g)) in want.iter().zip(&got).enumerate() {
             assert_eq!(w.0, g.0, "row {i} value");
             assert_eq!(w.1.len(), g.1.len(), "row {i} candidate count");
             for ((ws, wp, we), (gs, gp, ge)) in w.1.iter().zip(&g.1) {
-                assert!(ws == gs && wp == gp && we == ge, "row {i} candidate differs");
+                assert!(
+                    ws == gs && wp == gp && we == ge,
+                    "row {i} candidate differs"
+                );
             }
         }
 
@@ -1151,7 +1297,16 @@ mod tests {
         // do in production, where batch composition changes every wave. Hits
         // must still be exact; a miss on the wrong row would be off by >0.1.
         let (got, fresh) = m
-            .expand_batch_cached(&states, 2, true, 42, &half, &|n| n.next_multiple_of(4), true, &[])
+            .expand_batch_cached(
+                &states,
+                2,
+                true,
+                42,
+                &half,
+                &|n| n.next_multiple_of(4),
+                true,
+                &[],
+            )
             .unwrap();
         for (i, (c, f)) in half.iter().zip(&fresh.fresh).enumerate() {
             if c.is_some() {
@@ -1160,16 +1315,30 @@ mod tests {
             } else {
                 let v = f.expect("a miss comes back fresh");
                 let h = fresh.row(i);
-                assert!((v - kept[i].0).abs() < 1e-4, "row {i}: miss value {v} vs {}", kept[i].0);
-                assert!((got[i].0 - kept[i].0).abs() < 1e-4, "row {i}: returned value");
-                assert!(dist(h, &kept[i].1) < 2e-2, "row {i}: miss computed for the wrong position");
+                assert!(
+                    (v - kept[i].0).abs() < 1e-4,
+                    "row {i}: miss value {v} vs {}",
+                    kept[i].0
+                );
+                assert!(
+                    (got[i].0 - kept[i].0).abs() < 1e-4,
+                    "row {i}: returned value"
+                );
+                assert!(
+                    dist(h, &kept[i].1) < 2e-2,
+                    "row {i}: miss computed for the wrong position"
+                );
             }
         }
     }
 
     fn fixture_net() -> Option<crate::net::LocalNet> {
         let dir = std::env::var("MINIONS_PARITY_DIR").ok()?;
-        crate::net::LocalNet::load(&std::path::Path::new(&dir).join("checkpoint.safetensors"), false).ok()
+        crate::net::LocalNet::load(
+            &std::path::Path::new(&dir).join("checkpoint.safetensors"),
+            false,
+        )
+        .ok()
     }
 
     fn model(cfg: SamplerConfig) -> Option<MinionsModel> {
@@ -1238,7 +1407,10 @@ mod tests {
             let (_, u) = s.piece_at(c).unwrap();
             let offered = opts[c as usize] & (1 << TARGET_UNSUMMON) != 0;
             assert_eq!(offered, !u.stats().persistent, "cell {c}");
-            assert!(opts[c as usize] & (1 << TARGET_KILL) != 0, "kill is always offered");
+            assert!(
+                opts[c as usize] & (1 << TARGET_KILL) != 0,
+                "kill is always offered"
+            );
         }
     }
 
@@ -1254,14 +1426,21 @@ mod tests {
         s.money[0] = 99;
         let m = MinionsModel::spawn_options(&s);
         for u in BUYABLE {
-            assert!(m & (1 << u as u8) != 0, "{} should be affordable", u.stats().name);
+            assert!(
+                m & (1 << u as u8) != 0,
+                "{} should be affordable",
+                u.stats().name
+            );
         }
     }
 
     #[test]
     fn sampled_declarations_are_collision_free_and_realizable() {
-        let Some(m) = model(SamplerConfig { k_candidates: 8, seed: 3, ..Default::default() })
-        else {
+        let Some(m) = model(SamplerConfig {
+            k_candidates: 8,
+            seed: 3,
+            ..Default::default()
+        }) else {
             eprintln!("MINIONS_PARITY_DIR unset — skipping");
             return;
         };
@@ -1309,7 +1488,9 @@ mod tests {
                     continue;
                 }
                 let d = MOVE_DEST[c][kk as usize];
-                let Some((_, unit)) = s.piece_at(c as u8) else { continue };
+                let Some((_, unit)) = s.piece_at(c as u8) else {
+                    continue;
+                };
                 assert!(
                     d != NO_CELL && crate::map::dist(c as u8, d) <= unit.stats().speed as u32,
                     "declared a destination beyond the unit's speed"
@@ -1320,8 +1501,11 @@ mod tests {
 
     #[test]
     fn expand_returns_distinct_scored_candidates() {
-        let Some(m) = model(SamplerConfig { k_candidates: 12, seed: 9, ..Default::default() })
-        else {
+        let Some(m) = model(SamplerConfig {
+            k_candidates: 12,
+            seed: 9,
+            ..Default::default()
+        }) else {
             eprintln!("MINIONS_PARITY_DIR unset — skipping");
             return;
         };
@@ -1335,7 +1519,10 @@ mod tests {
         let mut keys = std::collections::HashSet::new();
         for (spec, _, _) in &cands {
             let next = MinionsTurns::apply(&s, spec);
-            assert!(keys.insert(Minions::encode_state(&next)), "duplicate position survived");
+            assert!(
+                keys.insert(Minions::encode_state(&next)),
+                "duplicate position survived"
+            );
         }
     }
 
@@ -1343,7 +1530,11 @@ mod tests {
     fn t_equals_one_degenerates_to_mean_field() {
         // Sanity on the dial: T=1 must still produce complete, legal declarations
         // — it is the mean-field baseline, not a broken configuration.
-        let Some(m) = model(SamplerConfig { t_steps: 1, seed: 4, ..Default::default() }) else {
+        let Some(m) = model(SamplerConfig {
+            t_steps: 1,
+            seed: 4,
+            ..Default::default()
+        }) else {
             eprintln!("MINIONS_PARITY_DIR unset — skipping");
             return;
         };
@@ -1439,14 +1630,26 @@ mod commit_bench {
         for cell in bitboard::cells(cx.live.targets) {
             let opts = cx.target_opts[cell as usize];
             let allow = |v: usize| opts & (1 << v) != 0;
-            consider(cell, C_TARGET, OFF_TARGETS, N_TARGETS, &allow, &mut picks, rng);
+            consider(
+                cell,
+                C_TARGET,
+                OFF_TARGETS,
+                N_TARGETS,
+                &allow,
+                &mut picks,
+                rng,
+            );
         }
         for cell in bitboard::cells(cx.live.spawns) {
             let so = cx.spawn_opts;
             let allow = |v: usize| so & (1 << v) != 0;
             consider(cell, C_SPAWN, OFF_SPAWNS, N_SPAWNS, &allow, &mut picks, rng);
         }
-        let already = chain.committed.iter().map(|c| c.count_ones() as usize).sum::<usize>();
+        let already = chain
+            .committed
+            .iter()
+            .map(|c| c.count_ones() as usize)
+            .sum::<usize>();
         let take = want.saturating_sub(already).max(1).min(picks.len());
         picks.sort_by(|a, b| b.0.total_cmp(&a.0));
         for &(_, cell, field, value) in picks.iter().take(take) {
@@ -1466,8 +1669,10 @@ mod commit_bench {
     fn position() -> MinionsState {
         let mut st = MinionsState::default();
         let mut rng = ChaCha8Rng::seed_from_u64(11);
-        let plies: usize =
-            std::env::var("COMMIT_BENCH_PLIES").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
+        let plies: usize = std::env::var("COMMIT_BENCH_PLIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6);
         for _ in 0..plies {
             if crate::game::Minions::outcome(&st).is_terminal() {
                 break;
@@ -1503,7 +1708,16 @@ mod commit_bench {
                     if legacy_arm {
                         legacy(&mut chain, &mut claimed, &cx, &logits, want, 1.0, &mut rng);
                     } else {
-                        commit_round(&mut chain, &mut claimed, &cx, &logits, want, 1.0, &mut rng, &mut picks);
+                        commit_round(
+                            &mut chain,
+                            &mut claimed,
+                            &cx,
+                            &logits,
+                            want,
+                            1.0,
+                            &mut rng,
+                            &mut picks,
+                        );
                     }
                 }
                 std::hint::black_box(&chain);
@@ -1558,7 +1772,10 @@ mod order_bench {
     ) {
         let temp = temperature.max(1e-3);
         picks.clear();
-        let mut consider = |cell: u8, field: u8, off: usize, n_cls: usize,
+        let mut consider = |cell: u8,
+                            field: u8,
+                            off: usize,
+                            n_cls: usize,
                             allowed: &dyn Fn(usize) -> bool,
                             picks: &mut Vec<(f32, u8, u8, u8)>,
                             rng: &mut ChaCha8Rng| {
@@ -1620,7 +1837,11 @@ mod order_bench {
             let allow = |v: usize| so & (1 << v) != 0;
             consider(cell, C_SPAWN, OFF_SPAWNS, N_SPAWNS, &allow, picks, rng);
         }
-        let already = chain.committed.iter().map(|c| c.count_ones() as usize).sum::<usize>();
+        let already = chain
+            .committed
+            .iter()
+            .map(|c| c.count_ones() as usize)
+            .sum::<usize>();
         let take = want.saturating_sub(already).max(1).min(picks.len());
         picks.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
         for &(_, cell, field, value) in picks.iter().take(take) {
@@ -1664,11 +1885,27 @@ mod order_bench {
                 for t in 1..=steps {
                     let want = MinionsModel::committed_after(t, steps, cx.n_live);
                     if legacy_arm {
-                        legacy(&mut chain, &mut claimed, &cx, &logits, want, 1.0, &mut rng,
-                               &mut old_picks);
+                        legacy(
+                            &mut chain,
+                            &mut claimed,
+                            &cx,
+                            &logits,
+                            want,
+                            1.0,
+                            &mut rng,
+                            &mut old_picks,
+                        );
                     } else {
-                        commit_round(&mut chain, &mut claimed, &cx, &logits, want, 1.0, &mut rng,
-                                     &mut new_picks);
+                        commit_round(
+                            &mut chain,
+                            &mut claimed,
+                            &cx,
+                            &logits,
+                            want,
+                            1.0,
+                            &mut rng,
+                            &mut new_picks,
+                        );
                     }
                 }
                 std::hint::black_box(&chain);
@@ -1688,7 +1925,10 @@ mod order_bench {
         let per = |ms: f64| ms * 1e6 / (reps as f64 * steps as f64 * 8.0);
         println!(
             "commit_round  confidence {:.0} ns/call   random {:.0} ns/call   {:+.1}%  (n_live={})",
-            per(la), per(nu), (la - nu) / la * 100.0, cx.n_live
+            per(la),
+            per(nu),
+            (la - nu) / la * 100.0,
+            cx.n_live
         );
     }
 }

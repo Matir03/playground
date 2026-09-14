@@ -14,7 +14,7 @@
 use std::sync::Mutex;
 
 use ort::ep::cuda::ConvAlgorithmSearch;
-use ort::execution_providers::{CUDA, TensorRT};
+use ort::execution_providers::{TensorRT, CUDA};
 use ort::session::Session;
 use ort::value::Tensor;
 
@@ -42,8 +42,11 @@ impl OrtModel {
         // Heuristic conv-algorithm selection: the default (Exhaustive) re-autotunes
         // cuDNN for every new batch shape, which is pathological for self-play's
         // varying batch sizes (a 16-game chunk took 75s; GPU 23%).
-        let cuda = || CUDA::default().with_device_id(0)
-            .with_conv_algorithm_search(ConvAlgorithmSearch::Heuristic);
+        let cuda = || {
+            CUDA::default()
+                .with_device_id(0)
+                .with_conv_algorithm_search(ConvAlgorithmSearch::Heuristic)
+        };
         let providers = match ep {
             "trt" => {
                 std::fs::create_dir_all(cache_dir).ok();
@@ -66,7 +69,9 @@ impl OrtModel {
             .map_err(e2a)?
             .commit_from_file(onnx_path)
             .map_err(e2a)?;
-        Ok(Self { session: Mutex::new(session) })
+        Ok(Self {
+            session: Mutex::new(session),
+        })
     }
 }
 

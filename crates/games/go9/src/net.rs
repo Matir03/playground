@@ -44,7 +44,10 @@ struct ResBlock {
 
 impl ResBlock {
     fn load(c: usize, vb: VarBuilder) -> candle_core::Result<Self> {
-        let cfg = Conv2dConfig { padding: 1, ..Default::default() };
+        let cfg = Conv2dConfig {
+            padding: 1,
+            ..Default::default()
+        };
         Ok(Self {
             c1: conv2d(c, c, 3, cfg, vb.pp("c1"))?,
             b1: batch_norm(c, BatchNormConfig::default(), vb.pp("b1"))?,
@@ -74,7 +77,10 @@ struct Net {
 
 impl Net {
     fn load(channels: usize, blocks_n: usize, vb: VarBuilder) -> candle_core::Result<Self> {
-        let cfg = Conv2dConfig { padding: 1, ..Default::default() };
+        let cfg = Conv2dConfig {
+            padding: 1,
+            ..Default::default()
+        };
         let mut blocks = Vec::with_capacity(blocks_n);
         let blocks_vb = vb.pp("blocks");
         for i in 0..blocks_n {
@@ -94,7 +100,10 @@ impl Net {
 
     /// planes (B,3,9,9) -> LGS (B,LGS_DIM), tanh-bounded.
     fn encode(&self, planes: &Tensor) -> candle_core::Result<Tensor> {
-        let mut x = self.stem_bn.forward_t(&self.stem.forward(planes)?, false)?.relu()?;
+        let mut x = self
+            .stem_bn
+            .forward_t(&self.stem.forward(planes)?, false)?
+            .relu()?;
         for blk in &self.blocks {
             x = blk.forward(&x)?;
         }
@@ -123,7 +132,11 @@ impl Net {
     /// LGS (1,LGS_DIM) -> (priors over 82, predicted next-LGS per action (82,LGS_DIM)).
     fn policy_heads(&self, lgs: &Tensor) -> candle_core::Result<(Vec<f32>, Tensor)> {
         let priors = candle_nn::ops::softmax(&self.pol_prior.forward(lgs)?, 1)?;
-        let nexts = self.pol_next.forward(lgs)?.tanh()?.reshape((ACTIONS, LGS_DIM))?;
+        let nexts = self
+            .pol_next
+            .forward(lgs)?
+            .tanh()?
+            .reshape((ACTIONS, LGS_DIM))?;
         Ok((priors.flatten_all()?.to_vec1::<f32>()?, nexts))
     }
 }
@@ -146,7 +159,10 @@ struct AzNet {
 
 impl AzNet {
     fn load(channels: usize, blocks_n: usize, vb: VarBuilder) -> candle_core::Result<Self> {
-        let cfg = Conv2dConfig { padding: 1, ..Default::default() };
+        let cfg = Conv2dConfig {
+            padding: 1,
+            ..Default::default()
+        };
         let cfg1 = Conv2dConfig::default(); // 1×1 conv (no padding)
         let mut blocks = Vec::with_capacity(blocks_n);
         let blocks_vb = vb.pp("blocks");
@@ -168,7 +184,10 @@ impl AzNet {
     }
 
     fn trunk(&self, planes: &Tensor) -> candle_core::Result<Tensor> {
-        let mut x = self.stem_bn.forward_t(&self.stem.forward(planes)?, false)?.relu()?;
+        let mut x = self
+            .stem_bn
+            .forward_t(&self.stem.forward(planes)?, false)?
+            .relu()?;
         for blk in &self.blocks {
             x = blk.forward(&x)?;
         }
@@ -178,13 +197,26 @@ impl AzNet {
     /// Batched self-play forward: planes (B,3,9,9) -> (values[B], probs[B*82]).
     fn value_policy_batch(&self, planes: &Tensor) -> candle_core::Result<(Vec<f32>, Vec<f32>)> {
         let x = self.trunk(planes)?;
-        let p = self.pol_bn.forward_t(&self.pol_conv.forward(&x)?, false)?.relu()?.flatten_from(1)?;
+        let p = self
+            .pol_bn
+            .forward_t(&self.pol_conv.forward(&x)?, false)?
+            .relu()?
+            .flatten_from(1)?;
         let probs = candle_nn::ops::softmax(&self.pol_fc.forward(&p)?, 1)?
             .flatten_all()?
             .to_vec1::<f32>()?;
-        let v = self.val_bn.forward_t(&self.val_conv.forward(&x)?, false)?.relu()?.flatten_from(1)?;
+        let v = self
+            .val_bn
+            .forward_t(&self.val_conv.forward(&x)?, false)?
+            .relu()?
+            .flatten_from(1)?;
         let v = self.val_fc1.forward(&v)?.relu()?;
-        let vals = self.val_fc2.forward(&v)?.tanh()?.flatten_all()?.to_vec1::<f32>()?;
+        let vals = self
+            .val_fc2
+            .forward(&v)?
+            .tanh()?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
         Ok((vals, probs))
     }
 }
@@ -228,7 +260,10 @@ fn read_arch(checkpoint: &Path) -> Arch {
             }
         }
     }
-    Arch::Reif { channels: 96, blocks: 10 }
+    Arch::Reif {
+        channels: 96,
+        blocks: 10,
+    }
 }
 
 /// A compute device for the in-process net. `cuda` needs the `cuda` feature.
@@ -263,13 +298,18 @@ impl LocalModel {
     pub fn load_on(checkpoint: &str, device: Device) -> anyhow::Result<Self> {
         let path = Path::new(checkpoint);
         // SAFETY: the mmap lives for the VarBuilder's load; tensors are copied.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[checkpoint], DType::F32, &device)? };
+        let vb =
+            unsafe { VarBuilder::from_mmaped_safetensors(&[checkpoint], DType::F32, &device)? };
         let net = match read_arch(path) {
             Arch::Reif { channels, blocks } => Backbone::Reif(Net::load(channels, blocks, vb)?),
             Arch::Az { channels, blocks } => Backbone::Az(AzNet::load(channels, blocks, vb)?),
         };
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("local");
-        Ok(Self { net, device, model_version: format!("go9-{stem}") })
+        Ok(Self {
+            net,
+            device,
+            model_version: format!("go9-{stem}"),
+        })
     }
 
     /// Fill `out` (length `b*3*CELLS`) with the 3 side-to-move planes of `states`,
@@ -292,7 +332,11 @@ impl LocalModel {
     }
 
     fn gs_state(&self, payload: Vec<f32>) -> LatentGameState {
-        LatentGameState::new(f32_to_bytes(&payload), vec![LGS_DIM as i32], self.model_version.clone())
+        LatentGameState::new(
+            f32_to_bytes(&payload),
+            vec![LGS_DIM as i32],
+            self.model_version.clone(),
+        )
     }
 
     /// AlphaZero-style self-play forward: state -> (value, softmax over 82).
@@ -339,7 +383,10 @@ impl ModelClient<Go9> for LocalModel {
         let Backbone::Reif(net) = &self.net else {
             anyhow::bail!("go9-az net has no latent encoder; reification MCTS unsupported");
         };
-        let lgs = net.encode(&self.planes(state)?)?.flatten_all()?.to_vec1::<f32>()?;
+        let lgs = net
+            .encode(&self.planes(state)?)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
         Ok(self.gs_state(lgs))
     }
 
@@ -350,7 +397,11 @@ impl ModelClient<Go9> for LocalModel {
         Ok(net.value(&self.lgs_tensor(lgs)?)? as f64)
     }
 
-    async fn policy(&self, lgs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>> {
+    async fn policy(
+        &self,
+        lgs: &LatentGameState,
+        top_b: u32,
+    ) -> anyhow::Result<Vec<PolicyCandidate>> {
         let Backbone::Reif(net) = &self.net else {
             anyhow::bail!("go9-az net: latent policy unsupported");
         };
@@ -399,7 +450,10 @@ pub fn action_to_move(a: usize) -> Go9Move {
     if a >= PASS {
         Go9Move::Pass
     } else {
-        Go9Move::Play { r: (a / N) as u8, c: (a % N) as u8 }
+        Go9Move::Play {
+            r: (a / N) as u8,
+            c: (a % N) as u8,
+        }
     }
 }
 
@@ -428,7 +482,10 @@ fn decode_action(seed: &[u8]) -> Option<usize> {
 }
 
 fn f32_le(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 fn f32_to_bytes(v: &[f32]) -> Vec<u8> {
@@ -450,13 +507,19 @@ mod tests {
         }
         let m = LocalModel::load(ckpt).unwrap();
         let mut s = Go9::initial_state();
-        for mv in [Go9Move::Play { r: 2, c: 2 }, Go9Move::Play { r: 6, c: 6 },
-                   Go9Move::Play { r: 4, c: 4 }] {
+        for mv in [
+            Go9Move::Play { r: 2, c: 2 },
+            Go9Move::Play { r: 6, c: 6 },
+            Go9Move::Play { r: 4, c: 4 },
+        ] {
             s = Go9::apply(&s, &mv);
         }
         let (v, probs) = m.policy_value(&s).unwrap();
         let psum: f32 = probs.iter().sum();
-        eprintln!("value {v:.5}  policy_sum {psum:.5}  pass_prior {:.5}", probs[PASS]);
+        eprintln!(
+            "value {v:.5}  policy_sum {psum:.5}  pass_prior {:.5}",
+            probs[PASS]
+        );
         assert!((psum - 1.0).abs() < 1e-3, "policy must be a distribution");
     }
 }

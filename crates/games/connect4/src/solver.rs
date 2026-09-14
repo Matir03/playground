@@ -215,7 +215,10 @@ struct MoveSorter {
 
 impl MoveSorter {
     fn new() -> Self {
-        Self { entries: [(0, 0); 7], size: 0 }
+        Self {
+            entries: [(0, 0); 7],
+            size: 0,
+        }
     }
     fn add(&mut self, mv: u64, score: u32) {
         let mut i = self.size;
@@ -237,7 +240,10 @@ struct Engine {
 
 impl Engine {
     fn new() -> Self {
-        Self { tt: TransTable::new(), nodes: 0 }
+        Self {
+            tt: TransTable::new(),
+            nodes: 0,
+        }
     }
 
     fn negamax(&mut self, pos: &Position, mut alpha: i32, mut beta: i32) -> i32 {
@@ -371,7 +377,11 @@ fn to_position(state: &Connect4State) -> Position {
             }
         }
     }
-    Position { current, mask, moves: state.ply as u32 }
+    Position {
+        current,
+        mask,
+        moves: state.ply as u32,
+    }
 }
 
 /// One engine (transposition table) reused across moves and games. Warming it
@@ -418,7 +428,11 @@ impl Solver for Connect4 {
         // Opening: center is provably optimal and skips the most expensive
         // full-board solve.
         if state.ply == 0 {
-            return SearchOutcome { best_move: Connect4Move { col: 3 }, value: 1.0, nodes: 0 };
+            return SearchOutcome {
+                best_move: Connect4Move { col: 3 },
+                value: 1.0,
+                nodes: 0,
+            };
         }
 
         let pos = to_position(state);
@@ -473,7 +487,10 @@ impl Solver for Connect4 {
         // all moves were skipped) — fall back to the first legal column.
         let (col, value) = match best_col {
             Some(c) => (c, best_score.clamp(-1, 1) as f64),
-            None => (fallback.expect("non-terminal position has a legal move"), -1.0),
+            None => (
+                fallback.expect("non-terminal position has a legal move"),
+                -1.0,
+            ),
         };
 
         SearchOutcome {
@@ -503,7 +520,7 @@ mod tests {
         s = play(&s, 1); // S
         s = play(&s, 2); // F
         s = play(&s, 2); // S
-        // First to move; col 3 completes four across the bottom row.
+                         // First to move; col 3 completes four across the bottom row.
         let out = Connect4::choose_move(&s);
         assert_eq!(out.best_move.col, 3);
         let next = play(&s, out.best_move.col);
@@ -519,7 +536,7 @@ mod tests {
         s = play(&s, 1); // F col1
         s = play(&s, 6); // S col6
         s = play(&s, 2); // F col2  -> threat to win at col3
-        // Second to move; must play col3 to block.
+                         // Second to move; must play col3 to block.
         let out = Connect4::choose_move(&s);
         assert_eq!(out.best_move.col, 3, "engine must block the open three");
     }

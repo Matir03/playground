@@ -66,12 +66,23 @@ pub fn examples_from_records(records: Vec<MvGameRecord<Amazons>>) -> Vec<Example
                 *a.entry(ai as u32).or_insert(0.0) += prob;
             }
             let z = match winner {
-                Some(w) => if w == mv.to_move { 1.0 } else { -1.0 },
+                Some(w) => {
+                    if w == mv.to_move {
+                        1.0
+                    } else {
+                        -1.0
+                    }
+                }
                 None => 0.0,
             };
             let mut planes = vec![0f32; PLANES];
             game::fill_planes_into(&rec.states[i], &mut planes);
-            out.push(Example { planes, value: z, queen: sparse(q), arrow: sparse(a) });
+            out.push(Example {
+                planes,
+                value: z,
+                queen: sparse(q),
+                arrow: sparse(a),
+            });
         }
     }
     out
@@ -109,7 +120,10 @@ fn max_chunk_seq(buffer: &Path) -> Option<u64> {
         .filter_map(|e| {
             let name = e.file_name();
             let s = name.to_str()?;
-            s.strip_prefix("chunk_")?.strip_suffix(".bin")?.parse::<u64>().ok()
+            s.strip_prefix("chunk_")?
+                .strip_suffix(".bin")?
+                .parse::<u64>()
+                .ok()
         })
         .max()
 }
@@ -120,8 +134,13 @@ fn prune_buffer(buffer: &Path, keep: usize) {
         .flatten()
         .filter_map(|e| e.ok())
         .filter_map(|e| {
-            let s = e.file_name().to_str()?.strip_prefix("chunk_")?.strip_suffix(".bin")?
-                .parse::<u64>().ok()?;
+            let s = e
+                .file_name()
+                .to_str()?
+                .strip_prefix("chunk_")?
+                .strip_suffix(".bin")?
+                .parse::<u64>()
+                .ok()?;
             Some((s, e.path()))
         })
         .collect();
@@ -156,16 +175,26 @@ pub fn run_loop(
     let buffer = Path::new(live_dir).join("buffer");
     std::fs::create_dir_all(&buffer)?;
     let ort = backend == "ort";
-    let device = if ort { None } else { Some(crate::net::pick_device(cuda)?) };
+    let device = if ort {
+        None
+    } else {
+        Some(crate::net::pick_device(cuda)?)
+    };
     // The weights file we hot-reload from when the learner snapshots.
     let weights = if ort { onnx.clone() } else { latest.clone() };
 
     // Build the current model (ORT/TRT or candle) as a trait object.
     let make_model = || -> anyhow::Result<Arc<dyn BatchModel>> {
         if ort {
-            Ok(Arc::new(crate::ort_net::OrtModel::new(&onnx, ep, fp16, &trt_cache)?) as Arc<dyn BatchModel>)
+            Ok(
+                Arc::new(crate::ort_net::OrtModel::new(&onnx, ep, fp16, &trt_cache)?)
+                    as Arc<dyn BatchModel>,
+            )
         } else {
-            Ok(Arc::new(LocalModel::load_on(&latest, device.clone().unwrap())?) as Arc<dyn BatchModel>)
+            Ok(
+                Arc::new(LocalModel::load_on(&latest, device.clone().unwrap())?)
+                    as Arc<dyn BatchModel>,
+            )
         }
     };
 
@@ -193,14 +222,18 @@ pub fn run_loop(
             let examples = examples_from_records(games);
             let tmp = buffer.join(format!("chunk_{seq:06}.bin.tmp"));
             let path = buffer.join(format!("chunk_{seq:06}.bin"));
-            if write_dump(tmp.to_str().unwrap(), &examples).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+            if write_dump(tmp.to_str().unwrap(), &examples).is_ok()
+                && std::fs::rename(&tmp, &path).is_ok()
+            {
                 prune_buffer(&buffer, max_chunks);
                 seq += 1;
             }
             eprintln!(
                 "  chunk {}: {n_games} games  {} ex  {:.0} plies/game  {:.0}% resigned",
-                seq.saturating_sub(1), examples.len(),
-                examples.len() as f64 / n_games as f64, 100.0 * resigned as f64 / n_games as f64,
+                seq.saturating_sub(1),
+                examples.len(),
+                examples.len() as f64 / n_games as f64,
+                100.0 * resigned as f64 / n_games as f64,
             );
         }
         let mt = std::fs::metadata(&weights).and_then(|m| m.modified()).ok();
@@ -218,7 +251,15 @@ pub fn run_loop(
     };
 
     batch_search::run_actor_continuous::<Amazons, _>(
-        &model, concurrency, params, threads, max_batch, base_seed, chunk_secs, 60.0, on_flush,
+        &model,
+        concurrency,
+        params,
+        threads,
+        max_batch,
+        base_seed,
+        chunk_secs,
+        60.0,
+        on_flush,
     );
     Ok(()) // unreachable (runs until the process is killed)
 }
@@ -241,11 +282,29 @@ pub fn run_benchmark(
 ) -> anyhow::Result<()> {
     let (records, cs) = if backend == "ort" {
         let model = crate::ort_net::OrtModel::new(onnx, ep, fp16, "data/amazons_trt_cache")?;
-        batch_search::run_selfplay_moves::<Amazons>(&model, concurrency, params, threads, max_batch, seed, secs, 1.0)
+        batch_search::run_selfplay_moves::<Amazons>(
+            &model,
+            concurrency,
+            params,
+            threads,
+            max_batch,
+            seed,
+            secs,
+            1.0,
+        )
     } else {
         let device = crate::net::pick_device(cuda)?;
         let model = LocalModel::load_on(model_path, device)?;
-        batch_search::run_selfplay_moves::<Amazons>(&model, concurrency, params, threads, max_batch, seed, secs, 1.0)
+        batch_search::run_selfplay_moves::<Amazons>(
+            &model,
+            concurrency,
+            params,
+            threads,
+            max_batch,
+            seed,
+            secs,
+            1.0,
+        )
     };
     let games = records.len();
     let plies: usize = records.iter().map(|r| r.moves.len()).sum();

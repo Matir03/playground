@@ -70,10 +70,10 @@ pub struct Params {
 
 struct Node {
     state: Connect4State,
-    p: [f32; C4_COLS],   // priors, 0 for illegal columns
-    n: [u32; C4_COLS],   // visit counts per child (incl. forced-random)
-    rnd: [u32; C4_COLS], // subset of n taken via ε-greedy forced-random selection
-    w: [f32; C4_COLS],   // total value per child (from the parent's perspective)
+    p: [f32; C4_COLS],        // priors, 0 for illegal columns
+    n: [u32; C4_COLS],        // visit counts per child (incl. forced-random)
+    rnd: [u32; C4_COLS],      // subset of n taken via ε-greedy forced-random selection
+    w: [f32; C4_COLS],        // total value per child (from the parent's perspective)
     children: [i32; C4_COLS], // arena index of each child, -1 = not created
     legal: [bool; C4_COLS],
     expanded: bool,
@@ -123,7 +123,11 @@ fn expand(arena: &mut Vec<Node>, idx: usize, eval: &impl Evaluator) -> anyhow::R
         .iter()
         .map(|m| m.col)
         .collect();
-    let s: f32 = legal.iter().map(|&c| probs[c as usize]).sum::<f32>().max(1e-12);
+    let s: f32 = legal
+        .iter()
+        .map(|&c| probs[c as usize])
+        .sum::<f32>()
+        .max(1e-12);
     let node = &mut arena[idx];
     for &c in &legal {
         let c = c as usize;
@@ -155,7 +159,11 @@ fn select(node: &Node, c_puct: f32) -> usize {
         if !node.legal[c] {
             continue;
         }
-        let q = if node.n[c] > 0 { node.w[c] / node.n[c] as f32 } else { fpu };
+        let q = if node.n[c] > 0 {
+            node.w[c] / node.n[c] as f32
+        } else {
+            fpu
+        };
         let u = c_puct * node.p[c] * sqrt_total / (1 + node.n[c]) as f32;
         let score = q + u;
         if score > best_score {
@@ -243,7 +251,8 @@ pub fn run_mcts(
             node = if child >= 0 {
                 child as usize
             } else {
-                let next_state = Connect4::apply(&arena[node].state, &Connect4Move { col: c as u8 });
+                let next_state =
+                    Connect4::apply(&arena[node].state, &Connect4Move { col: c as u8 });
                 let new_idx = arena.len();
                 arena.push(Node::new(next_state));
                 arena[node].children[c] = new_idx as i32;
@@ -302,10 +311,17 @@ impl playground_core::batch_search::BatchGame for Connect4 {
         <Connect4 as Game>::initial_state()
     }
     fn to_move(state: &Connect4State) -> u8 {
-        if state.ply % 2 == 0 { 1 } else { 2 }
+        if state.ply % 2 == 0 {
+            1
+        } else {
+            2
+        }
     }
     fn candidate_actions(state: &Connect4State) -> Vec<usize> {
-        Connect4::legal_moves(state).iter().map(|m| m.col as usize).collect()
+        Connect4::legal_moves(state)
+            .iter()
+            .map(|m| m.col as usize)
+            .collect()
     }
     fn apply_action(state: &Connect4State, action: usize) -> Option<Connect4State> {
         // Every legal column is a candidate, so a candidate is always legal.
@@ -376,7 +392,10 @@ pub fn self_play_game(
             };
         } else {
             // Degenerate (all root visits forced-random): uniform over legal.
-            let legal: Vec<usize> = Connect4::legal_moves(cur).iter().map(|m| m.col as usize).collect();
+            let legal: Vec<usize> = Connect4::legal_moves(cur)
+                .iter()
+                .map(|m| m.col as usize)
+                .collect();
             let u = 1.0 / legal.len().max(1) as f32;
             for &lc in &legal {
                 policy[lc] = u;
@@ -398,10 +417,20 @@ pub fn self_play_game(
     let mut examples = Vec::with_capacity(moves.len());
     for (i, (policy, to_move)) in moves.into_iter().enumerate() {
         let z = match winner {
-            Some(w) => if w == to_move { 1.0 } else { -1.0 },
+            Some(w) => {
+                if w == to_move {
+                    1.0
+                } else {
+                    -1.0
+                }
+            }
             None => 0.0,
         };
-        examples.push(Example { planes: planes_of(&states[i]), policy, value: z });
+        examples.push(Example {
+            planes: planes_of(&states[i]),
+            policy,
+            value: z,
+        });
     }
     Ok((examples, total_sims, total_nodes))
 }

@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use ort::ep::cuda::ConvAlgorithmSearch;
-use ort::execution_providers::{CUDA, TensorRT};
+use ort::execution_providers::{TensorRT, CUDA};
 use ort::session::Session;
 use ort::value::TensorRef;
 
@@ -49,10 +49,16 @@ struct Edges {
 
 fn edges(sess: &Session, input: &str, output: &str) -> Edges {
     let is16 = |outlets: &[ort::value::Outlet], name: &str| {
-        outlets.iter().find(|o| o.name() == name).and_then(|o| o.dtype().tensor_type())
+        outlets
+            .iter()
+            .find(|o| o.name() == name)
+            .and_then(|o| o.dtype().tensor_type())
             == Some(ort::value::TensorElementType::Float16)
     };
-    Edges { in16: is16(sess.inputs(), input), out16: is16(sess.outputs(), output) }
+    Edges {
+        in16: is16(sess.inputs(), input),
+        out16: is16(sess.outputs(), output),
+    }
 }
 
 /// One output as f32, widened when the graph emits fp16.
@@ -110,7 +116,11 @@ pub struct OrtNet {
 /// How many sessions to build per graph. `1` reproduces the old single-session
 /// behaviour exactly, so this is A/B-able without a rebuild.
 fn pool_size() -> usize {
-    std::env::var("MINIONS_ORT_POOL").ok().and_then(|v| v.parse().ok()).filter(|&n| n >= 1).unwrap_or(1)
+    std::env::var("MINIONS_ORT_POOL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1)
 }
 
 impl Drop for OrtNet {
@@ -224,7 +234,9 @@ impl OrtNet {
         let cache = playground_core::trt_cache::content_keyed(cache_dir, &trunk_path)?;
         let n_pool = n_pool.max(1);
         let pool = |path: std::path::PathBuf| -> anyhow::Result<Vec<Mutex<Session>>> {
-            (0..n_pool).map(|_| build(&path, ep, fp16, &cache).map(Mutex::new)).collect()
+            (0..n_pool)
+                .map(|_| build(&path, ep, fp16, &cache).map(Mutex::new))
+                .collect()
         };
         let trunk = pool(trunk_path.clone())?;
 
@@ -244,12 +256,17 @@ impl OrtNet {
         let diffusion = pool(dir.join("diffusion.onnx"))?;
         let energy = pool(dir.join("energy.onnx"))?;
         let io = |p: &[Mutex<Session>], i: &str, o: &str| edges(&p[0].lock().unwrap(), i, o);
-        let (trunk_io, diffusion_io, energy_io) =
-            (io(&trunk, "planes", "h"), io(&diffusion, "h", "logits"), io(&energy, "h", "energy"));
+        let (trunk_io, diffusion_io, energy_io) = (
+            io(&trunk, "planes", "h"),
+            io(&diffusion, "h", "logits"),
+            io(&energy, "h", "energy"),
+        );
         let alt = dir.join("fp32");
         let fp32_alt = if alt.join("trunk.onnx").exists() {
             eprintln!("loaded the fp32 graph set in {} (A/B arm)", alt.display());
-            Some(Box::new(Self::with_pool(&alt, ep, fp16, cache_dir, n_pool)?))
+            Some(Box::new(Self::with_pool(
+                &alt, ep, fp16, cache_dir, n_pool,
+            )?))
         } else {
             None
         };
@@ -301,13 +318,17 @@ impl OrtNet {
             let d16: Vec<f16> = Vec::from_f32_slice(decl);
             let ht = TensorRef::from_array_view((hshape, h)).map_err(e2a)?;
             let dt = TensorRef::from_array_view((dshape, &d16[..])).map_err(e2a)?;
-            let outputs = sess.run(ort::inputs!["h" => ht, "decl" => dt]).map_err(e2a)?;
+            let outputs = sess
+                .run(ort::inputs!["h" => ht, "decl" => dt])
+                .map_err(e2a)?;
             Ok(take_f32!(outputs, output, io.out16))
         } else {
             let h32 = h.to_f32_vec();
             let ht = TensorRef::from_array_view((hshape, &h32[..])).map_err(e2a)?;
             let dt = TensorRef::from_array_view((dshape, decl)).map_err(e2a)?;
-            let outputs = sess.run(ort::inputs!["h" => ht, "decl" => dt]).map_err(e2a)?;
+            let outputs = sess
+                .run(ort::inputs!["h" => ht, "decl" => dt])
+                .map_err(e2a)?;
             Ok(take_f32!(outputs, output, io.out16))
         }
     }
@@ -337,11 +358,17 @@ impl Backend for OrtNet {
             let p16: Vec<f16> = Vec::from_f32_slice(planes);
             let input = TensorRef::from_array_view((shape, &p16[..])).map_err(e2a)?;
             let outputs = sess.run(ort::inputs!["planes" => input]).map_err(e2a)?;
-            (take_f16!(outputs, "h", net.trunk_io.out16), take_f32!(outputs, "value", false))
+            (
+                take_f16!(outputs, "h", net.trunk_io.out16),
+                take_f32!(outputs, "value", false),
+            )
         } else {
             let input = TensorRef::from_array_view((shape, planes)).map_err(e2a)?;
             let outputs = sess.run(ort::inputs!["planes" => input]).map_err(e2a)?;
-            (take_f16!(outputs, "h", net.trunk_io.out16), take_f32!(outputs, "value", false))
+            (
+                take_f16!(outputs, "h", net.trunk_io.out16),
+                take_f32!(outputs, "value", false),
+            )
         };
         // Cheap guard against a config.json that has drifted from the graph:
         // silently wrong channel counts would reshape every later head call.
@@ -361,14 +388,30 @@ impl Backend for OrtNet {
 
     fn diffusion(&self, h: &[f16], decl: &[f32], b: usize) -> anyhow::Result<Vec<f32>> {
         let net = self.active();
-        let out = net.run_head(&net.diffusion, net.diffusion_io, h, decl, b, "logits", DECL_PLANES)?;
+        let out = net.run_head(
+            &net.diffusion,
+            net.diffusion_io,
+            h,
+            decl,
+            b,
+            "logits",
+            DECL_PLANES,
+        )?;
         debug_assert_eq!(out.len(), b * NUM_CELLS * DECL_LOGITS);
         Ok(out)
     }
 
     fn energy(&self, h: &[f16], decl: &[f32], b: usize) -> anyhow::Result<Vec<f32>> {
         let net = self.active();
-        net.run_head(&net.energy, net.energy_io, h, decl, b, "energy", ENERGY_PLANES)
+        net.run_head(
+            &net.energy,
+            net.energy_io,
+            h,
+            decl,
+            b,
+            "energy",
+            ENERGY_PLANES,
+        )
     }
 
     /// Per-step by default: with fp16 edges `h` is already in the graph's
@@ -377,11 +420,20 @@ impl Backend for OrtNet {
     /// `BoundPass` would bind `h` on the device once, but it is broken (see
     /// there), fp32-only, and needs a session pool, since it holds one session
     /// for the whole pass -- so it stays behind `MINIONS_ORT_BIND`.
-    fn diffusion_pass<'a>(&'a self, h: &'a [f16], b: usize) -> anyhow::Result<Box<dyn DiffusionPass + 'a>> {
+    fn diffusion_pass<'a>(
+        &'a self,
+        h: &'a [f16],
+        b: usize,
+    ) -> anyhow::Result<Box<dyn DiffusionPass + 'a>> {
         let net = self.active();
         let pool = net.diffusion.as_ref().expect("session outlives run");
         if !net.diffusion_io.in16 && pool.len() >= 2 && env_flag("MINIONS_ORT_BIND", false) {
-            return Ok(Box::new(BoundPass::new(net.acquire(pool), &h.to_f32_vec(), b, net.channels)?));
+            return Ok(Box::new(BoundPass::new(
+                net.acquire(pool),
+                &h.to_f32_vec(),
+                b,
+                net.channels,
+            )?));
         }
         Ok(Box::new(NaivePass { net, h, b }))
     }
@@ -449,8 +501,11 @@ impl DiffusionPass for BoundPass<'_> {
         // upload this optimisation exists to remove is `h`, not the output, so
         // allocating here costs nothing that matters.
         let n_out = self.b * NUM_CELLS * DECL_LOGITS;
-        let ot = Tensor::from_array((vec![self.b as i64, NUM_CELLS as i64, DECL_LOGITS as i64],
-            vec![0f32; n_out])).map_err(e2a)?;
+        let ot = Tensor::from_array((
+            vec![self.b as i64, NUM_CELLS as i64, DECL_LOGITS as i64],
+            vec![0f32; n_out],
+        ))
+        .map_err(e2a)?;
         self.binding.bind_output("logits", ot).map_err(e2a)?;
         let out = self.sess.run_binding(&self.binding).map_err(e2a)?;
         self.binding.synchronize_outputs().map_err(e2a)?;
@@ -473,22 +528,26 @@ mod tests {
     /// points at the input. ORT may run in-place ops on a bound input buffer.
     #[test]
     fn bound_h_is_not_mutated_across_runs() {
-        let Ok(dir) = std::env::var("MINIONS_ORT_DIR") else { return };
+        let Ok(dir) = std::env::var("MINIONS_ORT_DIR") else {
+            return;
+        };
         let dir = std::path::Path::new(&dir);
         let cache = dir.join("trt_cache").to_string_lossy().into_owned();
-        let Ok(ort) = OrtNet::with_pool(dir, "cuda", false, &cache, 2) else { return };
+        let Ok(ort) = OrtNet::with_pool(dir, "cuda", false, &cache, 2) else {
+            return;
+        };
         let b = 4usize;
         let c = ort.channels();
-        let h0: Vec<f32> =
-            (0..b * c * NUM_CELLS).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
-        let decl: Vec<f32> =
-            vec![0.25f32; b * DECL_PLANES * NUM_CELLS];
+        let h0: Vec<f32> = (0..b * c * NUM_CELLS)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0)
+            .collect();
+        let decl: Vec<f32> = vec![0.25f32; b * DECL_PLANES * NUM_CELLS];
 
         use ort::value::Tensor;
         let pool = ort.diffusion.as_ref().unwrap();
         let mut sess = pool[0].lock().unwrap();
-        let ht = Tensor::from_array((vec![b as i64, c as i64, N as i64, N as i64], h0.clone()))
-            .unwrap();
+        let ht =
+            Tensor::from_array((vec![b as i64, c as i64, N as i64, N as i64], h0.clone())).unwrap();
         // Fresh binding per run: if this is deterministic while a reused
         // binding is not, the bug is binding *reuse* — which is the whole
         // point of the optimisation.
@@ -515,8 +574,11 @@ mod tests {
             drop(out);
             // Read the h tensor back: has ORT written into our buffer?
             let (_, hnow) = ht.try_extract_tensor::<f32>().unwrap();
-            let drift: f32 =
-                hnow.iter().zip(h0.iter()).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+            let drift: f32 = hnow
+                .iter()
+                .zip(h0.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
             println!("run {run}: logits[0]={first:.6}  max |h_now - h_orig| = {drift:.6}");
         }
     }
@@ -524,14 +586,19 @@ mod tests {
     /// Diagnostic: is the mismatch from rebinding `decl`, or from `h`?
     #[test]
     fn bound_pass_diagnosis() {
-        let Ok(dir) = std::env::var("MINIONS_ORT_DIR") else { return };
+        let Ok(dir) = std::env::var("MINIONS_ORT_DIR") else {
+            return;
+        };
         let dir = std::path::Path::new(&dir);
         let cache = dir.join("trt_cache").to_string_lossy().into_owned();
-        let Ok(ort) = OrtNet::with_pool(dir, "cuda", false, &cache, 2) else { return };
+        let Ok(ort) = OrtNet::with_pool(dir, "cuda", false, &cache, 2) else {
+            return;
+        };
         let b = 4usize;
         let c = ort.channels();
-        let h: Vec<f32> =
-            (0..b * c * NUM_CELLS).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
+        let h: Vec<f32> = (0..b * c * NUM_CELLS)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0)
+            .collect();
         let h: Vec<f16> = Vec::from_f32_slice(&h);
         let d0: Vec<f32> = (0..b * DECL_PLANES * NUM_CELLS)
             .map(|i| ((i % 7) as f32 - 3.0) / 3.0)
@@ -547,7 +614,10 @@ mod tests {
         let mut pass = ort.diffusion_pass(&h, b).unwrap();
         for i in 0..3 {
             let got = pass.step(&d0).unwrap();
-            println!("same-decl step {i}: {:.6}  (direct0 {:.6})", got[0], direct0[0]);
+            println!(
+                "same-decl step {i}: {:.6}  (direct0 {:.6})",
+                got[0], direct0[0]
+            );
         }
         drop(pass);
         // (b) d0 then d1
@@ -555,8 +625,11 @@ mod tests {
         let a = pass.step(&d0).unwrap();
         let bb = pass.step(&d1).unwrap();
         println!("d0 then d1: {:.6} then {:.6}", a[0], bb[0]);
-        println!("  matches direct0? {}   matches direct1? {}",
-            (bb[0] - direct0[0]).abs() < 1e-4, (bb[0] - direct1[0]).abs() < 1e-4);
+        println!(
+            "  matches direct0? {}   matches direct1? {}",
+            (bb[0] - direct0[0]).abs() < 1e-4,
+            (bb[0] - direct1[0]).abs() < 1e-4
+        );
     }
 
     /// The bound pass must return exactly what the per-step path returns.
@@ -591,8 +664,9 @@ mod tests {
         let c = ort.channels();
         // Distinct per-row values: a binding that reused row 0 for every row, or
         // transposed the batch, would still look sane against uniform input.
-        let h: Vec<f32> =
-            (0..b * c * NUM_CELLS).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
+        let h: Vec<f32> = (0..b * c * NUM_CELLS)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0)
+            .collect();
         let h: Vec<f16> = Vec::from_f32_slice(&h);
         let steps = 4usize;
         let decls: Vec<Vec<f32>> = (0..steps)
@@ -630,8 +704,8 @@ mod tests {
             return;
         };
         let dir = std::path::Path::new(&dir);
-        let candle = LocalNet::load(&dir.join("latest.safetensors"), false)
-            .expect("load safetensors");
+        let candle =
+            LocalNet::load(&dir.join("latest.safetensors"), false).expect("load safetensors");
         let ort = match OrtNet::new(dir, "cuda", false, &dir.join("trt_cache").to_string_lossy()) {
             Ok(o) => o,
             Err(e) => {
@@ -656,12 +730,24 @@ mod tests {
         // agreement is to a few 1e-4 on activations of order 10, which is
         // numerical noise rather than a wiring bug.
         let worst = |a: &[f32], b: &[f32]| {
-            let abs = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            let abs = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
             let scale = a.iter().fold(1.0f32, |m, v| m.max(v.abs()));
             abs / scale
         };
-        assert!(worst(&tc.h.to_f32_vec(), &to.h.to_f32_vec()) < 1e-3, "trunk differs by {}", worst(&tc.h.to_f32_vec(), &to.h.to_f32_vec()));
-        assert!(worst(&tc.value, &to.value) < 1e-3, "value differs by {}", worst(&tc.value, &to.value));
+        assert!(
+            worst(&tc.h.to_f32_vec(), &to.h.to_f32_vec()) < 1e-3,
+            "trunk differs by {}",
+            worst(&tc.h.to_f32_vec(), &to.h.to_f32_vec())
+        );
+        assert!(
+            worst(&tc.value, &to.value) < 1e-3,
+            "value differs by {}",
+            worst(&tc.value, &to.value)
+        );
 
         // Heads, batched over two distinct declarations so a batch-axis bug
         // cannot hide behind a single row.
@@ -671,20 +757,32 @@ mod tests {
         for i in 0..2 {
             let spec = crate::turn::TurnSpec::random_plausible(&s, &mut rng);
             let p = crate::turn::Partial::fully_committed(&spec, &live);
-            p.write_planes(&mut decl[i * DECL_PLANES * NUM_CELLS..(i + 1) * DECL_PLANES * NUM_CELLS]);
+            p.write_planes(
+                &mut decl[i * DECL_PLANES * NUM_CELLS..(i + 1) * DECL_PLANES * NUM_CELLS],
+            );
         }
         let h2 = crate::net::repeat_trunk(&tc.h, 2);
         let dc = candle.diffusion(&h2, &decl, 2).unwrap();
         let do_ = ort.diffusion(&h2, &decl, 2).unwrap();
         assert_eq!(dc.len(), do_.len());
-        assert!(worst(&dc, &do_) < 1e-3, "diffusion differs by {}", worst(&dc, &do_));
+        assert!(
+            worst(&dc, &do_) < 1e-3,
+            "diffusion differs by {}",
+            worst(&dc, &do_)
+        );
 
         let ec = candle.energy(&h2, &decl, 2).unwrap();
         let eo = ort.energy(&h2, &decl, 2).unwrap();
-        assert!(worst(&ec, &eo) < 1e-3, "energy differs by {}", worst(&ec, &eo));
+        assert!(
+            worst(&ec, &eo) < 1e-3,
+            "energy differs by {}",
+            worst(&ec, &eo)
+        );
         eprintln!(
             "ort parity ok — trunk {:e}, diffusion {:e}, energy {:e}",
-            worst(&tc.h.to_f32_vec(), &to.h.to_f32_vec()), worst(&dc, &do_), worst(&ec, &eo)
+            worst(&tc.h.to_f32_vec(), &to.h.to_f32_vec()),
+            worst(&dc, &do_),
+            worst(&ec, &eo)
         );
     }
 }
@@ -719,18 +817,27 @@ pub fn bench_binding(
 
     let c = channels as i64;
     let b = rows as i64;
-    let h: Vec<f32> = (0..(rows * channels * NUM_CELLS)).map(|i| (i % 17) as f32 * 0.01).collect();
+    let h: Vec<f32> = (0..(rows * channels * NUM_CELLS))
+        .map(|i| (i % 17) as f32 * 0.01)
+        .collect();
     let mut decl: Vec<f32> = vec![0.0; rows * DECL_PLANES * NUM_CELLS];
 
     // Arm A: exactly today's path — a fresh TensorRef for both inputs, every step.
     let arm_a = |sess: &mut Session, decl: &mut Vec<f32>| -> anyhow::Result<f64> {
         let t0 = std::time::Instant::now();
         for step in 0..steps {
-            let n = decl.len(); decl[step % n] = step as f32;
-            let ht = TensorRef::from_array_view((vec![b, c, N as i64, N as i64], h.as_slice())).map_err(e2a)?;
-            let dt = TensorRef::from_array_view((vec![b, DECL_PLANES as i64, N as i64, N as i64], decl.as_slice()))
+            let n = decl.len();
+            decl[step % n] = step as f32;
+            let ht = TensorRef::from_array_view((vec![b, c, N as i64, N as i64], h.as_slice()))
                 .map_err(e2a)?;
-            let out = sess.run(ort::inputs!["h" => ht, "decl" => dt]).map_err(e2a)?;
+            let dt = TensorRef::from_array_view((
+                vec![b, DECL_PLANES as i64, N as i64, N as i64],
+                decl.as_slice(),
+            ))
+            .map_err(e2a)?;
+            let out = sess
+                .run(ort::inputs!["h" => ht, "decl" => dt])
+                .map_err(e2a)?;
             let (_, v) = out["logits"].try_extract_tensor::<f32>().map_err(e2a)?;
             std::hint::black_box(v.len());
         }
@@ -743,13 +850,24 @@ pub fn bench_binding(
         let mut binding = sess.create_binding().map_err(e2a)?;
         let ht = Tensor::from_array((vec![b, c, N as i64, N as i64], h.clone())).map_err(e2a)?;
         binding.bind_input("h", &ht).map_err(e2a)?;
-        let cuda_out = MemoryInfo::new(AllocationDevice::CPU, 0, AllocatorType::Device, MemoryType::CPUOutput)
+        let cuda_out = MemoryInfo::new(
+            AllocationDevice::CPU,
+            0,
+            AllocatorType::Device,
+            MemoryType::CPUOutput,
+        )
+        .map_err(e2a)?;
+        binding
+            .bind_output_to_device("logits", &cuda_out)
             .map_err(e2a)?;
-        binding.bind_output_to_device("logits", &cuda_out).map_err(e2a)?;
         for step in 0..steps {
-            let n = decl.len(); decl[step % n] = step as f32;
-            let dt = Tensor::from_array((vec![b, DECL_PLANES as i64, N as i64, N as i64], decl.clone()))
-                .map_err(e2a)?;
+            let n = decl.len();
+            decl[step % n] = step as f32;
+            let dt = Tensor::from_array((
+                vec![b, DECL_PLANES as i64, N as i64, N as i64],
+                decl.clone(),
+            ))
+            .map_err(e2a)?;
             binding.bind_input("decl", &dt).map_err(e2a)?;
             let out = sess.run_binding(&binding).map_err(e2a)?;
             let (_, v) = out["logits"].try_extract_tensor::<f32>().map_err(e2a)?;
@@ -772,10 +890,17 @@ pub fn bench_binding(
         let (a, bb) = ((a1 + a2) / 2.0, (b1 + b2) / 2.0);
         ta += a;
         tb += bb;
-        println!("  rep {rep}: rebind-h {a:7.2} ms   bind-once {bb:7.2} ms   {:+.1}%", (a - bb) / a * 100.0);
+        println!(
+            "  rep {rep}: rebind-h {a:7.2} ms   bind-once {bb:7.2} ms   {:+.1}%",
+            (a - bb) / a * 100.0
+        );
     }
-    println!("mean: rebind-h {:.2} ms   bind-once {:.2} ms   delta {:+.1}%", ta / reps as f64, tb / reps as f64,
-        (ta - tb) / ta * 100.0);
+    println!(
+        "mean: rebind-h {:.2} ms   bind-once {:.2} ms   delta {:+.1}%",
+        ta / reps as f64,
+        tb / reps as f64,
+        (ta - tb) / ta * 100.0
+    );
     Ok(())
 }
 
@@ -796,20 +921,31 @@ mod native_f16_tests {
     #[test]
     #[ignore = "needs a GPU and two exports of one net"]
     fn native_f16_graphs_match_fp32_graphs() {
-        let (Ok(d16), Ok(d32)) = (std::env::var("MINIONS_ORT_DIR16"), std::env::var("MINIONS_ORT_DIR32")) else {
+        let (Ok(d16), Ok(d32)) = (
+            std::env::var("MINIONS_ORT_DIR16"),
+            std::env::var("MINIONS_ORT_DIR32"),
+        ) else {
             return;
         };
         let cache = std::env::temp_dir().join("minions-native-f16-test-trt");
         let cache = cache.to_str().unwrap();
         let n16 = OrtNet::with_pool(Path::new(&d16), "trt", true, cache, 1).unwrap();
         let n32 = OrtNet::with_pool(Path::new(&d32), "trt", true, cache, 1).unwrap();
-        let all16 = Edges { in16: true, out16: true };
+        let all16 = Edges {
+            in16: true,
+            out16: true,
+        };
         assert!(
             n16.trunk_io == all16 && n16.diffusion_io == all16 && n16.energy_io == all16,
             "{d16} is not an fp16-edge export: {:?} {:?} {:?}",
-            n16.trunk_io, n16.diffusion_io, n16.energy_io
+            n16.trunk_io,
+            n16.diffusion_io,
+            n16.energy_io
         );
-        assert!(!n32.trunk_io.in16 && !n32.diffusion_io.in16 && !n32.energy_io.in16, "{d32} is not fp32");
+        assert!(
+            !n32.trunk_io.in16 && !n32.diffusion_io.in16 && !n32.energy_io.in16,
+            "{d32} is not fp32"
+        );
 
         let mut st = Minions::initial_state();
         let mut planes = Vec::new();
@@ -822,7 +958,10 @@ mod native_f16_tests {
             st = Minions::apply(&st, &legal[legal.len() / 2]);
         }
         let b = planes.len() / (IN_PLANES * NUM_CELLS);
-        let (t16, t32) = (n16.trunk(&planes, b).unwrap(), n32.trunk(&planes, b).unwrap());
+        let (t16, t32) = (
+            n16.trunk(&planes, b).unwrap(),
+            n32.trunk(&planes, b).unwrap(),
+        );
         let rel = |a: &[f32], z: &[f32]| {
             let scale = a.iter().fold(1e-6f32, |m, v| m.max(v.abs()));
             a.iter().zip(z).fold(0f32, |m, (p, q)| m.max((p - q).abs())) / scale
@@ -834,30 +973,56 @@ mod native_f16_tests {
             x ^= x << 17;
             (x >> 40) as f32 / (1u64 << 24) as f32
         };
-        let decl: Vec<f32> = (0..b * DECL_PLANES * NUM_CELLS).map(|_| (rnd() < 0.2) as u8 as f32).collect();
-        let edecl: Vec<f32> = (0..b * ENERGY_PLANES * NUM_CELLS).map(|_| (rnd() < 0.2) as u8 as f32).collect();
+        let decl: Vec<f32> = (0..b * DECL_PLANES * NUM_CELLS)
+            .map(|_| (rnd() < 0.2) as u8 as f32)
+            .collect();
+        let edecl: Vec<f32> = (0..b * ENERGY_PLANES * NUM_CELLS)
+            .map(|_| (rnd() < 0.2) as u8 as f32)
+            .collect();
         let d32 = n32.diffusion(&t32.h, &decl, b).unwrap();
         let rh = rel(&t32.h.to_f32_vec(), &t16.h.to_f32_vec());
         let rd = rel(&d32, &n16.diffusion(&t32.h, &decl, b).unwrap());
-        let re = rel(&n32.energy(&t32.h, &edecl, b).unwrap(), &n16.energy(&t32.h, &edecl, b).unwrap());
-        let rp = rel(&d32, &n16.diffusion_pass(&t32.h, b).unwrap().step(&decl).unwrap());
+        let re = rel(
+            &n32.energy(&t32.h, &edecl, b).unwrap(),
+            &n16.energy(&t32.h, &edecl, b).unwrap(),
+        );
+        let rp = rel(
+            &d32,
+            &n16.diffusion_pass(&t32.h, b).unwrap().step(&decl).unwrap(),
+        );
         // `value` is a tanh near zero on these positions, so an error relative
         // to its largest magnitude overstates it. Judge it absolutely, and --
         // given the checkpoint -- against candle's fp32 truth: the question is
         // whether fp16 edges make TensorRT's value *worse*, not whether two fp16
         // engines agree to the last bit.
-        let abs = |a: &[f32], z: &[f32]| a.iter().zip(z).fold(0f32, |m, (p, q)| m.max((p - q).abs()));
+        let abs =
+            |a: &[f32], z: &[f32]| a.iter().zip(z).fold(0f32, |m, (p, q)| m.max((p - q).abs()));
         let va = abs(&t32.value, &t16.value);
-        eprintln!("value, fp32 edges {:?}\nvalue, fp16 edges {:?}", t32.value, t16.value);
+        eprintln!(
+            "value, fp32 edges {:?}\nvalue, fp16 edges {:?}",
+            t32.value, t16.value
+        );
         if let Ok(ck) = std::env::var("MINIONS_CKPT") {
-            let truth = crate::net::LocalNet::load(Path::new(&ck), false).unwrap().trunk(&planes, b).unwrap().value;
+            let truth = crate::net::LocalNet::load(Path::new(&ck), false)
+                .unwrap()
+                .trunk(&planes, b)
+                .unwrap()
+                .value;
             let (e32, e16) = (abs(&truth, &t32.value), abs(&truth, &t16.value));
             eprintln!("value, candle fp32 {truth:?}\nvalue error vs fp32 truth: fp32 edges {e32:.2e}  fp16 edges {e16:.2e}");
-            assert!(e16 <= 2.0 * e32 + 1e-2, "fp16 edges make value worse: {e16} vs {e32}");
+            assert!(
+                e16 <= 2.0 * e32 + 1e-2,
+                "fp16 edges make value worse: {e16} vs {e32}"
+            );
         }
         eprintln!("fp16 vs fp32 edges (b={b}): trunk h {rh:.2e}  value |d| {va:.2e}  diffusion {rd:.2e}  energy {re:.2e}  pass {rp:.2e}");
         assert!(va < 5e-2, "value differs by {va}");
-        for (name, r) in [("trunk h", rh), ("diffusion", rd), ("energy", re), ("pass", rp)] {
+        for (name, r) in [
+            ("trunk h", rh),
+            ("diffusion", rd),
+            ("energy", re),
+            ("pass", rp),
+        ] {
             assert!(r < 2e-2, "{name} disagrees by {r}");
         }
     }

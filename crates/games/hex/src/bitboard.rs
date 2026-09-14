@@ -78,7 +78,11 @@ impl Bb {
     /// `self & !o`.
     #[inline]
     pub fn andnot(self, o: Bb) -> Bb {
-        Bb([self.0[0] & !o.0[0], self.0[1] & !o.0[1], self.0[2] & !o.0[2]])
+        Bb([
+            self.0[0] & !o.0[0],
+            self.0[1] & !o.0[1],
+            self.0[2] & !o.0[2],
+        ])
     }
 
     /// Complement, masked to the board.
@@ -92,7 +96,12 @@ impl Bb {
     pub fn shift_up(self, k: u32) -> Bb {
         debug_assert!(k > 0 && k < 64);
         let w = self.0;
-        Bb([w[0] << k, (w[1] << k) | (w[0] >> (64 - k)), (w[2] << k) | (w[1] >> (64 - k))]).and(BOARD_MASK)
+        Bb([
+            w[0] << k,
+            (w[1] << k) | (w[0] >> (64 - k)),
+            (w[2] << k) | (w[1] >> (64 - k)),
+        ])
+        .and(BOARD_MASK)
     }
 
     /// Shift towards lower indices by `k` (0 < k < 64).
@@ -100,7 +109,11 @@ impl Bb {
     pub fn shift_down(self, k: u32) -> Bb {
         debug_assert!(k > 0 && k < 64);
         let w = self.0;
-        Bb([(w[0] >> k) | (w[1] << (64 - k)), (w[1] >> k) | (w[2] << (64 - k)), w[2] >> k])
+        Bb([
+            (w[0] >> k) | (w[1] << (64 - k)),
+            (w[1] >> k) | (w[2] << (64 - k)),
+            w[2] >> k,
+        ])
     }
 
     /// Indices of the set bits, ascending.

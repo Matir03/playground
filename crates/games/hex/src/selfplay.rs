@@ -31,7 +31,10 @@ use crate::net::LocalModel;
 pub enum Backend {
     Candle,
     /// `ep` is "trt" or "cuda"; `fp16` applies to TensorRT.
-    Ort { ep: &'static str, fp16: bool },
+    Ort {
+        ep: &'static str,
+        fp16: bool,
+    },
 }
 
 impl Backend {
@@ -65,7 +68,11 @@ impl Backend {
         }
     }
 
-    fn load(self, live_dir: &str, device: Option<candle_core::Device>) -> anyhow::Result<Arc<dyn BatchModel>> {
+    fn load(
+        self,
+        live_dir: &str,
+        device: Option<candle_core::Device>,
+    ) -> anyhow::Result<Arc<dyn BatchModel>> {
         let path = self.weights_path(live_dir);
         tracing::debug!(%path, "loading self-play weights");
         match self {
@@ -81,7 +88,11 @@ impl Backend {
 
     /// Same, for a checkpoint given directly (the bench and eval take a path,
     /// not a live dir).
-    pub fn load_file(self, path: &str, device: Option<candle_core::Device>) -> anyhow::Result<Arc<dyn BatchModel>> {
+    pub fn load_file(
+        self,
+        path: &str,
+        device: Option<candle_core::Device>,
+    ) -> anyhow::Result<Arc<dyn BatchModel>> {
         match self {
             Backend::Candle => Ok(Arc::new(LocalModel::load_on(path, device.unwrap())?)),
             Backend::Ort { ep, fp16 } => {
@@ -89,7 +100,9 @@ impl Backend {
                     .parent()
                     .map(|d| d.join("trt_cache").to_string_lossy().into_owned())
                     .unwrap_or_else(|| "trt_cache".to_string());
-                Ok(Arc::new(crate::ort_net::OrtModel::new(path, ep, fp16, &cache)?))
+                Ok(Arc::new(crate::ort_net::OrtModel::new(
+                    path, ep, fp16, &cache,
+                )?))
             }
         }
     }
@@ -119,7 +132,10 @@ pub struct Example {
 pub fn examples_from_records(records: Vec<MvGameRecord<Hex>>) -> Vec<Example> {
     let mut out = Vec::new();
     for rec in records {
-        let final_state = rec.states.last().expect("a game has at least the initial state");
+        let final_state = rec
+            .states
+            .last()
+            .expect("a game has at least the initial state");
         let winner: Option<u8> = if let Some(loser) = rec.resigned_by {
             Some(3 - loser)
         } else if final_state.winner != 0 {
@@ -169,7 +185,12 @@ pub fn examples_from_records(records: Vec<MvGameRecord<Hex>>) -> Vec<Example> {
                         if owner == mv.to_move { 1.0 } else { -1.0 };
                 }
             }
-            out.push(Example { planes, value: z, policy, ownership });
+            out.push(Example {
+                planes,
+                value: z,
+                policy,
+                ownership,
+            });
         }
     }
     out
@@ -213,11 +234,18 @@ pub fn write_dump(out_path: &str, examples: &[Example]) -> anyhow::Result<()> {
 fn chunk_seq(entry: &std::fs::DirEntry) -> Option<u64> {
     let name = entry.file_name();
     let s = name.to_str()?;
-    s.strip_prefix("chunk_")?.strip_suffix(".bin")?.parse::<u64>().ok()
+    s.strip_prefix("chunk_")?
+        .strip_suffix(".bin")?
+        .parse::<u64>()
+        .ok()
 }
 
 fn max_chunk_seq(buffer: &Path) -> Option<u64> {
-    std::fs::read_dir(buffer).ok()?.filter_map(|e| e.ok()).filter_map(|e| chunk_seq(&e)).max()
+    std::fs::read_dir(buffer)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| chunk_seq(&e))
+        .max()
 }
 
 /// Number of examples in a chunk, from its header — cheap, no parsing of the body.
@@ -299,7 +327,11 @@ pub fn run_loop(
         eprintln!("waiting for the learner's first export at {weights} ...");
         std::thread::sleep(Duration::from_secs(5));
     }
-    let device = if backend.is_ort() { None } else { Some(crate::net::pick_device(cuda)?) };
+    let device = if backend.is_ort() {
+        None
+    } else {
+        Some(crate::net::pick_device(cuda)?)
+    };
     let make_model = || backend.load(live_dir, device.clone());
     let model: Mutex<Arc<dyn BatchModel>> = Mutex::new(make_model()?);
     let mut last_mtime = std::fs::metadata(&weights).and_then(|m| m.modified()).ok();
@@ -410,7 +442,11 @@ pub fn run_benchmark(
     secs: f64,
     backend: Backend,
 ) -> anyhow::Result<()> {
-    let device = if backend.is_ort() { None } else { Some(crate::net::pick_device(cuda)?) };
+    let device = if backend.is_ort() {
+        None
+    } else {
+        Some(crate::net::pick_device(cuda)?)
+    };
     let model = backend.load_file(model_path, device)?;
     let (records, cs) = batch_search::run_selfplay_moves::<Hex>(
         &*model,
@@ -516,9 +552,19 @@ mod tests {
         };
         // How often do independent searches of the *same* opening agree?
         let agreement = |k: f32| {
-            let params = SearchParams { forced_playout_k: k, ..base };
+            let params = SearchParams {
+                forced_playout_k: k,
+                ..base
+            };
             let (records, _) = batch_search::run_selfplay_moves::<Hex>(
-                &FlatPolicyNoisyValue, 32, params, 4, 16, 11, 25.0, 0.0,
+                &FlatPolicyNoisyValue,
+                32,
+                params,
+                4,
+                16,
+                11,
+                25.0,
+                0.0,
             );
             let picks: Vec<usize> = records
                 .iter()
@@ -530,7 +576,11 @@ mod tests {
                 *counts.entry(*p).or_insert(0usize) += 1;
             }
             let top = counts.values().copied().max().unwrap_or(0);
-            (picks.len(), counts.len(), top as f32 / picks.len().max(1) as f32)
+            (
+                picks.len(),
+                counts.len(),
+                top as f32 / picks.len().max(1) as f32,
+            )
         };
         let (n_off, distinct_off, top_off) = agreement(0.0);
         let (n_on, distinct_on, top_on) = agreement(2.0);
@@ -583,12 +633,21 @@ mod tests {
         // The ply of each game's first training example.
         let first_training_plies = |params: SearchParams| -> Vec<usize> {
             let (records, _) = batch_search::run_selfplay_moves::<Hex>(
-                &FlatPolicyNoisyValue, 24, params, 4, 16, 7, 20.0, 0.0,
+                &FlatPolicyNoisyValue,
+                24,
+                params,
+                4,
+                16,
+                7,
+                20.0,
+                0.0,
             );
             records
                 .iter()
                 .filter_map(|r| {
-                    r.moves.iter().position(|m| m.for_training && m.visits.iter().sum::<u32>() > 0)
+                    r.moves
+                        .iter()
+                        .position(|m| m.for_training && m.visits.iter().sum::<u32>() > 0)
                 })
                 .collect()
         };
@@ -596,12 +655,25 @@ mod tests {
         // Off: every game is trained on from the empty board.
         let off = first_training_plies(base);
         assert!(!off.is_empty(), "expected some games");
-        assert!(off.iter().all(|&p| p == 0), "without random openings every game starts at ply 0");
+        assert!(
+            off.iter().all(|&p| p == 0),
+            "without random openings every game starts at ply 0"
+        );
 
         // On: games start from many different positions.
-        let params = SearchParams { random_opening_max: 169, ..base };
+        let params = SearchParams {
+            random_opening_max: 169,
+            ..base
+        };
         let (records, _) = batch_search::run_selfplay_moves::<Hex>(
-            &FlatPolicyNoisyValue, 24, params, 4, 16, 7, 20.0, 0.0,
+            &FlatPolicyNoisyValue,
+            24,
+            params,
+            4,
+            16,
+            7,
+            20.0,
+            0.0,
         );
         assert!(!records.is_empty(), "expected some games");
 
@@ -621,8 +693,14 @@ mod tests {
             assert_eq!(r.states[first].winner, 0, "trained on a finished position");
             // The opening is a real prefix: every recorded move is legal at its state.
             for (i, m) in r.moves.iter().enumerate().take(first) {
-                assert!(m.played < m.moves.len(), "move index outside the legal list");
-                assert_eq!(r.states[i].winner, 0, "opening continued past a finished game");
+                assert!(
+                    m.played < m.moves.len(),
+                    "move index outside the legal list"
+                );
+                assert_eq!(
+                    r.states[i].winner, 0,
+                    "opening continued past a finished game"
+                );
             }
         }
         assert!(
@@ -656,7 +734,14 @@ mod tests {
             random_opening_decay: 1.0,
         };
         let (records, _) = batch_search::run_selfplay_moves::<Hex>(
-            &FlatPolicyNoisyValue, 24, params, 4, 16, 3, 20.0, 0.0,
+            &FlatPolicyNoisyValue,
+            24,
+            params,
+            4,
+            16,
+            3,
+            20.0,
+            0.0,
         );
         assert!(!records.is_empty(), "expected some games");
 
@@ -667,10 +752,16 @@ mod tests {
             .flat_map(|r| &r.moves)
             .filter(|m| m.visits.iter().sum::<u32>() == 0)
             .count();
-        assert!(openings > 0, "no random openings were played; the test proves nothing");
+        assert!(
+            openings > 0,
+            "no random openings were played; the test proves nothing"
+        );
         for m in records.iter().flat_map(|r| &r.moves) {
             if m.visits.iter().sum::<u32>() == 0 {
-                assert!(!m.for_training, "an unsearched opening move was marked for training");
+                assert!(
+                    !m.for_training,
+                    "an unsearched opening move was marked for training"
+                );
             }
         }
 
@@ -715,16 +806,25 @@ mod tests {
             random_opening_decay: 1.0,
         };
         let draw = |decay: f32| -> Vec<u32> {
-            let params = SearchParams { random_opening_decay: decay, ..base };
+            let params = SearchParams {
+                random_opening_decay: decay,
+                ..base
+            };
             let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(11);
-            (0..20_000).map(|_| batch_search::sample_opening_len_for_test(&params, &mut rng)).collect()
+            (0..20_000)
+                .map(|_| batch_search::sample_opening_len_for_test(&params, &mut rng))
+                .collect()
         };
         let mean = |v: &[u32]| v.iter().map(|&x| x as f64).sum::<f64>() / v.len() as f64;
         let in_range = |v: &[u32]| v.iter().all(|&x| x <= 169);
 
         let uniform = draw(1.0);
         assert!(in_range(&uniform));
-        assert!((mean(&uniform) - 84.5).abs() < 3.0, "decay 1.0 must stay uniform, mean {}", mean(&uniform));
+        assert!(
+            (mean(&uniform) - 84.5).abs() < 3.0,
+            "decay 1.0 must stay uniform, mean {}",
+            mean(&uniform)
+        );
 
         let tilted = draw(1.01);
         assert!(in_range(&tilted));
@@ -737,13 +837,23 @@ mod tests {
             den += w;
         }
         let want = num / den;
-        assert!((mean(&tilted) - want).abs() < 3.0, "mean {}, expected {want}", mean(&tilted));
-        assert!(mean(&tilted) < mean(&uniform), "decay must shorten openings");
+        assert!(
+            (mean(&tilted) - want).abs() < 3.0,
+            "mean {}, expected {want}",
+            mean(&tilted)
+        );
+        assert!(
+            mean(&tilted) < mean(&uniform),
+            "decay must shorten openings"
+        );
 
         // Steeper decay shortens further, and the tail is still reachable.
         let steep = draw(1.05);
         assert!(mean(&steep) < mean(&tilted));
-        assert!(tilted.iter().any(|&n| n > 140), "the deep tail must still be sampled");
+        assert!(
+            tilted.iter().any(|&n| n > 140),
+            "the deep tail must still be sampled"
+        );
     }
 
     struct FlatPolicyNoisyValue;
@@ -793,8 +903,16 @@ mod tests {
             random_opening_max: 0,
             random_opening_decay: 1.0,
         };
-        let (records, _) =
-            batch_search::run_selfplay_moves::<Hex>(&FlatPolicyNoisyValue, 2, params, 2, 2, 5, 30.0, 0.0);
+        let (records, _) = batch_search::run_selfplay_moves::<Hex>(
+            &FlatPolicyNoisyValue,
+            2,
+            params,
+            2,
+            2,
+            5,
+            30.0,
+            0.0,
+        );
         assert!(!records.is_empty(), "no game finished in 30s");
         let opening = &records[0].moves[0];
         let total: u32 = opening.visits.iter().sum();
@@ -819,7 +937,8 @@ mod tests {
             temp_moves: 0,
         };
         let (_m, visits, _v) =
-            crate::mcts::run_search(&Adapter, &Hex::initial_state(), &seq_params, &mut rng).unwrap();
+            crate::mcts::run_search(&Adapter, &Hex::initial_state(), &seq_params, &mut rng)
+                .unwrap();
         let st: u32 = visits.iter().sum();
         let seq_top = *visits.iter().max().unwrap() as f32 / st as f32;
         let seq_spread = visits.iter().filter(|&&v| v > 0).count();
@@ -878,15 +997,28 @@ mod tests {
             random_opening_decay: 1.0,
         };
         // Many games in flight against a small batch, so rows are mixed.
-        let (records, _stats) =
-            batch_search::run_selfplay_moves::<Hex>(&SpikeFirstEmpty, 24, params, 4, 8, 7, 25.0, 0.0);
+        let (records, _stats) = batch_search::run_selfplay_moves::<Hex>(
+            &SpikeFirstEmpty,
+            24,
+            params,
+            4,
+            8,
+            7,
+            25.0,
+            0.0,
+        );
         assert!(!records.is_empty(), "no game finished in 25s");
         let (mut checked, mut agreed) = (0usize, 0usize);
         for rec in &records {
             for (i, mv) in rec.moves.iter().enumerate() {
                 let state = &rec.states[i];
                 // What the model would have asked for, given this position.
-                let want = state.empty().iter().map(|c| canon_index(state, c)).min().unwrap();
+                let want = state
+                    .empty()
+                    .iter()
+                    .map(|c| canon_index(state, c))
+                    .min()
+                    .unwrap();
                 let best = (0..mv.moves.len()).max_by_key(|&k| mv.visits[k]).unwrap();
                 let got = match mv.moves[best] {
                     HexMove::Play { r, c } => canon_index(state, r as usize * N + c as usize),
@@ -933,22 +1065,39 @@ mod tests {
             batch_search::run_selfplay_moves::<Hex>(&Uniform, 8, params, 2, 8, 1, 20.0, 0.0);
         assert!(!records.is_empty(), "no game finished in 20s");
         for rec in &records {
-            assert_eq!(rec.states.len(), rec.moves.len() + 1, "one state per move, plus the last");
+            assert_eq!(
+                rec.states.len(),
+                rec.moves.len() + 1,
+                "one state per move, plus the last"
+            );
             for (i, mv) in rec.moves.iter().enumerate() {
                 assert_eq!(
                     rec.states[i].to_move, mv.to_move,
                     "record {i}: the position and the move record disagree on the mover"
                 );
-                assert_eq!(rec.states[i].winner, 0, "a decided position was still searched");
+                assert_eq!(
+                    rec.states[i].winner, 0,
+                    "a decided position was still searched"
+                );
                 // The move actually played must be one the search considered.
                 assert!(mv.moves.contains(&mv.moves[mv.played]));
             }
             let last = rec.states.last().unwrap();
-            assert_ne!(last.winner, 0, "a finished game ends decided (Hex has no draws)");
-            assert_eq!(last.winner, 3 - last.to_move, "the winner is whoever moved last");
+            assert_ne!(
+                last.winner, 0,
+                "a finished game ends decided (Hex has no draws)"
+            );
+            assert_eq!(
+                last.winner,
+                3 - last.to_move,
+                "the winner is whoever moved last"
+            );
         }
         // And the derived examples inherit that: the winner's positions score +1.
-        let winners: Vec<u8> = records.iter().map(|r| r.states.last().unwrap().winner).collect();
+        let winners: Vec<u8> = records
+            .iter()
+            .map(|r| r.states.last().unwrap().winner)
+            .collect();
         let plies: Vec<usize> = records.iter().map(|r| r.moves.len()).collect();
         let examples = examples_from_records(records);
         assert_eq!(examples.len(), plies.iter().sum::<usize>());
@@ -1027,11 +1176,18 @@ mod tests {
         write_dump(path.to_str().unwrap(), &ex).unwrap();
 
         let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), DUMP_MAGIC);
-        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), DUMP_VERSION);
+        assert_eq!(
+            u32::from_le_bytes(bytes[..4].try_into().unwrap()),
+            DUMP_MAGIC
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            DUMP_VERSION
+        );
         assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), 1);
         assert_eq!(bytes.len(), 16 + EXAMPLE_FLOATS * 4);
-        let f = |off: usize| f32::from_le_bytes(bytes[16 + off * 4..20 + off * 4].try_into().unwrap());
+        let f =
+            |off: usize| f32::from_le_bytes(bytes[16 + off * 4..20 + off * 4].try_into().unwrap());
         assert_eq!(f(0), 0.5, "planes");
         assert_eq!(f(PLANES), -1.0, "value");
         assert_eq!(f(PLANES + 2), 1.0, "policy[1]");

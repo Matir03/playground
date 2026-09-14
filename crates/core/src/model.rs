@@ -168,10 +168,7 @@ pub trait LatentModel<G: Game>: Send + Sync {
 
     /// Fused move-policy + value (node expansion needs both). Default delegates;
     /// the batched model overrides it to one round-trip.
-    async fn move_policy_eval(
-        &self,
-        lgs: &LatentGameState,
-    ) -> anyhow::Result<(MovePolicy, f64)> {
+    async fn move_policy_eval(&self, lgs: &LatentGameState) -> anyhow::Result<(MovePolicy, f64)> {
         let p = self.move_policy(lgs).await?;
         let v = self.eval(lgs).await?;
         Ok((p, v))
@@ -209,7 +206,11 @@ pub trait LatentModel<G: Game>: Send + Sync {
 pub trait ModelClient<G: Game>: Send + Sync {
     async fn encode(&self, state: &G::State) -> anyhow::Result<LatentGameState>;
     async fn eval(&self, lgs: &LatentGameState) -> anyhow::Result<f64>;
-    async fn policy(&self, lgs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>>;
+    async fn policy(
+        &self,
+        lgs: &LatentGameState,
+        top_b: u32,
+    ) -> anyhow::Result<Vec<PolicyCandidate>>;
 
     /// Given `from_state` (whose encoding is `from_lgs`) and a target LGS,
     /// produce a concrete move that approximately realizes the transition.

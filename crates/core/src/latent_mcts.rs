@@ -138,7 +138,11 @@ fn make_node<G: Game>(lgs: LatentGameState, state: G::State) -> Node<G> {
     let to_move = G::to_move(&state);
     let outcome = G::outcome(&state);
     let terminal = outcome.is_terminal();
-    let terminal_value = if terminal { outcome.value_for(to_move) } else { 0.0 };
+    let terminal_value = if terminal {
+        outcome.value_for(to_move)
+    } else {
+        0.0
+    };
     Node {
         lgs,
         state,
@@ -265,8 +269,17 @@ pub async fn search<G: Game, M: LatentModel<G>>(
     for &ci in tree[0].child_by_key.values() {
         let c = &tree[ci];
         if let Some(mv) = c.incoming_move.clone() {
-            let value = if c.visits > 0 { c.value_sum / c.visits as f64 } else { 0.0 };
-            root_children.push(RootChild { mv, state: c.state.clone(), visits: c.visits, value });
+            let value = if c.visits > 0 {
+                c.value_sum / c.visits as f64
+            } else {
+                0.0
+            };
+            root_children.push(RootChild {
+                mv,
+                state: c.state.clone(),
+                visits: c.visits,
+                value,
+            });
         }
     }
     root_children.sort_by(|a, b| b.visits.cmp(&a.visits));
@@ -281,7 +294,13 @@ pub async fn search<G: Game, M: LatentModel<G>>(
         0.0
     };
 
-    Ok(SearchResult { chosen, root_value, visits: tree[0].visits, reifications, root_children })
+    Ok(SearchResult {
+        chosen,
+        root_value,
+        visits: tree[0].visits,
+        reifications,
+        root_children,
+    })
 }
 
 async fn simulate<G: Game, M: LatentModel<G>>(
@@ -315,8 +334,9 @@ async fn simulate<G: Game, M: LatentModel<G>>(
         // The root under `root_explore` is already seeded with all legal moves —
         // don't widen it (MDN samples would just alias onto those children).
         if !(cur == 0 && config.root_explore) {
-            let stats: Vec<(f64, f64)> =
-                (0..tree[cur].candidates.len()).map(|j| cand_eff(tree, cur, j)).collect();
+            let stats: Vec<(f64, f64)> = (0..tree[cur].candidates.len())
+                .map(|j| cand_eff(tree, cur, j))
+                .collect();
             widen(&mut tree[cur], config, rng, &stats, h);
         }
         let a = kr_puct_select(tree, cur, config);
@@ -340,7 +360,7 @@ async fn simulate<G: Game, M: LatentModel<G>>(
             let ver = tree[cur].lgs.model_version.clone();
             let v_child = model.eval(&LatentGameState::from_f32(&pt, ver)).await?;
             tree[cur].candidates[a].value_sum += v_child; // child POV
-            // n_eff: 0→1, v_eff: 0→ -v_child. Propagate into sibling accumulators.
+                                                          // n_eff: 0→1, v_eff: 0→ -v_child. Propagate into sibling accumulators.
             propagate(&mut tree[cur], a, 1.0, -v_child, h);
             value = -v_child; // convert to cur's POV (path ends at cur)
             break;
@@ -394,7 +414,9 @@ fn widen<G: Game>(
         return;
     }
     // Disjoint field borrows avoid cloning the (k·d) MixturePolicy each widen.
-    let Node { policy, candidates, .. } = node;
+    let Node {
+        policy, candidates, ..
+    } = node;
     if let Some(pol) = policy.as_ref() {
         while candidates.len() < target {
             let point = pol.sample(rng);
@@ -427,8 +449,14 @@ fn kr_puct_select<G: Game>(tree: &[Node<G>], node_idx: usize, config: &SearchCon
     #[cfg(debug_assertions)]
     debug_verify_accumulators(tree, node_idx, config.kernel_bandwidth.max(1e-6));
     let node = &tree[node_idx];
-    debug_assert!(node.candidates.len() > 0, "select on a node with no candidates");
-    debug_assert!(node.candidates.len() <= MAX_CAND, "candidates exceed MAX_CAND");
+    debug_assert!(
+        node.candidates.len() > 0,
+        "select on a node with no candidates"
+    );
+    debug_assert!(
+        node.candidates.len() <= MAX_CAND,
+        "candidates exceed MAX_CAND"
+    );
     let m = node.candidates.len().min(MAX_CAND);
 
     // Priors. At the root under `root_explore`, use uniform priors so visits are
@@ -453,7 +481,11 @@ fn kr_puct_select<G: Game>(tree: &[Node<G>], node_idx: usize, config: &SearchCon
             psum += *v;
         }
         for v in p.iter_mut().take(m) {
-            *v = if psum > 0.0 { *v / psum } else { 1.0 / m as f64 };
+            *v = if psum > 0.0 {
+                *v / psum
+            } else {
+                1.0 / m as f64
+            };
         }
     }
 
@@ -547,7 +579,11 @@ async fn reify_candidate<G: Game, M: LatentModel<G>>(
         node.incoming_move = Some(mv);
         let ci = tree.len();
         let anchor = node.lgs.to_f32();
-        let v = if node.terminal { node.terminal_value } else { v0 };
+        let v = if node.terminal {
+            node.terminal_value
+        } else {
+            v0
+        };
         tree.push(node);
         tree[cur].child_by_key.insert(key, ci);
         (ci, anchor, v)
@@ -728,7 +764,10 @@ async fn expand_move_policy<G: Game, M: LatentModel<G>>(
 fn move_policy_select<G: Game>(tree: &[Node<G>], node_idx: usize, config: &SearchConfig) -> usize {
     const MAX_CAND: usize = 64;
     let node = &tree[node_idx];
-    debug_assert!(!node.candidates.is_empty(), "move-policy select on empty node");
+    debug_assert!(
+        !node.candidates.is_empty(),
+        "move-policy select on empty node"
+    );
     let m = node.candidates.len().min(MAX_CAND);
 
     let mut p = [0f64; MAX_CAND];
@@ -750,7 +789,11 @@ fn move_policy_select<G: Game>(tree: &[Node<G>], node_idx: usize, config: &Searc
             psum += *v;
         }
         for v in p.iter_mut().take(m) {
-            *v = if psum > 0.0 { *v / psum } else { 1.0 / m as f64 };
+            *v = if psum > 0.0 {
+                *v / psum
+            } else {
+                1.0 / m as f64
+            };
         }
     }
 
@@ -761,7 +804,11 @@ fn move_policy_select<G: Game>(tree: &[Node<G>], node_idx: usize, config: &Searc
     for a in 0..m {
         let ci = node.candidates[a].reified.expect("seeded reified child");
         let cn = tree[ci].visits as f64;
-        let q = if cn > 0.0 { -tree[ci].value_sum / cn } else { config.fpu };
+        let q = if cn > 0.0 {
+            -tree[ci].value_sum / cn
+        } else {
+            config.fpu
+        };
         let u = config.c_puct * p[a] * sqrt_total / (1.0 + cn);
         let s = q + u;
         if s > best_s {
@@ -774,7 +821,9 @@ fn move_policy_select<G: Game>(tree: &[Node<G>], node_idx: usize, config: &Searc
 
 fn is_legal<G: Game>(state: &G::State, mv: &G::Move) -> bool {
     let target = G::encode_move(mv);
-    G::legal_moves(state).iter().any(|m| G::encode_move(m) == target)
+    G::legal_moves(state)
+        .iter()
+        .any(|m| G::encode_move(m) == target)
 }
 
 fn first_legal<G: Game>(state: &G::State) -> anyhow::Result<G::Move> {
@@ -806,10 +855,17 @@ mod tests {
             99
         }
         fn initial_state() -> State {
-            State { remaining: 7, ply: 0 }
+            State {
+                remaining: 7,
+                ply: 0,
+            }
         }
         fn to_move(s: &State) -> Player {
-            if s.ply % 2 == 0 { Player::First } else { Player::Second }
+            if s.ply % 2 == 0 {
+                Player::First
+            } else {
+                Player::Second
+            }
         }
         fn outcome(s: &State) -> Outcome {
             if s.remaining == 0 {
@@ -825,7 +881,10 @@ mod tests {
             (1..=2).filter(|&t| t <= s.remaining).collect()
         }
         fn apply(s: &State, mv: &u8) -> State {
-            State { remaining: s.remaining - mv, ply: s.ply + 1 }
+            State {
+                remaining: s.remaining - mv,
+                ply: s.ply + 1,
+            }
         }
         fn ply(s: &State) -> u32 {
             s.ply
@@ -839,7 +898,10 @@ mod tests {
             v
         }
         fn decode_state(b: &[u8]) -> anyhow::Result<State> {
-            Ok(State { remaining: b[0], ply: u32::from_le_bytes([b[1], b[2], b[3], b[4]]) })
+            Ok(State {
+                remaining: b[0],
+                ply: u32::from_le_bytes([b[1], b[2], b[3], b[4]]),
+            })
         }
         fn encode_move(m: &u8) -> Vec<u8> {
             vec![*m]
@@ -868,7 +930,10 @@ mod tests {
         }
         async fn policy(&self, lgs: &LatentGameState) -> anyhow::Result<MixturePolicy> {
             let f = lgs.to_f32();
-            let s = State { remaining: f[0].round() as u8, ply: f[1].round() as u32 };
+            let s = State {
+                remaining: f[0].round() as u8,
+                ply: f[1].round() as u32,
+            };
             let moves = Countdown::legal_moves(&s);
             let k = moves.len().max(1);
             let mut means = Vec::with_capacity(k * 2);
@@ -883,18 +948,28 @@ mod tests {
                 stds: vec![0.05; k * 2],
             })
         }
-        async fn move_policy(&self, lgs: &LatentGameState) -> anyhow::Result<crate::model::MovePolicy> {
+        async fn move_policy(
+            &self,
+            lgs: &LatentGameState,
+        ) -> anyhow::Result<crate::model::MovePolicy> {
             // One slot per legal move; each slot's predicted next-encoding is the
             // real successor encoding, so `nearest` maps every child to its slot.
             let f = lgs.to_f32();
-            let s = State { remaining: f[0].round() as u8, ply: f[1].round() as u32 };
+            let s = State {
+                remaining: f[0].round() as u8,
+                ply: f[1].round() as u32,
+            };
             let moves = Countdown::legal_moves(&s);
             let k = moves.len().max(1);
             let mut next = Vec::with_capacity(k * 2);
             for mv in &moves {
                 next.extend_from_slice(&enc(&Countdown::apply(&s, mv)));
             }
-            Ok(crate::model::MovePolicy { dim: 2, priors: vec![1.0 / k as f32; k], next })
+            Ok(crate::model::MovePolicy {
+                dim: 2,
+                priors: vec![1.0 / k as f32; k],
+                next,
+            })
         }
         async fn reify(
             &self,
@@ -924,7 +999,11 @@ mod tests {
 
     #[tokio::test]
     async fn search_returns_legal_move_and_reifies() {
-        let cfg = SearchConfig { simulations: 96, seed: Some(1), ..Default::default() };
+        let cfg = SearchConfig {
+            simulations: 96,
+            seed: Some(1),
+            ..Default::default()
+        };
         let s = Countdown::initial_state();
         let res = search(&MockModel, &s, &cfg).await.unwrap();
         assert!(Countdown::legal_moves(&s).contains(&res.chosen));
@@ -959,7 +1038,11 @@ mod tests {
 
     #[tokio::test]
     async fn tiny_budget_returns_legal_move() {
-        let cfg = SearchConfig { simulations: 1, seed: Some(0), ..Default::default() };
+        let cfg = SearchConfig {
+            simulations: 1,
+            seed: Some(0),
+            ..Default::default()
+        };
         let s = Countdown::initial_state();
         let res = search(&MockModel, &s, &cfg).await.unwrap();
         assert!(Countdown::legal_moves(&s).contains(&res.chosen));
@@ -969,7 +1052,12 @@ mod tests {
     async fn robust_across_bandwidths() {
         let s = Countdown::initial_state();
         for h in [0.05, 0.5, 2.0, 20.0] {
-            let cfg = SearchConfig { simulations: 64, kernel_bandwidth: h, seed: Some(3), ..Default::default() };
+            let cfg = SearchConfig {
+                simulations: 64,
+                kernel_bandwidth: h,
+                seed: Some(3),
+                ..Default::default()
+            };
             let res = search(&MockModel, &s, &cfg).await.unwrap();
             assert!(Countdown::legal_moves(&s).contains(&res.chosen), "h={h}");
             assert_eq!(res.visits, 64);
@@ -1002,7 +1090,12 @@ mod tests {
     async fn root_explore_covers_all_legal_moves() {
         // With root_explore, the root must seed a child for every legal move
         // (Countdown has 2 from the start), regardless of the MDN.
-        let cfg = SearchConfig { simulations: 16, root_explore: true, seed: Some(1), ..Default::default() };
+        let cfg = SearchConfig {
+            simulations: 16,
+            root_explore: true,
+            seed: Some(1),
+            ..Default::default()
+        };
         let s = Countdown::initial_state();
         let res = search(&MockModel, &s, &cfg).await.unwrap();
         let cols: std::collections::HashSet<u8> = res.root_children.iter().map(|c| c.mv).collect();
@@ -1029,7 +1122,11 @@ mod tests {
         assert_eq!(res.visits, 64);
         assert_eq!(res.reifications, 0, "move-policy path never reifies");
         let cols: std::collections::HashSet<u8> = res.root_children.iter().map(|c| c.mv).collect();
-        assert_eq!(cols.len(), Countdown::legal_moves(&s).len(), "must seed all legal moves");
+        assert_eq!(
+            cols.len(),
+            Countdown::legal_moves(&s).len(),
+            "must seed all legal moves"
+        );
     }
 
     #[tokio::test]
@@ -1043,7 +1140,10 @@ mod tests {
             seed: Some(2),
             ..Default::default()
         };
-        let s = State { remaining: 3, ply: 0 };
+        let s = State {
+            remaining: 3,
+            ply: 0,
+        };
         let res = search(&MockModel, &s, &cfg).await.unwrap();
         assert!(Countdown::legal_moves(&s).contains(&res.chosen));
         assert!(res.root_value.abs() <= 1.0);

@@ -11,7 +11,7 @@
 use std::sync::Mutex;
 
 use ort::ep::cuda::ConvAlgorithmSearch;
-use ort::execution_providers::{CUDA, TensorRT};
+use ort::execution_providers::{TensorRT, CUDA};
 use ort::session::Session;
 use ort::value::Tensor;
 
@@ -80,7 +80,9 @@ impl OrtModel {
             .map_err(e2a)?
             .commit_from_file(onnx_path)
             .map_err(e2a)?;
-        Ok(Self { session: Some(Mutex::new(session)) })
+        Ok(Self {
+            session: Some(Mutex::new(session)),
+        })
     }
 }
 
@@ -91,7 +93,12 @@ impl BatchModel for OrtModel {
             planes.to_vec(),
         ))
         .map_err(e2a)?;
-        let mut sess = self.session.as_ref().expect("session outlives forward").lock().unwrap();
+        let mut sess = self
+            .session
+            .as_ref()
+            .expect("session outlives forward")
+            .lock()
+            .unwrap();
         let outputs = sess.run(ort::inputs!["planes" => input]).map_err(e2a)?;
         let (_vs, vals) = outputs["value"].try_extract_tensor::<f32>().map_err(e2a)?;
         let (shape, policy) = outputs["policy"].try_extract_tensor::<f32>().map_err(e2a)?;

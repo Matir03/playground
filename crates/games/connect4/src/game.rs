@@ -111,7 +111,10 @@ impl Game for Connect4 {
     fn decode_state(bytes: &[u8]) -> anyhow::Result<Self::State> {
         let expected = C4_ROWS * C4_COLS + 2;
         if bytes.len() != expected {
-            anyhow::bail!("connect4 state: expected {expected} bytes, got {}", bytes.len());
+            anyhow::bail!(
+                "connect4 state: expected {expected} bytes, got {}",
+                bytes.len()
+            );
         }
         let mut state = Connect4State::default();
         let mut i = 0;

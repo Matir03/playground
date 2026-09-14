@@ -48,7 +48,11 @@ impl ModelClient<Amazons> for AmazonsModel {
             Self::Local(m) => m.eval(lgs).await,
         }
     }
-    async fn policy(&self, lgs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>> {
+    async fn policy(
+        &self,
+        lgs: &LatentGameState,
+        top_b: u32,
+    ) -> anyhow::Result<Vec<PolicyCandidate>> {
         match self {
             Self::Remote(m) => m.policy(lgs, top_b).await,
             Self::Local(m) => m.policy(lgs, top_b).await,
@@ -63,8 +67,14 @@ impl ModelClient<Amazons> for AmazonsModel {
         noise_scale: Option<f64>,
     ) -> anyhow::Result<AmazonsMove> {
         match self {
-            Self::Remote(m) => m.reify(from_state, from_lgs, to_lgs, action_seed, noise_scale).await,
-            Self::Local(m) => m.reify(from_state, from_lgs, to_lgs, action_seed, noise_scale).await,
+            Self::Remote(m) => {
+                m.reify(from_state, from_lgs, to_lgs, action_seed, noise_scale)
+                    .await
+            }
+            Self::Local(m) => {
+                m.reify(from_state, from_lgs, to_lgs, action_seed, noise_scale)
+                    .await
+            }
         }
     }
     async fn model_version(&self) -> anyhow::Result<String> {
@@ -199,7 +209,9 @@ enum Cmd {
 }
 
 fn default_threads() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
 }
 
 #[tokio::main]
@@ -210,7 +222,12 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Serve { addr, model_uri, models_local, cuda } => {
+        Cmd::Serve {
+            addr,
+            model_uri,
+            models_local,
+            cuda,
+        } => {
             let device = net::pick_device(cuda)?;
             let mut clients: HashMap<String, AmazonsModel> = HashMap::new();
             for spec in &models_local {
@@ -231,57 +248,145 @@ async fn main() -> anyhow::Result<()> {
             playground_engine_server::run::<Amazons, _>(addr, clients).await?;
         }
         Cmd::SelfplayBench {
-            model, cuda, concurrency, secs, threads, max_batch, node_budget, c_puct, max_ply, seed,
-            backend, onnx, ep, fp16,
+            model,
+            cuda,
+            concurrency,
+            secs,
+            threads,
+            max_batch,
+            node_budget,
+            c_puct,
+            max_ply,
+            seed,
+            backend,
+            onnx,
+            ep,
+            fp16,
         } => {
             let threads = threads.unwrap_or_else(default_threads);
             let params = SearchParams {
-                sims: 0, node_budget, c_puct, dir_alpha: 0.5, dir_eps: 0.0, temp_moves: 0,
-                explore_eps: 0.0, max_ply, settle_plies: 0, resign_threshold: 0.0,
-                resign_consecutive: 0, resign_playout_frac: 0.0,
-            forced_playout_k: 0.0,
-            full_search_prob: 0.0,
-            fast_node_budget: 0,
-            random_opening_max: 0,
-            random_opening_decay: 1.0,
+                sims: 0,
+                node_budget,
+                c_puct,
+                dir_alpha: 0.5,
+                dir_eps: 0.0,
+                temp_moves: 0,
+                explore_eps: 0.0,
+                max_ply,
+                settle_plies: 0,
+                resign_threshold: 0.0,
+                resign_consecutive: 0,
+                resign_playout_frac: 0.0,
+                forced_playout_k: 0.0,
+                full_search_prob: 0.0,
+                fast_node_budget: 0,
+                random_opening_max: 0,
+                random_opening_decay: 1.0,
             };
             tokio::task::spawn_blocking(move || {
-                selfplay::run_benchmark(&model, cuda, concurrency, threads, params, max_batch, seed,
-                    secs, &backend, &onnx, &ep, fp16)
+                selfplay::run_benchmark(
+                    &model,
+                    cuda,
+                    concurrency,
+                    threads,
+                    params,
+                    max_batch,
+                    seed,
+                    secs,
+                    &backend,
+                    &onnx,
+                    &ep,
+                    fp16,
+                )
             })
             .await??;
         }
         Cmd::SelfplayLoop {
-            live, cuda, max_batch, concurrency, chunk_secs, max_chunks, threads, node_budget,
-            c_puct, dir_alpha, dir_eps, temp_moves, max_ply, resign_threshold, resign_consecutive,
-            resign_playout_frac, seed, backend, ep, fp16,
+            live,
+            cuda,
+            max_batch,
+            concurrency,
+            chunk_secs,
+            max_chunks,
+            threads,
+            node_budget,
+            c_puct,
+            dir_alpha,
+            dir_eps,
+            temp_moves,
+            max_ply,
+            resign_threshold,
+            resign_consecutive,
+            resign_playout_frac,
+            seed,
+            backend,
+            ep,
+            fp16,
         } => {
             let threads = threads.unwrap_or_else(default_threads);
             let params = SearchParams {
-                sims: 0, node_budget, c_puct, dir_alpha, dir_eps, temp_moves, explore_eps: 0.0,
-                max_ply, settle_plies: 0, resign_threshold, resign_consecutive, resign_playout_frac,
+                sims: 0,
+                node_budget,
+                c_puct,
+                dir_alpha,
+                dir_eps,
+                temp_moves,
+                explore_eps: 0.0,
+                max_ply,
+                settle_plies: 0,
+                resign_threshold,
+                resign_consecutive,
+                resign_playout_frac,
                 forced_playout_k: 0.0,
-            full_search_prob: 0.0,
-            fast_node_budget: 0,
-            random_opening_max: 0,
-            random_opening_decay: 1.0,
+                full_search_prob: 0.0,
+                fast_node_budget: 0,
+                random_opening_max: 0,
+                random_opening_decay: 1.0,
             };
             tokio::task::spawn_blocking(move || {
-                selfplay::run_loop(&live, cuda, params, concurrency, chunk_secs, max_chunks, threads,
-                    max_batch, seed, &backend, &ep, fp16)
+                selfplay::run_loop(
+                    &live,
+                    cuda,
+                    params,
+                    concurrency,
+                    chunk_secs,
+                    max_chunks,
+                    threads,
+                    max_batch,
+                    seed,
+                    &backend,
+                    &ep,
+                    fp16,
+                )
             })
             .await??;
         }
         Cmd::EvalMatch {
-            model_a, model_b, cuda, games, threads, max_batch, node_budget, c_puct, max_ply, seed,
+            model_a,
+            model_b,
+            cuda,
+            games,
+            threads,
+            max_batch,
+            node_budget,
+            c_puct,
+            max_ply,
+            seed,
         } => {
             let threads = threads.unwrap_or_else(default_threads);
             let params = mcts::Params {
-                node_budget, c_puct, dir_alpha: 0.5, dir_eps: 0.0, temp_moves: 6, max_ply,
+                node_budget,
+                c_puct,
+                dir_alpha: 0.5,
+                dir_eps: 0.0,
+                temp_moves: 6,
+                max_ply,
             };
             tokio::task::spawn_blocking(move || {
-                eval::run_match(&model_a, &model_b, cuda, games, params, threads, max_batch, seed)
-                    .map(|_| ())
+                eval::run_match(
+                    &model_a, &model_b, cuda, games, params, threads, max_batch, seed,
+                )
+                .map(|_| ())
             })
             .await??;
         }

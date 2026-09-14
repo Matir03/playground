@@ -64,7 +64,10 @@ impl MoveGame for Hex {
             if l > max {
                 max = l;
             }
-            moves.push(HexMove::Play { r: (i / N) as u8, c: (i % N) as u8 });
+            moves.push(HexMove::Play {
+                r: (i / N) as u8,
+                c: (i % N) as u8,
+            });
             priors.push(l);
         }
         let mut sum = 0.0;
@@ -96,7 +99,13 @@ pub struct Params {
 
 impl Default for Params {
     fn default() -> Self {
-        Self { sims: 400, c_puct: 1.5, dir_alpha: 0.3, dir_eps: 0.0, temp_moves: 0 }
+        Self {
+            sims: 400,
+            c_puct: 1.5,
+            dir_alpha: 0.3,
+            dir_eps: 0.0,
+            temp_moves: 0,
+        }
     }
 }
 
@@ -165,7 +174,8 @@ pub fn run_search(
             path.push((idx, a));
             let child = nodes[idx].child[a];
             if child < 0 {
-                let next = <Hex as playground_core::Game>::apply(&nodes[idx].state, &nodes[idx].moves[a]);
+                let next =
+                    <Hex as playground_core::Game>::apply(&nodes[idx].state, &nodes[idx].moves[a]);
                 nodes.push(Node::new(next));
                 let new_idx = nodes.len() - 1;
                 nodes[idx].child[a] = new_idx as i32;
@@ -225,7 +235,11 @@ fn select(node: &Node, c_puct: f32) -> usize {
             visited_p += node.priors[a];
         }
     }
-    let parent_q = if node.total_n > 0 { w_sum / node.total_n as f32 } else { 0.0 };
+    let parent_q = if node.total_n > 0 {
+        w_sum / node.total_n as f32
+    } else {
+        0.0
+    };
     let fpu = playground_core::puct::fpu(parent_q, visited_p);
     let mut best = 0usize;
     let mut best_score = f32::NEG_INFINITY;
@@ -332,9 +346,18 @@ mod tests {
         let real = 2 * N + 1;
         let canon = crate::game::transpose_index(real);
         let mut rng = rand::rngs::StdRng::from_seed([7; 32]);
-        let params = Params { sims: 200, dir_eps: 0.0, ..Default::default() };
+        let params = Params {
+            sims: 200,
+            dir_eps: 0.0,
+            ..Default::default()
+        };
         let (moves, visits, _v) = run_search(&Favours(canon, 8.0), &s, &params, &mut rng).unwrap();
-        let best = visits.iter().enumerate().max_by_key(|&(_, v)| *v).unwrap().0;
+        let best = visits
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, v)| *v)
+            .unwrap()
+            .0;
         assert_eq!(moves[best], HexMove::Play { r: 2, c: 1 });
     }
 
@@ -351,12 +374,20 @@ mod tests {
         s.white.clear(6 * N); // keep white's count one behind
         s.to_move = 1;
         let mut rng = rand::rngs::StdRng::from_seed([3; 32]);
-        let params = Params { sims: 400, dir_eps: 0.0, ..Default::default() };
+        let params = Params {
+            sims: 400,
+            dir_eps: 0.0,
+            ..Default::default()
+        };
         let (moves, visits, value) = run_search(&Favours(0, 0.0), &s, &params, &mut rng).unwrap();
         let mut order: Vec<usize> = (0..visits.len()).collect();
         order.sort_by_key(|&i| std::cmp::Reverse(visits[i]));
         let best = order[0];
-        assert_eq!(moves[best], HexMove::Play { r: 6, c: 6 }, "the winning cell");
+        assert_eq!(
+            moves[best],
+            HexMove::Play { r: 6, c: 6 },
+            "the winning cell"
+        );
         // It must be preferred *decisively*, not just edged ahead. (The root's
         // mean value stays modest: first-play urgency keeps the search widening
         // instead of pouring every visit into the win, so the mean mixes in all
@@ -364,9 +395,17 @@ mod tests {
         assert!(
             visits[best] >= 3 * visits[order[1]],
             "winning move got {} visits vs {} for the runner-up",
-            visits[best], visits[order[1]],
+            visits[best],
+            visits[order[1]],
         );
-        assert!(value > 0.0, "a forced win should score positive, got {value}");
-        assert_eq!(apply(&s, &moves[best]).winner, 1, "and it really ends the game");
+        assert!(
+            value > 0.0,
+            "a forced win should score positive, got {value}"
+        );
+        assert_eq!(
+            apply(&s, &moves[best]).winner,
+            1,
+            "and it really ends the game"
+        );
     }
 }

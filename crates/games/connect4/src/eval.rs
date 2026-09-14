@@ -56,7 +56,9 @@ fn play_game(
         let net_turn = (state.ply % 2 == 0) == net_first;
         let mv = if net_turn {
             let (counts, _v, _n, _s) = run_mcts(eval, &state, params, &mut rng)?;
-            Connect4Move { col: argmax(&counts) as u8 }
+            Connect4Move {
+                col: argmax(&counts) as u8,
+            }
         } else {
             Connect4::choose_move(&state).best_move
         };
@@ -64,8 +66,20 @@ fn play_game(
     }
     let net_player = if net_first { 1u8 } else { 2 };
     Ok(match Connect4::outcome(&state) {
-        Outcome::FirstWins => if net_player == 1 { 2 } else { 0 },
-        Outcome::SecondWins => if net_player == 2 { 2 } else { 0 },
+        Outcome::FirstWins => {
+            if net_player == 1 {
+                2
+            } else {
+                0
+            }
+        }
+        Outcome::SecondWins => {
+            if net_player == 2 {
+                2
+            } else {
+                0
+            }
+        }
         _ => 1,
     })
 }
@@ -100,7 +114,9 @@ pub fn run_eval_vs_solver(
         let model_ref: &LocalModel = &model;
         scope.spawn(move || run_inference_server(req_rx, model_ref, max_batch));
         for _ in 0..threads {
-            let eval = BatchedEval { req_tx: req_tx.clone() };
+            let eval = BatchedEval {
+                req_tx: req_tx.clone(),
+            };
             let next = &next;
             let score2 = &score2;
             let params = &params;
@@ -110,8 +126,14 @@ pub fn run_eval_vs_solver(
                     break;
                 }
                 let net_first = g % 2 == 0; // alternate which side the net takes
-                let s2 = play_game(&eval, params, opening, net_first, seed.wrapping_add(g as u64))
-                    .expect("eval game failed");
+                let s2 = play_game(
+                    &eval,
+                    params,
+                    opening,
+                    net_first,
+                    seed.wrapping_add(g as u64),
+                )
+                .expect("eval game failed");
                 score2.fetch_add(s2, Ordering::Relaxed);
             });
         }

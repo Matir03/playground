@@ -38,7 +38,11 @@ pub fn run_match(
     // took 40 minutes, because candle is latency-bound at these batch sizes
     // (~1.3k nodes/s against TensorRT's ~100k). Both sides load through the
     // same backend so neither gets an advantage from it.
-    let device = if backend.is_ort() { None } else { Some(crate::net::pick_device(cuda)?) };
+    let device = if backend.is_ort() {
+        None
+    } else {
+        Some(crate::net::pick_device(cuda)?)
+    };
     let a = backend.load_file(ckpt_a, device.clone())?;
     let b = backend.load_file(ckpt_b, device)?;
     eprintln!(
@@ -60,16 +64,19 @@ pub fn run_match(
         resign_threshold: 0.0,
         resign_consecutive: 0,
         resign_playout_frac: 0.0,
-            forced_playout_k: 0.0,
-            full_search_prob: 0.0,
-            fast_node_budget: 0,
-            random_opening_max: 0,
-            random_opening_decay: 1.0,
+        forced_playout_k: 0.0,
+        full_search_prob: 0.0,
+        fast_node_budget: 0,
+        random_opening_max: 0,
+        random_opening_decay: 1.0,
     };
     let t0 = Instant::now();
     let a_score =
         batch_search::run_eval_moves::<Hex>(&*a, &*b, games, sp, threads, max_batch, base_seed);
-    println!("A_score {a_score:.4}  ({games} games, {:.1}s)", t0.elapsed().as_secs_f64());
+    println!(
+        "A_score {a_score:.4}  ({games} games, {:.1}s)",
+        t0.elapsed().as_secs_f64()
+    );
     Ok(a_score)
 }
 
@@ -96,7 +103,13 @@ fn play_one(
     while state.winner == 0 {
         let mv = if (state.to_move == 1) == net_black {
             let (moves, visits, _v) = mcts::run_search(model, &state, params, &mut rng)?;
-            let mv = mcts::pick_move(&moves, &visits, state.ply as u32, params.temp_moves, &mut rng);
+            let mv = mcts::pick_move(
+                &moves,
+                &visits,
+                state.ply as u32,
+                params.temp_moves,
+                &mut rng,
+            );
             mohex.set_position(&state, last_synced.as_ref())?;
             mohex.play(state.to_move, &mv)?;
             mv
@@ -130,12 +143,22 @@ pub fn run_vs_mohex(
 ) -> anyhow::Result<f64> {
     let device = crate::net::pick_device(cuda)?;
     let model = LocalModel::load_on(ckpt, device)?;
-    let params = Params { sims, c_puct, dir_alpha: 0.3, dir_eps: 0.0, temp_moves: 2 };
+    let params = Params {
+        sims,
+        c_puct,
+        dir_alpha: 0.3,
+        dir_eps: 0.0,
+        temp_moves: 2,
+    };
     let mut mohex = Mohex::new(mohex_bin, mohex_playouts, mohex_time)?;
     eprintln!(
         "hex net vs mohex: {games} games, {sims} sims/move, mohex {mohex_playouts} playouts\
          {}\n  net={ckpt}",
-        if mohex_time > 0.0 { format!(" / {mohex_time}s") } else { String::new() },
+        if mohex_time > 0.0 {
+            format!(" / {mohex_time}s")
+        } else {
+            String::new()
+        },
     );
 
     let mut score = 0.0f64;
@@ -152,7 +175,13 @@ pub fn run_vs_mohex(
         // denominator counts only games that finished.
         let mut attempt = 0u64;
         loop {
-            match play_one(&model, &params, &mut mohex, g, seed.wrapping_add(attempt * 7919)) {
+            match play_one(
+                &model,
+                &params,
+                &mut mohex,
+                g,
+                seed.wrapping_add(attempt * 7919),
+            ) {
                 Ok((net_won, plies, resigned)) => {
                     score += f64::from(u8::from(net_won));
                     completed += 1;

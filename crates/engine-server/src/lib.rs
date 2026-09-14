@@ -26,7 +26,11 @@ fn new_handle_id() -> String {
         .unwrap_or_default()
         .subsec_nanos();
     // Simple non-crypto ID: combine coarse time with a thread-local counter.
-    format!("{:08x}{:08x}", t, HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    format!(
+        "{:08x}{:08x}",
+        t,
+        HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
 }
 
 static HANDLE_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -35,27 +39,27 @@ static HANDLE_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU
 
 fn player_to_proto(p: Player) -> i32 {
     match p {
-        Player::First  => game_pb::Player::First as i32,
+        Player::First => game_pb::Player::First as i32,
         Player::Second => game_pb::Player::Second as i32,
     }
 }
 
 fn outcome_to_proto(o: Outcome) -> i32 {
     match o {
-        Outcome::InProgress  => game_pb::Outcome::InProgress as i32,
-        Outcome::FirstWins   => game_pb::Outcome::FirstWins as i32,
-        Outcome::SecondWins  => game_pb::Outcome::SecondWins as i32,
-        Outcome::Draw        => game_pb::Outcome::Draw as i32,
+        Outcome::InProgress => game_pb::Outcome::InProgress as i32,
+        Outcome::FirstWins => game_pb::Outcome::FirstWins as i32,
+        Outcome::SecondWins => game_pb::Outcome::SecondWins as i32,
+        Outcome::Draw => game_pb::Outcome::Draw as i32,
     }
 }
 
 fn state_to_proto<G: Game>(state: &G::State) -> GameState {
     GameState {
-        game_id:  G::id() as i32,
-        payload:  G::encode_state(state).into(),
-        to_move:  player_to_proto(G::to_move(state)),
-        outcome:  outcome_to_proto(G::outcome(state)),
-        ply:      G::ply(state),
+        game_id: G::id() as i32,
+        payload: G::encode_state(state).into(),
+        to_move: player_to_proto(G::to_move(state)),
+        outcome: outcome_to_proto(G::outcome(state)),
+        ply: G::ply(state),
     }
 }
 
@@ -69,8 +73,8 @@ where
     /// NN models by name (e.g. "random", "trained"). The NN player picks one
     /// per RequestMove; empty name = the first inserted.
     models: HashMap<String, Arc<M>>,
-    games:  Registry,
-    _game:  PhantomData<G>,
+    games: Registry,
+    _game: PhantomData<G>,
 }
 
 impl<G, M> EngineServer<G, M>
@@ -81,8 +85,8 @@ where
     pub fn new(models: HashMap<String, M>) -> Self {
         Self {
             models: models.into_iter().map(|(k, v)| (k, Arc::new(v))).collect(),
-            games:  Arc::new(RwLock::new(HashMap::new())),
-            _game:  PhantomData,
+            games: Arc::new(RwLock::new(HashMap::new())),
+            _game: PhantomData,
         }
     }
 
@@ -117,7 +121,11 @@ struct Chosen {
 /// encode/eval/policy/reify heads (see playground_core::mcts and
 /// docs/algorithm.md). With random weights it plays weakly, but exercises the
 /// full planned search path rather than a 1-ply lookahead.
-async fn nn_choose_move<G, M>(model: &M, state: &G::State, budget: Option<&SearchBudget>) -> anyhow::Result<Chosen>
+async fn nn_choose_move<G, M>(
+    model: &M,
+    state: &G::State,
+    budget: Option<&SearchBudget>,
+) -> anyhow::Result<Chosen>
 where
     G: Game,
     M: ModelClient<G>,
@@ -191,7 +199,10 @@ where
         let c = G::search_config()
             .ok_or_else(|| Status::failed_precondition("this engine has no configurable search"))?
             .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(SearchConfig { json: c.current, default_json: c.default }))
+        Ok(Response::new(SearchConfig {
+            json: c.current,
+            default_json: c.default,
+        }))
     }
 
     /// Replace the search, or restore the one the engine started with. A
@@ -206,7 +217,10 @@ where
         let c = G::set_search_config(json)
             .ok_or_else(|| Status::failed_precondition("this engine has no configurable search"))?
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        Ok(Response::new(SearchConfig { json: c.current, default_json: c.default }))
+        Ok(Response::new(SearchConfig {
+            json: c.current,
+            default_json: c.default,
+        }))
     }
 
     /// Run the net and the search on a position and report what they saw.
@@ -253,9 +267,7 @@ where
 
         let analysis = G::analyze(&state, budget, opts)
             .ok_or_else(|| {
-                Status::failed_precondition(
-                    "analyze: this engine has no analysable net configured",
-                )
+                Status::failed_precondition("analyze: this engine has no analysable net configured")
             })?
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -310,10 +322,13 @@ where
             None => G::initial_state(),
         };
         let id = new_handle_id();
-        self.games.write().await.insert(id.clone(), G::encode_state(&state));
+        self.games
+            .write()
+            .await
+            .insert(id.clone(), G::encode_state(&state));
         Ok(Response::new(GameHandle {
             handle_id: id,
-            game_id:   G::id() as i32,
+            game_id: G::id() as i32,
         }))
     }
 
@@ -356,9 +371,9 @@ where
 
         // Validate legality.
         let legal = G::legal_moves(&state);
-        let is_legal = legal.iter().any(|m| {
-            G::encode_move(m) == G::encode_move(&mv)
-        });
+        let is_legal = legal
+            .iter()
+            .any(|m| G::encode_move(m) == G::encode_move(&mv));
         if !is_legal {
             return Err(Status::invalid_argument("move is not legal"));
         }
@@ -463,7 +478,9 @@ where
         }));
         drop(tx);
 
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     type PlayMatchStream = tokio_stream::wrappers::ReceiverStream<Result<MatchProgress, Status>>;
@@ -488,8 +505,8 @@ where
         _req: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
         Ok(Response::new(HealthResponse {
-            version:          env!("CARGO_PKG_VERSION").to_string(),
-            supported_games:  vec![G::id() as i32],
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            supported_games: vec![G::id() as i32],
         }))
     }
 }

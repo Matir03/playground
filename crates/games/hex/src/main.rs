@@ -38,7 +38,11 @@ impl ModelClient<Hex> for HexModel {
             Self::Local(m) => m.eval(lgs).await,
         }
     }
-    async fn policy(&self, lgs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>> {
+    async fn policy(
+        &self,
+        lgs: &LatentGameState,
+        top_b: u32,
+    ) -> anyhow::Result<Vec<PolicyCandidate>> {
         match self {
             Self::Remote(m) => m.policy(lgs, top_b).await,
             Self::Local(m) => m.policy(lgs, top_b).await,
@@ -53,8 +57,14 @@ impl ModelClient<Hex> for HexModel {
         noise_scale: Option<f64>,
     ) -> anyhow::Result<HexMove> {
         match self {
-            Self::Remote(m) => m.reify(from_state, from_lgs, to_lgs, action_seed, noise_scale).await,
-            Self::Local(m) => m.reify(from_state, from_lgs, to_lgs, action_seed, noise_scale).await,
+            Self::Remote(m) => {
+                m.reify(from_state, from_lgs, to_lgs, action_seed, noise_scale)
+                    .await
+            }
+            Self::Local(m) => {
+                m.reify(from_state, from_lgs, to_lgs, action_seed, noise_scale)
+                    .await
+            }
         }
     }
     async fn model_version(&self) -> anyhow::Result<String> {
@@ -388,19 +398,48 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Serve { addr, model_uri, models_local, cuda, mohex_bin, mohex_playouts, mohex_time } => {
+        Cmd::Serve {
+            addr,
+            model_uri,
+            models_local,
+            cuda,
+            mohex_bin,
+            mohex_playouts,
+            mohex_time,
+        } => {
             if let Some(bin) = &mohex_bin {
                 mohex::install(bin, mohex_playouts, mohex_time)?;
                 tracing::info!(bin, mohex_playouts, mohex_time, "mohex opponent ready");
             }
             serve(addr, &model_uri, &models_local, cuda).await?;
         }
-        Cmd::SelfPlay { addr, model_uri, .. } => serve(addr, &model_uri, &[], false).await?,
+        Cmd::SelfPlay {
+            addr, model_uri, ..
+        } => serve(addr, &model_uri, &[], false).await?,
         Cmd::SelfplayLoop {
-            live, cuda, concurrency, max_batch, chunk_secs, max_chunks, max_examples, threads, node_budget,
-            c_puct, dir_alpha, dir_eps, temp_moves, forced_playout_k, full_search_prob,
-            fast_node_budget, random_opening_max, random_opening_decay, target_examples, seed,
-            backend, ep, fp16,
+            live,
+            cuda,
+            concurrency,
+            max_batch,
+            chunk_secs,
+            max_chunks,
+            max_examples,
+            threads,
+            node_budget,
+            c_puct,
+            dir_alpha,
+            dir_eps,
+            temp_moves,
+            forced_playout_k,
+            full_search_prob,
+            fast_node_budget,
+            random_opening_max,
+            random_opening_decay,
+            target_examples,
+            seed,
+            backend,
+            ep,
+            fp16,
         } => {
             let mut params = search_params(node_budget, c_puct, dir_alpha, dir_eps, temp_moves);
             params.forced_playout_k = forced_playout_k;
@@ -409,20 +448,46 @@ async fn main() -> anyhow::Result<()> {
             params.random_opening_max = random_opening_max;
             params.random_opening_decay = random_opening_decay;
             selfplay::run_loop(
-                &live, cuda, params, concurrency, chunk_secs, max_chunks, max_examples,
-                threads.unwrap_or_else(default_threads), max_batch, seed,
-                parse_backend(&backend, &ep, fp16)?, target_examples,
+                &live,
+                cuda,
+                params,
+                concurrency,
+                chunk_secs,
+                max_chunks,
+                max_examples,
+                threads.unwrap_or_else(default_threads),
+                max_batch,
+                seed,
+                parse_backend(&backend, &ep, fp16)?,
+                target_examples,
             )?;
         }
         Cmd::SelfplayBench {
-            model, cuda, concurrency, secs, threads, max_batch, node_budget, c_puct, seed,
-            backend, ep, fp16,
+            model,
+            cuda,
+            concurrency,
+            secs,
+            threads,
+            max_batch,
+            node_budget,
+            c_puct,
+            seed,
+            backend,
+            ep,
+            fp16,
         } => {
             let params = search_params(node_budget, c_puct, 0.3, 0.25, 12);
             let backend = parse_backend(&backend, &ep, fp16)?;
             selfplay::run_benchmark(
-                &model, cuda, concurrency, threads.unwrap_or_else(default_threads), params,
-                max_batch, seed, secs, backend,
+                &model,
+                cuda,
+                concurrency,
+                threads.unwrap_or_else(default_threads),
+                params,
+                max_batch,
+                seed,
+                secs,
+                backend,
             )?;
             // ONNX Runtime's TensorRT EP intermittently aborts inside its own
             // teardown (heap corruption, ~1 run in 3, always *after* the results
@@ -435,24 +500,71 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::EvalMatch {
-            a, b, cuda, games, node_budget, c_puct, temp_moves, threads, max_batch, seed,
-            backend, ep, fp16,
+            a,
+            b,
+            cuda,
+            games,
+            node_budget,
+            c_puct,
+            temp_moves,
+            threads,
+            max_batch,
+            seed,
+            backend,
+            ep,
+            fp16,
         } => {
             eval::run_match(
-                &a, &b, cuda, games, node_budget, c_puct, temp_moves,
-                threads.unwrap_or_else(default_threads), max_batch, seed,
+                &a,
+                &b,
+                cuda,
+                games,
+                node_budget,
+                c_puct,
+                temp_moves,
+                threads.unwrap_or_else(default_threads),
+                max_batch,
+                seed,
                 parse_backend(&backend, &ep, fp16)?,
             )?;
         }
-        Cmd::VsMohex { model, cuda, mohex_bin, games, sims, c_puct, mohex_playouts, mohex_time, seed } => {
+        Cmd::VsMohex {
+            model,
+            cuda,
+            mohex_bin,
+            games,
+            sims,
+            c_puct,
+            mohex_playouts,
+            mohex_time,
+            seed,
+        } => {
             eval::run_vs_mohex(
-                &model, cuda, &mohex_bin, games, sims, c_puct, mohex_playouts, mohex_time, seed,
+                &model,
+                cuda,
+                &mohex_bin,
+                games,
+                sims,
+                c_puct,
+                mohex_playouts,
+                mohex_time,
+                seed,
             )?;
         }
-        Cmd::Verify { mohex_bin, games, seed } => {
+        Cmd::Verify {
+            mohex_bin,
+            games,
+            seed,
+        } => {
             mohex::verify_rules(&mohex_bin, games, seed)?;
         }
-        Cmd::Match { mohex_bin, games, seed, mohex_playouts, mohex_time } => {
+        Cmd::Match {
+            mohex_bin,
+            games,
+            seed,
+            mohex_playouts,
+            mohex_time,
+        } => {
             let mut rng = seed | 1;
             mohex::play_match(&mohex_bin, games, mohex_playouts, mohex_time, move |s| {
                 let moves = Hex::legal_moves(s);
@@ -462,15 +574,50 @@ async fn main() -> anyhow::Result<()> {
                 moves[(rng >> 33) as usize % moves.len()]
             })?;
         }
-        Cmd::NetEval { model, moves, top, mirror, backend, ep, fp16 } => {
-            net_eval(&model, &moves, top, mirror, parse_backend(&backend, &ep, fp16)?)?
-        }
-        Cmd::PlayGame { model, cuda, sims, c_puct, temp_moves, dir_eps, dir_alpha, seed, board, verbose } => {
-            play_game(&model, cuda, sims, c_puct, temp_moves, dir_eps, dir_alpha, seed, board, verbose)?
-        }
-        Cmd::NetBench { model, cuda, batch, iters, backend, ep, fp16 } => {
-            net_bench(&model, cuda, batch, iters, parse_backend(&backend, &ep, fp16)?)?
-        }
+        Cmd::NetEval {
+            model,
+            moves,
+            top,
+            mirror,
+            backend,
+            ep,
+            fp16,
+        } => net_eval(
+            &model,
+            &moves,
+            top,
+            mirror,
+            parse_backend(&backend, &ep, fp16)?,
+        )?,
+        Cmd::PlayGame {
+            model,
+            cuda,
+            sims,
+            c_puct,
+            temp_moves,
+            dir_eps,
+            dir_alpha,
+            seed,
+            board,
+            verbose,
+        } => play_game(
+            &model, cuda, sims, c_puct, temp_moves, dir_eps, dir_alpha, seed, board, verbose,
+        )?,
+        Cmd::NetBench {
+            model,
+            cuda,
+            batch,
+            iters,
+            backend,
+            ep,
+            fp16,
+        } => net_bench(
+            &model,
+            cuda,
+            batch,
+            iters,
+            parse_backend(&backend, &ep, fp16)?,
+        )?,
         Cmd::Bench { games } => bench(games),
         Cmd::Stdio => anyhow::bail!("stdio: implement when needed"),
     }
@@ -490,9 +637,9 @@ async fn serve(
     } else {
         let device = net::pick_device(cuda)?;
         for spec in models_local {
-            let (name, ckpt) = spec
-                .split_once('=')
-                .ok_or_else(|| anyhow::anyhow!("--model-local wants NAME=CHECKPOINT, got {spec:?}"))?;
+            let (name, ckpt) = spec.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!("--model-local wants NAME=CHECKPOINT, got {spec:?}")
+            })?;
             let m = net::LocalModel::load_on(ckpt, device.clone())?;
             tracing::info!(name, ckpt, "loaded embedded AZ net");
             models.insert(name.to_string(), HexModel::Local(m));
@@ -524,16 +671,18 @@ fn search_params(
         resign_threshold: 0.0,
         resign_consecutive: 0,
         resign_playout_frac: 0.0,
-            forced_playout_k: 0.0,
-            full_search_prob: 0.0,
-            fast_node_budget: 0,
-            random_opening_max: 0,
-            random_opening_decay: 1.0,
+        forced_playout_k: 0.0,
+        full_search_prob: 0.0,
+        fast_node_budget: 0,
+        random_opening_max: 0,
+        random_opening_decay: 1.0,
     }
 }
 
 fn default_threads() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
 }
 
 /// Value + top policy cells for a position, as JSON. `moves` is a comma-separated
@@ -550,7 +699,13 @@ fn net_eval(
     for token in moves.split(',').filter(|t| !t.trim().is_empty()) {
         let (r, c) = hex_engine::game::parse_cell(token)
             .ok_or_else(|| anyhow::anyhow!("bad cell {token:?}"))?;
-        state = <Hex as Game>::apply(&state, &HexMove::Play { r: r as u8, c: c as u8 });
+        state = <Hex as Game>::apply(
+            &state,
+            &HexMove::Play {
+                r: r as u8,
+                c: c as u8,
+            },
+        );
     }
     // In the mirrored frame every cell maps through the long diagonal, so map the
     // reported moves back to make the two outputs directly comparable.
@@ -567,7 +722,13 @@ fn net_eval(
             model,
             ep,
             fp16,
-            &format!("{}/trt_cache", std::path::Path::new(model).parent().unwrap_or(std::path::Path::new(".")).display()),
+            &format!(
+                "{}/trt_cache",
+                std::path::Path::new(model)
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .display()
+            ),
         )?),
     };
     let mut planes = vec![0f32; hex_engine::mcts::PLANES];
@@ -575,7 +736,12 @@ fn net_eval(
     let (vals, logits) = m.forward(&planes, 1)?;
     // Report in board terms: the priors the search would actually use.
     let (mut mvs, mut priors) = (Vec::new(), Vec::new());
-    <Hex as playground_core::batch_search::MoveGame>::expand(&state, &logits, &mut mvs, &mut priors);
+    <Hex as playground_core::batch_search::MoveGame>::expand(
+        &state,
+        &logits,
+        &mut mvs,
+        &mut priors,
+    );
     let mut order: Vec<usize> = (0..mvs.len()).collect();
     order.sort_by(|&a, &b| priors[b].total_cmp(&priors[a]));
     let best: Vec<serde_json::Value> = order
@@ -633,7 +799,13 @@ fn play_game(
     use rand::SeedableRng;
 
     let m = net::LocalModel::load_on(model, net::pick_device(cuda)?)?;
-    let params = Params { sims, c_puct, dir_alpha, dir_eps, temp_moves };
+    let params = Params {
+        sims,
+        c_puct,
+        dir_alpha,
+        dir_eps,
+        temp_moves,
+    };
     let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
     let mut state = <Hex as Game>::initial_state();
     let mut played: Vec<String> = Vec::new();
@@ -667,8 +839,11 @@ fn play_game(
                     HexMove::Swap => format!("swap:{}", visits[i]),
                 })
                 .collect();
-            println!("      root visits {total} over {} moves: {}", 
-                visits.iter().filter(|&&v| v > 0).count(), top.join(" "));
+            println!(
+                "      root visits {total} over {} moves: {}",
+                visits.iter().filter(|&&v| v > 0).count(),
+                top.join(" ")
+            );
         }
         played.push(name);
         state = <Hex as Game>::apply(&state, &mv);
@@ -702,7 +877,13 @@ fn net_bench(
             model,
             ep,
             fp16,
-            &format!("{}/trt_cache", std::path::Path::new(model).parent().unwrap_or(std::path::Path::new(".")).display()),
+            &format!(
+                "{}/trt_cache",
+                std::path::Path::new(model)
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .display()
+            ),
         )?),
     };
     let planes = vec![0f32; batch * hex_engine::mcts::PLANES];

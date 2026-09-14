@@ -93,9 +93,16 @@ fn search_seed(cfg: &NetSeatConfig) -> u64 {
 }
 
 fn current_search() -> anyhow::Result<playground_core::SearchConfigJson> {
-    let cfg = CONFIG.lock().unwrap().clone().ok_or_else(|| anyhow::anyhow!("no net configured"))?;
-    let default =
-        DEFAULT.lock().unwrap().clone().ok_or_else(|| anyhow::anyhow!("no starting search recorded"))?;
+    let cfg = CONFIG
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("no net configured"))?;
+    let default = DEFAULT
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("no starting search recorded"))?;
     Ok(playground_core::SearchConfigJson {
         current: crate::search_config::to_json(&cfg.actor, &cfg.sampler),
         default,
@@ -112,7 +119,9 @@ fn set_search(json: Option<&str>) -> anyhow::Result<playground_core::SearchConfi
     let mut model = MODEL.lock().unwrap();
     {
         let mut guard = CONFIG.lock().unwrap();
-        let cfg = guard.as_mut().ok_or_else(|| anyhow::anyhow!("no net configured"))?;
+        let cfg = guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("no net configured"))?;
         let text = match json {
             Some(t) => t.to_owned(),
             None => DEFAULT
@@ -139,8 +148,15 @@ pub fn is_configured() -> bool {
 }
 
 /// Plan a whole turn from `state`, then return its first action.
-fn plan_turn(state: &MinionsState, budget: &SolverBudget) -> anyhow::Result<SearchOutcome<MinionsMove>> {
-    let cfg = CONFIG.lock().unwrap().clone().ok_or_else(|| anyhow::anyhow!("no net configured"))?;
+fn plan_turn(
+    state: &MinionsState,
+    budget: &SolverBudget,
+) -> anyhow::Result<SearchOutcome<MinionsMove>> {
+    let cfg = CONFIG
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("no net configured"))?;
 
     let mut guard = MODEL.lock().unwrap();
     if guard.is_none() {
@@ -160,7 +176,9 @@ fn plan_turn(state: &MinionsState, budget: &SolverBudget) -> anyhow::Result<Sear
     //
     // (Sampling once handed back a null turn -- "the net passes on turn 1" --
     // because it counted forced visits. It counts chosen visits only now.)
-    let mut params = cfg.actor.search_params(&cfg.sampler, true, search_seed(&cfg));
+    let mut params = cfg
+        .actor
+        .search_params(&cfg.sampler, true, search_seed(&cfg));
     if let Some(v) = budget.max_visits {
         params.simulations = v;
     }
@@ -188,12 +206,19 @@ fn plan_turn(state: &MinionsState, budget: &SolverBudget) -> anyhow::Result<Sear
         value: result.value,
     });
 
-    Ok(SearchOutcome { best_move: first, value: result.value, nodes: params.simulations as u64 })
+    Ok(SearchOutcome {
+        best_move: first,
+        value: result.value,
+        nodes: params.simulations as u64,
+    })
 }
 
 /// One atomic move from the net, replaying the current turn's plan when it
 /// still applies and re-planning when it does not.
-pub fn choose(state: &MinionsState, budget: SolverBudget) -> Option<anyhow::Result<SearchOutcome<MinionsMove>>> {
+pub fn choose(
+    state: &MinionsState,
+    budget: SolverBudget,
+) -> Option<anyhow::Result<SearchOutcome<MinionsMove>>> {
     if !is_configured() {
         return None;
     }
@@ -207,7 +232,11 @@ pub fn choose(state: &MinionsState, budget: SolverBudget) -> Option<anyhow::Resu
                     p.expect = Minions::encode_state(&next);
                     // `nodes: 0` is honest — no search ran for this action —
                     // but the value is the planned turn's, not zero.
-                    return Some(Ok(SearchOutcome { best_move: mv, value: p.value, nodes: 0 }));
+                    return Some(Ok(SearchOutcome {
+                        best_move: mv,
+                        value: p.value,
+                        nodes: 0,
+                    }));
                 }
             }
         }
@@ -225,26 +254,38 @@ mod tests {
     /// Is the value head emitting NaN, or is the NaN made during backup?
     #[test]
     fn value_head_is_finite() {
-        let Ok(dir) = std::env::var("MINIONS_ORT_DIR") else { return };
+        let Ok(dir) = std::env::var("MINIONS_ORT_DIR") else {
+            return;
+        };
         let d = std::path::Path::new(&dir);
         let cache = d.join("trt_cache").to_string_lossy().into_owned();
         let ort = match crate::ort_net::OrtNet::new(d, "cuda", false, &cache) {
             Ok(o) => o,
-            Err(e) => { eprintln!("ORT unavailable ({e})"); return; }
+            Err(e) => {
+                eprintln!("ORT unavailable ({e})");
+                return;
+            }
         };
         use crate::net::Backend;
         let mut st = Minions::initial_state();
         for step in 0..4 {
-            let planes: Vec<f32> =
-                Minions::to_features(&st).iter().map(|&b| b as f32).collect();
+            let planes: Vec<f32> = Minions::to_features(&st)
+                .iter()
+                .map(|&b| b as f32)
+                .collect();
             let out = ort.trunk(&planes, 1).unwrap();
             let nan_h = out.h.iter().filter(|x| !x.is_finite()).count();
             println!(
                 "step {step}: value={:?} finite={} | trunk non-finite {} of {}",
-                out.value, out.value.iter().all(|v| v.is_finite()), nan_h, out.h.len()
+                out.value,
+                out.value.iter().all(|v| v.is_finite()),
+                nan_h,
+                out.h.len()
             );
             let legal = Minions::legal_moves(&st);
-            if legal.is_empty() { break; }
+            if legal.is_empty() {
+                break;
+            }
             st = Minions::apply(&st, &legal[0]);
         }
     }
@@ -262,11 +303,24 @@ mod tests {
         };
         configure(NetSeatConfig {
             dir: dir.into(),
-            kind: crate::net::BackendKind::Ort { ep: "trt".into(), fp16: true },
-            actor: crate::selfplay::ActorConfig { sims: 64, ..Default::default() },
-            sampler: SamplerConfig { k_candidates: 12, t_steps: 4, ..Default::default() },
+            kind: crate::net::BackendKind::Ort {
+                ep: "trt".into(),
+                fp16: true,
+            },
+            actor: crate::selfplay::ActorConfig {
+                sims: 64,
+                ..Default::default()
+            },
+            sampler: SamplerConfig {
+                k_candidates: 12,
+                t_steps: 4,
+                ..Default::default()
+            },
         });
-        let budget = SolverBudget { max_millis: None, max_visits: None };
+        let budget = SolverBudget {
+            max_millis: None,
+            max_visits: None,
+        };
 
         let mut seen = std::collections::HashSet::new();
         for _ in 0..6 {
@@ -311,11 +365,25 @@ mod tests {
         // temperature, as self-play does, and this is about the argmax.
         configure(NetSeatConfig {
             dir: dir.into(),
-            kind: crate::net::BackendKind::Ort { ep: "trt".into(), fp16: true },
-            actor: crate::selfplay::ActorConfig { sims: 64, temp_moves: 0, ..Default::default() },
-            sampler: SamplerConfig { k_candidates: 12, t_steps: 4, ..Default::default() },
+            kind: crate::net::BackendKind::Ort {
+                ep: "trt".into(),
+                fp16: true,
+            },
+            actor: crate::selfplay::ActorConfig {
+                sims: 64,
+                temp_moves: 0,
+                ..Default::default()
+            },
+            sampler: SamplerConfig {
+                k_candidates: 12,
+                t_steps: 4,
+                ..Default::default()
+            },
         });
-        let budget = SolverBudget { max_millis: None, max_visits: None };
+        let budget = SolverBudget {
+            max_millis: None,
+            max_visits: None,
+        };
 
         // Repeat: the old bug was stochastic, so one clean turn proves nothing.
         for attempt in 0..5 {
@@ -354,13 +422,26 @@ mod tests {
         };
         configure(NetSeatConfig {
             dir: dir.into(),
-            kind: crate::net::BackendKind::Ort { ep: "cuda".into(), fp16: false },
-            actor: crate::selfplay::ActorConfig { sims: 16, ..Default::default() },
-            sampler: SamplerConfig { k_candidates: 8, t_steps: 2, ..Default::default() },
+            kind: crate::net::BackendKind::Ort {
+                ep: "cuda".into(),
+                fp16: false,
+            },
+            actor: crate::selfplay::ActorConfig {
+                sims: 16,
+                ..Default::default()
+            },
+            sampler: SamplerConfig {
+                k_candidates: 8,
+                t_steps: 2,
+                ..Default::default()
+            },
         });
 
         let mut state = Minions::initial_state();
-        let budget = SolverBudget { max_millis: None, max_visits: None };
+        let budget = SolverBudget {
+            max_millis: None,
+            max_visits: None,
+        };
         let mut acted = 0;
         // Every action replayed from a plan must carry that plan's value.
         // `nodes > 0` marks the one action a search actually ran for; the rest
@@ -403,7 +484,10 @@ mod tests {
             state = Minions::apply(&state, &out.best_move);
             acted += 1;
         }
-        assert!(acted > 1, "expected the seat to play several actions, got {acted}");
+        assert!(
+            acted > 1,
+            "expected the seat to play several actions, got {acted}"
+        );
 
         // Analysis must see the same net without disturbing the seat: a tree
         // with the numbers the search selected on, and the aux heads if the
@@ -444,17 +528,22 @@ mod tests {
             let ev = Minions::analyze(
                 &st,
                 budget,
-                playground_core::AnalysisOptions { eval_only: true, ..Default::default() },
+                playground_core::AnalysisOptions {
+                    eval_only: true,
+                    ..Default::default()
+                },
             )
-                .expect("configured")
-                .expect("analysis");
+            .expect("configured")
+            .expect("analysis");
             assert!(ev.nodes.is_empty(), "eval_only must not build a tree");
             assert!(ev.chosen.is_none(), "eval_only has no move to choose");
         }
 
         // A state the plan does not expect must force a re-plan, not a stale replay.
         let fresh = Minions::initial_state();
-        let out = Minions::choose_move_external(&fresh, budget).expect("configured").expect("ok");
+        let out = Minions::choose_move_external(&fresh, budget)
+            .expect("configured")
+            .expect("ok");
         assert!(
             Minions::legal_moves(&fresh).contains(&out.best_move),
             "after a desync the seat must re-plan and return a move legal *here*"
@@ -529,7 +618,9 @@ fn aux_for(state: &MinionsState) -> Option<playground_core::AnalysisAux> {
     let logz = take("logz")?;
     // Optional: a checkpoint exported before the score head existed has no such
     // output, and analysis should still work against it rather than going dark.
-    let score = take("score").and_then(|v| v.first().copied()).unwrap_or(0.0);
+    let score = take("score")
+        .and_then(|v| v.first().copied())
+        .unwrap_or(0.0);
 
     let cells = crate::map::NUM_CELLS;
     let horizon = necro.len() / 2;
@@ -543,7 +634,11 @@ fn aux_for(state: &MinionsState) -> Option<playground_core::AnalysisAux> {
         ],
         necro_hazard: [
             necro[..horizon].iter().copied().map(sigmoid).collect(),
-            necro[horizon..2 * horizon].iter().copied().map(sigmoid).collect(),
+            necro[horizon..2 * horizon]
+                .iter()
+                .copied()
+                .map(sigmoid)
+                .collect(),
         ],
         log_z: logz.first().copied().unwrap_or(0.0),
         // Trained on score / SCORE_SCALE, so undo that here and hand every
@@ -580,7 +675,11 @@ fn label_turn(state: &MinionsState, spec: &TurnSpec) -> String {
     if actions.is_empty() {
         return "pass".to_string();
     }
-    actions.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(", ")
+    actions
+        .iter()
+        .map(|m| m.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl playground_core::Analyzable for Minions {
@@ -603,7 +702,9 @@ impl playground_core::Analyzable for Minions {
         is_configured().then(current_search)
     }
 
-    fn set_search_config(json: Option<&str>) -> Option<anyhow::Result<playground_core::SearchConfigJson>> {
+    fn set_search_config(
+        json: Option<&str>,
+    ) -> Option<anyhow::Result<playground_core::SearchConfigJson>> {
         is_configured().then(|| set_search(json))
     }
 }
@@ -613,8 +714,17 @@ fn analyze_inner(
     budget: SolverBudget,
     opts: playground_core::AnalysisOptions,
 ) -> anyhow::Result<playground_core::Analysis> {
-    let playground_core::AnalysisOptions { candidates, eval_only, kernel_sigma, fast } = opts;
-    let cfg = CONFIG.lock().unwrap().clone().ok_or_else(|| anyhow::anyhow!("no net configured"))?;
+    let playground_core::AnalysisOptions {
+        candidates,
+        eval_only,
+        kernel_sigma,
+        fast,
+    } = opts;
+    let cfg = CONFIG
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("no net configured"))?;
 
     let mut guard = MODEL.lock().unwrap();
     if guard.is_none() {
@@ -648,7 +758,9 @@ fn analyze_inner(
     // temperature included. A request may still override the budget, the
     // candidate count and the kernel.
     let full = !fast;
-    let base = cfg.actor.search_params(&cfg.sampler, full, search_seed(&cfg));
+    let base = cfg
+        .actor
+        .search_params(&cfg.sampler, full, search_seed(&cfg));
     let mut params = playground_core::sampled_mcts::SampledParams {
         k_candidates: candidates.unwrap_or(base.k_candidates),
         // Above 0 the kernel is live and every node exports its matrix.
@@ -660,7 +772,10 @@ fn analyze_inner(
     }
 
     let (result, tree) = playground_core::sampled_mcts::search_analyzed::<MinionsTurns, _>(
-        &crate::sampler::AsSearch { model: &**model, full },
+        &crate::sampler::AsSearch {
+            model: &**model,
+            full,
+        },
         state.clone(),
         &params,
         Minions::ply(state),

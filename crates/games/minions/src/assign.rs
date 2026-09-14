@@ -132,7 +132,10 @@ fn components(targets: &[Target], attackers: &[Attacker]) -> Vec<Component> {
         let r = find(&mut parent, n_a + ti);
         by_root
             .entry(r)
-            .or_insert_with(|| Component { targets: vec![], attackers: vec![] })
+            .or_insert_with(|| Component {
+                targets: vec![],
+                attackers: vec![],
+            })
             .targets
             .push(ti);
     }
@@ -158,8 +161,12 @@ pub const MAX_ENUMERABLE_REACH: usize = 20;
 /// this would silently drop candidates and a failed search would look like a
 /// proof of impossibility.
 fn sufficient_subsets(t: &Target, capacity: &[u8]) -> Vec<Vec<usize>> {
-    let reach: Vec<(usize, u32)> =
-        t.reach.iter().copied().filter(|&(a, d)| capacity[a] > 0 && d > 0).collect();
+    let reach: Vec<(usize, u32)> = t
+        .reach
+        .iter()
+        .copied()
+        .filter(|&(a, d)| capacity[a] > 0 && d > 0)
+        .collect();
     debug_assert!(reach.len() <= MAX_ENUMERABLE_REACH);
     let n = reach.len();
     let mut out: Vec<Vec<usize>> = Vec::new();
@@ -172,9 +179,16 @@ fn sufficient_subsets(t: &Target, capacity: &[u8]) -> Vec<Vec<usize>> {
             continue;
         }
         // Minimality: dropping any member must break it.
-        let minimal = (0..n).filter(|b| mask & (1 << b) != 0).all(|b| dmg - reach[b].1 < t.need);
+        let minimal = (0..n)
+            .filter(|b| mask & (1 << b) != 0)
+            .all(|b| dmg - reach[b].1 < t.need);
         if minimal {
-            out.push((0..n).filter(|b| mask & (1 << b) != 0).map(|b| reach[b].0).collect());
+            out.push(
+                (0..n)
+                    .filter(|b| mask & (1 << b) != 0)
+                    .map(|b| reach[b].0)
+                    .collect(),
+            );
         }
     }
     // Fewest units spent first: keeps attackers free for later targets and finds
@@ -200,8 +214,12 @@ pub fn greedy(targets: &[Target], attackers: &[Attacker]) -> Vec<Option<Vec<usiz
             if plan[i].is_some() {
                 continue;
             }
-            let avail: Vec<(usize, u32)> =
-                t.reach.iter().copied().filter(|&(a, d)| capacity[a] > 0 && d > 0).collect();
+            let avail: Vec<(usize, u32)> = t
+                .reach
+                .iter()
+                .copied()
+                .filter(|&(a, d)| capacity[a] > 0 && d > 0)
+                .collect();
             if avail.iter().map(|&(_, d)| d).sum::<u32>() < t.need {
                 continue;
             }
@@ -212,7 +230,13 @@ pub fn greedy(targets: &[Target], attackers: &[Attacker]) -> Vec<Option<Vec<usiz
         }
         let Some((_, i, order)) = best else { break };
         let t = &targets[i];
-        let dmg = |a: usize| t.reach.iter().find(|&&(x, _)| x == a).map(|&(_, d)| d).unwrap_or(0);
+        let dmg = |a: usize| {
+            t.reach
+                .iter()
+                .find(|&&(x, _)| x == a)
+                .map(|&(_, d)| d)
+                .unwrap_or(0)
+        };
         // Biggest hitters first to reach the threshold, then drop any member the
         // remainder no longer needs — fewest units spent, least overkill.
         let mut order = order;
@@ -260,7 +284,14 @@ pub fn solve(targets: &[Target], attackers: &[Attacker], budget: u64) -> Assignm
     let mut chosen: Vec<Vec<usize>> = vec![Vec::new(); targets.len()];
     let mut done = vec![false; targets.len()];
     let mut nodes = 0u64;
-    match search(targets, &mut capacity, &mut chosen, &mut done, &mut nodes, budget) {
+    match search(
+        targets,
+        &mut capacity,
+        &mut chosen,
+        &mut done,
+        &mut nodes,
+        budget,
+    ) {
         Some(true) => Assignment::Found(chosen),
         Some(false) => Assignment::Infeasible,
         None => Assignment::Unknown,
@@ -295,7 +326,9 @@ fn search(
             best = Some((i, opts));
         }
     }
-    let Some((i, options)) = best else { return Some(true) };
+    let Some((i, options)) = best else {
+        return Some(true);
+    };
 
     let mut exhausted = true;
     for opt in options {
@@ -329,10 +362,19 @@ mod tests {
     use super::*;
 
     fn t(cell: u8, need: u32, reach: &[(usize, u32)]) -> Target {
-        Target { cell, need, reach: reach.to_vec() }
+        Target {
+            cell,
+            need,
+            reach: reach.to_vec(),
+        }
     }
     fn a(n: usize) -> Vec<Attacker> {
-        (0..n).map(|i| Attacker { cell: i as u8, attacks: 1 }).collect()
+        (0..n)
+            .map(|i| Attacker {
+                cell: i as u8,
+                attacks: 1,
+            })
+            .collect()
     }
 
     #[test]
@@ -368,13 +410,14 @@ mod tests {
         // Two ghosts (health 4). Attacker 0 deals 5 and reaches both; 1 and 2
         // deal 3 and 1 and reach only the second. Spending the 5 on the second
         // target strands the first — the search must give the 5 to target 0.
-        let targets = vec![
-            t(10, 4, &[(0, 5)]),
-            t(11, 4, &[(0, 5), (1, 3), (2, 1)]),
-        ];
+        let targets = vec![t(10, 4, &[(0, 5)]), t(11, 4, &[(0, 5), (1, 3), (2, 1)])];
         match solve(&targets, &a(3), 10_000) {
             Assignment::Found(v) => {
-                assert_eq!(v[0], vec![0], "the only attacker for target 0 must go there");
+                assert_eq!(
+                    v[0],
+                    vec![0],
+                    "the only attacker for target 0 must go there"
+                );
                 let mut s = v[1].clone();
                 s.sort();
                 assert_eq!(s, vec![1, 2]);
@@ -401,13 +444,19 @@ mod tests {
             t(11, 1, &[(0, 1)]),
             t(12, 1, &[(0, 1)]),
         ];
-        let atk = vec![Attacker { cell: 0, attacks: 3 }];
+        let atk = vec![Attacker {
+            cell: 0,
+            attacks: 3,
+        }];
         match solve(&targets, &atk, 10_000) {
             Assignment::Found(v) => assert_eq!(v, vec![vec![0], vec![0], vec![0]]),
             other => panic!("expected the multi-attacker to cover all three, got {other:?}"),
         }
         // With only two attacks it is provably impossible.
-        let atk = vec![Attacker { cell: 0, attacks: 2 }];
+        let atk = vec![Attacker {
+            cell: 0,
+            attacks: 2,
+        }];
         assert_eq!(solve(&targets, &atk, 10_000), Assignment::Infeasible);
     }
 
@@ -415,7 +464,11 @@ mod tests {
     fn independent_components_do_not_interact() {
         let targets = vec![t(10, 1, &[(0, 1)]), t(50, 1, &[(1, 1)])];
         let comps = components(&targets, &a(2));
-        assert_eq!(comps.len(), 2, "disjoint targets should not share a component");
+        assert_eq!(
+            comps.len(),
+            2,
+            "disjoint targets should not share a component"
+        );
         assert!(matches!(solve(&targets, &a(2), 1000), Assignment::Found(_)));
     }
 
@@ -429,15 +482,17 @@ mod tests {
         let targets: Vec<Target> = (0..3).map(|i| t(i, 2, &reach)).collect();
         assert_eq!(solve(&targets, &a(8), 1), Assignment::Unknown);
         // With room to search it is solvable, so "unknown" really was ignorance.
-        assert!(matches!(solve(&targets, &a(8), 100_000), Assignment::Found(_)));
+        assert!(matches!(
+            solve(&targets, &a(8), 100_000),
+            Assignment::Found(_)
+        ));
     }
 
     #[test]
     fn an_unenumerable_reach_refuses_to_claim_a_proof() {
         // More reachable attackers than we can enumerate: the honest answer is
         // Unknown, never Infeasible.
-        let reach: Vec<(usize, u32)> =
-            (0..MAX_ENUMERABLE_REACH + 1).map(|k| (k, 1u32)).collect();
+        let reach: Vec<(usize, u32)> = (0..MAX_ENUMERABLE_REACH + 1).map(|k| (k, 1u32)).collect();
         let targets = vec![t(0, 99, &reach)];
         assert_eq!(
             solve(&targets, &a(MAX_ENUMERABLE_REACH + 1), 100_000),
@@ -445,7 +500,10 @@ mod tests {
             "the deficiency bound still applies and is sound"
         );
         let targets = vec![t(0, 2, &reach)];
-        assert_eq!(solve(&targets, &a(MAX_ENUMERABLE_REACH + 1), 100_000), Assignment::Unknown);
+        assert_eq!(
+            solve(&targets, &a(MAX_ENUMERABLE_REACH + 1), 100_000),
+            Assignment::Unknown
+        );
     }
 
     #[test]

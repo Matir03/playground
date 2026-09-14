@@ -40,19 +40,34 @@ impl Mohex {
             .arg("--quiet")
             // MoHex drops a `default.log` in the cwd unless told not to; keep it
             // when tracing, since its search log is where its reasoning lives.
-            .args(if debug { ["--use-logfile", "1"] } else { ["--use-logfile", "0"] })
+            .args(if debug {
+                ["--use-logfile", "1"]
+            } else {
+                ["--use-logfile", "0"]
+            })
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // MoHex's banner and search chatter go to stderr; surface it only
             // when tracing (see `send`).
-            .stderr(if debug { Stdio::inherit() } else { Stdio::null() })
+            .stderr(if debug {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
             .spawn()
             .map_err(|e| anyhow::anyhow!("spawning {bin}: {e} (run scripts/fetch-mohex.sh)"))?;
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
-        let mut m = Self { child, stdin, stdout };
+        let mut m = Self {
+            child,
+            stdin,
+            stdout,
+        };
         m.send(&format!("boardsize {N}"))?;
-        m.send(&format!("param_game allow_swap {}", u8::from(crate::game::ALLOW_SWAP)))?;
+        m.send(&format!(
+            "param_game allow_swap {}",
+            u8::from(crate::game::ALLOW_SWAP)
+        ))?;
         if max_games > 0 {
             m.send(&format!("param_mohex max_games {max_games}"))?;
         }
@@ -135,7 +150,11 @@ impl Mohex {
     /// no captures, and the winner depends only on the stones — so any replay
     /// order gives the same position; we alternate colours anyway so MoHex's
     /// move history looks like a real game.
-    pub fn set_position(&mut self, state: &HexState, last: Option<&HexState>) -> anyhow::Result<()> {
+    pub fn set_position(
+        &mut self,
+        state: &HexState,
+        last: Option<&HexState>,
+    ) -> anyhow::Result<()> {
         let empty = HexState::default();
         let (prev, reset) = match last.filter(|p| extends(p, state)) {
             Some(prev) => (prev, false),
@@ -153,7 +172,12 @@ impl Mohex {
     /// MoHex's verdict on the current position: `Some(1)` black, `Some(2)`
     /// white, `None` if neither side has connected yet.
     pub fn winner(&mut self) -> anyhow::Result<Option<u8>> {
-        match self.send("final_score")?.trim().to_ascii_lowercase().as_str() {
+        match self
+            .send("final_score")?
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "b" | "black" | "b+" => Ok(Some(1)),
             "w" | "white" | "w+" => Ok(Some(2)),
             other => {
@@ -202,14 +226,24 @@ fn replay_moves(prev: &HexState, state: &HexState) -> Vec<(u8, HexMove)> {
             side = 3 - side;
         }
         let i = pools[side as usize - 1].pop().expect("a non-empty pool");
-        moves.push((side, HexMove::Play { r: (i / N) as u8, c: (i % N) as u8 }));
+        moves.push((
+            side,
+            HexMove::Play {
+                r: (i / N) as u8,
+                c: (i % N) as u8,
+            },
+        ));
         side = 3 - side;
     }
     moves
 }
 
 fn color_name(player: u8) -> &'static str {
-    if player == 1 { "black" } else { "white" }
+    if player == 1 {
+        "black"
+    } else {
+        "white"
+    }
 }
 
 /// Our move → GTP move token (`swap-pieces` is benzene's spelling).
@@ -230,7 +264,10 @@ pub fn parse_move(token: &str) -> anyhow::Result<Option<HexMove>> {
         return Ok(Some(HexMove::Swap));
     }
     let (r, c) = parse_cell(&t).ok_or_else(|| anyhow::anyhow!("bad GTP move {token:?}"))?;
-    Ok(Some(HexMove::Play { r: r as u8, c: c as u8 }))
+    Ok(Some(HexMove::Play {
+        r: r as u8,
+        c: c as u8,
+    }))
 }
 
 // ── The interactive opponent ─────────────────────────────────────────────────
@@ -343,7 +380,10 @@ pub fn verify_rules(bin: &str, games: u32, seed: u64) -> anyhow::Result<u32> {
             );
         }
         let outcome = Hex::outcome(&state);
-        anyhow::ensure!(outcome.is_terminal() && outcome != Outcome::Draw, "hex has no draws");
+        anyhow::ensure!(
+            outcome.is_terminal() && outcome != Outcome::Draw,
+            "hex has no draws"
+        );
         eprintln!(
             "  game {g}: {} wins after {plies} plies (mohex agrees)",
             if state.winner == 1 { "black" } else { "white" },
@@ -412,7 +452,13 @@ mod tests {
 
     fn play(state: &HexState, cell: &str) -> HexState {
         let (r, c) = crate::game::parse_cell(cell).unwrap();
-        Hex::apply(state, &HexMove::Play { r: r as u8, c: c as u8 })
+        Hex::apply(
+            state,
+            &HexMove::Play {
+                r: r as u8,
+                c: c as u8,
+            },
+        )
     }
 
     #[test]

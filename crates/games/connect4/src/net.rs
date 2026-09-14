@@ -41,7 +41,10 @@ struct ResBlock {
 
 impl ResBlock {
     fn load(c: usize, vb: VarBuilder) -> candle_core::Result<Self> {
-        let cfg = Conv2dConfig { padding: 1, ..Default::default() };
+        let cfg = Conv2dConfig {
+            padding: 1,
+            ..Default::default()
+        };
         Ok(Self {
             c1: conv2d(c, c, 3, cfg, vb.pp("c1"))?,
             b1: batch_norm(c, BatchNormConfig::default(), vb.pp("b1"))?,
@@ -59,8 +62,15 @@ impl ResBlock {
 
 /// The trunk: either the small 2-conv net or the AlphaZero-style ResNet.
 enum Trunk {
-    Small { c1: Conv2d, c2: Conv2d },
-    Res { stem: Conv2d, stem_bn: BatchNorm, blocks: Vec<ResBlock> },
+    Small {
+        c1: Conv2d,
+        c2: Conv2d,
+    },
+    Res {
+        stem: Conv2d,
+        stem_bn: BatchNorm,
+        blocks: Vec<ResBlock>,
+    },
 }
 
 impl Trunk {
@@ -70,7 +80,11 @@ impl Trunk {
                 let x = c1.forward(planes)?.relu()?;
                 c2.forward(&x)?.relu()?
             }
-            Trunk::Res { stem, stem_bn, blocks } => {
+            Trunk::Res {
+                stem,
+                stem_bn,
+                blocks,
+            } => {
                 let mut x = stem_bn.forward_t(&stem.forward(planes)?, false)?.relu()?;
                 for blk in blocks {
                     x = blk.forward(&x)?;
@@ -94,7 +108,10 @@ struct Net {
 
 impl Net {
     fn load(arch: &Arch, vb: VarBuilder) -> candle_core::Result<Self> {
-        let cfg = Conv2dConfig { padding: 1, ..Default::default() };
+        let cfg = Conv2dConfig {
+            padding: 1,
+            ..Default::default()
+        };
         let (trunk, trunk_features) = match arch {
             Arch::Small => {
                 let trunk = Trunk::Small {
@@ -145,7 +162,12 @@ impl Net {
     /// the reification policy head needs.
     fn value_policy(&self, lgs: &Tensor) -> candle_core::Result<(f32, Vec<f32>)> {
         let x = self.val_fc1.forward(lgs)?.relu()?;
-        let v = self.val_fc2.forward(&x)?.tanh()?.flatten_all()?.to_vec1::<f32>()?[0];
+        let v = self
+            .val_fc2
+            .forward(&x)?
+            .tanh()?
+            .flatten_all()?
+            .to_vec1::<f32>()?[0];
         let pri = candle_nn::ops::softmax(&self.pol_prior.forward(lgs)?, 1)?
             .flatten_all()?
             .to_vec1::<f32>()?;
@@ -169,7 +191,11 @@ impl Net {
     /// LGS (1,64) -> (column priors over 7, predicted next-LGS per column (7,64)).
     fn policy_heads(&self, lgs: &Tensor) -> candle_core::Result<(Vec<f32>, Tensor)> {
         let priors = candle_nn::ops::softmax(&self.pol_prior.forward(lgs)?, 1)?;
-        let nexts = self.pol_next.forward(lgs)?.tanh()?.reshape((C4_COLS, LGS_DIM))?;
+        let nexts = self
+            .pol_next
+            .forward(lgs)?
+            .tanh()?
+            .reshape((C4_COLS, LGS_DIM))?;
         Ok((priors.flatten_all()?.to_vec1::<f32>()?, nexts))
     }
 }
@@ -234,12 +260,15 @@ impl LocalModel {
         let path = Path::new(checkpoint);
         let arch = read_arch(path);
         // SAFETY: the mmap lives for the VarBuilder's load; tensors are copied.
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[checkpoint], DType::F32, &device)?
-        };
+        let vb =
+            unsafe { VarBuilder::from_mmaped_safetensors(&[checkpoint], DType::F32, &device)? };
         let net = Net::load(&arch, vb)?;
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("local");
-        Ok(Self { net, device, model_version: format!("connect4-{stem}") })
+        Ok(Self {
+            net,
+            device,
+            model_version: format!("connect4-{stem}"),
+        })
     }
 
     /// Fill `out` (length `b*2*CELLS`) with the side-to-move planes of `states`.
@@ -305,7 +334,11 @@ impl LocalModel {
     }
 
     fn gs_state(&self, payload: Vec<f32>) -> LatentGameState {
-        LatentGameState::new(f32_to_bytes(&payload), vec![LGS_DIM as i32], self.model_version.clone())
+        LatentGameState::new(
+            f32_to_bytes(&payload),
+            vec![LGS_DIM as i32],
+            self.model_version.clone(),
+        )
     }
 
     /// AlphaZero-style self-play forward: a concrete state -> (value for the
@@ -345,7 +378,11 @@ impl ModelClient<Connect4> for LocalModel {
         Ok(self.net.value(&t)? as f64)
     }
 
-    async fn policy(&self, lgs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>> {
+    async fn policy(
+        &self,
+        lgs: &LatentGameState,
+        top_b: u32,
+    ) -> anyhow::Result<Vec<PolicyCandidate>> {
         let t = self.lgs_tensor(lgs)?;
         let (priors, nexts) = self.net.policy_heads(&t)?;
         // Highest-prior columns first, like the Python policy head.
@@ -372,7 +409,10 @@ impl ModelClient<Connect4> for LocalModel {
         _noise_scale: Option<f64>,
     ) -> anyhow::Result<Connect4Move> {
         use playground_core::Game;
-        let legal: Vec<u8> = Connect4::legal_moves(from_state).iter().map(|m| m.col).collect();
+        let legal: Vec<u8> = Connect4::legal_moves(from_state)
+            .iter()
+            .map(|m| m.col)
+            .collect();
         let col = action_seed
             .and_then(decode_column)
             .filter(|c| legal.contains(c))
@@ -431,8 +471,14 @@ mod tests {
     #[ignore]
     async fn bench_forward() {
         for (name, ckpt) in [
-            ("random", "../../../data/models/connect4/random/checkpoint.safetensors"),
-            ("selfplay", "../../../data/models/connect4/selfplay/checkpoint.safetensors"),
+            (
+                "random",
+                "../../../data/models/connect4/random/checkpoint.safetensors",
+            ),
+            (
+                "selfplay",
+                "../../../data/models/connect4/selfplay/checkpoint.safetensors",
+            ),
         ] {
             if !Path::new(ckpt).exists() {
                 continue;
@@ -455,8 +501,14 @@ mod tests {
     #[tokio::test]
     async fn parity_with_python_net() {
         for (name, ckpt) in [
-            ("random", "../../../data/models/connect4/random/checkpoint.safetensors"),
-            ("selfplay", "../../../data/models/connect4/selfplay/checkpoint.safetensors"),
+            (
+                "random",
+                "../../../data/models/connect4/random/checkpoint.safetensors",
+            ),
+            (
+                "selfplay",
+                "../../../data/models/connect4/selfplay/checkpoint.safetensors",
+            ),
         ] {
             if !Path::new(ckpt).exists() {
                 eprintln!("skip {name}: no checkpoint");

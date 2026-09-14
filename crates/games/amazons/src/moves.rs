@@ -44,7 +44,10 @@ pub fn move_type(fr: u8, fc: u8, tr: u8, tc: u8) -> usize {
     let dr = tr as i32 - fr as i32;
     let dc = tc as i32 - fc as i32;
     let dist = dr.abs().max(dc.abs());
-    debug_assert!(dist >= 1 && dist <= DISTS as i32, "bad slide distance {dist}");
+    debug_assert!(
+        dist >= 1 && dist <= DISTS as i32,
+        "bad slide distance {dist}"
+    );
     let dir = dir_index(dr.signum(), dc.signum());
     dir * DISTS + (dist as usize - 1)
 }
@@ -75,7 +78,14 @@ mod tests {
 
     #[test]
     fn indices_in_range() {
-        let mv = AmazonsMove { from_r: 0, from_c: 3, to_r: 0, to_c: 5, arrow_r: 4, arrow_c: 5 };
+        let mv = AmazonsMove {
+            from_r: 0,
+            from_c: 3,
+            to_r: 0,
+            to_c: 5,
+            arrow_r: 4,
+            arrow_c: 5,
+        };
         let (q, a) = move_to_indices(&mv);
         assert!(q < PER_HEAD);
         assert!(a < PER_HEAD);

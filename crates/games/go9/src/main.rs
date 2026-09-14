@@ -40,7 +40,11 @@ impl ModelClient<Go9> for Go9Model {
             Go9Model::Local(m) => m.eval(lgs).await,
         }
     }
-    async fn policy(&self, lgs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>> {
+    async fn policy(
+        &self,
+        lgs: &LatentGameState,
+        top_b: u32,
+    ) -> anyhow::Result<Vec<PolicyCandidate>> {
         match self {
             Go9Model::Remote(m) => m.policy(lgs, top_b).await,
             Go9Model::Local(m) => m.policy(lgs, top_b).await,
@@ -55,8 +59,14 @@ impl ModelClient<Go9> for Go9Model {
         noise_scale: Option<f64>,
     ) -> anyhow::Result<game::Go9Move> {
         match self {
-            Go9Model::Remote(m) => m.reify(from_state, from_lgs, to_lgs, action_seed, noise_scale).await,
-            Go9Model::Local(m) => m.reify(from_state, from_lgs, to_lgs, action_seed, noise_scale).await,
+            Go9Model::Remote(m) => {
+                m.reify(from_state, from_lgs, to_lgs, action_seed, noise_scale)
+                    .await
+            }
+            Go9Model::Local(m) => {
+                m.reify(from_state, from_lgs, to_lgs, action_seed, noise_scale)
+                    .await
+            }
         }
     }
     async fn model_version(&self) -> anyhow::Result<String> {
@@ -316,7 +326,9 @@ enum Cmd {
 }
 
 fn default_threads() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
 
 #[tokio::main]
@@ -332,15 +344,30 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Serve { addr, model_uri, models, models_local, cuda }
-        | Cmd::SelfPlay { addr, model_uri, models, models_local, cuda } => {
+        Cmd::Serve {
+            addr,
+            model_uri,
+            models,
+            models_local,
+            cuda,
+        }
+        | Cmd::SelfPlay {
+            addr,
+            model_uri,
+            models,
+            models_local,
+            cuda,
+        } => {
             let device = net::pick_device(cuda)?;
             let mut clients: HashMap<String, Go9Model> = HashMap::new();
             for spec in &models_local {
-                let (name, ckpt) = spec
-                    .split_once('=')
-                    .ok_or_else(|| anyhow::anyhow!("--model-local must be NAME=CHECKPOINT, got {spec:?}"))?;
-                clients.insert(name.to_string(), Go9Model::Local(LocalModel::load_on(ckpt, device.clone())?));
+                let (name, ckpt) = spec.split_once('=').ok_or_else(|| {
+                    anyhow::anyhow!("--model-local must be NAME=CHECKPOINT, got {spec:?}")
+                })?;
+                clients.insert(
+                    name.to_string(),
+                    Go9Model::Local(LocalModel::load_on(ckpt, device.clone())?),
+                );
             }
             let remote_specs: Vec<(String, String)> = if models.is_empty() && clients.is_empty() {
                 vec![("nn".to_string(), model_uri)]
@@ -355,36 +382,91 @@ async fn main() -> anyhow::Result<()> {
                     .collect::<anyhow::Result<_>>()?
             };
             for (name, uri) in remote_specs {
-                clients.insert(name, Go9Model::Remote(RemoteModelClient::<Go9>::connect(&uri).await?));
+                clients.insert(
+                    name,
+                    Go9Model::Remote(RemoteModelClient::<Go9>::connect(&uri).await?),
+                );
             }
             playground_engine_server::run::<Go9, _>(addr, clients).await?;
         }
         Cmd::SelfplayBench {
-            model, cuda, batched, max_batch, games, threads,
-            sims, c_puct, dir_alpha, dir_eps, temp_moves, explore_eps, max_ply, seed,
-            backend, onnx, ep, fp16,
+            model,
+            cuda,
+            batched,
+            max_batch,
+            games,
+            threads,
+            sims,
+            c_puct,
+            dir_alpha,
+            dir_eps,
+            temp_moves,
+            explore_eps,
+            max_ply,
+            seed,
+            backend,
+            onnx,
+            ep,
+            fp16,
         } => {
             let threads = threads.unwrap_or_else(default_threads);
             let params = mcts::Params {
-                sims, move_ms: 0.0, node_budget: 0, c_puct, dir_alpha, dir_eps, temp_moves,
-                explore_eps, max_ply,
-                settle_plies: 0, resign_threshold: 0.0, resign_consecutive: 0, resign_playout_frac: 0.0,
+                sims,
+                move_ms: 0.0,
+                node_budget: 0,
+                c_puct,
+                dir_alpha,
+                dir_eps,
+                temp_moves,
+                explore_eps,
+                max_ply,
+                settle_plies: 0,
+                resign_threshold: 0.0,
+                resign_consecutive: 0,
+                resign_playout_frac: 0.0,
             };
             tokio::task::spawn_blocking(move || {
-                selfplay::run_benchmark(&model, cuda, games, threads, params, batched, max_batch,
-                    seed, &backend, &onnx, &ep, fp16)
+                selfplay::run_benchmark(
+                    &model, cuda, games, threads, params, batched, max_batch, seed, &backend,
+                    &onnx, &ep, fp16,
+                )
             })
             .await??;
         }
         Cmd::SelfplayGen {
-            model, out, cuda, batched, max_batch, games, threads, node_budget, move_ms,
-            sims, c_puct, dir_alpha, dir_eps, temp_moves, explore_eps, max_ply, seed,
+            model,
+            out,
+            cuda,
+            batched,
+            max_batch,
+            games,
+            threads,
+            node_budget,
+            move_ms,
+            sims,
+            c_puct,
+            dir_alpha,
+            dir_eps,
+            temp_moves,
+            explore_eps,
+            max_ply,
+            seed,
         } => {
             let threads = threads.unwrap_or_else(default_threads);
             let params = mcts::Params {
-                sims, move_ms, node_budget, c_puct, dir_alpha, dir_eps, temp_moves,
-                explore_eps, max_ply,
-                settle_plies: 0, resign_threshold: 0.0, resign_consecutive: 0, resign_playout_frac: 0.0,
+                sims,
+                move_ms,
+                node_budget,
+                c_puct,
+                dir_alpha,
+                dir_eps,
+                temp_moves,
+                explore_eps,
+                max_ply,
+                settle_plies: 0,
+                resign_threshold: 0.0,
+                resign_consecutive: 0,
+                resign_playout_frac: 0.0,
             };
             tokio::task::spawn_blocking(move || {
                 selfplay::run_generate(
@@ -394,44 +476,115 @@ async fn main() -> anyhow::Result<()> {
             .await??;
         }
         Cmd::SelfplayLoop {
-            live, cuda, max_batch, games_per_chunk, max_chunks, threads,
-            node_budget, c_puct, dir_alpha, dir_eps, temp_moves, explore_eps, max_ply, seed,
-            settle_plies, resign_threshold, resign_consecutive, resign_playout_frac,
-            backend, ep, fp16,
+            live,
+            cuda,
+            max_batch,
+            games_per_chunk,
+            max_chunks,
+            threads,
+            node_budget,
+            c_puct,
+            dir_alpha,
+            dir_eps,
+            temp_moves,
+            explore_eps,
+            max_ply,
+            seed,
+            settle_plies,
+            resign_threshold,
+            resign_consecutive,
+            resign_playout_frac,
+            backend,
+            ep,
+            fp16,
         } => {
             let threads = threads.unwrap_or_else(default_threads);
             let params = mcts::Params {
-                sims: 0, move_ms: 0.0, node_budget, c_puct, dir_alpha, dir_eps, temp_moves,
-                explore_eps, max_ply,
-                settle_plies, resign_threshold, resign_consecutive, resign_playout_frac,
+                sims: 0,
+                move_ms: 0.0,
+                node_budget,
+                c_puct,
+                dir_alpha,
+                dir_eps,
+                temp_moves,
+                explore_eps,
+                max_ply,
+                settle_plies,
+                resign_threshold,
+                resign_consecutive,
+                resign_playout_frac,
             };
             tokio::task::spawn_blocking(move || {
-                selfplay::run_loop(&live, cuda, params, games_per_chunk, max_chunks, threads,
-                    max_batch, seed, &backend, &ep, fp16)
+                selfplay::run_loop(
+                    &live,
+                    cuda,
+                    params,
+                    games_per_chunk,
+                    max_chunks,
+                    threads,
+                    max_batch,
+                    seed,
+                    &backend,
+                    &ep,
+                    fp16,
+                )
             })
             .await??;
         }
         Cmd::EvalMatch {
-            model_a, model_b, cuda, games, threads, max_batch, node_budget, c_puct, max_ply, seed,
+            model_a,
+            model_b,
+            cuda,
+            games,
+            threads,
+            max_batch,
+            node_budget,
+            c_puct,
+            max_ply,
+            seed,
         } => {
             let threads = threads.unwrap_or_else(default_threads);
             // Match play: net's best move (argmax), but sample the first few
             // moves for game diversity (temp_moves), and no root noise.
             let params = mcts::Params {
-                sims: 0, move_ms: 0.0, node_budget, c_puct,
-                dir_alpha: 0.5, dir_eps: 0.0, temp_moves: 8, explore_eps: 0.0, max_ply,
-                settle_plies: 0, resign_threshold: 0.0, resign_consecutive: 0, resign_playout_frac: 0.0,
+                sims: 0,
+                move_ms: 0.0,
+                node_budget,
+                c_puct,
+                dir_alpha: 0.5,
+                dir_eps: 0.0,
+                temp_moves: 8,
+                explore_eps: 0.0,
+                max_ply,
+                settle_plies: 0,
+                resign_threshold: 0.0,
+                resign_consecutive: 0,
+                resign_playout_frac: 0.0,
             };
             tokio::task::spawn_blocking(move || {
-                eval::run_match(&model_a, &model_b, cuda, games, params, threads, max_batch, seed)
-                    .map(|_| ())
+                eval::run_match(
+                    &model_a, &model_b, cuda, games, params, threads, max_batch, seed,
+                )
+                .map(|_| ())
             })
             .await??;
         }
-        Cmd::GnugoMatch { model, cuda, games, level, visits, c_puct, max_ply, gnugo, seed } => {
+        Cmd::GnugoMatch {
+            model,
+            cuda,
+            games,
+            level,
+            visits,
+            c_puct,
+            max_ply,
+            gnugo,
+            seed,
+        } => {
             tokio::task::spawn_blocking(move || {
-                gnugo::run_gnugo_match(&model, cuda, &gnugo, level, games, visits, c_puct, max_ply, seed)
-                    .map(|_| ())
+                gnugo::run_gnugo_match(
+                    &model, cuda, &gnugo, level, games, visits, c_puct, max_ply, seed,
+                )
+                .map(|_| ())
             })
             .await??;
         }

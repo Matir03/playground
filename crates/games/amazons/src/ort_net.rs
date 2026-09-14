@@ -9,7 +9,7 @@
 use std::sync::Mutex;
 
 use ort::ep::cuda::ConvAlgorithmSearch;
-use ort::execution_providers::{CUDA, TensorRT};
+use ort::execution_providers::{TensorRT, CUDA};
 use ort::session::Session;
 use ort::value::Tensor;
 
@@ -62,7 +62,9 @@ impl OrtModel {
             .map_err(e2a)?
             .commit_from_file(onnx_path)
             .map_err(e2a)?;
-        Ok(Self { session: Mutex::new(session) })
+        Ok(Self {
+            session: Mutex::new(session),
+        })
     }
 }
 

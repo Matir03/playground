@@ -40,14 +40,14 @@ fn idx(r: usize, c: usize) -> usize {
 #[inline]
 fn shift(b: u128, d: usize) -> u128 {
     match d {
-        0 => (b << N) & BOARD_MASK,                 // N  (r+1)
-        1 => b >> N,                                // S  (r-1)
-        2 => ((b & !FILE_LAST) << 1) & BOARD_MASK,  // E  (c+1)
-        3 => (b & !FILE_0) >> 1,                     // W  (c-1)
+        0 => (b << N) & BOARD_MASK,                      // N  (r+1)
+        1 => b >> N,                                     // S  (r-1)
+        2 => ((b & !FILE_LAST) << 1) & BOARD_MASK,       // E  (c+1)
+        3 => (b & !FILE_0) >> 1,                         // W  (c-1)
         4 => ((b & !FILE_LAST) << (N + 1)) & BOARD_MASK, // NE (r+1,c+1)
         5 => ((b & !FILE_0) << (N - 1)) & BOARD_MASK,    // NW (r+1,c-1)
-        6 => (b & !FILE_LAST) >> (N - 1),            // SE (r-1,c+1)
-        _ => (b & !FILE_0) >> (N + 1),               // SW (r-1,c-1)
+        6 => (b & !FILE_LAST) >> (N - 1),                // SE (r-1,c+1)
+        _ => (b & !FILE_0) >> (N + 1),                   // SW (r-1,c-1)
     }
 }
 
@@ -88,7 +88,13 @@ fn initial_state() -> AmazonsState {
     for (r, c) in [(6, 0), (6, 9), (9, 3), (9, 6)] {
         second |= 1u128 << idx(r, c);
     }
-    AmazonsState { first, second, arrows: 0, to_move: 1, ply: 0 }
+    AmazonsState {
+        first,
+        second,
+        arrows: 0,
+        to_move: 1,
+        ply: 0,
+    }
 }
 
 impl Default for AmazonsState {
@@ -312,9 +318,15 @@ pub fn fill_planes_into(state: &AmazonsState, out: &mut [f32]) {
 /// Position identity hash (boards + side); excludes ply. (For future eval cache.)
 #[allow(dead_code)]
 pub fn hash_key(state: &AmazonsState) -> u128 {
-    let mut h = state.first.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(31)
+    let mut h = state
+        .first
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .rotate_left(31)
         ^ state.second.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
-    h ^= state.arrows.rotate_left(17).wrapping_mul(0x1656_67B1_9E37_79F9);
+    h ^= state
+        .arrows
+        .rotate_left(17)
+        .wrapping_mul(0x1656_67B1_9E37_79F9);
     h ^= state.to_move as u128;
     h
 }
@@ -389,7 +401,10 @@ impl Game for Amazons {
     fn decode_state(bytes: &[u8]) -> anyhow::Result<Self::State> {
         let expected = 16 * 3 + 3;
         if bytes.len() != expected {
-            anyhow::bail!("amazons state: expected {expected} bytes, got {}", bytes.len());
+            anyhow::bail!(
+                "amazons state: expected {expected} bytes, got {}",
+                bytes.len()
+            );
         }
         let rd = |o: usize| {
             let mut b = [0u8; 16];
@@ -406,7 +421,9 @@ impl Game for Amazons {
     }
 
     fn encode_move(mv: &Self::Move) -> Vec<u8> {
-        vec![mv.from_r, mv.from_c, mv.to_r, mv.to_c, mv.arrow_r, mv.arrow_c]
+        vec![
+            mv.from_r, mv.from_c, mv.to_r, mv.to_c, mv.arrow_r, mv.arrow_c,
+        ]
     }
 
     fn decode_move(bytes: &[u8]) -> anyhow::Result<Self::Move> {
@@ -431,7 +448,11 @@ impl Solver for Amazons {
             .into_iter()
             .next()
             .expect("non-terminal position has a legal move");
-        SearchOutcome { best_move, value: 0.0, nodes: 0 }
+        SearchOutcome {
+            best_move,
+            value: 0.0,
+            nodes: 0,
+        }
     }
 }
 
@@ -499,7 +520,13 @@ mod tests {
     #[test]
     fn no_wrap_on_edges() {
         // A queen at column 0 must not slide "west" into column 9 of the row below.
-        let mut s = AmazonsState { first: 0, second: 0, arrows: 0, to_move: 1, ply: 0 };
+        let mut s = AmazonsState {
+            first: 0,
+            second: 0,
+            arrows: 0,
+            to_move: 1,
+            ply: 0,
+        };
         s.first = 1u128 << idx(5, 0);
         s.second = 1u128 << idx(0, 0); // keep it non-terminal-ish
         let reach = ray_reach(s.occupied(), idx(5, 0));

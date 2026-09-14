@@ -59,7 +59,13 @@ impl OpeningBook {
         let mut values = vec![0u8; size as usize];
         r.read_exact(&mut values)?;
 
-        Ok(Self { depth: depth as u32, size, partial_key_bytes: pkb, keys, values })
+        Ok(Self {
+            depth: depth as u32,
+            size,
+            partial_key_bytes: pkb,
+            keys,
+            values,
+        })
     }
 
     /// Exact score for the side to move, or `None` if the position is past the

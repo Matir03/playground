@@ -85,11 +85,19 @@ impl Stats {
     }
 
     fn pct(num: u64, den: u64) -> f64 {
-        if den == 0 { 0.0 } else { 100.0 * num as f64 / den as f64 }
+        if den == 0 {
+            0.0
+        } else {
+            100.0 * num as f64 / den as f64
+        }
     }
 
     fn report(&self, elapsed: Duration) -> String {
-        let per = if self.turns == 0 { 0.0 } else { self.realize_nanos as f64 / self.turns as f64 };
+        let per = if self.turns == 0 {
+            0.0
+        } else {
+            self.realize_nanos as f64 / self.turns as f64
+        };
         format!(
             "{:>6.0}s  games {:>7}  turns {:>9}  realize {:>7.1}µs ({:>6.0}/s/thread)\n\
              \x20        fidelity wild      moves {:>5.1}%  kills {:>5.1}%  spawns {:>5.1}%\n\
@@ -125,7 +133,11 @@ impl Stats {
     }
 
     fn to_json(&self, elapsed: Duration) -> String {
-        let per = if self.turns == 0 { 0.0 } else { self.realize_nanos as f64 / self.turns as f64 };
+        let per = if self.turns == 0 {
+            0.0
+        } else {
+            self.realize_nanos as f64 / self.turns as f64
+        };
         format!(
             r#"{{
   "elapsed_secs": {:.1},
@@ -159,23 +171,32 @@ impl Stats {
             self.turns,
             per / 1000.0,
             if per > 0.0 { 1e9 / per } else { 0.0 },
-            self.declared_moves[0], self.done_moves[0],
+            self.declared_moves[0],
+            self.done_moves[0],
             Self::pct(self.done_moves[0], self.declared_moves[0]),
-            self.declared_kills[0], self.done_kills[0],
+            self.declared_kills[0],
+            self.done_kills[0],
             Self::pct(self.done_kills[0], self.declared_kills[0]),
-            self.declared_spawns[0], self.done_spawns[0],
+            self.declared_spawns[0],
+            self.done_spawns[0],
             Self::pct(self.done_spawns[0], self.declared_spawns[0]),
-            self.declared_moves[1], self.done_moves[1],
+            self.declared_moves[1],
+            self.done_moves[1],
             Self::pct(self.done_moves[1], self.declared_moves[1]),
-            self.declared_kills[1], self.done_kills[1],
+            self.declared_kills[1],
+            self.done_kills[1],
             Self::pct(self.done_kills[1], self.declared_kills[1]),
-            self.declared_spawns[1], self.done_spawns[1],
+            self.declared_spawns[1],
+            self.done_spawns[1],
             Self::pct(self.done_spawns[1], self.declared_spawns[1]),
-            self.declared_moves[2], self.done_moves[2],
+            self.declared_moves[2],
+            self.done_moves[2],
             Self::pct(self.done_moves[2], self.declared_moves[2]),
-            self.declared_kills[2], self.done_kills[2],
+            self.declared_kills[2],
+            self.done_kills[2],
             Self::pct(self.done_kills[2], self.declared_kills[2]),
-            self.declared_spawns[2], self.done_spawns[2],
+            self.declared_spawns[2],
+            self.done_spawns[2],
             Self::pct(self.done_spawns[2], self.declared_spawns[2]),
             self.solver_calls,
             self.solver_rescued,
@@ -187,7 +208,11 @@ impl Stats {
             self.outcomes[3],
             self.illegal,
             self.panics,
-            self.failures.iter().map(|f| format!("{f:?}")).collect::<Vec<_>>().join(", "),
+            self.failures
+                .iter()
+                .map(|f| format!("{f:?}"))
+                .collect::<Vec<_>>()
+                .join(", "),
         )
     }
 }
@@ -327,7 +352,8 @@ fn play_one(seed: u64, verify: bool, oracle: bool) -> Stats {
             for mv in &r.actions {
                 if !Minions::legal_moves(&check).contains(mv) {
                     st.illegal += 1;
-                    st.failures.push(format!("illegal {mv} @seed={seed} turn={}", check.turn));
+                    st.failures
+                        .push(format!("illegal {mv} @seed={seed} turn={}", check.turn));
                     break;
                 }
                 check = Minions::apply(&check, mv);

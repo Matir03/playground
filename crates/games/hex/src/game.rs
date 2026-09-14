@@ -85,7 +85,13 @@ pub struct HexState {
 
 impl Default for HexState {
     fn default() -> Self {
-        Self { black: Bb::ZERO, white: Bb::ZERO, to_move: 1, winner: 0, ply: 0 }
+        Self {
+            black: Bb::ZERO,
+            white: Bb::ZERO,
+            to_move: 1,
+            winner: 0,
+            ply: 0,
+        }
     }
 }
 
@@ -115,13 +121,20 @@ impl HexState {
     /// Stones of the side to move, then the opponent's.
     #[inline]
     pub fn own_opp(&self) -> (Bb, Bb) {
-        if self.to_move == 1 { (self.black, self.white) } else { (self.white, self.black) }
+        if self.to_move == 1 {
+            (self.black, self.white)
+        } else {
+            (self.white, self.black)
+        }
     }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum HexMove {
-    Play { r: u8, c: u8 },
+    Play {
+        r: u8,
+        c: u8,
+    },
     /// The pie-rule reply (see [`ALLOW_SWAP`]).
     Swap,
 }
@@ -274,7 +287,11 @@ pub fn transpose_swap(state: &HexState) -> HexState {
 /// connecting top↔bottom. Apply [`transpose_index`] to map a move chosen in this
 /// frame back to the real board (only needed when the original mover was White).
 pub fn canonical(state: &HexState) -> HexState {
-    if state.to_move == 1 { *state } else { transpose_swap(state) }
+    if state.to_move == 1 {
+        *state
+    } else {
+        transpose_swap(state)
+    }
 }
 
 /// The cell index `i` as the mover sees it — identity for Black, transposed for
@@ -282,7 +299,11 @@ pub fn canonical(state: &HexState) -> HexState {
 /// [`fill_planes_into`] encodes and the policy head indexes.
 #[inline]
 pub fn canon_index(state: &HexState, i: usize) -> usize {
-    if state.to_move == 1 { i } else { transpose_index(i) }
+    if state.to_move == 1 {
+        i
+    } else {
+        transpose_index(i)
+    }
 }
 
 /// Write the `PLANES`×13×13 net input into `out` (len 338). Single source of truth
@@ -331,7 +352,11 @@ impl Game for Hex {
     }
 
     fn to_move(state: &Self::State) -> Player {
-        if state.to_move == 1 { Player::First } else { Player::Second }
+        if state.to_move == 1 {
+            Player::First
+        } else {
+            Player::Second
+        }
     }
 
     fn outcome(state: &Self::State) -> Outcome {
@@ -351,7 +376,10 @@ impl Game for Hex {
             moves.push(HexMove::Swap);
         }
         for i in state.empty().iter() {
-            moves.push(HexMove::Play { r: (i / N) as u8, c: (i % N) as u8 });
+            moves.push(HexMove::Play {
+                r: (i / N) as u8,
+                c: (i % N) as u8,
+            });
         }
         moves
     }
@@ -382,7 +410,11 @@ impl Game for Hex {
                     state.ply == 1 && state.to_move == 2,
                     "swap is only the reply to First's opening move"
                 );
-                let i = state.black.iter().next().expect("swap follows exactly one black stone");
+                let i = state
+                    .black
+                    .iter()
+                    .next()
+                    .expect("swap follows exactly one black stone");
                 next.black.clear(i);
                 next.white.set(transpose_index(i));
             }
@@ -471,9 +503,16 @@ pub fn placeholder_move(state: &HexState) -> HexMove {
     let i = if state.cell_at(centre) == 0 {
         centre
     } else {
-        state.empty().iter().next().expect("non-terminal position has an empty cell")
+        state
+            .empty()
+            .iter()
+            .next()
+            .expect("non-terminal position has an empty cell")
     };
-    HexMove::Play { r: (i / N) as u8, c: (i % N) as u8 }
+    HexMove::Play {
+        r: (i / N) as u8,
+        c: (i % N) as u8,
+    }
 }
 
 /// Hex gets its strength from the AZ net (not written yet) and from MoHex, the
@@ -482,7 +521,11 @@ pub fn placeholder_move(state: &HexState) -> HexMove {
 /// startup (`hex-engine serve --mohex-bin …`).
 impl Solver for Hex {
     fn choose_move(state: &Self::State) -> SearchOutcome<Self::Move> {
-        SearchOutcome { best_move: placeholder_move(state), value: 0.0, nodes: 0 }
+        SearchOutcome {
+            best_move: placeholder_move(state),
+            value: 0.0,
+            nodes: 0,
+        }
     }
 
     fn choose_move_external(
@@ -491,7 +534,11 @@ impl Solver for Hex {
     ) -> Option<anyhow::Result<SearchOutcome<Self::Move>>> {
         let chosen = crate::mohex::choose_move(state, budget.max_millis, budget.max_visits)?;
         // MoHex reports no node count over GTP; `visits` stays 0 in the UI.
-        Some(chosen.map(|best_move| SearchOutcome { best_move, value: 0.0, nodes: 0 }))
+        Some(chosen.map(|best_move| SearchOutcome {
+            best_move,
+            value: 0.0,
+            nodes: 0,
+        }))
     }
 }
 
@@ -501,7 +548,13 @@ mod tests {
 
     fn play(state: &HexState, cell: &str) -> HexState {
         let (r, c) = parse_cell(cell).unwrap();
-        Hex::apply(state, &HexMove::Play { r: r as u8, c: c as u8 })
+        Hex::apply(
+            state,
+            &HexMove::Play {
+                r: r as u8,
+                c: c as u8,
+            },
+        )
     }
 
     #[test]
@@ -559,12 +612,20 @@ mod tests {
                 r -= 1; // (r-1, c+1): the NE diagonal is adjacent on a hex grid
             }
         }
-        let s = HexState { white, to_move: 1, ..Default::default() };
+        let s = HexState {
+            white,
+            to_move: 1,
+            ..Default::default()
+        };
         assert_eq!(compute_winner(&s), 2);
         // Break one link (the chain's stone in the middle column) and the
         // connection is gone.
         let mut broken = s;
-        let mid = s.white.iter().find(|i| i % N == N / 2).expect("chain crosses every column");
+        let mid = s
+            .white
+            .iter()
+            .find(|i| i % N == N / 2)
+            .expect("chain crosses every column");
         broken.white.clear(mid);
         assert_eq!(compute_winner(&broken), 0);
     }
@@ -580,7 +641,9 @@ mod tests {
             while s.winner == 0 {
                 let moves = Hex::legal_moves(&s);
                 assert!(!moves.is_empty(), "board filled with no winner");
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let mv = moves[(seed >> 33) as usize % moves.len()];
                 s = Hex::apply(&s, &mv);
             }
@@ -655,7 +718,11 @@ mod tests {
 
     #[test]
     fn move_roundtrip() {
-        for mv in [HexMove::Swap, HexMove::Play { r: 12, c: 0 }, HexMove::Play { r: 6, c: 6 }] {
+        for mv in [
+            HexMove::Swap,
+            HexMove::Play { r: 12, c: 0 },
+            HexMove::Play { r: 6, c: 6 },
+        ] {
             assert_eq!(Hex::decode_move(&Hex::encode_move(&mv)).unwrap(), mv);
         }
         assert!(Hex::decode_move(&[1, 13, 0]).is_err());

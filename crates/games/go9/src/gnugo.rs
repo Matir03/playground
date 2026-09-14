@@ -57,7 +57,11 @@ impl Gtp {
             .spawn()?;
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
-        Ok(Self { child, stdin, stdout })
+        Ok(Self {
+            child,
+            stdin,
+            stdout,
+        })
     }
 
     /// Send a GTP command and return the response body (leading `=`/`?` stripped).
@@ -109,9 +113,19 @@ pub fn run_gnugo_match(
     let model = LocalModel::load_on(ckpt, device)?;
     let eval = |s: &Go9State| model.policy_value(s);
     let params = Params {
-        sims: 0, move_ms: 0.0, node_budget, c_puct,
-        dir_alpha: 1.0, dir_eps: 0.0, temp_moves: 0, explore_eps: 0.0, max_ply,
-        settle_plies: 0, resign_threshold: 0.0, resign_consecutive: 0, resign_playout_frac: 0.0,
+        sims: 0,
+        move_ms: 0.0,
+        node_budget,
+        c_puct,
+        dir_alpha: 1.0,
+        dir_eps: 0.0,
+        temp_moves: 0,
+        explore_eps: 0.0,
+        max_ply,
+        settle_plies: 0,
+        resign_threshold: 0.0,
+        resign_consecutive: 0,
+        resign_playout_frac: 0.0,
     };
     eprintln!(
         "go9 vs GNU Go L{level}: {games} games, {node_budget} visits/move (concrete value+policy), \
@@ -154,7 +168,10 @@ pub fn run_gnugo_match(
                 } else {
                     let (r, c) = rc_from_vertex(&v)
                         .ok_or_else(|| anyhow::anyhow!("bad GTP vertex {v:?}"))?;
-                    Go9Move::Play { r: r as u8, c: c as u8 }
+                    Go9Move::Play {
+                        r: r as u8,
+                        c: c as u8,
+                    }
                 };
                 state = Go9::apply(&state, &mv);
             }

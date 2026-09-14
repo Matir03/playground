@@ -10,23 +10,34 @@ use playground_model_client::RemoteModelClient;
 
 #[derive(Parser)]
 #[command(name = "arimaa-engine", version)]
-struct Cli { #[command(subcommand)] cmd: Cmd }
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
 
 #[derive(Subcommand)]
 enum Cmd {
     Serve {
-        #[arg(long, default_value = "127.0.0.1:7103")] addr: SocketAddr,
-        #[arg(long, default_value = "http://127.0.0.1:7203")] model_uri: String,
+        #[arg(long, default_value = "127.0.0.1:7103")]
+        addr: SocketAddr,
+        #[arg(long, default_value = "http://127.0.0.1:7203")]
+        model_uri: String,
     },
     SelfPlay {
-        #[arg(long, default_value = "127.0.0.1:7103")] addr: SocketAddr,
-        #[arg(long, default_value = "http://127.0.0.1:7203")] model_uri: String,
-        #[arg(long, default_value_t = 16)] workers: u32,
+        #[arg(long, default_value = "127.0.0.1:7103")]
+        addr: SocketAddr,
+        #[arg(long, default_value = "http://127.0.0.1:7203")]
+        model_uri: String,
+        #[arg(long, default_value_t = 16)]
+        workers: u32,
     },
     Match {
-        #[arg(long)] first_player_uri: String,
-        #[arg(long)] second_player_uri: String,
-        #[arg(long, default_value_t = 1)] num_games: u32,
+        #[arg(long)]
+        first_player_uri: String,
+        #[arg(long)]
+        second_player_uri: String,
+        #[arg(long, default_value_t = 1)]
+        num_games: u32,
     },
     Stdio,
 }
@@ -39,7 +50,10 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Serve { addr, model_uri } | Cmd::SelfPlay { addr, model_uri, .. } => {
+        Cmd::Serve { addr, model_uri }
+        | Cmd::SelfPlay {
+            addr, model_uri, ..
+        } => {
             let model = RemoteModelClient::<Arimaa>::connect(&model_uri).await?;
             let models = std::collections::HashMap::from([("nn".to_string(), model)]);
             playground_engine_server::run::<Arimaa, _>(addr, models).await?;

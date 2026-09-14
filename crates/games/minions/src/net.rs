@@ -47,7 +47,10 @@ impl ConvNeck {
         bn: BatchNormConfig,
         vb: VarBuilder,
     ) -> candle_core::Result<Self> {
-        let cfg = Conv2dConfig { padding: 1, ..Default::default() };
+        let cfg = Conv2dConfig {
+            padding: 1,
+            ..Default::default()
+        };
         Ok(Self {
             c1: conv2d(c_in, c_out, 3, cfg, vb.pp("0"))?,
             b1: batch_norm(c_out, bn, vb.pp("1"))?,
@@ -80,8 +83,14 @@ impl ConvNeck1 {
         bn: BatchNormConfig,
         vb: VarBuilder,
     ) -> candle_core::Result<Self> {
-        let cfg = Conv2dConfig { padding: 1, ..Default::default() };
-        Ok(Self { c: conv2d(c_in, c_out, 3, cfg, vb.pp("0"))?, b: batch_norm(c_out, bn, vb.pp("1"))? })
+        let cfg = Conv2dConfig {
+            padding: 1,
+            ..Default::default()
+        };
+        Ok(Self {
+            c: conv2d(c_in, c_out, 3, cfg, vb.pp("0"))?,
+            b: batch_norm(c_out, bn, vb.pp("1"))?,
+        })
     }
 
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
@@ -98,7 +107,10 @@ struct ResBlock {
 
 impl ResBlock {
     fn load(c: usize, vb: VarBuilder) -> candle_core::Result<Self> {
-        let cfg = Conv2dConfig { padding: 1, ..Default::default() };
+        let cfg = Conv2dConfig {
+            padding: 1,
+            ..Default::default()
+        };
         Ok(Self {
             c1: conv2d(c, c, 3, cfg, vb.pp("c1"))?,
             b1: batch_norm(c, BatchNormConfig::default(), vb.pp("b1"))?,
@@ -123,7 +135,9 @@ struct GlobalPoolBias {
 
 impl GlobalPoolBias {
     fn load(c: usize, vb: VarBuilder) -> candle_core::Result<Self> {
-        Ok(Self { fc: linear(2 * c, c, vb.pp("fc"))? })
+        Ok(Self {
+            fc: linear(2 * c, c, vb.pp("fc"))?,
+        })
     }
 
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
@@ -198,7 +212,11 @@ pub trait Backend: Send + Sync {
     /// once — but only when it has a session pool, because binding requires
     /// holding one session for the whole pass, which with a single shared
     /// session would serialize the self-play workers.
-    fn diffusion_pass<'a>(&'a self, h: &'a [f16], b: usize) -> anyhow::Result<Box<dyn DiffusionPass + 'a>>;
+    fn diffusion_pass<'a>(
+        &'a self,
+        h: &'a [f16],
+        b: usize,
+    ) -> anyhow::Result<Box<dyn DiffusionPass + 'a>>;
 }
 
 /// Repeat one position's trunk features across `n` rows, so a batch of `n`
@@ -247,7 +265,10 @@ impl MinionsNet {
         energy_blocks_n: usize,
         vb: VarBuilder,
     ) -> candle_core::Result<Self> {
-        let cfg = Conv2dConfig { padding: 1, ..Default::default() };
+        let cfg = Conv2dConfig {
+            padding: 1,
+            ..Default::default()
+        };
         let cfg1 = Conv2dConfig::default();
         let bn = BatchNormConfig::default();
 
@@ -301,7 +322,10 @@ impl MinionsNet {
     /// and reused across every diffusion step and every energy evaluation, which
     /// is what keeps the T-step sampling loop affordable.
     pub fn trunk(&self, planes: &Tensor) -> candle_core::Result<Tensor> {
-        let mut x = self.stem_bn.forward_t(&self.stem.forward(planes)?, false)?.relu()?;
+        let mut x = self
+            .stem_bn
+            .forward_t(&self.stem.forward(planes)?, false)?
+            .relu()?;
         for blk in &self.blocks {
             x = blk.forward(&x)?;
         }
@@ -319,9 +343,17 @@ impl MinionsNet {
     /// → `values[B]`.
     pub fn value(&self, h: &Tensor) -> candle_core::Result<Vec<f32>> {
         let vh = self.val_neck.forward(h)?;
-        let v = self.val_bn.forward_t(&self.val_conv.forward(&vh)?, false)?.relu()?.flatten_from(1)?;
+        let v = self
+            .val_bn
+            .forward_t(&self.val_conv.forward(&vh)?, false)?
+            .relu()?
+            .flatten_from(1)?;
         let v = self.val_fc1.forward(&v)?.relu()?;
-        self.val_fc2.forward(&v)?.tanh()?.flatten_all()?.to_vec1::<f32>()
+        self.val_fc2
+            .forward(&v)?
+            .tanh()?
+            .flatten_all()?
+            .to_vec1::<f32>()
     }
 
     /// Declaration logits for a partially committed turn.
@@ -329,7 +361,10 @@ impl MinionsNet {
     pub fn declaration_logits(&self, h: &Tensor, decl: &Tensor) -> candle_core::Result<Tensor> {
         let b = h.dim(0)?;
         let x = Tensor::cat(&[h, decl], 1)?;
-        let x = self.dif_bn.forward_t(&self.dif_in.forward(&x)?, false)?.relu()?;
+        let x = self
+            .dif_bn
+            .forward_t(&self.dif_in.forward(&x)?, false)?
+            .relu()?;
         let x = self.dif_gpool.forward(&self.dif_block.forward(&x)?)?;
         self.dif_out
             .forward(&x)?
@@ -341,7 +376,10 @@ impl MinionsNet {
     /// `f(s, a)` for a whole declaration → one score per batch row.
     pub fn energy(&self, h: &Tensor, decl: &Tensor) -> candle_core::Result<Vec<f32>> {
         let x = Tensor::cat(&[h, decl], 1)?;
-        let mut x = self.eng_bn.forward_t(&self.eng_in.forward(&x)?, false)?.relu()?;
+        let mut x = self
+            .eng_bn
+            .forward_t(&self.eng_in.forward(&x)?, false)?
+            .relu()?;
         for blk in &self.eng_blocks {
             x = blk.forward(&x)?;
         }
@@ -386,7 +424,10 @@ impl BackendKind {
     pub fn parse(name: &str, ep: &str, fp16: bool, cuda: bool) -> anyhow::Result<Self> {
         match name {
             "candle" => Ok(Self::Candle { cuda }),
-            "ort" => Ok(Self::Ort { ep: ep.to_string(), fp16 }),
+            "ort" => Ok(Self::Ort {
+                ep: ep.to_string(),
+                fp16,
+            }),
             other => anyhow::bail!("unknown --backend {other:?} (use candle|ort)"),
         }
     }
@@ -399,11 +440,19 @@ impl BackendKind {
             // its match.
             Self::Candle { .. } => {
                 let best = live.join("best.safetensors");
-                if best.exists() { best } else { live.join("latest.safetensors") }
+                if best.exists() {
+                    best
+                } else {
+                    live.join("latest.safetensors")
+                }
             }
             Self::Ort { .. } => {
                 let best = live.join("best").join("trunk.onnx");
-                if best.exists() { best } else { live.join("trunk.onnx") }
+                if best.exists() {
+                    best
+                } else {
+                    live.join("trunk.onnx")
+                }
             }
         }
     }
@@ -420,7 +469,9 @@ pub fn load_backend(
         BackendKind::Candle { cuda } => Ok(Box::new(LocalNet::load(&path, *cuda)?)),
         BackendKind::Ort { ep, fp16 } => {
             let dir = path.parent().unwrap_or(live);
-            Ok(Box::new(crate::ort_net::OrtNet::new(dir, ep, *fp16, cache_dir)?))
+            Ok(Box::new(crate::ort_net::OrtNet::new(
+                dir, ep, *fp16, cache_dir,
+            )?))
         }
     }
 }
@@ -441,20 +492,34 @@ impl std::ops::Deref for LocalNet {
 
 impl LocalNet {
     pub fn load(checkpoint: &Path, cuda: bool) -> anyhow::Result<Self> {
-        let device = if cuda { Device::new_cuda(0)? } else { Device::Cpu };
-        let (c, b, e) = read_arch(checkpoint);
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[checkpoint], DType::F32, &device)?
+        let device = if cuda {
+            Device::new_cuda(0)?
+        } else {
+            Device::Cpu
         };
-        Ok(Self { net: MinionsNet::load(c, b, e, vb)?, device })
+        let (c, b, e) = read_arch(checkpoint);
+        let vb =
+            unsafe { VarBuilder::from_mmaped_safetensors(&[checkpoint], DType::F32, &device)? };
+        Ok(Self {
+            net: MinionsNet::load(c, b, e, vb)?,
+            device,
+        })
     }
 
     pub fn planes_tensor(&self, planes: &[f32], b: usize) -> anyhow::Result<Tensor> {
-        Ok(Tensor::from_slice(planes, (b, IN_PLANES, N, N), &self.device)?)
+        Ok(Tensor::from_slice(
+            planes,
+            (b, IN_PLANES, N, N),
+            &self.device,
+        )?)
     }
 
     pub fn decl_tensor(&self, decl: &[f32], b: usize) -> anyhow::Result<Tensor> {
-        Ok(Tensor::from_slice(decl, (b, DECL_PLANES, N, N), &self.device)?)
+        Ok(Tensor::from_slice(
+            decl,
+            (b, DECL_PLANES, N, N),
+            &self.device,
+        )?)
     }
 
     pub fn h_tensor(&self, h: &[f32], b: usize) -> anyhow::Result<Tensor> {
@@ -463,7 +528,11 @@ impl LocalNet {
     }
 
     pub fn energy_decl_tensor(&self, decl: &[f32], b: usize) -> anyhow::Result<Tensor> {
-        Ok(Tensor::from_slice(decl, (b, ENERGY_PLANES, N, N), &self.device)?)
+        Ok(Tensor::from_slice(
+            decl,
+            (b, ENERGY_PLANES, N, N),
+            &self.device,
+        )?)
     }
 }
 
@@ -481,16 +550,27 @@ impl Backend for LocalNet {
         // Emit the head features, not the raw trunk: they are what the sampler
         // repeats across chains and reuses for every diffusion round.
         let hh: Vec<f32> = self.net.head_features(&h)?.flatten_all()?.to_vec1()?;
-        Ok(TrunkOut { h: Vec::from_f32_slice(&hh), value })
+        Ok(TrunkOut {
+            h: Vec::from_f32_slice(&hh),
+            value,
+        })
     }
 
     fn diffusion(&self, h: &[f16], decl: &[f32], b: usize) -> anyhow::Result<Vec<f32>> {
         let ht = self.h_tensor(&h.to_f32_vec(), b)?;
         let dt = self.decl_tensor(decl, b)?;
-        Ok(self.net.declaration_logits(&ht, &dt)?.flatten_all()?.to_vec1()?)
+        Ok(self
+            .net
+            .declaration_logits(&ht, &dt)?
+            .flatten_all()?
+            .to_vec1()?)
     }
 
-    fn diffusion_pass<'a>(&'a self, h: &'a [f16], b: usize) -> anyhow::Result<Box<dyn DiffusionPass + 'a>> {
+    fn diffusion_pass<'a>(
+        &'a self,
+        h: &'a [f16],
+        b: usize,
+    ) -> anyhow::Result<Box<dyn DiffusionPass + 'a>> {
         Ok(Box::new(NaivePass { net: self, h, b }))
     }
 

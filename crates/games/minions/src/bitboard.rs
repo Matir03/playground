@@ -143,9 +143,14 @@ mod tests {
         // it is clipped by the rim, so compare against the geometry rather than
         // the constant — the move head still has 37 slots, most of them
         // off-board from any given cell.
-        let ball = (0..NUM_CELLS as u8).filter(|&c| dist(start, c) <= 3).count();
+        let ball = (0..NUM_CELLS as u8)
+            .filter(|&c| dist(start, c) <= 3)
+            .count();
         assert_eq!(cells(reachable(bit(start), 3, FULL)).count(), ball);
-        assert!(ball <= 37, "the ball cannot exceed the move head's 37 offsets");
+        assert!(
+            ball <= 37,
+            "the ball cannot exceed the move head's 37 offsets"
+        );
     }
 
     #[test]
@@ -155,7 +160,10 @@ mod tests {
         let behind = idx(5, 4);
         let pass = FULL & !bit(corridor);
         let r = reachable(bit(start), 2, pass);
-        assert!(!has(r, behind), "the only 2-step route runs through the corridor");
+        assert!(
+            !has(r, behind),
+            "the only 2-step route runs through the corridor"
+        );
         assert!(has(r, start));
     }
 

@@ -35,7 +35,10 @@ struct ResBlock {
 
 impl ResBlock {
     fn load(c: usize, vb: VarBuilder) -> candle_core::Result<Self> {
-        let cfg = Conv2dConfig { padding: 1, ..Default::default() };
+        let cfg = Conv2dConfig {
+            padding: 1,
+            ..Default::default()
+        };
         Ok(Self {
             c1: conv2d(c, c, 3, cfg, vb.pp("c1"))?,
             b1: batch_norm(c, BatchNormConfig::default(), vb.pp("b1"))?,
@@ -64,7 +67,10 @@ struct AzNet {
 
 impl AzNet {
     fn load(channels: usize, blocks_n: usize, vb: VarBuilder) -> candle_core::Result<Self> {
-        let cfg = Conv2dConfig { padding: 1, ..Default::default() };
+        let cfg = Conv2dConfig {
+            padding: 1,
+            ..Default::default()
+        };
         let cfg1 = Conv2dConfig::default(); // 1×1
         let mut blocks = Vec::with_capacity(blocks_n);
         let blocks_vb = vb.pp("blocks");
@@ -85,7 +91,10 @@ impl AzNet {
     }
 
     fn trunk(&self, planes: &Tensor) -> candle_core::Result<Tensor> {
-        let mut x = self.stem_bn.forward_t(&self.stem.forward(planes)?, false)?.relu()?;
+        let mut x = self
+            .stem_bn
+            .forward_t(&self.stem.forward(planes)?, false)?
+            .relu()?;
         for blk in &self.blocks {
             x = blk.forward(&x)?;
         }
@@ -98,9 +107,18 @@ impl AzNet {
         let x = self.trunk(planes)?;
         let policy = self.pol_conv.forward(&x)?.reshape((b, POLICY_DIM))?;
         let policy = policy.flatten_all()?.to_vec1::<f32>()?;
-        let v = self.val_bn.forward_t(&self.val_conv.forward(&x)?, false)?.relu()?.flatten_from(1)?;
+        let v = self
+            .val_bn
+            .forward_t(&self.val_conv.forward(&x)?, false)?
+            .relu()?
+            .flatten_from(1)?;
         let v = self.val_fc1.forward(&v)?.relu()?;
-        let vals = self.val_fc2.forward(&v)?.tanh()?.flatten_all()?.to_vec1::<f32>()?;
+        let vals = self
+            .val_fc2
+            .forward(&v)?
+            .tanh()?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
         Ok((vals, policy))
     }
 }
@@ -151,10 +169,15 @@ impl LocalModel {
         let path = Path::new(checkpoint);
         let (channels, blocks) = read_arch(path);
         // SAFETY: the mmap outlives the load; tensors are copied out of it.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[checkpoint], DType::F32, &device)? };
+        let vb =
+            unsafe { VarBuilder::from_mmaped_safetensors(&[checkpoint], DType::F32, &device)? };
         let net = AzNet::load(channels, blocks, vb)?;
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("hex");
-        Ok(Self { net, device, model_version: format!("hex-{stem}") })
+        Ok(Self {
+            net,
+            device,
+            model_version: format!("hex-{stem}"),
+        })
     }
 
     /// Batched forward over positions: (values, raw policy logits[169] each).
@@ -196,7 +219,11 @@ impl Evaluator for LocalModel {
 #[async_trait]
 impl ModelClient<Hex> for LocalModel {
     async fn encode(&self, state: &HexState) -> anyhow::Result<LatentGameState> {
-        Ok(LatentGameState::new(Hex::encode_state(state), vec![], self.model_version.clone()))
+        Ok(LatentGameState::new(
+            Hex::encode_state(state),
+            vec![],
+            self.model_version.clone(),
+        ))
     }
 
     async fn eval(&self, lgs: &LatentGameState) -> anyhow::Result<f64> {
@@ -205,7 +232,11 @@ impl ModelClient<Hex> for LocalModel {
         Ok(vals[0] as f64)
     }
 
-    async fn policy(&self, lgs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>> {
+    async fn policy(
+        &self,
+        lgs: &LatentGameState,
+        top_b: u32,
+    ) -> anyhow::Result<Vec<PolicyCandidate>> {
         let state = Hex::decode_state(&lgs.payload)?;
         let (_vals, logits) = self.value_policy_batch(&[&state])?;
         let (mut moves, mut priors) = (Vec::new(), Vec::new());

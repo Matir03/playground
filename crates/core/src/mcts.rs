@@ -169,8 +169,8 @@ pub async fn search<G: Game, M: ModelClient<G>>(
         // Uncapped rollouts until the per-move time budget elapses (with a
         // generous hard cap to bound tree memory).
         const HARD_CAP: u32 = 2_000_000;
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_millis(config.move_millis);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(config.move_millis);
         let mut n = 0u32;
         while n < HARD_CAP && std::time::Instant::now() < deadline {
             simulate(model, &mut tree, config, &mut reifications).await?;
@@ -286,7 +286,10 @@ async fn reify_edge<G: Game, M: ModelClient<G>>(
     edge_idx: usize,
     child: usize,
 ) -> anyhow::Result<()> {
-    let parent_state = tree[parent].state.clone().expect("reified parent has state");
+    let parent_state = tree[parent]
+        .state
+        .clone()
+        .expect("reified parent has state");
     let parent_lgs = tree[parent].lgs.clone();
     let to_lgs = tree[parent].edges[edge_idx].predicted_lgs.clone();
     let seed = tree[parent].edges[edge_idx].action_vector.clone();
@@ -351,14 +354,26 @@ async fn expand<G: Game, M: ModelClient<G>>(
 ///   W(a)     = Σ_b k(a,b) · n_b                      (kernel-weighted count)
 ///   Q_kr(a)  = Σ_b k(a,b) · n_b · q_b / W(a)         (kernel-regressed value)
 ///   score(a) = Q_kr(a) + c · prior_a · √N / (1 + W(a))
-fn kr_uct_select<G: Game>(tree: &[Node<G>], node_idx: usize, config: &SearchConfig) -> Option<usize> {
+fn kr_uct_select<G: Game>(
+    tree: &[Node<G>],
+    node_idx: usize,
+    config: &SearchConfig,
+) -> Option<usize> {
     let node = &tree[node_idx];
     let m = node.edges.len();
     if m == 0 {
         return None;
     }
-    let pts: Vec<Vec<f32>> = node.edges.iter().map(|e| action_point(&e.action_vector)).collect();
-    let n: Vec<f64> = node.edges.iter().map(|e| tree[e.child].visits as f64).collect();
+    let pts: Vec<Vec<f32>> = node
+        .edges
+        .iter()
+        .map(|e| action_point(&e.action_vector))
+        .collect();
+    let n: Vec<f64> = node
+        .edges
+        .iter()
+        .map(|e| tree[e.child].visits as f64)
+        .collect();
     let q: Vec<f64> = node
         .edges
         .iter()
@@ -387,7 +402,11 @@ fn kr_uct_select<G: Game>(tree: &[Node<G>], node_idx: usize, config: &SearchConf
         .filter(|(b, _)| n[*b] > 0.0)
         .map(|(_, e)| e.prior as f32)
         .sum();
-    let parent_q = if node.visits > 0 { node.value_sum / node.visits as f64 } else { 0.0 };
+    let parent_q = if node.visits > 0 {
+        node.value_sum / node.visits as f64
+    } else {
+        0.0
+    };
     let fpu = crate::puct::fpu(parent_q as f32, visited_prior) as f64;
     let mut best = None;
     let mut best_score = f64::NEG_INFINITY;
@@ -412,7 +431,9 @@ fn kr_uct_select<G: Game>(tree: &[Node<G>], node_idx: usize, config: &SearchConf
 
 fn is_legal<G: Game>(state: &G::State, mv: &G::Move) -> bool {
     let target = G::encode_move(mv);
-    G::legal_moves(state).iter().any(|m| G::encode_move(m) == target)
+    G::legal_moves(state)
+        .iter()
+        .any(|m| G::encode_move(m) == target)
 }
 
 fn first_legal<G: Game>(state: &G::State) -> anyhow::Result<G::Move> {
@@ -446,10 +467,17 @@ mod tests {
             99
         }
         fn initial_state() -> State {
-            State { remaining: 7, ply: 0 }
+            State {
+                remaining: 7,
+                ply: 0,
+            }
         }
         fn to_move(s: &State) -> Player {
-            if s.ply % 2 == 0 { Player::First } else { Player::Second }
+            if s.ply % 2 == 0 {
+                Player::First
+            } else {
+                Player::Second
+            }
         }
         fn outcome(s: &State) -> Outcome {
             if s.remaining == 0 {
@@ -466,7 +494,10 @@ mod tests {
             (1..=2).filter(|&t| t <= s.remaining).collect()
         }
         fn apply(s: &State, mv: &u8) -> State {
-            State { remaining: s.remaining - mv, ply: s.ply + 1 }
+            State {
+                remaining: s.remaining - mv,
+                ply: s.ply + 1,
+            }
         }
         fn ply(s: &State) -> u32 {
             s.ply
@@ -509,7 +540,11 @@ mod tests {
         async fn eval(&self, _lgs: &LatentGameState) -> anyhow::Result<f64> {
             Ok(0.0)
         }
-        async fn policy(&self, lgs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>> {
+        async fn policy(
+            &self,
+            lgs: &LatentGameState,
+            top_b: u32,
+        ) -> anyhow::Result<Vec<PolicyCandidate>> {
             let state = Countdown::decode_state(&lgs.payload)?;
             let moves = Countdown::legal_moves(&state);
             let n = moves.len().max(1) as f64;
@@ -550,20 +585,32 @@ mod tests {
 
     #[tokio::test]
     async fn search_returns_legal_move_and_reifies() {
-        let cfg = SearchConfig { simulations: 64, ..Default::default() };
+        let cfg = SearchConfig {
+            simulations: 64,
+            ..Default::default()
+        };
         let state = Countdown::initial_state();
         let res = search(&MockModel, &state, &cfg).await.unwrap();
 
-        assert!(Countdown::legal_moves(&state).contains(&res.chosen), "chosen move must be legal");
+        assert!(
+            Countdown::legal_moves(&state).contains(&res.chosen),
+            "chosen move must be legal"
+        );
         assert_eq!(res.visits, 64);
-        assert!(res.reifications > 0, "search should reify at least one edge");
+        assert!(
+            res.reifications > 0,
+            "search should reify at least one edge"
+        );
         assert!(res.root_value.abs() <= 1.0);
     }
 
     #[tokio::test]
     async fn search_works_with_tiny_budget() {
         // One simulation only expands the root; we must still return a legal move.
-        let cfg = SearchConfig { simulations: 1, ..Default::default() };
+        let cfg = SearchConfig {
+            simulations: 1,
+            ..Default::default()
+        };
         let state = Countdown::initial_state();
         let res = search(&MockModel, &state, &cfg).await.unwrap();
         assert!(Countdown::legal_moves(&state).contains(&res.chosen));
@@ -574,9 +621,16 @@ mod tests {
         // From near-PUCT (σ→0) to heavy smoothing, search stays well-formed.
         let state = Countdown::initial_state();
         for sigma in [0.01, 0.5, 2.0, 50.0] {
-            let cfg = SearchConfig { simulations: 48, kernel_bandwidth: sigma, ..Default::default() };
+            let cfg = SearchConfig {
+                simulations: 48,
+                kernel_bandwidth: sigma,
+                ..Default::default()
+            };
             let res = search(&MockModel, &state, &cfg).await.unwrap();
-            assert!(Countdown::legal_moves(&state).contains(&res.chosen), "σ={sigma}");
+            assert!(
+                Countdown::legal_moves(&state).contains(&res.chosen),
+                "σ={sigma}"
+            );
             assert_eq!(res.visits, 48);
         }
     }

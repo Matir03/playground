@@ -45,8 +45,14 @@ impl<G: Game> ModelClient<G> for RemoteModelClient<G> {
         };
         let mut client = self.client.lock().await;
         let resp = client.encode(req).await?.into_inner();
-        let lgs = resp.lgs.ok_or_else(|| anyhow::anyhow!("model server returned empty LGS"))?;
-        Ok(LatentGameState::new(lgs.payload, lgs.shape, lgs.model_version))
+        let lgs = resp
+            .lgs
+            .ok_or_else(|| anyhow::anyhow!("model server returned empty LGS"))?;
+        Ok(LatentGameState::new(
+            lgs.payload,
+            lgs.shape,
+            lgs.model_version,
+        ))
     }
 
     async fn eval(&self, lgs: &LatentGameState) -> anyhow::Result<f64> {
@@ -57,7 +63,11 @@ impl<G: Game> ModelClient<G> for RemoteModelClient<G> {
         Ok(client.eval(req).await?.into_inner().value)
     }
 
-    async fn policy(&self, lgs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>> {
+    async fn policy(
+        &self,
+        lgs: &LatentGameState,
+        top_b: u32,
+    ) -> anyhow::Result<Vec<PolicyCandidate>> {
         let req = pb::PolicyRequest {
             lgs: Some(to_proto_lgs(lgs)),
             top_b,
@@ -100,7 +110,9 @@ impl<G: Game> ModelClient<G> for RemoteModelClient<G> {
         };
         let mut client = self.client.lock().await;
         let resp = client.reify(req).await?.into_inner();
-        let mv = resp.r#move.ok_or_else(|| anyhow::anyhow!("reify returned empty move"))?;
+        let mv = resp
+            .r#move
+            .ok_or_else(|| anyhow::anyhow!("reify returned empty move"))?;
         G::decode_move(&mv.payload)
     }
 

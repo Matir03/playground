@@ -82,8 +82,11 @@ fn record(a: &ActorConfig, s: &SamplerConfig) -> Recorded {
 /// sees half a file.
 pub fn save(path: &Path, actor: &ActorConfig, sampler: &SamplerConfig) -> anyhow::Result<()> {
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(&record(actor, sampler))? + "\n")
-        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::write(
+        &tmp,
+        serde_json::to_string_pretty(&record(actor, sampler))? + "\n",
+    )
+    .with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("renaming onto {}", path.display()))?;
     Ok(())
 }
@@ -158,8 +161,14 @@ fn validate(r: &Recorded) -> anyhow::Result<()> {
     ] {
         anyhow::ensure!(v > 0, "{name} must be at least 1");
     }
-    for (name, v) in [("full_search_prob", r.full_search_prob as f32), ("random_fraction", r.random_fraction)] {
-        anyhow::ensure!((0.0..=1.0).contains(&v), "{name} must be within [0, 1], got {v}");
+    for (name, v) in [
+        ("full_search_prob", r.full_search_prob as f32),
+        ("random_fraction", r.random_fraction),
+    ] {
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&v),
+            "{name} must be within [0, 1], got {v}"
+        );
     }
     for (name, v) in [
         ("c_puct", r.c_puct),
@@ -168,7 +177,10 @@ fn validate(r: &Recorded) -> anyhow::Result<()> {
         ("pw_alpha", r.pw_alpha),
         ("kernel_sigma", r.kernel_sigma),
     ] {
-        anyhow::ensure!(v.is_finite() && v >= 0.0, "{name} must be a number >= 0, got {v}");
+        anyhow::ensure!(
+            v.is_finite() && v >= 0.0,
+            "{name} must be a number >= 0, got {v}"
+        );
     }
     anyhow::ensure!(r.pw_beta.is_finite(), "pw_beta must be a number");
     anyhow::ensure!(
@@ -219,11 +231,15 @@ mod tests {
     #[test]
     fn a_file_missing_a_setting_is_refused() {
         let path = scratch("missing");
-        let mut v = serde_json::to_value(record(&ActorConfig::default(), &SamplerConfig::default()))
-            .unwrap();
+        let mut v =
+            serde_json::to_value(record(&ActorConfig::default(), &SamplerConfig::default()))
+                .unwrap();
         v.as_object_mut().unwrap().remove("random_fraction");
         std::fs::write(&path, v.to_string()).unwrap();
-        assert!(load(&path).is_err(), "a search.json without random_fraction loaded");
+        assert!(
+            load(&path).is_err(),
+            "a search.json without random_fraction loaded"
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -231,8 +247,15 @@ mod tests {
     /// not a setting alone, and refuse a value no search can run with.
     #[test]
     fn applying_settings_keeps_the_rest_and_refuses_bad_values() {
-        let mut actor = ActorConfig { workers: 7, ..Default::default() };
-        let mut sampler = SamplerConfig { seed: 99, pad_to: 12, ..Default::default() };
+        let mut actor = ActorConfig {
+            workers: 7,
+            ..Default::default()
+        };
+        let mut sampler = SamplerConfig {
+            seed: 99,
+            pad_to: 12,
+            ..Default::default()
+        };
         let mut v = serde_json::to_value(record(&actor, &sampler)).unwrap();
         v["sims"] = 123.into();
         v["random_fraction"] = 0.5.into();
@@ -243,6 +266,9 @@ mod tests {
         v["random_fraction"] = 1.5.into();
         let err = apply_json(&v.to_string(), &mut actor, &mut sampler).unwrap_err();
         assert!(err.to_string().contains("random_fraction"), "{err}");
-        assert_eq!(sampler.random_fraction, 0.5, "a refused apply must change nothing");
+        assert_eq!(
+            sampler.random_fraction, 0.5,
+            "a refused apply must change nothing"
+        );
     }
 }

@@ -134,11 +134,7 @@ pub trait SampledModel<G: SampledGame>: Send + Sync {
     /// positions/s at batch 1 and 115,000/s at batch 512, a 141x difference for
     /// the same arithmetic. The default here is a loop for correctness and for
     /// mock models; every real backend should override it.
-    fn expand_batch(
-        &self,
-        states: &[G::State],
-        k: usize,
-    ) -> anyhow::Result<Vec<Expansion<G>>> {
+    fn expand_batch(&self, states: &[G::State], k: usize) -> anyhow::Result<Vec<Expansion<G>>> {
         states.iter().map(|s| self.expand(s, k)).collect()
     }
 
@@ -160,10 +156,22 @@ pub trait SampledModel<G: SampledGame>: Send + Sync {
         fill: &[bool],
         k: usize,
     ) -> anyhow::Result<Vec<Vec<(G::Move, f32, bool)>>> {
-        anyhow::ensure!(fill.len() == states.len(), "widen_batch: one fill flag per state");
-        let ask: Vec<G::State> =
-            states.iter().zip(fill).filter(|(_, f)| !**f).map(|(s, _)| s.clone()).collect();
-        let mut got = if ask.is_empty() { Vec::new() } else { self.expand_batch(&ask, k)? }.into_iter();
+        anyhow::ensure!(
+            fill.len() == states.len(),
+            "widen_batch: one fill flag per state"
+        );
+        let ask: Vec<G::State> = states
+            .iter()
+            .zip(fill)
+            .filter(|(_, f)| !**f)
+            .map(|(s, _)| s.clone())
+            .collect();
+        let mut got = if ask.is_empty() {
+            Vec::new()
+        } else {
+            self.expand_batch(&ask, k)?
+        }
+        .into_iter();
         fill.iter()
             .map(|&f| {
                 if f {
@@ -414,7 +422,10 @@ struct Node<G: SampledGame> {
 /// highest, not the order the sampler happened to emit them in.
 fn renormalise<G: SampledGame>(entries: &mut [Entry<G>]) {
     entries.sort_by(|a, b| b.energy.total_cmp(&a.energy));
-    let max = entries.iter().map(|e| e.energy).fold(f32::NEG_INFINITY, f32::max);
+    let max = entries
+        .iter()
+        .map(|e| e.energy)
+        .fold(f32::NEG_INFINITY, f32::max);
     if !max.is_finite() {
         // Every candidate was reported as impossible, or there are none. A
         // uniform prior at least lets the search proceed on its own statistics.
@@ -540,7 +551,10 @@ impl<G: SampledGame> SampledSearchResult<G> {
     /// this, every forced visit and every randomly injected candidate would be
     /// taught to the policy as if the search had chosen it.
     pub fn policy_target(&self, k_forced: f32) -> Vec<f32> {
-        self.policy_target_with(&SampledParams { k_forced, ..Default::default() })
+        self.policy_target_with(&SampledParams {
+            k_forced,
+            ..Default::default()
+        })
     }
 
     /// As [`Self::policy_target`]; the `params` are accepted for symmetry with
@@ -758,7 +772,11 @@ fn select<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool)
         }
     }
 
-    let parent_q = if node.total_n > 0 { node.w_sum / node.total_n as f32 } else { 0.0 };
+    let parent_q = if node.total_n > 0 {
+        node.w_sum / node.total_n as f32
+    } else {
+        0.0
+    };
     let fpu = puct::fpu(parent_q, node.visited_p);
 
     // KR-PUCT (docs/algorithm.md "Selection"): regress each candidate's value
@@ -793,7 +811,11 @@ fn select<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool)
             // A candidate with no kernel-weighted visits falls back to the
             // node's own value, never a flat 0 — see `puct::fpu` for why 0 is a
             // trap. Normally a neighbour supplies an estimate and this is dead.
-            let q = if nq_hat[i] > 0.0 { w_hat[i] / nq_hat[i] } else { fpu };
+            let q = if nq_hat[i] > 0.0 {
+                w_hat[i] / nq_hat[i]
+            } else {
+                fpu
+            };
             let u = params.c_puct * node.entries[i].p * sqrt_total / (1.0 + n_hat[i]);
             let s = q + u;
             if s > best_score {
@@ -921,20 +943,18 @@ impl<G: SampledGame> Search<G> {
             .iter()
             .enumerate()
             .map(|(i, node)| {
-
                 TreeNode {
                     // The root is node 0 and every other node is reached by
                     // exactly one edge, so the parent is recoverable by scan.
                     parent: if i == 0 {
                         None
                     } else {
-                        self.tree.iter().position(|n| {
-                            n.entries.iter().any(|e| e.child == i as i32)
-                        })
+                        self.tree
+                            .iter()
+                            .position(|n| n.entries.iter().any(|e| e.child == i as i32))
                     },
                     total_visits: node.total_n,
-                    value: (node.total_n > 0)
-                        .then(|| node.w_sum / node.total_n as f32),
+                    value: (node.total_n > 0).then(|| node.w_sum / node.total_n as f32),
                     terminal: node.terminal,
                     term_value: node.term_v,
                     edges: node
@@ -963,9 +983,7 @@ impl<G: SampledGame> Search<G> {
         Self {
             tree: vec![new_node::<G>(root)],
             params: *params,
-            rng: ChaCha8Rng::seed_from_u64(
-                params.seed ^ (ply as u64).wrapping_mul(0x9E3779B9),
-            ),
+            rng: ChaCha8Rng::seed_from_u64(params.seed ^ (ply as u64).wrapping_mul(0x9E3779B9)),
             ply,
             sims_left: params.simulations,
             nodes: 0,
@@ -979,7 +997,10 @@ impl<G: SampledGame> Search<G> {
 
     /// Advance until an expansion is needed or the budget is spent.
     pub fn step(&mut self) -> Step<G> {
-        debug_assert!(self.pending.is_none(), "step called with an expansion outstanding");
+        debug_assert!(
+            self.pending.is_none(),
+            "step called with an expansion outstanding"
+        );
         while self.sims_left > 0 {
             let mut cur = match self.resume_at.take() {
                 Some(node) => node,
@@ -1028,7 +1049,10 @@ impl<G: SampledGame> Search<G> {
                                 // edge is not in `path` yet -- only its
                                 // ancestors'.
                                 self.resume_at = Some(cur);
-                                return Step::NeedWiden { state: self.tree[cur].state.clone(), fill };
+                                return Step::NeedWiden {
+                                    state: self.tree[cur].state.clone(),
+                                    fill,
+                                };
                             }
                         }
                         if self.tree[cur].entries.is_empty() {
@@ -1062,7 +1086,10 @@ impl<G: SampledGame> Search<G> {
 
     /// Supply the value and candidates for the position `step` handed out.
     pub fn provide(&mut self, value: f32, candidates: Vec<(G::Move, f32, bool)>) {
-        let cur = self.pending.take().expect("provide without a pending expansion");
+        let cur = self
+            .pending
+            .take()
+            .expect("provide without a pending expansion");
         self.nodes += 1;
 
         // Merge candidates that reach the same position — distinct turns
@@ -1170,7 +1197,10 @@ impl<G: SampledGame> Search<G> {
     /// that brings nothing new is a miss, and the node is exhausted once its
     /// misses reach the candidates it has earned. See [`SampledParams::k_draws`].
     pub fn provide_widen(&mut self, candidates: Vec<(G::Move, f32, bool)>) {
-        let (cur, fill) = self.pending_widen.take().expect("provide_widen without a pending widen");
+        let (cur, fill) = self
+            .pending_widen
+            .take()
+            .expect("provide_widen without a pending widen");
         let mut seen: std::collections::HashMap<u128, usize> = Default::default();
         for (i, e) in self.tree[cur].entries.iter().enumerate() {
             seen.insert(G::state_key(&G::apply(&self.tree[cur].state, &e.mv)), i);
@@ -1337,11 +1367,7 @@ impl<G: SampledGame> Search<G> {
         // 30-visit quota would otherwise win the argmax outright at small
         // budgets purely because we insisted on measuring it -- which is exactly
         // what `an_immediate_win_is_taken` caught.
-        let eff: Vec<u32> = root
-            .entries
-            .iter()
-            .map(|e| e.n_eff())
-            .collect();
+        let eff: Vec<u32> = root.entries.iter().map(|e| e.n_eff()).collect();
         let chosen = if candidates.is_empty() {
             0
         } else if self.ply < self.params.temp_moves {
@@ -1368,7 +1394,16 @@ impl<G: SampledGame> Search<G> {
                 .map(|(i, _)| i)
                 .unwrap_or(0)
         };
-        SampledSearchResult { candidates, priors, explore, forced, chosen, value, nodes: self.nodes, stats }
+        SampledSearchResult {
+            candidates,
+            priors,
+            explore,
+            forced,
+            chosen,
+            value,
+            nodes: self.nodes,
+            stats,
+        }
     }
 }
 
@@ -1569,7 +1604,10 @@ mod tests {
             s.side
         }
         fn apply(s: &CountState, mv: &u32) -> CountState {
-            CountState { n: s.n.saturating_sub(*mv), side: 3 - s.side }
+            CountState {
+                n: s.n.saturating_sub(*mv),
+                side: 3 - s.side,
+            }
         }
         fn terminal_value(s: &CountState) -> Option<f32> {
             // The player who took the last counter won, so the side now to move
@@ -1602,7 +1640,10 @@ mod tests {
                 0.0,
                 // Equal energies — any constant is a uniform prior after the
                 // search's softmax, so 0.0 states that plainly.
-                (1..=3u32).filter(|m| *m <= s.n).map(|m| (m, 0.0, false)).collect(),
+                (1..=3u32)
+                    .filter(|m| *m <= s.n)
+                    .map(|m| (m, 0.0, false))
+                    .collect(),
             ))
         }
     }
@@ -1612,7 +1653,15 @@ mod tests {
     impl SampledModel<Count> for Duplicating {
         fn expand(&self, s: &CountState, _k: usize) -> anyhow::Result<Expansion<Count>> {
             let _ = s;
-            Ok((0.0, vec![(1, 0.0, false), (1, 0.0, false), (1, 0.0, false), (2, 0.0, false)]))
+            Ok((
+                0.0,
+                vec![
+                    (1, 0.0, false),
+                    (1, 0.0, false),
+                    (1, 0.0, false),
+                    (2, 0.0, false),
+                ],
+            ))
         }
     }
 
@@ -1624,7 +1673,12 @@ mod tests {
     }
 
     fn params(sims: u32) -> SampledParams {
-        SampledParams { simulations: sims, temp_moves: 0, seed: 1, ..Default::default() }
+        SampledParams {
+            simulations: sims,
+            temp_moves: 0,
+            seed: 1,
+            ..Default::default()
+        }
     }
 
     /// Answer one widen the way `drive` does.
@@ -1651,12 +1705,22 @@ mod tests {
     }
     impl Stuck {
         fn new(fills: bool) -> Self {
-            Self { fills, cursor: std::sync::atomic::AtomicUsize::new(0) }
+            Self {
+                fills,
+                cursor: std::sync::atomic::AtomicUsize::new(0),
+            }
         }
     }
     impl SampledModel<Count> for Stuck {
         fn expand(&self, _s: &CountState, k: usize) -> anyhow::Result<Expansion<Count>> {
-            Ok((0.0, if k == 0 { Vec::new() } else { vec![(1, 0.0, false)] }))
+            Ok((
+                0.0,
+                if k == 0 {
+                    Vec::new()
+                } else {
+                    vec![(1, 0.0, false)]
+                },
+            ))
         }
         fn widen_batch(
             &self,
@@ -1678,7 +1742,9 @@ mod tests {
                     (0..k)
                         .filter(|_| !others.is_empty())
                         .map(|_| {
-                            let i = self.cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let i = self
+                                .cursor
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             (others[i % others.len()], 0.0, true)
                         })
                         .collect()
@@ -1722,12 +1788,18 @@ mod tests {
                     Step::Done => break,
                 }
             }
-            assert_eq!(proposals[&0], d, "D={d}: the root must be asked exactly D times");
+            assert_eq!(
+                proposals[&0], d,
+                "D={d}: the root must be asked exactly D times"
+            );
             for (node, n) in &proposals {
                 assert!(*n <= d, "D={d}: node {node} was asked {n} times");
             }
-            let mut held: Vec<(u32, u32, bool)> =
-                search.tree[0].entries.iter().map(|e| (e.mv, e.draws, e.explore)).collect();
+            let mut held: Vec<(u32, u32, bool)> = search.tree[0]
+                .entries
+                .iter()
+                .map(|e| (e.mv, e.draws, e.explore))
+                .collect();
             held.sort();
             assert_eq!(
                 held,
@@ -1797,11 +1869,23 @@ mod tests {
             }
             let longest = runs.values().map(|r| r.1).max().unwrap_or(0);
             if retries > 0 {
-                assert!(cap_fills > 5, "retries={retries}: only {cap_fills} fills from the cap");
-                assert_eq!(longest, retries, "retries={retries}: a run of {longest} misses");
+                assert!(
+                    cap_fills > 5,
+                    "retries={retries}: only {cap_fills} fills from the cap"
+                );
+                assert_eq!(
+                    longest, retries,
+                    "retries={retries}: a run of {longest} misses"
+                );
             } else {
-                assert_eq!(cap_fills, 0, "retries=0: filled before the draw budget ran out");
-                assert!(longest > 3, "retries=0: runs of misses should run on, got {longest}");
+                assert_eq!(
+                    cap_fills, 0,
+                    "retries=0: filled before the draw budget ran out"
+                );
+                assert!(
+                    longest > 3,
+                    "retries=0: runs of misses should run on, got {longest}"
+                );
             }
         }
     }
@@ -1818,7 +1902,14 @@ mod tests {
         }
         impl SampledModel<Count> for Colliding {
             fn expand(&self, _s: &CountState, k: usize) -> anyhow::Result<Expansion<Count>> {
-                Ok((0.0, if k == 0 { Vec::new() } else { vec![(1, 0.0, false)] }))
+                Ok((
+                    0.0,
+                    if k == 0 {
+                        Vec::new()
+                    } else {
+                        vec![(1, 0.0, false)]
+                    },
+                ))
             }
             fn widen_batch(
                 &self,
@@ -1849,16 +1940,24 @@ mod tests {
             seed: 4,
             ..Default::default()
         };
-        let model = Colliding { fills: std::sync::Mutex::new([1, 1, 2, 3].into()) };
+        let model = Colliding {
+            fills: std::sync::Mutex::new([1, 1, 2, 3].into()),
+        };
         let mut search = Search::<Count>::new(CountState { n: 21, side: 1 }, &params, 0);
         drive(&model, &mut search).unwrap();
         let root = &search.tree[0];
-        let mut held: Vec<(u32, u32, bool)> =
-            root.entries.iter().map(|e| (e.mv, e.draws, e.explore)).collect();
+        let mut held: Vec<(u32, u32, bool)> = root
+            .entries
+            .iter()
+            .map(|e| (e.mv, e.draws, e.explore))
+            .collect();
         held.sort();
         assert_eq!(held, vec![(1, 3, true), (2, 0, true), (3, 0, true)]);
         assert_eq!(root.fill_misses, 2);
-        assert!(!root.widen_exhausted, "two misses against a target of three must not exhaust");
+        assert!(
+            !root.widen_exhausted,
+            "two misses against a target of three must not exhaust"
+        );
     }
 
     /// With no exploration source every fill misses, and the node is exhausted
@@ -1898,12 +1997,23 @@ mod tests {
             seed: 4,
             ..Default::default()
         };
-        assert_eq!(expansion_k(&params), 4, "unchunked expansion asks for all D draws");
-        let (_, tree) =
-            search_analyzed::<Count, _>(&Stuck::new(true), CountState { n: 21, side: 1 }, &params, 0)
-                .expect("search");
-        let mut held: Vec<(u32, u32, bool)> =
-            tree[0].edges.iter().map(|e| (e.mv, e.draws, e.explore)).collect();
+        assert_eq!(
+            expansion_k(&params),
+            4,
+            "unchunked expansion asks for all D draws"
+        );
+        let (_, tree) = search_analyzed::<Count, _>(
+            &Stuck::new(true),
+            CountState { n: 21, side: 1 },
+            &params,
+            0,
+        )
+        .expect("search");
+        let mut held: Vec<(u32, u32, bool)> = tree[0]
+            .edges
+            .iter()
+            .map(|e| (e.mv, e.draws, e.explore))
+            .collect();
         held.sort();
         assert_eq!(held, vec![(1, 1, false), (2, 0, true), (3, 0, true)]);
     }
@@ -1968,26 +2078,42 @@ mod tests {
             ..Default::default()
         };
         params.kernel_sigma = 0.0;
-        let flat = search::<Count, _>(&Spread, CountState { n: 21, side: 1 }, &params, 0).expect("flat search");
+        let flat = search::<Count, _>(&Spread, CountState { n: 21, side: 1 }, &params, 0)
+            .expect("flat search");
 
         // Same params, same seed, through the same code path a KR run takes.
-        let again = search::<Count, _>(&Spread, CountState { n: 21, side: 1 }, &params, 0).expect("repeat");
+        let again =
+            search::<Count, _>(&Spread, CountState { n: 21, side: 1 }, &params, 0).expect("repeat");
         assert_eq!(
-            flat.candidates.iter().map(|(m, n)| (*m, *n)).collect::<Vec<_>>(),
-            again.candidates.iter().map(|(m, n)| (*m, *n)).collect::<Vec<_>>(),
+            flat.candidates
+                .iter()
+                .map(|(m, n)| (*m, *n))
+                .collect::<Vec<_>>(),
+            again
+                .candidates
+                .iter()
+                .map(|(m, n)| (*m, *n))
+                .collect::<Vec<_>>(),
             "sigma = 0 must be deterministic and unchanged"
         );
         assert_eq!(flat.chosen, again.chosen);
         assert_eq!(flat.priors, again.priors);
-        assert_eq!(flat.policy_target_with(&params), again.policy_target_with(&params));
+        assert_eq!(
+            flat.policy_target_with(&params),
+            again.policy_target_with(&params)
+        );
 
         // And a positive bandwidth must actually do something different, or the
         // test above proves nothing.
         params.kernel_sigma = 1.0;
-        let kr = search::<Count, _>(&Spread, CountState { n: 21, side: 1 }, &params, 0).expect("kr search");
+        let kr = search::<Count, _>(&Spread, CountState { n: 21, side: 1 }, &params, 0)
+            .expect("kr search");
         let flat_n: Vec<u32> = flat.candidates.iter().map(|(_, n)| *n).collect();
         let kr_n: Vec<u32> = kr.candidates.iter().map(|(_, n)| *n).collect();
-        assert_ne!(flat_n, kr_n, "a live kernel must change the visit distribution");
+        assert_ne!(
+            flat_n, kr_n,
+            "a live kernel must change the visit distribution"
+        );
     }
 
     /// The root sweep: every candidate is visited at least once, so each has a
@@ -1998,7 +2124,10 @@ mod tests {
         impl SampledModel<Count> for Wide {
             fn expand(&self, _s: &CountState, _k: usize) -> anyhow::Result<Expansion<Count>> {
                 // Lopsided priors: without the sweep, PUCT would starve move 3.
-                Ok((0.0, vec![(1, 0.98, false), (2, 0.01, false), (3, 0.01, false)]))
+                Ok((
+                    0.0,
+                    vec![(1, 0.98, false), (2, 0.01, false), (3, 0.01, false)],
+                ))
             }
         }
         let params = SampledParams {
@@ -2009,8 +2138,8 @@ mod tests {
             seed: 3,
             ..Default::default()
         };
-        let r = search::<Count, _>(&Wide, CountState { n: 21, side: 1 }, &params, 0)
-            .expect("search");
+        let r =
+            search::<Count, _>(&Wide, CountState { n: 21, side: 1 }, &params, 0).expect("search");
         for (mv, n) in &r.candidates {
             assert!(*n >= 1, "root candidate {mv:?} was never visited (n={n})");
         }
@@ -2023,7 +2152,10 @@ mod tests {
         struct Wide;
         impl SampledModel<Count> for Wide {
             fn expand(&self, _s: &CountState, _k: usize) -> anyhow::Result<Expansion<Count>> {
-                Ok((0.0, vec![(1, 0.98, false), (2, 0.01, false), (3, 0.01, false)]))
+                Ok((
+                    0.0,
+                    vec![(1, 0.98, false), (2, 0.01, false), (3, 0.01, false)],
+                ))
             }
         }
         // Budget just large enough to sweep and little else: the two weak moves
@@ -2036,8 +2168,8 @@ mod tests {
             seed: 5,
             ..Default::default()
         };
-        let r = search::<Count, _>(&Wide, CountState { n: 21, side: 1 }, &params, 0)
-            .expect("search");
+        let r =
+            search::<Count, _>(&Wide, CountState { n: 21, side: 1 }, &params, 0).expect("search");
         let target = r.policy_target_with(&params);
         for (i, (mv, n)) in r.candidates.iter().enumerate() {
             if *n == 1 {
@@ -2048,32 +2180,69 @@ mod tests {
             }
         }
         let sum: f32 = target.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-5, "target must stay normalised, got {sum}");
+        assert!(
+            (sum - 1.0).abs() < 1e-5,
+            "target must stay normalised, got {sum}"
+        );
     }
 
     /// Progressive widening exposes only a prefix at interior nodes, and never
     /// restricts the root.
     #[test]
     fn widening_limits_interior_nodes_but_not_the_root() {
-        let params = SampledParams { pw_alpha: 0.5, pw_beta: 2.0, ..Default::default() };
+        let params = SampledParams {
+            pw_alpha: 0.5,
+            pw_beta: 2.0,
+            ..Default::default()
+        };
         let mut node = new_node::<Count>(CountState { n: 21, side: 1 });
         node.entries = (0..12)
-            .map(|i| Entry::<Count> { mv: i, energy: 0.0, p: 1.0 / 12.0, n: 0, w: 0.0, child: -1, explore: false, forced_n: 0, forced_quota: 0, draws: 1 })
+            .map(|i| Entry::<Count> {
+                mv: i,
+                energy: 0.0,
+                p: 1.0 / 12.0,
+                n: 0,
+                w: 0.0,
+                child: -1,
+                explore: false,
+                forced_n: 0,
+                forced_quota: 0,
+                draws: 1,
+            })
             .collect();
 
         node.total_n = 1;
-        assert_eq!(visible(&node, &params, true), 12, "the root always sees every candidate");
+        assert_eq!(
+            visible(&node, &params, true),
+            12,
+            "the root always sees every candidate"
+        );
         // At one visit the schedule is ceil(pw_beta) — the initial count is
         // pw_beta itself, which is why there is no separate knob for it.
-        assert_eq!(visible(&node, &params, false), 2, "one visit -> ceil(pw_beta)");
+        assert_eq!(
+            visible(&node, &params, false),
+            2,
+            "one visit -> ceil(pw_beta)"
+        );
         node.total_n = 16;
         assert_eq!(visible(&node, &params, false), 8, "ceil(2*sqrt(16)) = 8");
         node.total_n = 100;
-        assert_eq!(visible(&node, &params, false), 12, "clamped to the candidate count");
+        assert_eq!(
+            visible(&node, &params, false),
+            12,
+            "clamped to the candidate count"
+        );
 
-        let off = SampledParams { pw_beta: 0.0, ..params };
+        let off = SampledParams {
+            pw_beta: 0.0,
+            ..params
+        };
         node.total_n = 1;
-        assert_eq!(visible(&node, &off, false), 12, "pw_beta = 0 disables widening");
+        assert_eq!(
+            visible(&node, &off, false),
+            12,
+            "pw_beta = 0 disables widening"
+        );
     }
 
     /// Widening must never reveal more than one new candidate per visit, for
@@ -2082,7 +2251,11 @@ mod tests {
     #[test]
     fn widening_never_adds_more_than_one_candidate_per_visit() {
         for (beta, alpha) in [(2.0f32, 0.5f32), (4.0, 0.5), (8.0, 0.9), (1.0, 0.3)] {
-            let params = SampledParams { pw_alpha: alpha, pw_beta: beta, ..Default::default() };
+            let params = SampledParams {
+                pw_alpha: alpha,
+                pw_beta: beta,
+                ..Default::default()
+            };
             let mut node = new_node::<Count>(CountState { n: 21, side: 1 });
             node.entries = (0..64)
                 .map(|i| Entry::<Count> {
@@ -2124,7 +2297,9 @@ mod tests {
         }
         impl SampledModel<Count> for Rot {
             fn expand(&self, _s: &CountState, k: usize) -> anyhow::Result<Expansion<Count>> {
-                let start = self.cursor.fetch_add(k.max(1), std::sync::atomic::Ordering::Relaxed);
+                let start = self
+                    .cursor
+                    .fetch_add(k.max(1), std::sync::atomic::Ordering::Relaxed);
                 Ok((
                     0.0,
                     (0..k.max(1))
@@ -2145,7 +2320,9 @@ mod tests {
             seed: 4,
             ..Default::default()
         };
-        let model = Rot { cursor: std::sync::atomic::AtomicUsize::new(0) };
+        let model = Rot {
+            cursor: std::sync::atomic::AtomicUsize::new(0),
+        };
         let mut search = Search::<Count>::new(CountState { n: 40, side: 1 }, &params, 0);
         let mut saw_full_before_first_visit = false;
         loop {
@@ -2178,7 +2355,10 @@ mod tests {
                 Step::Done => break,
             }
         }
-        assert!(saw_full_before_first_visit, "root was never fully populated before its sweep");
+        assert!(
+            saw_full_before_first_visit,
+            "root was never fully populated before its sweep"
+        );
     }
 
     /// Resuming a paused descent must not corrupt the tree: visits still sum
@@ -2199,12 +2379,18 @@ mod tests {
             seed: 9,
             ..Default::default()
         };
-        let r = search::<Count, _>(&Mock, CountState { n: 5, side: 1 }, &params, 0)
-            .expect("search");
+        let r =
+            search::<Count, _>(&Mock, CountState { n: 5, side: 1 }, &params, 0).expect("search");
         let total: u32 = r.candidates.iter().map(|(_, n)| *n).sum();
-        assert!(total <= params.simulations, "root visits {total} exceed the simulation budget");
+        assert!(
+            total <= params.simulations,
+            "root visits {total} exceed the simulation budget"
+        );
         assert!(total > 0, "no visits recorded at all");
-        assert_eq!(r.candidates[r.chosen].0, 1, "should leave a multiple of four");
+        assert_eq!(
+            r.candidates[r.chosen].0, 1,
+            "should leave a multiple of four"
+        );
     }
 
     /// A candidate a widen adds to an interior node is visited by the very
@@ -2220,8 +2406,15 @@ mod tests {
         impl SampledModel<Count> for Cycle {
             fn expand(&self, s: &CountState, k: usize) -> anyhow::Result<Expansion<Count>> {
                 let moves: Vec<u32> = (1..=3u32).filter(|m| *m <= s.n).collect();
-                let start = self.cursor.fetch_add(k, std::sync::atomic::Ordering::Relaxed);
-                Ok((0.0, (0..k).map(|i| (moves[(start + i) % moves.len()], 0.0, false)).collect()))
+                let start = self
+                    .cursor
+                    .fetch_add(k, std::sync::atomic::Ordering::Relaxed);
+                Ok((
+                    0.0,
+                    (0..k)
+                        .map(|i| (moves[(start + i) % moves.len()], 0.0, false))
+                        .collect(),
+                ))
             }
         }
         let params = SampledParams {
@@ -2237,10 +2430,16 @@ mod tests {
             seed: 6,
             ..Default::default()
         };
-        let model = Cycle { cursor: std::sync::atomic::AtomicUsize::new(0) };
+        let model = Cycle {
+            cursor: std::sync::atomic::AtomicUsize::new(0),
+        };
         let keys = |s: &Search<Count>, node: usize| -> Vec<u128> {
             let st = &s.tree[node].state;
-            s.tree[node].entries.iter().map(|e| Count::state_key(&Count::apply(st, &e.mv))).collect()
+            s.tree[node]
+                .entries
+                .iter()
+                .map(|e| Count::state_key(&Count::apply(st, &e.mv)))
+                .collect()
         };
         let mut search = Search::<Count>::new(CountState { n: 21, side: 1 }, &params, 0);
         let mut checked = 0;
@@ -2254,11 +2453,14 @@ mod tests {
                     let (node, _) = search.pending_widen.expect("a widen names its node");
                     let before = keys(&search, node);
                     search.provide_widen(widen(&model, &state, fill, chunk_k(&params)));
-                    let new: Vec<u128> =
-                        keys(&search, node).into_iter().filter(|k| !before.contains(k)).collect();
+                    let new: Vec<u128> = keys(&search, node)
+                        .into_iter()
+                        .filter(|k| !before.contains(k))
+                        .collect();
                     let leads_to_terminal = search.tree[node].entries.iter().any(|e| {
                         let next = Count::apply(&search.tree[node].state, &e.mv);
-                        new.contains(&Count::state_key(&next)) && Count::terminal_value(&next).is_some()
+                        new.contains(&Count::state_key(&next))
+                            && Count::terminal_value(&next).is_some()
                     });
                     if node == 0 || new.is_empty() || leads_to_terminal {
                         continue;
@@ -2275,7 +2477,9 @@ mod tests {
                             let (v, c) = model.expand(&st, expansion_k(&params)).unwrap();
                             search.provide(v, c);
                         }
-                        _ => panic!("node {node}: the widening simulation did not visit its new candidate"),
+                        _ => panic!(
+                            "node {node}: the widening simulation did not visit its new candidate"
+                        ),
                     }
                 }
                 Step::Done => break,
@@ -2284,7 +2488,10 @@ mod tests {
         assert!(checked > 10, "only {checked} interior widens checked");
         for (i, node) in search.tree.iter().enumerate().skip(1) {
             for e in &node.entries {
-                assert!(e.n >= 1, "node {i}: a candidate the search widened to was never visited");
+                assert!(
+                    e.n >= 1,
+                    "node {i}: a candidate the search widened to was never visited"
+                );
             }
         }
     }
@@ -2307,8 +2514,15 @@ mod tests {
         impl SampledModel<Count> for OneAtATime {
             fn expand(&self, s: &CountState, k: usize) -> anyhow::Result<Expansion<Count>> {
                 let moves: Vec<u32> = (1..=3u32).filter(|m| *m <= s.n).collect();
-                let start = self.cursor.fetch_add(k, std::sync::atomic::Ordering::Relaxed);
-                Ok((0.0, (0..k).map(|i| (moves[(start + i) % moves.len()], 0.0, true)).collect()))
+                let start = self
+                    .cursor
+                    .fetch_add(k, std::sync::atomic::Ordering::Relaxed);
+                Ok((
+                    0.0,
+                    (0..k)
+                        .map(|i| (moves[(start + i) % moves.len()], 0.0, true))
+                        .collect(),
+                ))
             }
         }
         let params = SampledParams {
@@ -2320,7 +2534,9 @@ mod tests {
             seed: 5,
             ..Default::default()
         };
-        let model = OneAtATime { cursor: std::sync::atomic::AtomicUsize::new(0) };
+        let model = OneAtATime {
+            cursor: std::sync::atomic::AtomicUsize::new(0),
+        };
 
         // Step by step, because final totals hide it: PUCT's own visits to
         // a candidate cover a few phantom forced ones. Between two `step`
@@ -2330,8 +2546,11 @@ mod tests {
         let mut search = Search::<Count>::new(CountState { n: 21, side: 1 }, &params, 0);
         let mut widens = 0;
         loop {
-            let before: Vec<(u32, u32)> =
-                search.tree[0].entries.iter().map(|e| (e.n, e.forced_n)).collect();
+            let before: Vec<(u32, u32)> = search.tree[0]
+                .entries
+                .iter()
+                .map(|e| (e.n, e.forced_n))
+                .collect();
             let step = search.step();
             for (i, &(n0, f0)) in before.iter().enumerate() {
                 let e = &search.tree[0].entries[i];
@@ -2354,7 +2573,10 @@ mod tests {
                 Step::Done => break,
             }
         }
-        assert!(widens > 50, "only {widens} widens -- the test is not exercising them");
+        assert!(
+            widens > 50,
+            "only {widens} widens -- the test is not exercising them"
+        );
 
         let tree = search.export_tree();
         for (i, node) in tree.iter().enumerate() {
@@ -2414,10 +2636,17 @@ mod tests {
             seed: 2,
             ..Default::default()
         };
-        assert_eq!(expansion_k(&params), 3, "unchunked expansion must ask for all its draws");
-        let r = search::<Count, _>(&Mock, CountState { n: 21, side: 1 }, &params, 0)
-            .expect("search");
-        assert!(!r.candidates.is_empty(), "root held no candidates with chunking off");
+        assert_eq!(
+            expansion_k(&params),
+            3,
+            "unchunked expansion must ask for all its draws"
+        );
+        let r =
+            search::<Count, _>(&Mock, CountState { n: 21, side: 1 }, &params, 0).expect("search");
+        assert!(
+            !r.candidates.is_empty(),
+            "root held no candidates with chunking off"
+        );
         assert!(
             r.candidates.iter().any(|(_, n)| *n > 0),
             "no candidate was ever visited with chunking off"
@@ -2439,7 +2668,9 @@ mod tests {
         }
         impl SampledModel<Count> for Pool {
             fn expand(&self, s: &CountState, k: usize) -> anyhow::Result<Expansion<Count>> {
-                let start = self.cursor.fetch_add(k.max(1), std::sync::atomic::Ordering::Relaxed);
+                let start = self
+                    .cursor
+                    .fetch_add(k.max(1), std::sync::atomic::Ordering::Relaxed);
                 let moves: Vec<u32> = (1..=3u32).filter(|m| *m <= s.n).collect();
                 let cands: Vec<(u32, f32, bool)> = (0..k.max(1))
                     .map(|i| moves[(start + i) % moves.len()])
@@ -2457,11 +2688,16 @@ mod tests {
             seed: 11,
             ..Default::default()
         };
-        let pool = Pool { cursor: std::sync::atomic::AtomicUsize::new(0) };
-        let whole = search::<Count, _>(&pool, CountState { n: 21, side: 1 }, &base, 0)
-            .expect("unchunked");
+        let pool = Pool {
+            cursor: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let whole =
+            search::<Count, _>(&pool, CountState { n: 21, side: 1 }, &base, 0).expect("unchunked");
 
-        let chunked_params = SampledParams { pw_chunk: 1, ..base };
+        let chunked_params = SampledParams {
+            pw_chunk: 1,
+            ..base
+        };
         let chunked = search::<Count, _>(&pool, CountState { n: 21, side: 1 }, &chunked_params, 0)
             .expect("chunked");
 
@@ -2469,9 +2705,15 @@ mod tests {
         let mut b: Vec<u32> = chunked.candidates.iter().map(|(m, _)| *m).collect();
         a.sort_unstable();
         b.sort_unstable();
-        assert_eq!(a, b, "chunked generation must reach the same root candidates");
+        assert_eq!(
+            a, b,
+            "chunked generation must reach the same root candidates"
+        );
         let sum: f32 = chunked.priors.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-5, "priors must stay normalised, got {sum}");
+        assert!(
+            (sum - 1.0).abs() < 1e-5,
+            "priors must stay normalised, got {sum}"
+        );
     }
 
     /// An explore candidate must be *tried* even when its prior is negligible.
@@ -2537,7 +2779,11 @@ mod tests {
     /// judgement — strictly worse than not exploring at all.
     #[test]
     fn guaranteed_explore_visits_are_pruned_from_the_target() {
-        let params = SampledParams { k_forced: 0.0, min_explore_visits: 4.0, ..Default::default() };
+        let params = SampledParams {
+            k_forced: 0.0,
+            min_explore_visits: 4.0,
+            ..Default::default()
+        };
         // The explore candidate earned exactly its floor and nothing more: all
         // four of its visits were demanded, none chosen.
         let r = SampledSearchResult::<Count> {
@@ -2551,8 +2797,14 @@ mod tests {
             nodes: 64,
         };
         let t = r.policy_target_with(&params);
-        assert_eq!(t[2], 0.0, "a candidate that only ever got its floor must not survive");
-        assert!((t.iter().sum::<f32>() - 1.0).abs() < 1e-5, "target must stay normalised");
+        assert_eq!(
+            t[2], 0.0,
+            "a candidate that only ever got its floor must not survive"
+        );
+        assert!(
+            (t.iter().sum::<f32>() - 1.0).abs() < 1e-5,
+            "target must stay normalised"
+        );
 
         // Earning well beyond the floor, it survives on merit: four visits were
         // demanded, the other twenty-one were chosen.
@@ -2567,19 +2819,20 @@ mod tests {
             nodes: 85,
         };
         let t2 = r2.policy_target_with(&params);
-        assert!(t2[2] > 0.0, "organic visits beyond the floor must survive pruning");
+        assert!(
+            t2[2] > 0.0,
+            "organic visits beyond the floor must survive pruning"
+        );
     }
 
     #[test]
     fn lockstep_matches_running_the_searches_alone() {
         // The batching must be a scheduling change and nothing more: each game
         // holds one outstanding expansion, so its tree is unchanged.
-        let roots: Vec<CountState> =
-            (3..=9).map(|n| CountState { n, side: 1 }).collect();
+        let roots: Vec<CountState> = (3..=9).map(|n| CountState { n, side: 1 }).collect();
         let plies: Vec<u32> = (0..roots.len() as u32).collect();
         let p = params(200);
-        let batched =
-            search_lockstep::<Count, _>(&Mock, roots.clone(), &p, &plies).unwrap();
+        let batched = search_lockstep::<Count, _>(&Mock, roots.clone(), &p, &plies).unwrap();
         assert_eq!(batched.len(), roots.len());
         for (i, root) in roots.into_iter().enumerate() {
             let alone = search::<Count, _>(&Mock, root, &p, plies[i]).unwrap();
@@ -2587,8 +2840,14 @@ mod tests {
                 batched[i].candidates, alone.candidates,
                 "game {i}: visit counts differ under lockstep"
             );
-            assert_eq!(batched[i].chosen, alone.chosen, "game {i}: chose differently");
-            assert!((batched[i].value - alone.value).abs() < 1e-9, "game {i}: value differs");
+            assert_eq!(
+                batched[i].chosen, alone.chosen,
+                "game {i}: chose differently"
+            );
+            assert!(
+                (batched[i].value - alone.value).abs() < 1e-9,
+                "game {i}: value differs"
+            );
         }
     }
 
@@ -2600,8 +2859,15 @@ mod tests {
         // resolve the line rather than lean on a value head.
         let s = CountState { n: 5, side: 1 };
         let r = search::<Count, _>(&Mock, s, &params(400), 99).unwrap();
-        assert_eq!(r.candidates[r.chosen].0, 1, "should leave a multiple of four");
-        assert!(r.value > 0.0, "a won position should evaluate positive, got {}", r.value);
+        assert_eq!(
+            r.candidates[r.chosen].0, 1,
+            "should leave a multiple of four"
+        );
+        assert!(
+            r.value > 0.0,
+            "a won position should evaluate positive, got {}",
+            r.value
+        );
     }
 
     #[test]
@@ -2610,7 +2876,11 @@ mod tests {
             let s = CountState { n, side: 1 };
             let r = search::<Count, _>(&Mock, s, &params(100), 99).unwrap();
             assert_eq!(r.candidates[r.chosen].0, n, "should just take the last {n}");
-            assert!(r.value > 0.5, "a won position should evaluate positive, got {}", r.value);
+            assert!(
+                r.value > 0.5,
+                "a won position should evaluate positive, got {}",
+                r.value
+            );
         }
     }
 
@@ -2618,7 +2888,11 @@ mod tests {
     fn a_lost_position_evaluates_negative() {
         // 4 is a multiple of 4: every move leaves the opponent a winning take.
         let r = search::<Count, _>(&Mock, CountState { n: 4, side: 1 }, &params(400), 99).unwrap();
-        assert!(r.value < 0.0, "a lost position should evaluate negative, got {}", r.value);
+        assert!(
+            r.value < 0.0,
+            "a lost position should evaluate negative, got {}",
+            r.value
+        );
     }
 
     #[test]
@@ -2634,7 +2908,11 @@ mod tests {
     #[test]
     fn duplicate_candidates_are_merged_not_fragmented() {
         let r = search::<Count, _>(&Duplicating, Count::initial_state(), &params(50), 99).unwrap();
-        assert_eq!(r.candidates.len(), 2, "three copies of `1` should merge into one child");
+        assert_eq!(
+            r.candidates.len(),
+            2,
+            "three copies of `1` should merge into one child"
+        );
         let moves: Vec<u32> = r.candidates.iter().map(|(m, _)| *m).collect();
         assert!(moves.contains(&1) && moves.contains(&2));
     }
@@ -2664,7 +2942,10 @@ mod tests {
             nodes: 0,
         };
         let t = r.policy_target(2.0);
-        assert!((t.iter().sum::<f32>() - 1.0).abs() < 1e-5, "target must be normalised");
+        assert!(
+            (t.iter().sum::<f32>() - 1.0).abs() < 1e-5,
+            "target must be normalised"
+        );
         assert_eq!(t[1], 0.0, "forced-only visits earn no mass: {t:?}");
         assert_eq!(t[2], 0.0, "forced-only visits earn no mass: {t:?}");
         assert!((t[0] - 1.0).abs() < 1e-6, "92 of 92 chosen visits: {t:?}");
@@ -2724,13 +3005,18 @@ mod tests {
     /// parents pointing back, priors normalised per node.
     #[test]
     fn exported_tree_is_internally_consistent() {
-        let params = SampledParams { simulations: 60, ..Default::default() };
-        let (_, tree) = search_analyzed::<Count, _>(
-            &Mock, CountState { n: 21, side: 0 }, &params, 0,
-        )
-        .expect("search");
+        let params = SampledParams {
+            simulations: 60,
+            ..Default::default()
+        };
+        let (_, tree) =
+            search_analyzed::<Count, _>(&Mock, CountState { n: 21, side: 0 }, &params, 0)
+                .expect("search");
 
-        assert!(!tree.is_empty(), "a completed search must export at least the root");
+        assert!(
+            !tree.is_empty(),
+            "a completed search must export at least the root"
+        );
         assert_eq!(tree[0].parent, None, "node 0 must be the root");
 
         for (i, node) in tree.iter().enumerate() {
@@ -2754,7 +3040,11 @@ mod tests {
                 }
                 // An unvisited edge has no value to report, and a visited one
                 // must: the alternative is a caller rendering 0.0 as an opinion.
-                assert_eq!(e.value.is_some(), e.visits > 0, "node {i} value/visit disagree");
+                assert_eq!(
+                    e.value.is_some(),
+                    e.visits > 0,
+                    "node {i} value/visit disagree"
+                );
                 assert!(e.forced <= e.visits, "node {i} forced visits exceed total");
             }
         }
@@ -2776,7 +3066,9 @@ mod tests {
         }
         impl SampledModel<Count> for Skewed {
             fn expand(&self, s: &CountState, k: usize) -> anyhow::Result<Expansion<Count>> {
-                let start = self.cursor.fetch_add(k.max(1), std::sync::atomic::Ordering::Relaxed);
+                let start = self
+                    .cursor
+                    .fetch_add(k.max(1), std::sync::atomic::Ordering::Relaxed);
                 let moves: Vec<u32> = (1..=3u32).filter(|m| *m <= s.n).collect();
                 Ok((
                     0.0,
@@ -2799,12 +3091,17 @@ mod tests {
             seed: 5,
             ..Default::default()
         };
-        let model = Skewed { cursor: std::sync::atomic::AtomicUsize::new(0) };
+        let model = Skewed {
+            cursor: std::sync::atomic::AtomicUsize::new(0),
+        };
         let (_, tree) =
             search_analyzed::<Count, _>(&model, CountState { n: 21, side: 1 }, &params, 0)
                 .expect("search");
         let priors: Vec<f32> = tree[0].edges.iter().map(|e| e.prior).collect();
-        assert!(priors.len() > 1, "need several candidates to compare: {priors:?}");
+        assert!(
+            priors.len() > 1,
+            "need several candidates to compare: {priors:?}"
+        );
         assert!(
             priors[0] > 0.98,
             "a 10-nat lead should take nearly all the mass, got {priors:?}"
@@ -2837,14 +3134,22 @@ mod tests {
     #[test]
     fn temperature_sampling_explores_the_opening() {
         // With temp_moves high, early plies should not always pick the argmax.
-        let p = SampledParams { simulations: 60, temp_moves: 100, seed: 7, ..Default::default() };
+        let p = SampledParams {
+            simulations: 60,
+            temp_moves: 100,
+            seed: 7,
+            ..Default::default()
+        };
         let picks: std::collections::HashSet<u32> = (0..30)
             .map(|ply| {
                 let r = search::<Count, _>(&Mock, Count::initial_state(), &p, ply).unwrap();
                 r.candidates[r.chosen].0
             })
             .collect();
-        assert!(picks.len() > 1, "temperature should diversify the opening, got {picks:?}");
+        assert!(
+            picks.len() > 1,
+            "temperature should diversify the opening, got {picks:?}"
+        );
     }
 }
 
@@ -2859,19 +3164,37 @@ mod forced_quota_tests {
         type Move = u32;
         const PLANES: usize = 1;
         fn initial_state() -> Self::State {}
-        fn to_move(_: &Self::State) -> u8 { 1 }
+        fn to_move(_: &Self::State) -> u8 {
+            1
+        }
         fn apply(_: &Self::State, _: &Self::Move) -> Self::State {}
-        fn terminal_value(_: &Self::State) -> Option<f32> { None }
+        fn terminal_value(_: &Self::State) -> Option<f32> {
+            None
+        }
         fn encode_planes(_: &Self::State, _: &mut [f32]) {}
-        fn state_key(_: &Self::State) -> u128 { 0 }
+        fn state_key(_: &Self::State) -> u128 {
+            0
+        }
     }
 
     fn entry(explore: bool) -> Entry<G0> {
-        Entry { mv: 1, energy: 0.0, p: 0.25, n: 0, w: 0.0, child: -1, explore, forced_n: 0, forced_quota: 0, draws: 1 }
+        Entry {
+            mv: 1,
+            energy: 0.0,
+            p: 0.25,
+            n: 0,
+            w: 0.0,
+            child: -1,
+            explore,
+            forced_n: 0,
+            forced_quota: 0,
+            draws: 1,
+        }
     }
 
     fn quotas(n_explore: usize, n_plain: usize, params: &SampledParams) -> Vec<u32> {
-        let mut es: Vec<Entry<G0>> = (0..n_explore).map(|_| entry(true))
+        let mut es: Vec<Entry<G0>> = (0..n_explore)
+            .map(|_| entry(true))
             .chain((0..n_plain).map(|_| entry(false)))
             .collect();
         let mut rng = ChaCha8Rng::seed_from_u64(7);
@@ -2881,16 +3204,33 @@ mod forced_quota_tests {
 
     #[test]
     fn every_explore_candidate_is_covered() {
-        let p = SampledParams { simulations: 4000, forced_visits: 30, forced_extra: 4, ..Default::default() };
+        let p = SampledParams {
+            simulations: 4000,
+            forced_visits: 30,
+            forced_extra: 4,
+            ..Default::default()
+        };
         let q = quotas(5, 10, &p);
-        assert!(q[..5].iter().all(|&x| x == 30), "explore candidates must all be covered: {q:?}");
+        assert!(
+            q[..5].iter().all(|&x| x == 30),
+            "explore candidates must all be covered: {q:?}"
+        );
     }
 
     #[test]
     fn exactly_forced_extra_plain_candidates_are_drawn() {
-        let p = SampledParams { simulations: 4000, forced_visits: 30, forced_extra: 4, ..Default::default() };
+        let p = SampledParams {
+            simulations: 4000,
+            forced_visits: 30,
+            forced_extra: 4,
+            ..Default::default()
+        };
         let q = quotas(5, 10, &p);
-        assert_eq!(q[5..].iter().filter(|&&x| x > 0).count(), 4, "expected 4 extras: {q:?}");
+        assert_eq!(
+            q[5..].iter().filter(|&&x| x > 0).count(),
+            4,
+            "expected 4 extras: {q:?}"
+        );
     }
 
     #[test]
@@ -2898,7 +3238,12 @@ mod forced_quota_tests {
         // 4.3 explore candidates per node plus 4 extras at 30 each is ~250
         // visits, which is 62% of a 400-simulation search. The cap is what
         // stops forced exploration from crowding out the search it informs.
-        let p = SampledParams { simulations: 400, forced_visits: 30, forced_extra: 4, ..Default::default() };
+        let p = SampledParams {
+            simulations: 400,
+            forced_visits: 30,
+            forced_extra: 4,
+            ..Default::default()
+        };
         let q = quotas(5, 10, &p);
         let total: u32 = q.iter().sum();
         assert!(total <= 200, "forced total {total} exceeds half of 400");
@@ -2908,10 +3253,22 @@ mod forced_quota_tests {
     fn explore_candidates_keep_priority_when_the_budget_binds() {
         // Under pressure the random extras are what gets dropped, never the
         // injected candidates -- those are the ones with no value estimate.
-        let p = SampledParams { simulations: 120, forced_visits: 30, forced_extra: 4, ..Default::default() };
+        let p = SampledParams {
+            simulations: 120,
+            forced_visits: 30,
+            forced_extra: 4,
+            ..Default::default()
+        };
         let q = quotas(2, 10, &p);
-        assert!(q[..2].iter().all(|&x| x == 30), "explore dropped before extras: {q:?}");
-        assert_eq!(q.iter().sum::<u32>(), 60, "budget 60 should buy exactly the two explore quotas");
+        assert!(
+            q[..2].iter().all(|&x| x == 30),
+            "explore dropped before extras: {q:?}"
+        );
+        assert_eq!(
+            q.iter().sum::<u32>(),
+            60,
+            "budget 60 should buy exactly the two explore quotas"
+        );
     }
 
     #[test]
@@ -2930,7 +3287,10 @@ mod forced_quota_tests {
             stats: SearchStats::default(),
         };
         let t = r.policy_target_with(&SampledParams::default());
-        assert_eq!(t[1], 0.0, "a purely-forced candidate must target 0, got {t:?}");
+        assert_eq!(
+            t[1], 0.0,
+            "a purely-forced candidate must target 0, got {t:?}"
+        );
         assert!((t[0] - 0.8).abs() < 1e-6, "40 of 50 chosen visits: {t:?}");
         assert!((t[2] - 0.2).abs() < 1e-6, "10 of 50 chosen visits: {t:?}");
     }

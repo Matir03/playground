@@ -16,7 +16,10 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use candle_core::{DType, Device, Module, ModuleT, Tensor};
-use candle_nn::{batch_norm, conv2d, linear, BatchNorm, BatchNormConfig, Conv2d, Conv2dConfig, Linear, VarBuilder};
+use candle_nn::{
+    batch_norm, conv2d, linear, BatchNorm, BatchNormConfig, Conv2d, Conv2dConfig, Linear,
+    VarBuilder,
+};
 use playground_core::{Game, LatentGameState, LatentModel, MixturePolicy, MovePolicy};
 
 use crate::game::{Connect4, Connect4Move, Connect4State, C4_COLS, C4_ROWS};
@@ -34,7 +37,10 @@ struct ResBlock {
 
 impl ResBlock {
     fn load(c: usize, vb: VarBuilder) -> candle_core::Result<Self> {
-        let cfg = Conv2dConfig { padding: 1, ..Default::default() };
+        let cfg = Conv2dConfig {
+            padding: 1,
+            ..Default::default()
+        };
         Ok(Self {
             c1: conv2d(c, c, 3, cfg, vb.pp("c1"))?,
             b1: batch_norm(c, BatchNormConfig::default(), vb.pp("b1"))?,
@@ -57,7 +63,9 @@ struct GlobalPoolBias {
 
 impl GlobalPoolBias {
     fn load(c: usize, vb: VarBuilder) -> candle_core::Result<Self> {
-        Ok(Self { fc: linear(2 * c, c, vb.pp("fc"))? })
+        Ok(Self {
+            fc: linear(2 * c, c, vb.pp("fc"))?,
+        })
     }
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let (b, c, _h, _w) = x.dims4()?;
@@ -125,8 +133,15 @@ impl ValueHead {
 /// config.json's optional `decoder` bool selects which one to load, so a gens/
 /// dir can hold both kinds for ladder matches.
 enum EdgeHead {
-    Reifier { reif1: Linear, reif2: Linear },
-    Decoder { dec_fc1: Linear, dec_fc2: Linear, dec_out: Linear },
+    Reifier {
+        reif1: Linear,
+        reif2: Linear,
+    },
+    Decoder {
+        dec_fc1: Linear,
+        dec_fc2: Linear,
+        dec_out: Linear,
+    },
 }
 
 impl EdgeHead {
@@ -150,8 +165,15 @@ impl EdgeHead {
 /// `Move` is the discrete per-move head for C4: `pol_prior` (A move-prior logits)
 /// + `pol_next` (A predicted next-encodings). Selected by config `move_policy`.
 enum PolicyHead {
-    Mdn { mix_logits: Linear, means: Linear, log_stds: Linear },
-    Move { pol_prior: Linear, pol_next: Linear },
+    Mdn {
+        mix_logits: Linear,
+        means: Linear,
+        log_stds: Linear,
+    },
+    Move {
+        pol_prior: Linear,
+        pol_next: Linear,
+    },
 }
 
 impl PolicyHead {
@@ -185,7 +207,10 @@ struct Net {
 
 impl Net {
     fn load(arch: &Arch, vb: VarBuilder) -> candle_core::Result<Self> {
-        let cfg = Conv2dConfig { padding: 1, ..Default::default() };
+        let cfg = Conv2dConfig {
+            padding: 1,
+            ..Default::default()
+        };
         let c = arch.channels;
         let mut blocks = Vec::with_capacity(arch.blocks);
         let blocks_vb = vb.pp("blocks");
@@ -208,7 +233,10 @@ impl Net {
 
     /// planes (B,2,6,7) -> LGS (B,64), tanh-bounded.
     fn encode(&self, planes: &Tensor) -> candle_core::Result<Tensor> {
-        let mut x = self.stem_bn.forward_t(&self.stem.forward(planes)?, false)?.relu()?;
+        let mut x = self
+            .stem_bn
+            .forward_t(&self.stem.forward(planes)?, false)?
+            .relu()?;
         for blk in &self.blocks {
             x = blk.forward(&x)?;
         }
@@ -225,12 +253,17 @@ impl Net {
     fn policy_mdn(&self, lgs: &Tensor) -> candle_core::Result<(Tensor, Tensor, Tensor)> {
         let b = lgs.dim(0)?;
         match &self.policy {
-            PolicyHead::Mdn { mix_logits, means, log_stds } => {
+            PolicyHead::Mdn {
+                mix_logits,
+                means,
+                log_stds,
+            } => {
                 let w = candle_nn::ops::softmax(&mix_logits.forward(lgs)?, 1)?;
                 let mu = means.forward(lgs)?.tanh()?.reshape((b, self.k, LGS_DIM))?;
                 let raw = log_stds.forward(lgs)?;
                 // softplus(z) = ln(1+exp(z)); + SIGMA_MIN floor.
-                let std = ((raw.exp()? + 1.0)?.log()? + SIGMA_MIN)?.reshape((b, self.k, LGS_DIM))?;
+                let std =
+                    ((raw.exp()? + 1.0)?.log()? + SIGMA_MIN)?.reshape((b, self.k, LGS_DIM))?;
                 Ok((w, mu, std))
             }
             PolicyHead::Move { .. } => candle_core::bail!("policy_mdn called on a move-policy net"),
@@ -241,9 +274,15 @@ impl Net {
     fn move_policy(&self, lgs: &Tensor) -> candle_core::Result<(Tensor, Tensor)> {
         let b = lgs.dim(0)?;
         match &self.policy {
-            PolicyHead::Move { pol_prior, pol_next } => {
+            PolicyHead::Move {
+                pol_prior,
+                pol_next,
+            } => {
                 let prior = candle_nn::ops::softmax(&pol_prior.forward(lgs)?, 1)?; // (B,A)
-                let nxt = pol_next.forward(lgs)?.tanh()?.reshape((b, C4_COLS, LGS_DIM))?; // (B,A,d)
+                let nxt = pol_next
+                    .forward(lgs)?
+                    .tanh()?
+                    .reshape((b, C4_COLS, LGS_DIM))?; // (B,A,d)
                 Ok((prior, nxt))
             }
             PolicyHead::Mdn { .. } => candle_core::bail!("move_policy called on an MDN net"),
@@ -269,7 +308,11 @@ impl Net {
     /// next-LGS (B,64) -> board-plane logits (B, 2*CELLS). Decoder nets only.
     fn decode(&self, lgs: &Tensor) -> candle_core::Result<Tensor> {
         match &self.edge {
-            EdgeHead::Decoder { dec_fc1, dec_fc2, dec_out } => {
+            EdgeHead::Decoder {
+                dec_fc1,
+                dec_fc2,
+                dec_out,
+            } => {
                 let h = dec_fc1.forward(lgs)?.relu()?;
                 let h = dec_fc2.forward(&h)?.relu()?;
                 dec_out.forward(&h)
@@ -330,9 +373,8 @@ pub fn move_from_decoded(from_state: &Connect4State, decoded: &[f32]) -> (Connec
     }
     let exact = new_count == 1
         && removed == 0
-        && new_cell.is_some_and(|(r, c)| {
-            (0..C4_ROWS).find(|&rr| from_state.cells[rr][c] == 0) == Some(r)
-        });
+        && new_cell
+            .is_some_and(|(r, c)| (0..C4_ROWS).find(|&rr| from_state.cells[rr][c] == 0) == Some(r));
     (best.clone(), exact)
 }
 
@@ -349,12 +391,23 @@ struct Arch {
 }
 
 fn read_arch(checkpoint: &Path) -> Arch {
-    let mut a = Arch { channels: 64, blocks: 5, k: 8, val_hidden: None, decoder: false, move_policy: false };
+    let mut a = Arch {
+        channels: 64,
+        blocks: 5,
+        k: 8,
+        val_hidden: None,
+        decoder: false,
+        move_policy: false,
+    };
     // Prefer a per-checkpoint sidecar (e.g. gen_000153.config.json) so a single
     // gens/ dir can hold mixed archs (legacy + grown value heads); fall back to
     // config.json in the same dir (live/ uses that).
     let sidecar = checkpoint.with_extension("config.json");
-    let cfg = if sidecar.exists() { sidecar } else { checkpoint.with_file_name("config.json") };
+    let cfg = if sidecar.exists() {
+        sidecar
+    } else {
+        checkpoint.with_file_name("config.json")
+    };
     if let Ok(text) = std::fs::read_to_string(&cfg) {
         let text = text.replace("NaN", "null").replace("Infinity", "null");
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -364,7 +417,11 @@ fn read_arch(checkpoint: &Path) -> Arch {
                 a.blocks = arch["blocks"].as_u64().unwrap_or(5) as usize;
                 a.k = arch["k"].as_u64().unwrap_or(8) as usize;
                 if let Some(vh) = arch["val_hidden"].as_array() {
-                    a.val_hidden = Some(vh.iter().map(|x| x.as_u64().unwrap_or(64) as usize).collect());
+                    a.val_hidden = Some(
+                        vh.iter()
+                            .map(|x| x.as_u64().unwrap_or(64) as usize)
+                            .collect(),
+                    );
                 }
                 a.decoder = arch["decoder"].as_bool().unwrap_or(false);
                 a.move_policy = arch["move_policy"].as_bool().unwrap_or(false);
@@ -396,10 +453,15 @@ impl LgsModel {
     pub fn load_on(checkpoint: &str, device: Device) -> anyhow::Result<Self> {
         let path = Path::new(checkpoint);
         let arch = read_arch(path);
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[checkpoint], DType::F32, &device)? };
+        let vb =
+            unsafe { VarBuilder::from_mmaped_safetensors(&[checkpoint], DType::F32, &device)? };
         let net = Net::load(&arch, vb)?;
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("local");
-        Ok(Self { net, device, model_version: format!("connect4-lgs-{stem}") })
+        Ok(Self {
+            net,
+            device,
+            model_version: format!("connect4-lgs-{stem}"),
+        })
     }
 
     fn planes(&self, state: &Connect4State) -> candle_core::Result<Tensor> {
@@ -466,18 +528,28 @@ impl LatentModel<Connect4> for LgsModel {
     ) -> anyhow::Result<Connect4Move> {
         if self.net.is_decoder() {
             // Decode the target next-LGS to a board and infer the move.
-            let decoded = self.net.decode(&self.lgs_tensor(to_lgs)?)?
-                .flatten_all()?.to_vec1::<f32>()?;
+            let decoded = self
+                .net
+                .decode(&self.lgs_tensor(to_lgs)?)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
             return Ok(move_from_decoded(from_state, &decoded).0);
         }
-        let legal: Vec<u8> = Connect4::legal_moves(from_state).iter().map(|m| m.col).collect();
-        let logits = self.net.reify_logits(&self.lgs_tensor(from_lgs)?, &self.lgs_tensor(to_lgs)?)?;
+        let legal: Vec<u8> = Connect4::legal_moves(from_state)
+            .iter()
+            .map(|m| m.col)
+            .collect();
+        let logits = self
+            .net
+            .reify_logits(&self.lgs_tensor(from_lgs)?, &self.lgs_tensor(to_lgs)?)?;
         // Pick the highest-logit *legal* column; structural fallback keeps play legal.
         let best = legal
             .iter()
             .copied()
             .max_by(|&a, &b| logits[a as usize].total_cmp(&logits[b as usize]));
-        Ok(Connect4Move { col: best.or_else(|| legal.first().copied()).unwrap_or(0) })
+        Ok(Connect4Move {
+            col: best.or_else(|| legal.first().copied()).unwrap_or(0),
+        })
     }
 
     async fn model_version(&self) -> anyhow::Result<String> {
@@ -498,10 +570,15 @@ impl LgsServer {
     pub fn load_on(checkpoint: &str, device: Device) -> anyhow::Result<Self> {
         let path = Path::new(checkpoint);
         let arch = read_arch(path);
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[checkpoint], DType::F32, &device)? };
+        let vb =
+            unsafe { VarBuilder::from_mmaped_safetensors(&[checkpoint], DType::F32, &device)? };
         let net = Net::load(&arch, vb)?;
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("local");
-        Ok(Self { net, device, model_version: format!("connect4-lgs-{stem}") })
+        Ok(Self {
+            net,
+            device,
+            model_version: format!("connect4-lgs-{stem}"),
+        })
     }
 
     /// `b` × planes (PLANES each) → `b` × LGS (LGS_DIM each), flattened.
@@ -519,11 +596,18 @@ impl LgsServer {
     /// Fused encode+value: `b` × planes → (`b` × LGS, `b` values). One forward
     /// (shared trunk) so the reify-leaf value rides along with the child encode
     /// instead of a separate eval round-trip.
-    pub fn encode_eval_batch(&self, planes: &[f32], b: usize) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
+    pub fn encode_eval_batch(
+        &self,
+        planes: &[f32],
+        b: usize,
+    ) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
         let t = Tensor::from_vec(planes.to_vec(), (b, 2, C4_ROWS, C4_COLS), &self.device)?;
         let lgs = self.net.encode(&t)?;
         let val = self.net.value(&lgs)?;
-        Ok((lgs.flatten_all()?.to_vec1::<f32>()?, val.flatten_all()?.to_vec1::<f32>()?))
+        Ok((
+            lgs.flatten_all()?.to_vec1::<f32>()?,
+            val.flatten_all()?.to_vec1::<f32>()?,
+        ))
     }
 
     /// Fused move-policy+value: `b` × LGS → (priors `b·A`, next-latents `b·A·d`,
@@ -616,18 +700,37 @@ mod tests {
         let v = m.eval(&lgs).await.unwrap();
         let pol = m.policy(&lgs).await.unwrap();
 
-        let r: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(refp).unwrap()).unwrap();
+        let r: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(refp).unwrap()).unwrap();
         let ref_v = r["value"].as_f64().unwrap();
-        let ref_lgs5: Vec<f64> = r["lgs5"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+        let ref_lgs5: Vec<f64> = r["lgs5"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap())
+            .collect();
         let lgs_f = lgs.to_f32();
         eprintln!("candle value {v:.6} vs torch {ref_v:.6}");
         assert!((v - ref_v).abs() < 1e-4, "value parity: {v} vs {ref_v}");
         for (i, &rv) in ref_lgs5.iter().enumerate() {
-            assert!((lgs_f[i] as f64 - rv).abs() < 1e-4, "lgs[{i}] {} vs {rv}", lgs_f[i]);
+            assert!(
+                (lgs_f[i] as f64 - rv).abs() < 1e-4,
+                "lgs[{i}] {} vs {rv}",
+                lgs_f[i]
+            );
         }
-        let ref_w: Vec<f64> = r["w"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+        let ref_w: Vec<f64> = r["w"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap())
+            .collect();
         for (i, &rw) in ref_w.iter().enumerate() {
-            assert!((pol.weights[i] as f64 - rw).abs() < 1e-4, "w[{i}] {} vs {rw}", pol.weights[i]);
+            assert!(
+                (pol.weights[i] as f64 - rw).abs() < 1e-4,
+                "w[{i}] {} vs {rw}",
+                pol.weights[i]
+            );
         }
         assert!((pol.weights.iter().sum::<f32>() - 1.0).abs() < 1e-4);
     }

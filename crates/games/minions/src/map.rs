@@ -30,11 +30,7 @@ pub const GRAVEYARDS_TO_WIN: u32 = 4;
 /// adjacent to another (minimum pairwise hex distance 2) and none on a starting
 /// cell. Two flank the centre diagonal, two sit on the short flanks, and one
 /// pair holds the board's opposite edges.
-pub const GRAVEYARD_XY: [(u8, u8); 6] = [
-    (1, 4), (5, 2),
-    (4, 1), (2, 5),
-    (0, 3), (6, 3),
-];
+pub const GRAVEYARD_XY: [(u8, u8); 6] = [(1, 4), (5, 2), (4, 1), (2, 5), (0, 3), (6, 3)];
 
 /// Necromancer start cells: `b1` for the first player, `f5` for the second —
 /// each a full hex in from its corner, so all six neighbours exist for the
@@ -155,7 +151,13 @@ mod tests {
     #[test]
     fn interior_cells_have_six_neighbours() {
         let interior = idx(3, 3);
-        assert_eq!(NEIGHBORS[interior as usize].iter().filter(|&&n| n != NO_CELL).count(), 6);
+        assert_eq!(
+            NEIGHBORS[interior as usize]
+                .iter()
+                .filter(|&&n| n != NO_CELL)
+                .count(),
+            6
+        );
     }
 
     #[test]
@@ -175,7 +177,12 @@ mod tests {
         }
         for (i, &a) in gys.iter().enumerate() {
             for &b in &gys[i + 1..] {
-                assert!(dist(a, b) >= 2, "{} and {} are adjacent", cell_name(a), cell_name(b));
+                assert!(
+                    dist(a, b) >= 2,
+                    "{} and {} are adjacent",
+                    cell_name(a),
+                    cell_name(b)
+                );
             }
         }
     }
@@ -234,15 +241,22 @@ mod rotation_tests {
                 .filter(|&&n| n != NO_CELL)
                 .map(|&n| rot(n as usize) as u8)
                 .collect();
-            let mut b: Vec<u8> =
-                NEIGHBORS[rot(i)].iter().filter(|&&n| n != NO_CELL).copied().collect();
+            let mut b: Vec<u8> = NEIGHBORS[rot(i)]
+                .iter()
+                .filter(|&&n| n != NO_CELL)
+                .copied()
+                .collect();
             a.sort_unstable();
             b.sort_unstable();
             assert_eq!(a, b, "adjacency broken at cell {i}");
         }
         // The graveyards are setwise invariant.
         for i in 0..NUM_CELLS {
-            assert_eq!(IS_GRAVEYARD[i], IS_GRAVEYARD[rot(i)], "graveyards asymmetric at {i}");
+            assert_eq!(
+                IS_GRAVEYARD[i],
+                IS_GRAVEYARD[rot(i)],
+                "graveyards asymmetric at {i}"
+            );
         }
         // The two necromancers start on rotated squares.
         assert_eq!(rot(NECRO_START[0] as usize), NECRO_START[1] as usize);

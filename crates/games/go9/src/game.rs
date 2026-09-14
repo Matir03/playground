@@ -42,7 +42,14 @@ pub struct Go9State {
 
 impl Default for Go9State {
     fn default() -> Self {
-        Self { black: 0, white: 0, prev: None, to_move: 1, consecutive_passes: 0, ply: 0 }
+        Self {
+            black: 0,
+            white: 0,
+            prev: None,
+            to_move: 1,
+            consecutive_passes: 0,
+            ply: 0,
+        }
     }
 }
 
@@ -61,7 +68,11 @@ impl Go9State {
     /// Stones of the side to move / the opponent, as bitboards.
     #[inline]
     pub fn own_opp(&self) -> (u128, u128) {
-        if self.to_move == 1 { (self.black, self.white) } else { (self.white, self.black) }
+        if self.to_move == 1 {
+            (self.black, self.white)
+        } else {
+            (self.white, self.black)
+        }
     }
 }
 
@@ -135,7 +146,11 @@ impl Game for Go9 {
     }
 
     fn to_move(state: &Self::State) -> Player {
-        if state.to_move == 1 { Player::First } else { Player::Second }
+        if state.to_move == 1 {
+            Player::First
+        } else {
+            Player::Second
+        }
     }
 
     fn outcome(state: &Self::State) -> Outcome {
@@ -155,7 +170,10 @@ impl Game for Go9 {
             let i = empty.trailing_zeros() as usize;
             empty &= empty - 1;
             if apply_play_checked(state, i / N, i % N).is_some() {
-                moves.push(Go9Move::Play { r: (i / N) as u8, c: (i % N) as u8 });
+                moves.push(Go9Move::Play {
+                    r: (i / N) as u8,
+                    c: (i % N) as u8,
+                });
             }
         }
         moves
@@ -222,7 +240,13 @@ impl Game for Go9 {
         if let Some((pb, pw)) = state.prev {
             out.push(1);
             for i in 0..NN {
-                out.push(if (pb >> i) & 1 == 1 { 1 } else if (pw >> i) & 1 == 1 { 2 } else { 0 });
+                out.push(if (pb >> i) & 1 == 1 {
+                    1
+                } else if (pw >> i) & 1 == 1 {
+                    2
+                } else {
+                    0
+                });
             }
         } else {
             out.push(0);
@@ -306,7 +330,11 @@ pub fn apply_play_checked(state: &Go9State, r: usize, c: usize) -> Option<Go9Sta
     if !has_lib(group_of(mine2, b), empty) {
         return None; // suicide
     }
-    let (nb, nw) = if state.to_move == 1 { (mine2, opp2) } else { (opp2, mine2) };
+    let (nb, nw) = if state.to_move == 1 {
+        (mine2, opp2)
+    } else {
+        (opp2, mine2)
+    };
     if let Some((pb, pw)) = state.prev {
         if nb == pb && nw == pw {
             return None; // positional ko
@@ -379,7 +407,11 @@ impl Solver for Go9 {
             .into_iter()
             .next()
             .expect("non-terminal position has a legal move");
-        SearchOutcome { best_move, value: 0.0, nodes: 0 }
+        SearchOutcome {
+            best_move,
+            value: 0.0,
+            nodes: 0,
+        }
     }
 }
 

@@ -49,7 +49,7 @@ pub const REC_F32: usize = PLANES + 1 + MAX_CHILDREN * (2 + PLANES);
 /// One move's training target before the final outcome `z` is known.
 struct MoveRec {
     parent: Connect4State,
-    mover: u8, // 1 or 2, the side to move at `parent`
+    mover: u8,                               // 1 or 2, the side to move at `parent`
     children: Vec<(u8, Connect4State, u32)>, // (col, child state, merged visits)
 }
 
@@ -85,13 +85,20 @@ async fn play_game<M: LatentModel<Connect4>>(
         let pick = choose(&res.root_children, sample, rng);
         // PCR: only full (high-playout) moves contribute a policy/reifier target.
         let children = if full {
-            res.root_children.iter().map(|c| (c.mv.col, c.state.clone(), c.visits)).collect()
+            res.root_children
+                .iter()
+                .map(|c| (c.mv.col, c.state.clone(), c.visits))
+                .collect()
         } else {
             Vec::new()
         };
         let mover = if state.ply % 2 == 0 { 1u8 } else { 2u8 };
         let next = res.root_children[pick].state.clone();
-        recs.push(MoveRec { parent: state.clone(), mover, children });
+        recs.push(MoveRec {
+            parent: state.clone(),
+            mover,
+            children,
+        });
         state = next;
     }
 
@@ -104,7 +111,13 @@ async fn play_game<M: LatentModel<Connect4>>(
         .into_iter()
         .map(|r| {
             let z = match winner {
-                Some(w) => if w == r.mover { 1.0 } else { -1.0 },
+                Some(w) => {
+                    if w == r.mover {
+                        1.0
+                    } else {
+                        -1.0
+                    }
+                }
                 None => 0.0,
             };
             (r, z)
@@ -188,8 +201,24 @@ pub async fn run_generate(
     let device = crate::net::pick_device(cuda)?;
     let model = Arc::new(LgsModel::load_on(checkpoint, device)?);
     let mp = checkpoint_is_move_policy(checkpoint);
-    let cfg_full = SearchConfig { simulations: sims, c_puct, kernel_bandwidth, root_explore: true, move_policy: mp, seed: None, ..Default::default() };
-    let cfg_fast = SearchConfig { simulations: fast_sims, c_puct, kernel_bandwidth, root_explore: false, move_policy: mp, seed: None, ..Default::default() };
+    let cfg_full = SearchConfig {
+        simulations: sims,
+        c_puct,
+        kernel_bandwidth,
+        root_explore: true,
+        move_policy: mp,
+        seed: None,
+        ..Default::default()
+    };
+    let cfg_fast = SearchConfig {
+        simulations: fast_sims,
+        c_puct,
+        kernel_bandwidth,
+        root_explore: false,
+        move_policy: mp,
+        seed: None,
+        ..Default::default()
+    };
     eprintln!(
         "c4 LGS self-play: {n_games} games, PCR full {sims}/fast {fast_sims} sims (p_full {pcr_full_prob}), h {kernel_bandwidth}, model {checkpoint} -> {out_path}"
     );
@@ -198,7 +227,15 @@ pub async fn run_generate(
     let mut reifications = 0u64;
     for g in 0..n_games {
         let mut rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(g as u64));
-        let (recs, reif) = play_game(model.as_ref(), &cfg_full, &cfg_fast, pcr_full_prob, temp_moves, &mut rng).await?;
+        let (recs, reif) = play_game(
+            model.as_ref(),
+            &cfg_full,
+            &cfg_fast,
+            pcr_full_prob,
+            temp_moves,
+            &mut rng,
+        )
+        .await?;
         reifications += reif as u64;
         all.extend(recs);
     }
@@ -231,11 +268,11 @@ pub async fn run_generate(
 /// leaf) and `PolicyEval` (node expansion). Only sampled-latent and aliased-child
 /// evals remain as standalone `Eval`s.
 enum Pending {
-    EncodeEval(Vec<f32>),       // planes  → (lgs, value)
-    Eval(Vec<f32>),             // lgs     → value
-    PolicyEval(Vec<f32>),       // lgs     → (MDN, value)
-    MovePolicyEval(Vec<f32>),   // lgs     → (move-policy, value)
-    Reify(Vec<f32>),            // next-LGS → decoded board planes
+    EncodeEval(Vec<f32>),     // planes  → (lgs, value)
+    Eval(Vec<f32>),           // lgs     → value
+    PolicyEval(Vec<f32>),     // lgs     → (MDN, value)
+    MovePolicyEval(Vec<f32>), // lgs     → (move-policy, value)
+    Reify(Vec<f32>),          // next-LGS → decoded board planes
 }
 
 /// The driver's reply to a yielded op.
@@ -244,7 +281,7 @@ enum OpOut {
     Val(f32),
     PolVal(MixturePolicy, f32),
     MovePolVal(MovePolicy, f32),
-    Decoded(Vec<f32>),  // decoder plane logits (2*CELLS)
+    Decoded(Vec<f32>), // decoder plane logits (2*CELLS)
 }
 
 type PolOut = (usize, Vec<f32>, Vec<f32>, Vec<f32>);
@@ -257,7 +294,9 @@ struct ShardCache<V> {
 
 impl<V> ShardCache<V> {
     fn new(shards: usize) -> Self {
-        Self { shards: (0..shards).map(|_| Mutex::new(HashMap::new())).collect() }
+        Self {
+            shards: (0..shards).map(|_| Mutex::new(HashMap::new())).collect(),
+        }
     }
     #[inline]
     fn shard(&self, key: u64) -> &Mutex<HashMap<u64, Arc<V>>> {
@@ -350,7 +389,10 @@ impl Future for OpFuture {
 impl LockstepModel {
     fn submit(&self, req: Pending) -> OpFuture {
         self.lane.lock().unwrap().request[self.slot] = Some(req);
-        OpFuture { slot: self.slot, lane: self.lane.clone() }
+        OpFuture {
+            slot: self.slot,
+            lane: self.lane.clone(),
+        }
     }
 }
 
@@ -361,8 +403,14 @@ impl LatentModel<Connect4> for LockstepModel {
         Ok(lgs)
     }
     async fn encode_eval(&self, state: &Connect4State) -> anyhow::Result<(LatentGameState, f64)> {
-        match self.submit(Pending::EncodeEval(planes_of(state).to_vec())).await {
-            OpOut::LgsVal(v, val) => Ok((LatentGameState::from_f32(&v, self.version.clone()), val as f64)),
+        match self
+            .submit(Pending::EncodeEval(planes_of(state).to_vec()))
+            .await
+        {
+            OpOut::LgsVal(v, val) => Ok((
+                LatentGameState::from_f32(&v, self.version.clone()),
+                val as f64,
+            )),
             _ => unreachable!("encode_eval reply"),
         }
     }
@@ -439,9 +487,22 @@ fn make_game(
     decode_stats: Arc<(AtomicU64, AtomicU64)>,
 ) -> GameFut {
     Box::pin(async move {
-        let model = LockstepModel { slot, lane, version, decode_stats };
+        let model = LockstepModel {
+            slot,
+            lane,
+            version,
+            decode_stats,
+        };
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        play_game(&model, &cfg_full, &cfg_fast, pcr_full_prob, temp_moves, &mut rng).await
+        play_game(
+            &model,
+            &cfg_full,
+            &cfg_fast,
+            pcr_full_prob,
+            temp_moves,
+            &mut rng,
+        )
+        .await
     })
 }
 
@@ -466,16 +527,20 @@ struct ServerStats {
 /// One worker's wave of net-op *misses* for the central inference server.
 #[derive(Default)]
 struct Wave {
-    enc_eval: Vec<Vec<f32>>, // planes
-    eval: Vec<Vec<f32>>,     // lgs (sampled / aliased child)
-    pol_eval: Vec<Vec<f32>>, // lgs
+    enc_eval: Vec<Vec<f32>>,   // planes
+    eval: Vec<Vec<f32>>,       // lgs (sampled / aliased child)
+    pol_eval: Vec<Vec<f32>>,   // lgs
     mvpol_eval: Vec<Vec<f32>>, // lgs (move-policy)
-    reif: Vec<Vec<f32>>,     // next-LGS to decode
+    reif: Vec<Vec<f32>>,       // next-LGS to decode
 }
 
 impl Wave {
     fn count(&self) -> usize {
-        self.enc_eval.len() + self.eval.len() + self.pol_eval.len() + self.mvpol_eval.len() + self.reif.len()
+        self.enc_eval.len()
+            + self.eval.len()
+            + self.pol_eval.len()
+            + self.mvpol_eval.len()
+            + self.reif.len()
     }
     fn is_empty(&self) -> bool {
         self.count() == 0
@@ -536,11 +601,15 @@ fn inference_server(
                     flat.extend_from_slice(p);
                 }
             }
-            let (lgs, val) = server.encode_eval_batch(&flat, n).expect("encode_eval_batch");
+            let (lgs, val) = server
+                .encode_eval_batch(&flat, n)
+                .expect("encode_eval_batch");
             let mut off = 0;
             for (ji, j) in jobs.iter().enumerate() {
                 for _ in 0..j.wave.enc_eval.len() {
-                    outs[ji].enc_eval.push((lgs[off * LGS_DIM..(off + 1) * LGS_DIM].to_vec(), val[off]));
+                    outs[ji]
+                        .enc_eval
+                        .push((lgs[off * LGS_DIM..(off + 1) * LGS_DIM].to_vec(), val[off]));
                     off += 1;
                 }
             }
@@ -572,7 +641,9 @@ fn inference_server(
                     flat.extend_from_slice(x);
                 }
             }
-            let (k, w, mu, std, val) = server.policy_eval_batch(&flat, n).expect("policy_eval_batch");
+            let (k, w, mu, std, val) = server
+                .policy_eval_batch(&flat, n)
+                .expect("policy_eval_batch");
             let md = k * LGS_DIM;
             let mut off = 0;
             for (ji, j) in jobs.iter().enumerate() {
@@ -599,7 +670,9 @@ fn inference_server(
                     flat.extend_from_slice(x);
                 }
             }
-            let (pri, nxt, val) = server.move_policy_eval_batch(&flat, n).expect("move_policy_eval_batch");
+            let (pri, nxt, val) = server
+                .move_policy_eval_batch(&flat, n)
+                .expect("move_policy_eval_batch");
             let nd = C4_COLS * LGS_DIM;
             let mut off = 0;
             for (ji, j) in jobs.iter().enumerate() {
@@ -626,7 +699,9 @@ fn inference_server(
             let mut off = 0;
             for (ji, j) in jobs.iter().enumerate() {
                 for _ in 0..j.wave.reif.len() {
-                    outs[ji].reif.push(r[off * PLANES..(off + 1) * PLANES].to_vec());
+                    outs[ji]
+                        .reif
+                        .push(r[off * PLANES..(off + 1) * PLANES].to_vec());
                     off += 1;
                 }
             }
@@ -634,11 +709,26 @@ fn inference_server(
 
         stats.rounds.fetch_add(1, Ordering::Relaxed);
         stats.ops.fetch_add(total as u64, Ordering::Relaxed);
-        stats.n_enc.fetch_add(jobs.iter().map(|j| j.wave.enc_eval.len() as u64).sum(), Ordering::Relaxed);
-        stats.n_eval.fetch_add(jobs.iter().map(|j| j.wave.eval.len() as u64).sum(), Ordering::Relaxed);
-        stats.n_pol.fetch_add(jobs.iter().map(|j| j.wave.pol_eval.len() as u64).sum(), Ordering::Relaxed);
-        stats.n_mvpol.fetch_add(jobs.iter().map(|j| j.wave.mvpol_eval.len() as u64).sum(), Ordering::Relaxed);
-        stats.n_reif.fetch_add(jobs.iter().map(|j| j.wave.reif.len() as u64).sum(), Ordering::Relaxed);
+        stats.n_enc.fetch_add(
+            jobs.iter().map(|j| j.wave.enc_eval.len() as u64).sum(),
+            Ordering::Relaxed,
+        );
+        stats.n_eval.fetch_add(
+            jobs.iter().map(|j| j.wave.eval.len() as u64).sum(),
+            Ordering::Relaxed,
+        );
+        stats.n_pol.fetch_add(
+            jobs.iter().map(|j| j.wave.pol_eval.len() as u64).sum(),
+            Ordering::Relaxed,
+        );
+        stats.n_mvpol.fetch_add(
+            jobs.iter().map(|j| j.wave.mvpol_eval.len() as u64).sum(),
+            Ordering::Relaxed,
+        );
+        stats.n_reif.fetch_add(
+            jobs.iter().map(|j| j.wave.reif.len() as u64).sum(),
+            Ordering::Relaxed,
+        );
         for (j, o) in jobs.into_iter().zip(outs) {
             let _ = j.resp.send(o);
         }
@@ -762,10 +852,18 @@ fn worker(
                     let k = hash_f32s(&x);
                     if let Some(v) = cache.pol.get(k) {
                         let ((_, w, mu, std), val) = v.as_ref();
-                        hits_out.push((slot, OpOut::PolVal(
-                            MixturePolicy { dim: LGS_DIM, weights: w.clone(), means: mu.clone(), stds: std.clone() },
-                            *val,
-                        )));
+                        hits_out.push((
+                            slot,
+                            OpOut::PolVal(
+                                MixturePolicy {
+                                    dim: LGS_DIM,
+                                    weights: w.clone(),
+                                    means: mu.clone(),
+                                    stds: std.clone(),
+                                },
+                                *val,
+                            ),
+                        ));
                         cache.hits.fetch_add(1, Ordering::Relaxed);
                     } else {
                         pol_slot.push(slot);
@@ -778,10 +876,17 @@ fn worker(
                     let k = hash_f32s(&x);
                     if let Some(v) = cache.mvpol.get(k) {
                         let (pri, nxt, val) = v.as_ref();
-                        hits_out.push((slot, OpOut::MovePolVal(
-                            MovePolicy { dim: LGS_DIM, priors: pri.clone(), next: nxt.clone() },
-                            *val,
-                        )));
+                        hits_out.push((
+                            slot,
+                            OpOut::MovePolVal(
+                                MovePolicy {
+                                    dim: LGS_DIM,
+                                    priors: pri.clone(),
+                                    next: nxt.clone(),
+                                },
+                                *val,
+                            ),
+                        ));
                         cache.hits.fetch_add(1, Ordering::Relaxed);
                     } else {
                         mvpol_slot.push(slot);
@@ -810,7 +915,11 @@ fn worker(
         if wave.is_empty() {
             continue; // every active game resolved via cache this round
         }
-        tx.send(Job { wave, resp: resp_tx.clone() }).expect("inference server gone");
+        tx.send(Job {
+            wave,
+            resp: resp_tx.clone(),
+        })
+        .expect("inference server gone");
         let wo = resp_rx.recv().expect("inference response dropped");
 
         // Populate caches (sharded), then write results back (brief lane lock).
@@ -832,14 +941,23 @@ fn worker(
             for (i, &slot) in pol_slot.iter().enumerate() {
                 let ((_, w, mu, std), val) = &wo.pol_eval[i];
                 l.result[slot] = Some(OpOut::PolVal(
-                    MixturePolicy { dim: LGS_DIM, weights: w.clone(), means: mu.clone(), stds: std.clone() },
+                    MixturePolicy {
+                        dim: LGS_DIM,
+                        weights: w.clone(),
+                        means: mu.clone(),
+                        stds: std.clone(),
+                    },
                     *val,
                 ));
             }
             for (i, &slot) in mvpol_slot.iter().enumerate() {
                 let (pri, nxt, val) = &wo.mvpol_eval[i];
                 l.result[slot] = Some(OpOut::MovePolVal(
-                    MovePolicy { dim: LGS_DIM, priors: pri.clone(), next: nxt.clone() },
+                    MovePolicy {
+                        dim: LGS_DIM,
+                        priors: pri.clone(),
+                        next: nxt.clone(),
+                    },
                     *val,
                 ));
             }
@@ -878,8 +996,24 @@ pub fn run_generate_batched(
     let server = LgsServer::load_on(checkpoint, device)?;
     let version = server.model_version.clone();
     let mp = checkpoint_is_move_policy(checkpoint);
-    let cfg_full = SearchConfig { simulations: sims, c_puct, kernel_bandwidth, root_explore: true, move_policy: mp, seed: None, ..Default::default() };
-    let cfg_fast = SearchConfig { simulations: fast_sims, c_puct, kernel_bandwidth, root_explore: false, move_policy: mp, seed: None, ..Default::default() };
+    let cfg_full = SearchConfig {
+        simulations: sims,
+        c_puct,
+        kernel_bandwidth,
+        root_explore: true,
+        move_policy: mp,
+        seed: None,
+        ..Default::default()
+    };
+    let cfg_fast = SearchConfig {
+        simulations: fast_sims,
+        c_puct,
+        kernel_bandwidth,
+        root_explore: false,
+        move_policy: mp,
+        seed: None,
+        ..Default::default()
+    };
     let pool = threads * in_flight;
     eprintln!(
         "c4 LGS self-play (central-batched): {n_games} games, pool {pool} ({threads}×{in_flight}), \
@@ -909,7 +1043,20 @@ pub fn run_generate_batched(
             let version = version.as_str();
             let decode_stats = &decode_stats;
             handles.push(scope.spawn(move || {
-                worker(&tx, cache, in_flight, next_game, n_games, cfg_full, cfg_fast, pcr_full_prob, temp_moves, seed, version, decode_stats)
+                worker(
+                    &tx,
+                    cache,
+                    in_flight,
+                    next_game,
+                    n_games,
+                    cfg_full,
+                    cfg_fast,
+                    pcr_full_prob,
+                    temp_moves,
+                    seed,
+                    version,
+                    decode_stats,
+                )
             }));
         }
         drop(tx); // let the server detect shutdown once workers finish
@@ -926,12 +1073,20 @@ pub fn run_generate_batched(
     let dt = t0.elapsed().as_secs_f64();
     let hits = cache.hits.load(Ordering::Relaxed);
     let misses = cache.misses.load(Ordering::Relaxed);
-    let hit_rate = if hits + misses > 0 { hits as f64 / (hits + misses) as f64 } else { 0.0 };
+    let hit_rate = if hits + misses > 0 {
+        hits as f64 / (hits + misses) as f64
+    } else {
+        0.0
+    };
     let rounds = stats.rounds.load(Ordering::Relaxed).max(1);
     let ops = stats.ops.load(Ordering::Relaxed);
     let dec_valid = decode_stats.0.load(Ordering::Relaxed);
     let dec_total = decode_stats.1.load(Ordering::Relaxed);
-    let dec_rate = if dec_total > 0 { 100.0 * dec_valid as f64 / dec_total as f64 } else { 0.0 };
+    let dec_rate = if dec_total > 0 {
+        100.0 * dec_valid as f64 / dec_total as f64
+    } else {
+        0.0
+    };
     eprintln!(
         "  wrote {} examples ({} games) in {:.1}s  ({:.1} games/s, {} reifications)\n  \
          avg_batch {:.0}  forwards/s {:.0} ({:.1}k)  cache_hit {:.0}% (encode+policy)\n  \
@@ -1059,15 +1214,25 @@ pub async fn run_lgs_move(
     }
     let res = search(&model, &state, &cfg).await?;
     let sol = Connect4::choose_move(&state);
-    let mut kids: Vec<(u8, u32, f64)> =
-        res.root_children.iter().map(|c| (c.mv.col, c.visits, c.value)).collect();
+    let mut kids: Vec<(u8, u32, f64)> = res
+        .root_children
+        .iter()
+        .map(|c| (c.mv.col, c.visits, c.value))
+        .collect();
     kids.sort_by(|a, b| b.1.cmp(&a.1));
-    let flag = if res.chosen.col == sol.best_move.col { "OK" } else { "DIFF-from-solver" };
+    let flag = if res.chosen.col == sol.best_move.col {
+        "OK"
+    } else {
+        "DIFF-from-solver"
+    };
     eprintln!(
         "lgs_move  after [{moves}]: net plays col {} (root_value {:.3}); solver {} ({flag})\n  children (col,visits,value): {:?}",
         res.chosen.col, res.root_value, sol.best_move.col, kids
     );
-    println!("MOVE {} {} {:.4}", res.chosen.col, sol.best_move.col, res.root_value);
+    println!(
+        "MOVE {} {} {:.4}",
+        res.chosen.col, sol.best_move.col, res.root_value
+    );
     Ok(())
 }
 
@@ -1082,7 +1247,10 @@ impl Player {
         Ok(if spec == "solver" {
             Player::Solver
         } else {
-            Player::Lgs(LgsModel::load_on(spec, device.clone())?, checkpoint_is_move_policy(spec))
+            Player::Lgs(
+                LgsModel::load_on(spec, device.clone())?,
+                checkpoint_is_move_policy(spec),
+            )
         })
     }
     async fn pick(&self, state: &Connect4State, cfg: &SearchConfig) -> anyhow::Result<u8> {
@@ -1092,7 +1260,10 @@ impl Player {
             // The search path must match this player's net arch, regardless of the
             // opponent's (a move-policy net can face a reifier/MDN baseline).
             Player::Lgs(m, mp) => {
-                let cfg = SearchConfig { move_policy: *mp, ..cfg.clone() };
+                let cfg = SearchConfig {
+                    move_policy: *mp,
+                    ..cfg.clone()
+                };
                 search(m, state, &cfg).await?.chosen.col
             }
         })
@@ -1196,30 +1367,39 @@ pub fn run_lgs_match(
         let mut handles = Vec::new();
         for t in 0..threads {
             let device = device.clone();
-            handles.push(scope.spawn(move || -> anyhow::Result<(usize, usize, usize)> {
-                // Per-thread model instances (matches are CPU-bound per game, so
-                // parallel games overlap their search work on the otherwise-idle GPU).
-                let a = Player::load(a_spec, &device)?;
-                let b = Player::load(b_spec, &device)?;
-                let cfg = SearchConfig {
-                    simulations: sims,
-                    c_puct,
-                    kernel_bandwidth,
-                    seed: None,
-                    ..Default::default()
-                };
-                let (mut aw, mut dr, mut bw) = (0usize, 0usize, 0usize);
-                let mut g = t;
-                while g < games {
-                    match play_match_game(&a, &b, &cfg, opening, g % 2 == 0, seed.wrapping_add(g as u64))? {
-                        Some(true) => aw += 1,
-                        Some(false) => bw += 1,
-                        None => dr += 1,
+            handles.push(
+                scope.spawn(move || -> anyhow::Result<(usize, usize, usize)> {
+                    // Per-thread model instances (matches are CPU-bound per game, so
+                    // parallel games overlap their search work on the otherwise-idle GPU).
+                    let a = Player::load(a_spec, &device)?;
+                    let b = Player::load(b_spec, &device)?;
+                    let cfg = SearchConfig {
+                        simulations: sims,
+                        c_puct,
+                        kernel_bandwidth,
+                        seed: None,
+                        ..Default::default()
+                    };
+                    let (mut aw, mut dr, mut bw) = (0usize, 0usize, 0usize);
+                    let mut g = t;
+                    while g < games {
+                        match play_match_game(
+                            &a,
+                            &b,
+                            &cfg,
+                            opening,
+                            g % 2 == 0,
+                            seed.wrapping_add(g as u64),
+                        )? {
+                            Some(true) => aw += 1,
+                            Some(false) => bw += 1,
+                            None => dr += 1,
+                        }
+                        g += threads;
                     }
-                    g += threads;
-                }
-                Ok((aw, dr, bw))
-            }));
+                    Ok((aw, dr, bw))
+                }),
+            );
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });

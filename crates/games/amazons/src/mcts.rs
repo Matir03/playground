@@ -37,7 +37,12 @@ impl MoveGame for crate::game::Amazons {
     fn encode_planes(state: &AmazonsState, out: &mut [f32]) {
         game::fill_planes_into(state, out);
     }
-    fn expand(state: &AmazonsState, policy: &[f32], moves: &mut Vec<AmazonsMove>, priors: &mut Vec<f32>) {
+    fn expand(
+        state: &AmazonsState,
+        policy: &[f32],
+        moves: &mut Vec<AmazonsMove>,
+        priors: &mut Vec<f32>,
+    ) {
         game::expand_into(state, policy, moves, priors);
     }
 }

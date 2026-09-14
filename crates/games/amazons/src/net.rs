@@ -20,7 +20,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use playground_core::{Game, LatentGameState, ModelClient, PolicyCandidate};
 
-use crate::game::{apply, expand_into, fill_planes_into, legal_moves, Amazons, AmazonsMove, AmazonsState, CELLS, N, PLANES};
+use crate::game::{
+    apply, expand_into, fill_planes_into, legal_moves, Amazons, AmazonsMove, AmazonsState, CELLS,
+    N, PLANES,
+};
 use crate::moves::{MOVE_TYPES, PER_HEAD};
 
 const IN_PLANES: usize = PLANES; // 4
@@ -34,7 +37,10 @@ struct ResBlock {
 
 impl ResBlock {
     fn load(c: usize, vb: VarBuilder) -> candle_core::Result<Self> {
-        let cfg = Conv2dConfig { padding: 1, ..Default::default() };
+        let cfg = Conv2dConfig {
+            padding: 1,
+            ..Default::default()
+        };
         Ok(Self {
             c1: conv2d(c, c, 3, cfg, vb.pp("c1"))?,
             b1: batch_norm(c, BatchNormConfig::default(), vb.pp("b1"))?,
@@ -64,7 +70,10 @@ struct AzNet {
 
 impl AzNet {
     fn load(channels: usize, blocks_n: usize, vb: VarBuilder) -> candle_core::Result<Self> {
-        let cfg = Conv2dConfig { padding: 1, ..Default::default() };
+        let cfg = Conv2dConfig {
+            padding: 1,
+            ..Default::default()
+        };
         let cfg1 = Conv2dConfig::default(); // 1×1
         let mut blocks = Vec::with_capacity(blocks_n);
         let blocks_vb = vb.pp("blocks");
@@ -85,7 +94,10 @@ impl AzNet {
     }
 
     fn trunk(&self, planes: &Tensor) -> candle_core::Result<Tensor> {
-        let mut x = self.stem_bn.forward_t(&self.stem.forward(planes)?, false)?.relu()?;
+        let mut x = self
+            .stem_bn
+            .forward_t(&self.stem.forward(planes)?, false)?
+            .relu()?;
         for blk in &self.blocks {
             x = blk.forward(&x)?;
         }
@@ -98,14 +110,26 @@ impl AzNet {
         let x = self.trunk(planes)?;
         let head = |conv: &Conv2d| -> candle_core::Result<Tensor> {
             // (B,72,N,N) -> (B,N,N,72) -> (B,7200), so idx = (r*N+c)*72 + mt.
-            conv.forward(&x)?.permute((0, 2, 3, 1))?.contiguous()?.reshape((b, PER_HEAD))
+            conv.forward(&x)?
+                .permute((0, 2, 3, 1))?
+                .contiguous()?
+                .reshape((b, PER_HEAD))
         };
         let q = head(&self.q_conv)?;
         let a = head(&self.a_conv)?;
         let policy = Tensor::cat(&[&q, &a], 1)?.flatten_all()?.to_vec1::<f32>()?;
-        let v = self.val_bn.forward_t(&self.val_conv.forward(&x)?, false)?.relu()?.flatten_from(1)?;
+        let v = self
+            .val_bn
+            .forward_t(&self.val_conv.forward(&x)?, false)?
+            .relu()?
+            .flatten_from(1)?;
         let v = self.val_fc1.forward(&v)?.relu()?;
-        let vals = self.val_fc2.forward(&v)?.tanh()?.flatten_all()?.to_vec1::<f32>()?;
+        let vals = self
+            .val_fc2
+            .forward(&v)?
+            .tanh()?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
         Ok((vals, policy))
     }
 }
@@ -156,10 +180,18 @@ impl LocalModel {
         let path = Path::new(checkpoint);
         let (channels, blocks) = read_arch(path);
         // SAFETY: mmap lives for the load; tensors are copied.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[checkpoint], DType::F32, &device)? };
+        let vb =
+            unsafe { VarBuilder::from_mmaped_safetensors(&[checkpoint], DType::F32, &device)? };
         let net = AzNet::load(channels, blocks, vb)?;
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("amazons");
-        Ok(Self { net, device, model_version: format!("amazons-{stem}") })
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("amazons");
+        Ok(Self {
+            net,
+            device,
+            model_version: format!("amazons-{stem}"),
+        })
     }
 
     #[allow(dead_code)]
@@ -215,7 +247,11 @@ impl ModelClient<Amazons> for LocalModel {
         Ok(vals[0] as f64)
     }
 
-    async fn policy(&self, lgs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>> {
+    async fn policy(
+        &self,
+        lgs: &LatentGameState,
+        top_b: u32,
+    ) -> anyhow::Result<Vec<PolicyCandidate>> {
         let state = <Amazons as Game>::decode_state(&lgs.payload)?;
         let (_vals, logits) = self.value_policy_batch(&[&state])?;
         let mut moves: Vec<AmazonsMove> = Vec::new();
@@ -252,7 +288,10 @@ impl ModelClient<Amazons> for LocalModel {
         if let Some(seed) = action_seed {
             if let Ok(mv) = <Amazons as Game>::decode_move(seed) {
                 let tgt = <Amazons as Game>::encode_move(&mv);
-                if legal.iter().any(|m| <Amazons as Game>::encode_move(m) == tgt) {
+                if legal
+                    .iter()
+                    .any(|m| <Amazons as Game>::encode_move(m) == tgt)
+                {
                     return Ok(mv);
                 }
             }

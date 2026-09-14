@@ -29,7 +29,7 @@ use playground_core::batch_search::{self, SearchParams};
 use playground_core::{Game, Outcome};
 
 use crate::game::{Connect4, Connect4State, C4_COLS};
-use crate::mcts::{self_play_game, planes_of, Evaluator, Example, Params};
+use crate::mcts::{planes_of, self_play_game, Evaluator, Example, Params};
 use crate::net::LocalModel;
 
 type EvalOut = (f32, [f32; C4_COLS]);
@@ -73,9 +73,13 @@ impl Evaluator for BatchedEval {
     fn eval(&self, state: &Connect4State) -> anyhow::Result<EvalOut> {
         RESP.with(|(tx, rx)| {
             self.req_tx
-                .send(Req { state: state.clone(), resp: tx.clone() })
+                .send(Req {
+                    state: state.clone(),
+                    resp: tx.clone(),
+                })
                 .map_err(|_| anyhow::anyhow!("inference server gone"))?;
-            rx.recv().map_err(|_| anyhow::anyhow!("inference response dropped"))
+            rx.recv()
+                .map_err(|_| anyhow::anyhow!("inference response dropped"))
         })
     }
 }
@@ -85,7 +89,12 @@ impl Evaluator for BatchedEval {
 /// Returns when every `Sender` has been dropped (all search threads finished).
 /// `counters` is optional so the same server backs both self-play (which wants
 /// the avg-batch stats) and the evaluator (which does not).
-fn server_loop(rx: Receiver<Req>, model: &LocalModel, max_batch: usize, counters: Option<&Counters>) {
+fn server_loop(
+    rx: Receiver<Req>,
+    model: &LocalModel,
+    max_batch: usize,
+    counters: Option<&Counters>,
+) {
     loop {
         let first = match rx.recv() {
             Ok(r) => r,
@@ -100,7 +109,8 @@ fn server_loop(rx: Receiver<Req>, model: &LocalModel, max_batch: usize, counters
         }
         if let Some(c) = counters {
             c.batches.fetch_add(1, Ordering::Relaxed);
-            c.batch_samples.fetch_add(batch.len() as u64, Ordering::Relaxed);
+            c.batch_samples
+                .fetch_add(batch.len() as u64, Ordering::Relaxed);
         }
         let states: Vec<&Connect4State> = batch.iter().map(|r| &r.state).collect();
         let out = model
@@ -121,11 +131,11 @@ pub(crate) fn run_inference_server(rx: Receiver<Req>, model: &LocalModel, max_ba
 // ── Driver ───────────────────────────────────────────────────────────────────
 
 struct Counters {
-    next: AtomicUsize,    // next game index to claim
-    sims: AtomicU64,      // total simulations run (root-to-leaf traversals)
-    nodes: AtomicU64,     // total tree nodes built (distinct positions searched)
-    examples: AtomicU64,  // total training examples produced
-    batches: AtomicU64,   // batched forwards executed (batched mode)
+    next: AtomicUsize,        // next game index to claim
+    sims: AtomicU64,          // total simulations run (root-to-leaf traversals)
+    nodes: AtomicU64,         // total tree nodes built (distinct positions searched)
+    examples: AtomicU64,      // total training examples produced
+    batches: AtomicU64,       // batched forwards executed (batched mode)
     batch_samples: AtomicU64, // leaves summed over those forwards
 }
 
@@ -150,7 +160,9 @@ fn worker_loop(
             self_play_game(eval, params, &mut rng).expect("self-play game failed");
         counters.sims.fetch_add(sims, Ordering::Relaxed);
         counters.nodes.fetch_add(nodes, Ordering::Relaxed);
-        counters.examples.fetch_add(examples.len() as u64, Ordering::Relaxed);
+        counters
+            .examples
+            .fetch_add(examples.len() as u64, Ordering::Relaxed);
         if let Some(sink) = sink {
             sink.lock().unwrap().extend(examples);
         }
@@ -185,11 +197,11 @@ fn to_search_params(p: &Params) -> SearchParams {
         resign_threshold: 0.0,
         resign_consecutive: 0,
         resign_playout_frac: 0.0,
-            forced_playout_k: 0.0,
-            full_search_prob: 0.0,
-            fast_node_budget: 0,
-            random_opening_max: 0,
-            random_opening_decay: 1.0,
+        forced_playout_k: 0.0,
+        full_search_prob: 0.0,
+        fast_node_budget: 0,
+        random_opening_max: 0,
+        random_opening_decay: 1.0,
     }
 }
 
@@ -205,12 +217,22 @@ fn examples_from_records(records: Vec<batch_search::GameRecord<Connect4>>) -> Ve
         };
         for (i, mv) in rec.moves.iter().enumerate() {
             let z = match winner {
-                Some(w) => if w == mv.to_move { 1.0 } else { -1.0 },
+                Some(w) => {
+                    if w == mv.to_move {
+                        1.0
+                    } else {
+                        -1.0
+                    }
+                }
                 None => 0.0,
             };
             let mut policy = [0f32; C4_COLS];
             policy.copy_from_slice(&mv.policy);
-            out.push(Example { planes: planes_of(&rec.states[i]), policy, value: z });
+            out.push(Example {
+                planes: planes_of(&rec.states[i]),
+                policy,
+                value: z,
+            });
         }
     }
     out
@@ -252,7 +274,11 @@ pub fn generate(
             evals: cs.evals,
             cache_hits: cs.cache_hits,
         };
-        let examples = if collect { examples_from_records(records) } else { Vec::new() };
+        let examples = if collect {
+            examples_from_records(records)
+        } else {
+            Vec::new()
+        };
         return (stats, examples);
     }
 
@@ -274,7 +300,9 @@ pub fn generate(
             let counters_ref = &counters;
             scope.spawn(move || server_loop(req_rx, model_ref, max_batch, Some(counters_ref)));
             for _ in 0..threads {
-                let eval = BatchedEval { req_tx: req_tx.clone() };
+                let eval = BatchedEval {
+                    req_tx: req_tx.clone(),
+                };
                 let counters = &counters;
                 let params = &params;
                 let sink = sink.as_ref();
@@ -285,7 +313,9 @@ pub fn generate(
     } else {
         std::thread::scope(|scope| {
             for _ in 0..threads {
-                let eval = DirectEval { model: Arc::clone(&model) };
+                let eval = DirectEval {
+                    model: Arc::clone(&model),
+                };
                 let counters = &counters;
                 let params = &params;
                 let sink = sink.as_ref();
@@ -327,21 +357,34 @@ pub fn run_benchmark(
 ) -> anyhow::Result<()> {
     let device = crate::net::pick_device(cuda)?;
     let model = Arc::new(LocalModel::load_on(checkpoint, device)?);
-    let mode = if batched { format!("batched (max_batch {max_batch})") } else { "direct".into() };
+    let mode = if batched {
+        format!("batched (max_batch {max_batch})")
+    } else {
+        "direct".into()
+    };
     eprintln!(
         "rust self-play: {n_games} games, {threads} threads, {} sims/move, \
          device {}, {mode}, model {checkpoint}",
         params.sims,
         if cuda { "cuda" } else { "cpu" },
     );
-    let (s, _) = generate(model, n_games, threads, params, base_seed, batched, max_batch, false);
+    let (s, _) = generate(
+        model, n_games, threads, params, base_seed, batched, max_batch, false,
+    );
     let nodes_per_s = s.nodes as f64 / s.elapsed;
     let evals_per_s = s.evals as f64 / s.elapsed;
     let games_per_s = n_games as f64 / s.elapsed;
-    let hit_rate = if s.nodes > 0 { s.cache_hits as f64 / s.nodes as f64 } else { 0.0 };
+    let hit_rate = if s.nodes > 0 {
+        s.cache_hits as f64 / s.nodes as f64
+    } else {
+        0.0
+    };
     let batch_note = if batched {
-        format!("  avg_batch {:.0}  evals/s {evals_per_s:.0}  cache_hit {:.1}%",
-                s.avg_batch, 100.0 * hit_rate)
+        format!(
+            "  avg_batch {:.0}  evals/s {evals_per_s:.0}  cache_hit {:.1}%",
+            s.avg_batch,
+            100.0 * hit_rate
+        )
     } else {
         String::new()
     };
@@ -386,16 +429,21 @@ pub fn run_generate(
          device {}, model {checkpoint} -> {out_path}",
         if cuda { "cuda" } else { "cpu" },
     );
-    let (s, examples) =
-        generate(model, n_games, threads, params, base_seed, batched, max_batch, true);
+    let (s, examples) = generate(
+        model, n_games, threads, params, base_seed, batched, max_batch, true,
+    );
     write_dump(out_path, &examples)?;
 
     let moves = s.examples.max(1) as f64;
     eprintln!(
         "  wrote {} examples ({} games, {:.0} nodes/move, {:.0} sims/move, \
          avg_batch {:.0}) in {:.1}s",
-        examples.len(), n_games, s.nodes as f64 / moves, s.sims as f64 / moves,
-        s.avg_batch, s.elapsed,
+        examples.len(),
+        n_games,
+        s.nodes as f64 / moves,
+        s.sims as f64 / moves,
+        s.avg_batch,
+        s.elapsed,
     );
     Ok(())
 }
@@ -406,7 +454,12 @@ pub fn write_dump(out_path: &str, examples: &[Example]) -> anyhow::Result<()> {
     let mut buf = Vec::with_capacity(8 + examples.len() * RECORD_F32 * 4);
     buf.extend_from_slice(&(examples.len() as u64).to_le_bytes());
     for ex in examples {
-        for &x in ex.planes.iter().chain(ex.policy.iter()).chain(std::iter::once(&ex.value)) {
+        for &x in ex
+            .planes
+            .iter()
+            .chain(ex.policy.iter())
+            .chain(std::iter::once(&ex.value))
+        {
             buf.extend_from_slice(&x.to_le_bytes());
         }
     }
@@ -418,21 +471,33 @@ pub fn write_dump(out_path: &str, examples: &[Example]) -> anyhow::Result<()> {
 
 /// Highest existing `chunk_NNNNNN.bin` index in `dir`, or None.
 fn max_chunk_seq(dir: &std::path::Path) -> Option<u64> {
-    std::fs::read_dir(dir).ok()?.filter_map(|e| {
-        let name = e.ok()?.file_name().into_string().ok()?;
-        name.strip_prefix("chunk_")?.strip_suffix(".bin")?.parse::<u64>().ok()
-    }).max()
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| {
+            let name = e.ok()?.file_name().into_string().ok()?;
+            name.strip_prefix("chunk_")?
+                .strip_suffix(".bin")?
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
 }
 
 /// Delete oldest `chunk_*.bin` so at most `keep` remain (FIFO replay window).
 fn prune_buffer(dir: &std::path::Path, keep: usize) {
     let mut chunks: Vec<(u64, std::path::PathBuf)> = match std::fs::read_dir(dir) {
-        Ok(rd) => rd.filter_map(|e| {
-            let e = e.ok()?;
-            let n = e.file_name().into_string().ok()?;
-            let seq = n.strip_prefix("chunk_")?.strip_suffix(".bin")?.parse::<u64>().ok()?;
-            Some((seq, e.path()))
-        }).collect(),
+        Ok(rd) => rd
+            .filter_map(|e| {
+                let e = e.ok()?;
+                let n = e.file_name().into_string().ok()?;
+                let seq = n
+                    .strip_prefix("chunk_")?
+                    .strip_suffix(".bin")?
+                    .parse::<u64>()
+                    .ok()?;
+                Some((seq, e.path()))
+            })
+            .collect(),
         Err(_) => return,
     };
     if chunks.len() <= keep {
@@ -484,15 +549,25 @@ pub fn run_loop(
     eprintln!(
         "c4 actor loop: {games_per_chunk} games/chunk, {threads} threads, device {}, \
          buffer {} (keep {max_chunks}), eps {}, model {latest}",
-        if cuda { "cuda" } else { "cpu" }, buffer.display(), params.explore_eps,
+        if cuda { "cuda" } else { "cpu" },
+        buffer.display(),
+        params.explore_eps,
     );
     loop {
         pause_gate(live_dir);
         let t0 = Instant::now();
         let model = Arc::new(LocalModel::load_on(&latest, device.clone())?);
         let chunk_seed = base_seed.wrapping_add(seq.wrapping_mul(games_per_chunk as u64));
-        let (s, examples) =
-            generate(model, games_per_chunk, threads, params, chunk_seed, cuda, max_batch, true);
+        let (s, examples) = generate(
+            model,
+            games_per_chunk,
+            threads,
+            params,
+            chunk_seed,
+            cuda,
+            max_batch,
+            true,
+        );
         let path = buffer.join(format!("chunk_{seq:06}.bin"));
         let tmp = buffer.join(format!("chunk_{seq:06}.bin.tmp"));
         write_dump(tmp.to_str().unwrap(), &examples)?;
@@ -501,7 +576,10 @@ pub fn run_loop(
         let moves = s.examples.max(1) as f64;
         eprintln!(
             "  chunk {seq}: {} ex  {:.0} nodes/move  avg_batch {:.0}  {:.1}s",
-            examples.len(), s.nodes as f64 / moves, s.avg_batch, t0.elapsed().as_secs_f64(),
+            examples.len(),
+            s.nodes as f64 / moves,
+            s.avg_batch,
+            t0.elapsed().as_secs_f64(),
         );
         seq += 1;
     }

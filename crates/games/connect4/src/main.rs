@@ -45,7 +45,11 @@ impl ModelClient<Connect4> for C4Model {
             C4Model::Local(m) => m.eval(lgs).await,
         }
     }
-    async fn policy(&self, lgs: &LatentGameState, top_b: u32) -> anyhow::Result<Vec<PolicyCandidate>> {
+    async fn policy(
+        &self,
+        lgs: &LatentGameState,
+        top_b: u32,
+    ) -> anyhow::Result<Vec<PolicyCandidate>> {
         match self {
             C4Model::Remote(m) => m.policy(lgs, top_b).await,
             C4Model::Local(m) => m.policy(lgs, top_b).await,
@@ -60,8 +64,14 @@ impl ModelClient<Connect4> for C4Model {
         noise_scale: Option<f64>,
     ) -> anyhow::Result<game::Connect4Move> {
         match self {
-            C4Model::Remote(m) => m.reify(from_state, from_lgs, to_lgs, action_seed, noise_scale).await,
-            C4Model::Local(m) => m.reify(from_state, from_lgs, to_lgs, action_seed, noise_scale).await,
+            C4Model::Remote(m) => {
+                m.reify(from_state, from_lgs, to_lgs, action_seed, noise_scale)
+                    .await
+            }
+            C4Model::Local(m) => {
+                m.reify(from_state, from_lgs, to_lgs, action_seed, noise_scale)
+                    .await
+            }
         }
     }
     async fn model_version(&self) -> anyhow::Result<String> {
@@ -389,7 +399,9 @@ enum Cmd {
 
 /// Default worker-thread count: all available cores.
 fn default_threads() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
 
 #[tokio::main]
@@ -408,8 +420,21 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Serve { addr, model_uri, models, models_local, book }
-        | Cmd::SelfPlay { addr, model_uri, models, models_local, book, .. } => {
+        Cmd::Serve {
+            addr,
+            model_uri,
+            models,
+            models_local,
+            book,
+        }
+        | Cmd::SelfPlay {
+            addr,
+            model_uri,
+            models,
+            models_local,
+            book,
+            ..
+        } => {
             if let Some(path) = book {
                 // The solver reads this on first use (see solver::book()).
                 std::env::set_var("CONNECT4_BOOK", path);
@@ -417,9 +442,9 @@ async fn main() -> anyhow::Result<()> {
             let mut clients: HashMap<String, C4Model> = HashMap::new();
             // In-process nets first (`--model-local name=checkpoint`).
             for spec in &models_local {
-                let (name, ckpt) = spec
-                    .split_once('=')
-                    .ok_or_else(|| anyhow::anyhow!("--model-local must be NAME=CHECKPOINT, got {spec:?}"))?;
+                let (name, ckpt) = spec.split_once('=').ok_or_else(|| {
+                    anyhow::anyhow!("--model-local must be NAME=CHECKPOINT, got {spec:?}")
+                })?;
                 clients.insert(name.to_string(), C4Model::Local(LocalModel::load(ckpt)?));
             }
             // Remote model servers (`--model name=uri`). With neither flavor of
@@ -437,7 +462,10 @@ async fn main() -> anyhow::Result<()> {
                     .collect::<anyhow::Result<_>>()?
             };
             for (name, uri) in remote_specs {
-                clients.insert(name, C4Model::Remote(RemoteModelClient::<Connect4>::connect(&uri).await?));
+                clients.insert(
+                    name,
+                    C4Model::Remote(RemoteModelClient::<Connect4>::connect(&uri).await?),
+                );
             }
             playground_engine_server::run::<Connect4, _>(addr, clients).await?;
         }
@@ -448,12 +476,30 @@ async fn main() -> anyhow::Result<()> {
             anyhow::bail!("stdio subcommand: implement when a second tool needs it");
         }
         Cmd::SelfplayBench {
-            model, cuda, batched, max_batch, games, threads,
-            sims, c_puct, dir_alpha, dir_eps, temp_moves, explore_eps, seed,
+            model,
+            cuda,
+            batched,
+            max_batch,
+            games,
+            threads,
+            sims,
+            c_puct,
+            dir_alpha,
+            dir_eps,
+            temp_moves,
+            explore_eps,
+            seed,
         } => {
             let threads = threads.unwrap_or_else(default_threads);
             let params = mcts::Params {
-                sims, move_ms: 0.0, node_budget: 0, c_puct, dir_alpha, dir_eps, temp_moves, explore_eps,
+                sims,
+                move_ms: 0.0,
+                node_budget: 0,
+                c_puct,
+                dir_alpha,
+                dir_eps,
+                temp_moves,
+                explore_eps,
             };
             // Run off the async runtime: this is CPU-bound, synchronous work.
             tokio::task::spawn_blocking(move || {
@@ -464,12 +510,33 @@ async fn main() -> anyhow::Result<()> {
             .await??;
         }
         Cmd::SelfplayGen {
-            model, out, cuda, batched, max_batch, games, threads, node_budget, move_ms,
-            sims, c_puct, dir_alpha, dir_eps, temp_moves, explore_eps, seed,
+            model,
+            out,
+            cuda,
+            batched,
+            max_batch,
+            games,
+            threads,
+            node_budget,
+            move_ms,
+            sims,
+            c_puct,
+            dir_alpha,
+            dir_eps,
+            temp_moves,
+            explore_eps,
+            seed,
         } => {
             let threads = threads.unwrap_or_else(default_threads);
             let params = mcts::Params {
-                sims, move_ms, node_budget, c_puct, dir_alpha, dir_eps, temp_moves, explore_eps,
+                sims,
+                move_ms,
+                node_budget,
+                c_puct,
+                dir_alpha,
+                dir_eps,
+                temp_moves,
+                explore_eps,
             };
             tokio::task::spawn_blocking(move || {
                 selfplay::run_generate(
@@ -479,68 +546,192 @@ async fn main() -> anyhow::Result<()> {
             .await??;
         }
         Cmd::SelfplayLoop {
-            live, cuda, max_batch, games_per_chunk, max_chunks, threads, node_budget, move_ms,
-            sims, c_puct, dir_alpha, dir_eps, temp_moves, explore_eps, seed,
+            live,
+            cuda,
+            max_batch,
+            games_per_chunk,
+            max_chunks,
+            threads,
+            node_budget,
+            move_ms,
+            sims,
+            c_puct,
+            dir_alpha,
+            dir_eps,
+            temp_moves,
+            explore_eps,
+            seed,
         } => {
             let threads = threads.unwrap_or_else(default_threads);
             let params = mcts::Params {
-                sims, move_ms, node_budget, c_puct, dir_alpha, dir_eps, temp_moves, explore_eps,
+                sims,
+                move_ms,
+                node_budget,
+                c_puct,
+                dir_alpha,
+                dir_eps,
+                temp_moves,
+                explore_eps,
             };
             tokio::task::spawn_blocking(move || {
-                selfplay::run_loop(&live, cuda, params, games_per_chunk, max_chunks, threads, max_batch, seed)
+                selfplay::run_loop(
+                    &live,
+                    cuda,
+                    params,
+                    games_per_chunk,
+                    max_chunks,
+                    threads,
+                    max_batch,
+                    seed,
+                )
             })
             .await??;
         }
         Cmd::LgsGen {
-            model, out, cuda, games, sims, fast_sims, pcr_full_prob, temp_moves, c_puct,
-            kernel_bandwidth, concurrency, threads, max_batch, seed,
+            model,
+            out,
+            cuda,
+            games,
+            sims,
+            fast_sims,
+            pcr_full_prob,
+            temp_moves,
+            c_puct,
+            kernel_bandwidth,
+            concurrency,
+            threads,
+            max_batch,
+            seed,
         } => {
             if concurrency > 1 {
                 let threads = threads.unwrap_or_else(default_threads);
                 // Central-batched self-play is synchronous + CPU-bound; run off the runtime.
                 tokio::task::spawn_blocking(move || {
                     lgs_selfplay::run_generate_batched(
-                        &model, cuda, &out, games, concurrency, threads, max_batch, sims,
-                        fast_sims, pcr_full_prob, temp_moves, c_puct, kernel_bandwidth, seed,
+                        &model,
+                        cuda,
+                        &out,
+                        games,
+                        concurrency,
+                        threads,
+                        max_batch,
+                        sims,
+                        fast_sims,
+                        pcr_full_prob,
+                        temp_moves,
+                        c_puct,
+                        kernel_bandwidth,
+                        seed,
                     )
                 })
                 .await??;
             } else {
                 lgs_selfplay::run_generate(
-                    &model, cuda, &out, games, sims, fast_sims, pcr_full_prob, temp_moves,
-                    c_puct, kernel_bandwidth, seed,
+                    &model,
+                    cuda,
+                    &out,
+                    games,
+                    sims,
+                    fast_sims,
+                    pcr_full_prob,
+                    temp_moves,
+                    c_puct,
+                    kernel_bandwidth,
+                    seed,
                 )
                 .await?;
             }
         }
-        Cmd::LgsEval { model, cuda, positions, opening, sims, c_puct, kernel_bandwidth, seed } => {
+        Cmd::LgsEval {
+            model,
+            cuda,
+            positions,
+            opening,
+            sims,
+            c_puct,
+            kernel_bandwidth,
+            seed,
+        } => {
             lgs_selfplay::run_lgs_eval(
-                &model, cuda, positions, opening, sims, c_puct, kernel_bandwidth, seed,
+                &model,
+                cuda,
+                positions,
+                opening,
+                sims,
+                c_puct,
+                kernel_bandwidth,
+                seed,
             )
             .await?;
         }
-        Cmd::LgsMatch { a, b, cuda, games, sims, opening, c_puct, kernel_bandwidth, seed, threads } => {
+        Cmd::LgsMatch {
+            a,
+            b,
+            cuda,
+            games,
+            sims,
+            opening,
+            c_puct,
+            kernel_bandwidth,
+            seed,
+            threads,
+        } => {
             // Multi-threaded, CPU-bound per game; run off the async runtime.
             tokio::task::spawn_blocking(move || {
                 lgs_selfplay::run_lgs_match(
-                    &a, &b, cuda, games, sims, opening, c_puct, kernel_bandwidth, seed, threads,
+                    &a,
+                    &b,
+                    cuda,
+                    games,
+                    sims,
+                    opening,
+                    c_puct,
+                    kernel_bandwidth,
+                    seed,
+                    threads,
                 )
             })
             .await??;
         }
-        Cmd::LgsMove { model, cuda, moves, sims, c_puct, kernel_bandwidth } => {
-            lgs_selfplay::run_lgs_move(&model, cuda, &moves, sims, c_puct, kernel_bandwidth).await?;
+        Cmd::LgsMove {
+            model,
+            cuda,
+            moves,
+            sims,
+            c_puct,
+            kernel_bandwidth,
+        } => {
+            lgs_selfplay::run_lgs_move(&model, cuda, &moves, sims, c_puct, kernel_bandwidth)
+                .await?;
         }
-        Cmd::EvalSolver { model, cuda, games, node_budget, c_puct, opening, threads, max_batch, seed } => {
+        Cmd::EvalSolver {
+            model,
+            cuda,
+            games,
+            node_budget,
+            c_puct,
+            opening,
+            threads,
+            max_batch,
+            seed,
+        } => {
             // Deterministic-ish net play (argmax, no root noise) vs the solver.
             let threads = threads.unwrap_or_else(default_threads);
             let params = mcts::Params {
-                sims: 0, move_ms: 0.0, node_budget, c_puct,
-                dir_alpha: 1.0, dir_eps: 0.0, temp_moves: 0, explore_eps: 0.0,
+                sims: 0,
+                move_ms: 0.0,
+                node_budget,
+                c_puct,
+                dir_alpha: 1.0,
+                dir_eps: 0.0,
+                temp_moves: 0,
+                explore_eps: 0.0,
             };
             tokio::task::spawn_blocking(move || {
-                eval::run_eval_vs_solver(&model, cuda, games, params, opening, seed, threads, max_batch)
-                    .map(|_| ())
+                eval::run_eval_vs_solver(
+                    &model, cuda, games, params, opening, seed, threads, max_batch,
+                )
+                .map(|_| ())
             })
             .await??;
         }

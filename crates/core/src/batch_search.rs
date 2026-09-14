@@ -202,15 +202,27 @@ pub struct ChunkStats {
 
 impl ChunkStats {
     pub fn avg_batch(&self) -> f64 {
-        if self.batches > 0 { self.batch_samples as f64 / self.batches as f64 } else { 0.0 }
+        if self.batches > 0 {
+            self.batch_samples as f64 / self.batches as f64
+        } else {
+            0.0
+        }
     }
     pub fn cache_hit_rate(&self) -> f64 {
         let total = self.evals + self.cache_hits;
-        if total > 0 { self.cache_hits as f64 / total as f64 } else { 0.0 }
+        if total > 0 {
+            self.cache_hits as f64 / total as f64
+        } else {
+            0.0
+        }
     }
     /// Fraction of wall time the GPU was computing (≈1 = GPU-bound).
     pub fn gpu_duty(&self) -> f64 {
-        if self.elapsed > 0.0 { self.gpu_secs / self.elapsed } else { 0.0 }
+        if self.elapsed > 0.0 {
+            self.gpu_secs / self.elapsed
+        } else {
+            0.0
+        }
     }
 }
 
@@ -220,7 +232,7 @@ impl ChunkStats {
 /// hit skips both the network forward and legal-move generation.
 struct ExpandOut {
     value: f32,
-    p: Vec<f32>,        // length ACTIONS, renormalised over legal (0 elsewhere)
+    p: Vec<f32>, // length ACTIONS, renormalised over legal (0 elsewhere)
     legal: Vec<usize>,
 }
 
@@ -232,7 +244,11 @@ struct Cache {
 
 impl Cache {
     fn new() -> Self {
-        Self { shards: (0..CACHE_SHARDS).map(|_| Mutex::new(HashMap::new())).collect() }
+        Self {
+            shards: (0..CACHE_SHARDS)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
+        }
     }
     fn shard(&self, key: u128) -> &Mutex<HashMap<u128, Arc<ExpandOut>>> {
         &self.shards[(key as usize) & (CACHE_SHARDS - 1)]
@@ -288,14 +304,19 @@ fn inference_server<G: BatchGame>(
             planes.extend_from_slice(&w.planes);
         }
         let t_gpu = Instant::now();
-        let (vals, priors) = model.forward(&planes, total).expect("batched forward failed");
+        let (vals, priors) = model
+            .forward(&planes, total)
+            .expect("batched forward failed");
         local_gpu += t_gpu.elapsed().as_secs_f64();
         let mut off = 0usize;
         for w in waves {
             let mut out = Vec::with_capacity(w.count);
             for j in 0..w.count {
                 let gi = off + j;
-                out.push((vals[gi], priors[gi * G::ACTIONS..(gi + 1) * G::ACTIONS].to_vec()));
+                out.push((
+                    vals[gi],
+                    priors[gi * G::ACTIONS..(gi + 1) * G::ACTIONS].to_vec(),
+                ));
             }
             off += w.count;
             let _ = w.resp.send(out);
@@ -419,7 +440,11 @@ impl<G: BatchGame> GameSearch<G> {
             if !nd.legal[a] {
                 continue;
             }
-            let q = if nd.n[a] > 0 { nd.w[a] / nd.n[a] as f32 } else { fpu };
+            let q = if nd.n[a] > 0 {
+                nd.w[a] / nd.n[a] as f32
+            } else {
+                fpu
+            };
             let u = c_puct * nd.p[a] * sqrt_total / (1 + nd.n[a]) as f32;
             let score = q + u;
             if score > best_score {
@@ -454,7 +479,11 @@ impl<G: BatchGame> GameSearch<G> {
                 let was_random = node == 0
                     && self.params.explore_eps > 0.0
                     && rng.gen::<f32>() < self.params.explore_eps;
-                let a = if was_random { self.random_legal(node, rng) } else { self.select(node) };
+                let a = if was_random {
+                    self.random_legal(node, rng)
+                } else {
+                    self.select(node)
+                };
                 if a == usize::MAX {
                     break; // no legal action left (shouldn't happen: pass is always legal)
                 }
@@ -515,7 +544,10 @@ impl<G: BatchGame> GameSearch<G> {
     /// Apply a network/cache evaluation to the pending leaf: write priors+legal,
     /// (root) Dirichlet, then back up the value.
     fn apply(&mut self, out: &ExpandOut, rng: &mut impl Rng) {
-        let node = self.pending_leaf.take().expect("apply with no pending leaf");
+        let node = self
+            .pending_leaf
+            .take()
+            .expect("apply with no pending leaf");
         {
             let nd = &mut self.arena[node];
             for a in 0..G::ACTIONS {
@@ -542,7 +574,9 @@ impl<G: BatchGame> GameSearch<G> {
     }
 
     fn apply_dirichlet(&mut self, rng: &mut impl Rng) {
-        let legal: Vec<usize> = (0..G::ACTIONS).filter(|&a| self.arena[0].legal[a]).collect();
+        let legal: Vec<usize> = (0..G::ACTIONS)
+            .filter(|&a| self.arena[0].legal[a])
+            .collect();
         if legal.is_empty() {
             return;
         }
@@ -573,7 +607,9 @@ impl<G: BatchGame> GameSearch<G> {
     /// PUCT-only visit counts at the root (forced-random visits excluded).
     fn policy_counts(&self) -> Vec<u32> {
         let root = &self.arena[0];
-        (0..G::ACTIONS).map(|a| root.n[a].saturating_sub(root.rnd[a])).collect()
+        (0..G::ACTIONS)
+            .map(|a| root.n[a].saturating_sub(root.rnd[a]))
+            .collect()
     }
 
     /// Mean action-value at the root from the side-to-move's perspective, in
@@ -680,11 +716,19 @@ impl<G: BatchGame> Runner<G> {
                 self.resign_run[si] = 0;
             }
         }
-        self.moves.push(MoveRecord { policy, action, to_move });
+        self.moves.push(MoveRecord {
+            policy,
+            action,
+            to_move,
+        });
         // The chosen action came from visited (hence legal) children, so this is
         // legal; fall back to the first candidate if the degenerate branch hit.
         let next = G::apply_action(cur, action)
-            .or_else(|| G::candidate_actions(cur).iter().find_map(|&a| G::apply_action(cur, a)))
+            .or_else(|| {
+                G::candidate_actions(cur)
+                    .iter()
+                    .find_map(|&a| G::apply_action(cur, a))
+            })
             .expect("no legal move from a non-terminal state");
         self.states.push(next.clone());
 
@@ -703,10 +747,8 @@ impl<G: BatchGame> Runner<G> {
         }
         let settled = params.settle_plies > 0 && self.stable_plies >= params.settle_plies;
         let capped = params.max_ply > 0 && self.states.len() as u32 - 1 >= params.max_ply;
-        let over = G::terminal_value(&next).is_some()
-            || self.resigned_by.is_some()
-            || settled
-            || capped;
+        let over =
+            G::terminal_value(&next).is_some() || self.resigned_by.is_some() || settled || capped;
         if over {
             self.finished = true;
         } else {
@@ -755,9 +797,11 @@ pub fn run_chunk<G: BatchGame>(
             let req_tx = req_tx.clone();
             let cache = Arc::clone(&cache);
             let params = params;
-            handles.push(scope.spawn(move || {
-                worker::<G>(lo, hi, base_seed, params, &req_tx, &cache, use_cache)
-            }));
+            handles.push(
+                scope.spawn(move || {
+                    worker::<G>(lo, hi, base_seed, params, &req_tx, &cache, use_cache)
+                }),
+            );
         }
         drop(req_tx); // let the server detect shutdown once workers finish
 
@@ -802,8 +846,9 @@ fn worker<G: BatchGame>(
     cache: &Cache,
     use_cache: bool,
 ) -> (Vec<GameRecord<G>>, WorkerStats) {
-    let mut runners: Vec<Runner<G>> =
-        (lo..hi).map(|i| Runner::new(base_seed.wrapping_add(i as u64), params)).collect();
+    let mut runners: Vec<Runner<G>> = (lo..hi)
+        .map(|i| Runner::new(base_seed.wrapping_add(i as u64), params))
+        .collect();
     let mut ws = WorkerStats::default();
     // One reply channel, reused for every wave this worker submits.
     let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel::<Vec<(f32, Vec<f32>)>>(1);
@@ -859,7 +904,11 @@ fn worker<G: BatchGame>(
 
         let t_wait = Instant::now();
         req_tx
-            .send(Req { planes: wave_planes, count: wave_meta.len(), resp: resp_tx.clone() })
+            .send(Req {
+                planes: wave_planes,
+                count: wave_meta.len(),
+                resp: resp_tx.clone(),
+            })
             .expect("inference server gone");
         let results = resp_rx.recv().expect("inference response dropped");
         ws.wait_secs += t_wait.elapsed().as_secs_f64();
@@ -890,7 +939,11 @@ fn worker<G: BatchGame>(
     }
     let recs = runners
         .into_iter()
-        .map(|r| GameRecord { states: r.states, moves: r.moves, resigned_by: r.resigned_by })
+        .map(|r| GameRecord {
+            states: r.states,
+            moves: r.moves,
+            resigned_by: r.resigned_by,
+        })
         .collect();
     (recs, ws)
 }
@@ -904,7 +957,10 @@ fn sample_categorical(probs: &[f32], rng: &mut impl Rng) -> usize {
             return a;
         }
     }
-    (0..probs.len()).rev().find(|&a| probs[a] > 0.0).unwrap_or(0)
+    (0..probs.len())
+        .rev()
+        .find(|&a| probs[a] > 0.0)
+        .unwrap_or(0)
 }
 
 fn argmax(counts: &[u32]) -> usize {
@@ -1069,7 +1125,11 @@ impl<M: MoveGame> MvSearch<M> {
         // than a flat 0 (see `core::puct`). Both terms are maintained by
         // `backup`, so this stays a single pass over the entries even for games
         // with thousands of moves.
-        let parent_q = if nd.total_n > 0 { nd.w_sum / nd.total_n as f32 } else { 0.0 };
+        let parent_q = if nd.total_n > 0 {
+            nd.w_sum / nd.total_n as f32
+        } else {
+            0.0
+        };
         let fpu = crate::puct::fpu(parent_q, nd.visited_p);
         // Forced playouts (root only): make sure a child the noise favours is
         // actually tried, rather than dismissed after one bad rollout. The
@@ -1153,13 +1213,22 @@ impl<M: MoveGame> MvSearch<M> {
     /// Expand the pending leaf from the freshly-generated `moves`+`priors` (passed by
     /// reference from reused worker scratch — one allocation here for the entries).
     fn apply(&mut self, value: f32, moves: &[M::Move], priors: &[f32], rng: &mut impl Rng) {
-        let node = self.pending_leaf.take().expect("apply with no pending leaf");
+        let node = self
+            .pending_leaf
+            .take()
+            .expect("apply with no pending leaf");
         {
             let nd = &mut self.arena[node];
             nd.entries.clear();
             nd.entries.reserve(moves.len());
             for (mv, &p) in moves.iter().zip(priors) {
-                nd.entries.push(MoveEntry { mv: *mv, p, n: 0, w: 0.0, child: -1 });
+                nd.entries.push(MoveEntry {
+                    mv: *mv,
+                    p,
+                    n: 0,
+                    w: 0.0,
+                    child: -1,
+                });
             }
             nd.total_n = 0;
             nd.w_sum = 0.0;
@@ -1258,7 +1327,10 @@ impl<M: MoveGame> MvSearch<M> {
 
     /// State of the leaf awaiting evaluation (set by `next`, consumed by `apply`).
     fn pending_state(&self) -> &M::State {
-        &self.arena[self.pending_leaf.expect("pending_state with no pending leaf")].state
+        &self.arena[self
+            .pending_leaf
+            .expect("pending_state with no pending leaf")]
+        .state
     }
 
     /// Mean action-value at the root from the side-to-move's view, for resignation.
@@ -1350,7 +1422,13 @@ impl<M: MoveGame> MvRunner<M> {
 
         let next = M::apply(cur, &moves[played]);
         let for_training = self.full_search;
-        self.moves.push(MvMoveRecord { moves, visits: target, played, to_move, for_training });
+        self.moves.push(MvMoveRecord {
+            moves,
+            visits: target,
+            played,
+            to_move,
+            for_training,
+        });
         self.states.push(next.clone());
 
         let capped = params.max_ply > 0 && self.states.len() as u32 - 1 >= params.max_ply;
@@ -1436,8 +1514,16 @@ fn mv_apply_chunk<M: MoveGame>(
     for (r, v, off) in entries {
         let slice = &priors[off * pd..(off + 1) * pd];
         mv_advance(
-            r, Some((v, slice)), params, base_seed, seed_ctr, eval_tx, finished, moves_buf,
-            prior_buf, ws,
+            r,
+            Some((v, slice)),
+            params,
+            base_seed,
+            seed_ctr,
+            eval_tx,
+            finished,
+            moves_buf,
+            prior_buf,
+            ws,
         );
     }
 }
@@ -1706,8 +1792,9 @@ fn mv_gpu_loop<M: MoveGame>(
             local.gpu_block_secs += blocked;
             let useful = runners.len();
             let t_gpu = Instant::now();
-            let (vals, priors) =
-                model.forward(&planes, batch_size).expect("batched forward failed");
+            let (vals, priors) = model
+                .forward(&planes, batch_size)
+                .expect("batched forward failed");
             local.gpu_secs += t_gpu.elapsed().as_secs_f64();
             local.batches += 1;
             local.batch_samples += useful as u64;
@@ -1768,7 +1855,10 @@ pub fn run_selfplay_moves<M: MoveGame>(
     let (eval_tx, eval_rx) = crossbeam_channel::unbounded::<(MvRunner<M>, Vec<f32>)>();
     for i in 0..concurrency {
         work_tx
-            .send(MvTask::Seed(MvRunner::new(base_seed.wrapping_add(i as u64), params)))
+            .send(MvTask::Seed(MvRunner::new(
+                base_seed.wrapping_add(i as u64),
+                params,
+            )))
             .unwrap();
     }
 
@@ -1779,7 +1869,14 @@ pub fn run_selfplay_moves<M: MoveGame>(
             let stats = &stats;
             scope.spawn(move || {
                 mv_gpu_loop::<M>(
-                    eval_rx, work_tx, model, batch_size, deadline, report_secs, stats, n_workers,
+                    eval_rx,
+                    work_tx,
+                    model,
+                    batch_size,
+                    deadline,
+                    report_secs,
+                    stats,
+                    n_workers,
                 )
             });
         }
@@ -1800,12 +1897,28 @@ pub fn run_selfplay_moves<M: MoveGame>(
                     }
                     match work_rx.recv_deadline(deadline) {
                         Ok(MvTask::Seed(r)) => mv_advance(
-                            r, None, &params, base_seed, seed_ctr, &eval_tx, finished,
-                            &mut moves_buf, &mut prior_buf, &mut ws,
+                            r,
+                            None,
+                            &params,
+                            base_seed,
+                            seed_ctr,
+                            &eval_tx,
+                            finished,
+                            &mut moves_buf,
+                            &mut prior_buf,
+                            &mut ws,
                         ),
                         Ok(MvTask::Apply(entries, pr)) => mv_apply_chunk(
-                            entries, &pr, &params, base_seed, seed_ctr, &eval_tx, finished,
-                            &mut moves_buf, &mut prior_buf, &mut ws,
+                            entries,
+                            &pr,
+                            &params,
+                            base_seed,
+                            seed_ctr,
+                            &eval_tx,
+                            finished,
+                            &mut moves_buf,
+                            &mut prior_buf,
+                            &mut ws,
                         ),
                         Err(_) => break,
                     }
@@ -1865,7 +1978,10 @@ pub fn run_actor_continuous<M, F>(
     let (eval_tx, eval_rx) = crossbeam_channel::unbounded::<(MvRunner<M>, Vec<f32>)>();
     for i in 0..concurrency {
         work_tx
-            .send(MvTask::Seed(MvRunner::new(base_seed.wrapping_add(i as u64), params)))
+            .send(MvTask::Seed(MvRunner::new(
+                base_seed.wrapping_add(i as u64),
+                params,
+            )))
             .unwrap();
     }
     // Set just before we exit, so the forward thread can tell "the model is being
@@ -1938,12 +2054,28 @@ pub fn run_actor_continuous<M, F>(
                 loop {
                     match work_rx.recv() {
                         Ok(MvTask::Seed(r)) => mv_advance(
-                            r, None, &params, base_seed, seed_ctr, &eval_tx, finished,
-                            &mut moves_buf, &mut prior_buf, &mut ws,
+                            r,
+                            None,
+                            &params,
+                            base_seed,
+                            seed_ctr,
+                            &eval_tx,
+                            finished,
+                            &mut moves_buf,
+                            &mut prior_buf,
+                            &mut ws,
                         ),
                         Ok(MvTask::Apply(entries, pr)) => mv_apply_chunk(
-                            entries, &pr, &params, base_seed, seed_ctr, &eval_tx, finished,
-                            &mut moves_buf, &mut prior_buf, &mut ws,
+                            entries,
+                            &pr,
+                            &params,
+                            base_seed,
+                            seed_ctr,
+                            &eval_tx,
+                            finished,
+                            &mut moves_buf,
+                            &mut prior_buf,
+                            &mut ws,
                         ),
                         Err(_) => break,
                     }
@@ -2030,7 +2162,11 @@ fn eval_advance<M: MoveGame>(
                     let s2: u64 = match M::terminal_value(final_state) {
                         Some(_) => {
                             let loser = M::to_move(final_state);
-                            if loser != r.eval_a_side { 2 } else { 0 }
+                            if loser != r.eval_a_side {
+                                2
+                            } else {
+                                0
+                            }
                         }
                         None => 1, // hit max_ply: draw
                     };
@@ -2042,7 +2178,11 @@ fn eval_advance<M: MoveGame>(
                 }
             }
             MvStep::NeedEval(state) => {
-                let model_id = if M::to_move(&state) == r.eval_a_side { 0 } else { 1 };
+                let model_id = if M::to_move(&state) == r.eval_a_side {
+                    0
+                } else {
+                    1
+                };
                 let mut planes = vec![0f32; M::PLANES];
                 M::encode_planes(&state, &mut planes);
                 let _ = eval_tx.send((r, planes, model_id));
@@ -2096,7 +2236,9 @@ fn eval_gpu_loop<M: MoveGame>(
             for &i in &idxs {
                 planes.extend_from_slice(&leaves[i].1);
             }
-            let (vals, priors) = model.forward(&planes, idxs.len()).expect("eval forward failed");
+            let (vals, priors) = model
+                .forward(&planes, idxs.len())
+                .expect("eval forward failed");
             let priors = std::sync::Arc::new(priors);
             for (slot, &i) in idxs.iter().enumerate() {
                 results[i] = Some((vals[slot], std::sync::Arc::clone(&priors), slot));
@@ -2108,7 +2250,11 @@ fn eval_gpu_loop<M: MoveGame>(
             HashMap::new();
         for ((r, _planes, mid), res) in leaves.into_iter().zip(results) {
             let (value, priors, off) = res.unwrap();
-            by_model.entry(mid).or_insert_with(|| (Vec::new(), priors)).0.push((r, value, off));
+            by_model
+                .entry(mid)
+                .or_insert_with(|| (Vec::new(), priors))
+                .0
+                .push((r, value, off));
         }
         for (_mid, (entries, priors)) in by_model {
             let chunk = entries.len().div_ceil(n_workers.max(1));
@@ -2154,7 +2300,9 @@ pub fn run_eval_moves<M: MoveGame>(
             let eval_rx = eval_rx.clone();
             let work_tx = work_tx.clone();
             let (models, done) = (&models, &done);
-            scope.spawn(move || eval_gpu_loop::<M>(eval_rx, work_tx, models, batch_size, done, n_workers));
+            scope.spawn(move || {
+                eval_gpu_loop::<M>(eval_rx, work_tx, models, batch_size, done, n_workers)
+            });
         }
         for _ in 0..n_workers {
             let work_rx = work_rx.clone();
@@ -2167,15 +2315,29 @@ pub fn run_eval_moves<M: MoveGame>(
                 loop {
                     match work_rx.recv_timeout(timeout) {
                         Ok(MvTask::Seed(r)) => eval_advance(
-                            r, None, &params, &eval_tx, score_x2, remaining, done,
-                            &mut moves_buf, &mut prior_buf,
+                            r,
+                            None,
+                            &params,
+                            &eval_tx,
+                            score_x2,
+                            remaining,
+                            done,
+                            &mut moves_buf,
+                            &mut prior_buf,
                         ),
                         Ok(MvTask::Apply(entries, pr)) => {
                             for (r, v, off) in entries {
                                 let slice = &pr[off * pd..(off + 1) * pd];
                                 eval_advance(
-                                    r, Some((v, slice)), &params, &eval_tx, score_x2, remaining,
-                                    done, &mut moves_buf, &mut prior_buf,
+                                    r,
+                                    Some((v, slice)),
+                                    &params,
+                                    &eval_tx,
+                                    score_x2,
+                                    remaining,
+                                    done,
+                                    &mut moves_buf,
+                                    &mut prior_buf,
                                 );
                             }
                         }
@@ -2228,7 +2390,10 @@ mod opening_len_tests {
                 "length {k}: sampled {got:.4}, geometric {want:.4} (counts {counts:?})"
             );
         }
-        assert!(counts[max as usize] > 0, "the deepest opening must be reachable");
+        assert!(
+            counts[max as usize] > 0,
+            "the deepest opening must be reachable"
+        );
     }
 
     #[test]
