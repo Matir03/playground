@@ -807,13 +807,17 @@ impl MinionsModel {
     /// candidate with random playouts: asked for more draws, it would only
     /// repeat that turn until `draw_retries` gave up.
     pub fn tune_params(&self, params: &SampledParams) -> SampledParams {
+        // The seat's own sampler sets its width, so one match can pit two
+        // candidate counts against each other (`eval-match --candidates-b`).
+        let p = SampledParams {
+            k_candidates: self.cfg.k_candidates,
+            k_draws: self.cfg.k_draws,
+            ..*params
+        };
         if self.best_mode() {
-            SampledParams {
-                k_draws: 1,
-                ..*params
-            }
+            SampledParams { k_draws: 1, ..p }
         } else {
-            *params
+            p
         }
     }
 

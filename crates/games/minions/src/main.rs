@@ -227,6 +227,9 @@ enum Cmd {
         /// against itself at two sampler depths.
         #[arg(long)]
         t_steps_b: Option<usize>,
+        /// Candidates (and draws) per node for seat B; defaults to A's.
+        #[arg(long)]
+        candidates_b: Option<usize>,
         #[arg(long, default_value = "candle")]
         backend: String,
         #[arg(long, default_value = "trt")]
@@ -517,6 +520,7 @@ async fn main() -> anyhow::Result<()> {
             candidates,
             t_steps,
             t_steps_b,
+            candidates_b,
             backend,
             ep,
             fp16,
@@ -536,9 +540,14 @@ async fn main() -> anyhow::Result<()> {
             let kind = minions_engine::net::BackendKind::parse(&backend, &ep, fp16, cuda)?;
             let sa = load_seat(std::path::Path::new(&a), &kind, sampler)?;
             let tb = t_steps_b.unwrap_or(t_steps);
+            let cb = candidates_b.unwrap_or(candidates);
             let sampler_b = minions_engine::sampler::SamplerConfig {
                 t_steps: tb,
                 t_steps_fast: tb,
+                k_candidates: cb,
+                k_candidates_fast: cb,
+                k_draws: cb,
+                k_draws_fast: cb,
                 ..sampler
             };
             let sb = match &b {
