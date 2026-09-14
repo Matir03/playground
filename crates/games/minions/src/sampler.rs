@@ -1821,7 +1821,15 @@ mod t_sweep {
 
     const GAMES: usize = 32;
     const K: usize = 16;
-    const TS: [usize; 4] = [4, 8, 16, 100];
+
+    /// The depths to compare: `MINIONS_SWEEP_TS` as a comma list, else
+    /// 4, 8, 16, 100. Repeating one (`4,4`) measures the sweep's own noise.
+    fn ts() -> Vec<usize> {
+        std::env::var("MINIONS_SWEEP_TS")
+            .ok()
+            .map(|v| v.split(',').map(|t| t.trim().parse().expect("T")).collect())
+            .unwrap_or_else(|| vec![4, 8, 16, 100])
+    }
 
     /// One `T`'s draws at one position.
     #[derive(Default, Clone)]
@@ -1973,8 +1981,9 @@ mod t_sweep {
         }
 
         // ── every T on the same positions and trunk features ─────────────────
-        let mut probes: Vec<Vec<Probe>> = vec![Vec::new(); TS.len()];
-        let mut secs = vec![0f64; TS.len()];
+        let ts = ts();
+        let mut probes: Vec<Vec<Probe>> = vec![Vec::new(); ts.len()];
+        let mut secs = vec![0f64; ts.len()];
         let mut batches = 0;
         for chunk in pool.chunks(GAMES) {
             let n = chunk.len();
@@ -1982,7 +1991,7 @@ mod t_sweep {
                 .map(|i| chunk[i.min(n - 1)].canonical())
                 .collect();
             let h = trunk_of(&m, &canon).h;
-            for (ti, &t) in TS.iter().enumerate() {
+            for (ti, &t) in ts.iter().enumerate() {
                 m.cfg.t_steps = t;
                 let clk = Instant::now();
                 let decls = m
@@ -2016,7 +2025,7 @@ mod t_sweep {
         };
         let best_e = best(|d| d.1);
         let best_v = best(|d| d.2);
-        for (ti, &t) in TS.iter().enumerate() {
+        for (ti, &t) in ts.iter().enumerate() {
             let p = &probes[ti];
             let mean = |f: &dyn Fn(usize) -> f64| (0..npos).map(f).sum::<f64>() / npos as f64;
             let top = |i: usize, key: fn(&(Vec<u8>, f32, f32)) -> f32| {
