@@ -261,15 +261,9 @@ export function AnalysisTree({
     if (depth > maxDepth) return;
     const node = nodes[nodeIdx];
     if (!node) return;
-    // Only edges the search actually looked at. A node holds every candidate it
-    // generated, and listing the unvisited ones would bury the searched line in
-    // dozens of rows the search never considered — they stay reachable by
-    // switching the sort to prior.
-    // An edge visited only by a forced floor counts as looked at: it has a
-    // value estimate, and hiding it would hide what the floor bought.
-    const listed = sortEdges(node.edges, sort).filter(
-      (e) => sort === "prior" || e.visits > 0 || e.forced > 0 || depth === 0,
-    );
+    // Every candidate the node holds, visited or not: a node whose visits all
+    // went to one child looks like a node with one child otherwise.
+    const listed = sortEdges(node.edges, sort);
     // Per node, not per tree: each node's candidate set has its own arbitrary
     // offset, so a shift shared across depths would compare incomparable scales.
     const energyRef = node.edges.reduce(
@@ -355,7 +349,7 @@ export function AnalysisTree({
 export function KernelMatrix({
   node,
   order,
-  max = 24,
+  max = Infinity,
 }: {
   node: AnalyzeNode;
   /** Edge indices in display order, so the axes match the tree above. */
