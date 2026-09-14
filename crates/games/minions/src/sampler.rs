@@ -37,7 +37,7 @@ use std::time::Instant;
 use half::f16;
 
 use playground_core::sampled_mcts::Expansion;
-use playground_core::{Game, SampledModel};
+use playground_core::{Game, SampledModel, SampledParams};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -298,6 +298,65 @@ fn commit_round(
         }
         chain.commit(cell, field, value);
     }
+}
+
+/// The best-move head's turn for one position: every live variable at its
+/// highest-scoring legal class.
+///
+/// Moves are settled most-confident first, so when two units want the same hex
+/// the surer one gets it and the other takes its best remaining option -- the
+/// no-shared-destination rule `commit_round` enforces with `claimed`.
+fn decode_best(cx: &GameCtx, out: &[f32]) -> TurnSpec {
+    let mut chain = Partial::new();
+    let at = |cell: u8, off: usize, v: usize| out[cell as usize * DECL_LOGITS + off + v];
+    let mut claimed: Bb = 0;
+    let mut pending: Vec<u8> = bitboard::cells(cx.live.moves).collect();
+    while !pending.is_empty() {
+        let mut pick: Option<(usize, usize, f32)> = None;
+        for (i, &cell) in pending.iter().enumerate() {
+            let opts = cx.move_opts[cell as usize];
+            for v in 0..N_OFFSETS {
+                if opts & (1 << v) == 0 {
+                    continue;
+                }
+                let d = MOVE_DEST[cell as usize][v];
+                // Offset 0 is "stay", always legal, and never claims a hex.
+                if v != 0 && (d == NO_CELL || bitboard::has(claimed, d)) {
+                    continue;
+                }
+                let s = at(cell, OFF_MOVES, v);
+                if pick.is_none_or(|(_, _, best)| s > best) {
+                    pick = Some((i, v, s));
+                }
+            }
+        }
+        let Some((i, v, _)) = pick else { break };
+        let cell = pending.swap_remove(i);
+        if v != 0 {
+            claimed |= bit(MOVE_DEST[cell as usize][v]);
+        }
+        chain.commit(cell, C_MOVE, v as u8);
+    }
+    let mut argmax =
+        |cell: u8, field: u8, off: usize, n: usize, allowed: &dyn Fn(usize) -> bool| {
+            let best = (0..n)
+                .filter(|&v| allowed(v))
+                .max_by(|&a, &b| at(cell, off, a).total_cmp(&at(cell, off, b)));
+            if let Some(v) = best {
+                chain.commit(cell, field, v as u8);
+            }
+        };
+    for cell in bitboard::cells(cx.live.targets) {
+        let opts = cx.target_opts[cell as usize];
+        argmax(cell, C_TARGET, OFF_TARGETS, N_TARGETS, &|v| {
+            opts & (1 << v) != 0
+        });
+    }
+    for cell in bitboard::cells(cx.live.spawns) {
+        let so = cx.spawn_opts;
+        argmax(cell, C_SPAWN, OFF_SPAWNS, N_SPAWNS, &|v| so & (1 << v) != 0);
+    }
+    chain.spec
 }
 
 /// Where the time in an expansion actually goes.
@@ -737,6 +796,53 @@ impl MinionsModel {
     fn priors_from(&self, energies: &[f32]) -> Vec<f32> {
         energies.to_vec()
     }
+
+    /// Whether this net proposes with a best-move head rather than diffusion.
+    pub fn best_mode(&self) -> bool {
+        self.net.has_best()
+    }
+
+    /// `params` as this net's search must run them. A best-move head proposes
+    /// one turn per position, so a node draws once and fills every other
+    /// candidate with random playouts: asked for more draws, it would only
+    /// repeat that turn until `draw_retries` gave up.
+    pub fn tune_params(&self, params: &SampledParams) -> SampledParams {
+        if self.best_mode() {
+            SampledParams {
+                k_draws: 1,
+                ..*params
+            }
+        } else {
+            *params
+        }
+    }
+
+    /// The best-move head's turn for each of `states`, from their trunk rows
+    /// `h_all`. One call over every row, so the shape is the batch's.
+    fn best_declarations_batch(
+        &self,
+        states: &[MinionsState],
+        h_all: &[f16],
+    ) -> anyhow::Result<Vec<TurnSpec>> {
+        let g = states.len();
+        let clk = Instant::now();
+        let out = self.net.best(h_all, g)?;
+        Phases::add(&self.phases.diffusion_ns, clk);
+        let width = NUM_CELLS * DECL_LOGITS;
+        anyhow::ensure!(
+            out.len() == g * width,
+            "best.onnx returned {} values for {g} positions",
+            out.len()
+        );
+        let clk = Instant::now();
+        let specs = states
+            .iter()
+            .enumerate()
+            .map(|(gi, s)| decode_best(&Self::context(s), &out[gi * width..(gi + 1) * width]))
+            .collect();
+        Phases::add(&self.phases.commit_ns, clk);
+        Ok(specs)
+    }
 }
 
 /// The model as one kind of self-play search calls it.
@@ -1039,7 +1145,10 @@ impl MinionsModel {
         // mechanism that took kill fidelity from 3.8% to 99.6%. Taking the
         // fractional part as a coin keeps the long-run fraction exact at any
         // chunk size.
-        let k_rand = if full {
+        // A best-move head proposes one turn per position; every other
+        // candidate is a random playout, so there is no separate injection.
+        let best_mode = self.best_mode();
+        let k_rand = if full && !best_mode {
             let want = (k as f32) * self.cfg.random_fraction;
             let floor = want.floor();
             let extra = if rng.gen::<f32>() < (want - floor) {
@@ -1053,12 +1162,24 @@ impl MinionsModel {
         };
         let k_diff = k.saturating_sub(k_rand);
 
-        // ── diffusion, batched across every chain of every game ───────────────
-        let per_game_specs = self.sample_declarations_batch(states, &h, k_diff, full, &mut rng)?;
-        let mut per_game: Vec<Vec<(TurnSpec, bool)>> = per_game_specs
-            .into_iter()
-            .map(|v| v.into_iter().map(|s| (s, false)).collect())
-            .collect();
+        // ── proposals: diffusion, batched across every chain of every game, or
+        // the best-move head's one turn per position ──────────────────────────
+        let is_fill = |gi: usize| fill.get(gi).copied().unwrap_or(false);
+        let mut per_game: Vec<Vec<(TurnSpec, bool)>> = if best_mode {
+            if (0..g).any(|gi| !is_fill(gi)) {
+                self.best_declarations_batch(states, &h)?
+                    .into_iter()
+                    .map(|s| vec![(s, false)])
+                    .collect()
+            } else {
+                vec![Vec::new(); g]
+            }
+        } else {
+            self.sample_declarations_batch(states, &h, k_diff, full, &mut rng)?
+                .into_iter()
+                .map(|v| v.into_iter().map(|s| (s, false)).collect())
+                .collect()
+        };
         // Forced exploration: a slice of every candidate set is drawn without the
         // net, by *playing* a random legal turn rather than declaring one.
         //
@@ -1071,12 +1192,26 @@ impl MinionsModel {
         // depend on the sampler being any good.
         let t_play = Instant::now();
         for (gi, decls) in per_game.iter_mut().enumerate() {
-            if fill.get(gi).copied().unwrap_or(false) {
+            if is_fill(gi) {
                 // A fill: this node's proposals already repeat, so it takes
                 // exploration draws only.
+                //
+                // Under a best-move head these playouts are not exploration
+                // but the ordinary candidates -- all but one of every node's
+                // -- so they are not flagged. Flagged, each would claim an
+                // explore quota (`forced_visits` apiece), and fifteen of them
+                // would spend a root's whole budget on forced visits.
                 decls.clear();
                 for _ in 0..k {
-                    decls.push((TurnSpec::random_playout(&states[gi], &mut rng), true));
+                    decls.push((TurnSpec::random_playout(&states[gi], &mut rng), !best_mode));
+                }
+                continue;
+            }
+            if best_mode {
+                // A draw asking for more than one turn: the head's, then
+                // playouts.
+                while decls.len() < k {
+                    decls.push((TurnSpec::random_playout(&states[gi], &mut rng), false));
                 }
                 continue;
             }
@@ -1548,6 +1683,63 @@ mod tests {
                     "declared a destination beyond the unit's speed"
                 );
             }
+        }
+    }
+
+    /// The best-move decoder commits every live variable to a class its masks
+    /// offer and never sends two units to one hex -- even when every unit's
+    /// top choice is the same hex, where the surest unit gets it and the rest
+    /// take their next best.
+    #[test]
+    fn best_decoding_is_legal_and_collision_free() {
+        let mut rng = ChaCha8Rng::seed_from_u64(11);
+        let mut s = Minions::initial_state();
+        for turn in 0..30 {
+            if Minions::outcome(&s).is_terminal() {
+                break;
+            }
+            let cx = MinionsModel::context(&s);
+            let mut out: Vec<f32> = (0..NUM_CELLS * DECL_LOGITS)
+                .map(|_| rng.gen_range(-1.0f32..1.0))
+                .collect();
+            if turn % 2 == 1 {
+                let hot = rng.gen_range(0..NUM_CELLS) as u8;
+                for c in 0..NUM_CELLS {
+                    for v in 1..N_OFFSETS {
+                        if MOVE_DEST[c][v] == hot {
+                            out[c * DECL_LOGITS + OFF_MOVES + v] = 10.0 + rng.gen::<f32>();
+                        }
+                    }
+                }
+            }
+            let spec = decode_best(&cx, &out);
+            let mut dests = std::collections::HashSet::new();
+            for c in bitboard::cells(cx.live.moves) {
+                let k = spec.moves[c as usize];
+                assert!(
+                    k != crate::turn::NO_MOVE && cx.move_opts[c as usize] & (1 << k) != 0,
+                    "cell {c}: move {k} is not on offer"
+                );
+                if k != 0 {
+                    assert!(
+                        dests.insert(MOVE_DEST[c as usize][k as usize]),
+                        "two units sent to one hex"
+                    );
+                }
+            }
+            for c in bitboard::cells(cx.live.targets) {
+                assert!(cx.target_opts[c as usize] & (1 << spec.targets[c as usize]) != 0);
+            }
+            for c in bitboard::cells(cx.live.spawns) {
+                assert!(cx.spawn_opts & (1 << spec.spawns[c as usize]) != 0);
+            }
+            let r = realize(&s, &spec);
+            let mut check = s.clone();
+            for mv in &r.actions {
+                assert!(Minions::legal_moves(&check).contains(mv), "illegal {mv}");
+                check = Minions::apply(&check, mv);
+            }
+            s = realize(&s, &TurnSpec::random_playout(&s, &mut rng)).next;
         }
     }
 

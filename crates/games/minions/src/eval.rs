@@ -43,7 +43,7 @@ impl Seat {
     fn root_value(&self, state: &MinionsState, params: &SampledParams) -> anyhow::Result<f64> {
         match self {
             Seat::Net(m) => {
-                let r = search::<MinionsTurns, _>(&**m, state.clone(), params, 0)?;
+                let r = search::<MinionsTurns, _>(&**m, state.clone(), &m.tune_params(params), 0)?;
                 // `search` reports from the side to move, which at the opening
                 // is yellow — the seat `bid_of` measures against.
                 Ok(r.value)
@@ -64,7 +64,8 @@ impl Seat {
     ) -> anyhow::Result<(TurnSpec, playground_core::SearchStats)> {
         match self {
             Seat::Net(m) => {
-                let r = search::<MinionsTurns, _>(&**m, state.clone(), params, turn)?;
+                let r =
+                    search::<MinionsTurns, _>(&**m, state.clone(), &m.tune_params(params), turn)?;
                 let spec = r
                     .candidates
                     .get(r.chosen)
@@ -205,7 +206,8 @@ fn pick_many(
             let results = playground_core::sampled_mcts::search_lockstep::<MinionsTurns, _>(
                 &**m,
                 states.to_vec(),
-                params,
+                // A best-move seat draws once per node; see `tune_params`.
+                &m.tune_params(params),
                 plies,
             )?;
             let specs = results
@@ -596,6 +598,94 @@ pub fn load_seat(
 mod tests {
     use super::*;
     use crate::turn::{NO_MOVE, TARGET_STAY};
+
+    /// Diagnostic, run by hand: a best-move seat against a diffusion seat on
+    /// the same trunk. Prints each seat's root value across the bid range, then
+    /// walks a game the diffusion seat plays against itself and reports, per
+    /// position, where the head's own turn stands in the best seat's root --
+    /// prior rank, share of the chosen visits, whether it is played -- and
+    /// whether it is the turn the diffusion seat's search plays.
+    ///
+    /// `MINIONS_DIAG_DIRS=<best dir>,<diffusion dir> cargo test --release
+    /// best_head_diagnostic -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn best_head_diagnostic() {
+        let dirs =
+            std::env::var("MINIONS_DIAG_DIRS").expect("MINIONS_DIAG_DIRS=<best>,<diffusion>");
+        let (best_dir, dif_dir) = dirs.split_once(',').expect("two directories");
+        // Padded to eval's width so the cached TensorRT engines serve it.
+        let (sampler, params) = match_search(400, 16, 4, 40, 11);
+        let kind = crate::net::BackendKind::parse("ort", "trt", true, false).unwrap();
+        let best = load_seat(Path::new(best_dir), &kind, sampler).unwrap();
+        let dif = load_seat(Path::new(dif_dir), &kind, sampler).unwrap();
+        for (name, seat) in [("best", &best), ("diffusion", &dif)] {
+            let curve: Vec<String> = (crate::game::BID_MIN..=crate::game::BID_MAX)
+                .map(|b| {
+                    let v = seat
+                        .root_value(&MinionsState::with_bid(b), &params)
+                        .unwrap();
+                    format!("{b}:{v:+.3}")
+                })
+                .collect();
+            println!(
+                "{name}: bid {:?}  root value by handicap {}",
+                bid_of(seat, &params).unwrap(),
+                curve.join(" ")
+            );
+        }
+        let (Seat::Net(bm), Seat::Net(dm)) = (&best, &dif) else {
+            unreachable!("both seats are nets")
+        };
+        let bp = bm.tune_params(&params);
+        let mut state = MinionsState::with_bid(3);
+        let (mut rows, mut played_n, mut same_n, mut top_n) = (0, 0, 0, 0);
+        let mut share_sum = 0.0;
+        while rows < 30 && !Minions::outcome(&state).is_terminal() {
+            let turn = state.turn as u32;
+            let (br, tree) = playground_core::sampled_mcts::search_analyzed::<MinionsTurns, _>(
+                &**bm,
+                state.clone(),
+                &bp,
+                turn,
+            )
+            .unwrap();
+            let dr = search::<MinionsTurns, _>(&**dm, state.clone(), &params, turn).unwrap();
+            let dif_turn = dr.candidates[dr.chosen].0;
+            let key = |s: &TurnSpec| Minions::encode_state(&realize(&state, s).next);
+            let root = &tree[0];
+            // The head's turn is the root's one drawn candidate; fills have 0.
+            let Some(head) = root.edges.iter().find(|e| e.draws > 0) else {
+                println!("turn {turn}: no drawn candidate at the root");
+                break;
+            };
+            let rank = root.edges.iter().filter(|e| e.prior > head.prior).count();
+            let chosen: u32 = root.edges.iter().map(|e| e.visits - e.forced).sum();
+            let share = f64::from(head.visits - head.forced) / f64::from(chosen.max(1));
+            let played = key(&br.candidates[br.chosen].0) == key(&head.mv);
+            let same = key(&head.mv) == key(&dif_turn);
+            println!(
+                "turn {turn:2}: head prior rank {rank:2} of {:2} (p {:.3}), chosen-visit share \
+                 {share:.2}, played {played:5}, = diffusion's pick {same:5} | root value best \
+                 {:+.3} diffusion {:+.3}",
+                root.edges.len(),
+                head.prior,
+                br.value,
+                dr.value
+            );
+            rows += 1;
+            played_n += usize::from(played);
+            same_n += usize::from(same);
+            top_n += usize::from(rank == 0);
+            share_sum += share;
+            state = realize(&state, &dif_turn).next;
+        }
+        println!(
+            "{rows} positions: head turn has the top prior {top_n}, is played {played_n}, is \
+             the diffusion seat's pick {same_n}; mean chosen-visit share {:.2}",
+            share_sum / f64::from(rows.max(1))
+        );
+    }
 
     /// Building eval's search through `search_params` must not change it: the
     /// match is the one eval ran before the builder was shared.

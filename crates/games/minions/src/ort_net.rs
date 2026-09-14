@@ -99,11 +99,15 @@ pub struct OrtNet {
     ///
     /// `Option` only so [`Drop`] can take them out — see there.
     trunk: Option<Vec<Mutex<Session>>>,
+    /// The proposer: exactly one of `diffusion` and `best` is loaded, from
+    /// whichever of `diffusion.onnx` and `best.onnx` the export wrote.
     diffusion: Option<Vec<Mutex<Session>>>,
+    best: Option<Vec<Mutex<Session>>>,
     energy: Option<Vec<Mutex<Session>>>,
     /// Edge dtypes of each graph, read at load (see [`Edges`]).
     trunk_io: Edges,
     diffusion_io: Edges,
+    best_io: Edges,
     energy_io: Edges,
     /// The same net exported with fp32 edges, from `<dir>/fp32/`, when that
     /// exists: the other arm of a `graph_f16_ab` A/B. `None` otherwise.
@@ -135,6 +139,7 @@ impl Drop for OrtNet {
     fn drop(&mut self) {
         std::mem::forget(self.trunk.take());
         std::mem::forget(self.diffusion.take());
+        std::mem::forget(self.best.take());
         std::mem::forget(self.energy.take());
     }
 }
@@ -253,14 +258,33 @@ impl OrtNet {
         }
         let (channels, _, _) = crate::net::read_arch(&probe);
 
-        let diffusion = pool(dir.join("diffusion.onnx"))?;
+        let (dif_path, best_path) = (dir.join("diffusion.onnx"), dir.join("best.onnx"));
+        anyhow::ensure!(
+            dif_path.exists() != best_path.exists(),
+            "{} must hold exactly one proposer graph, diffusion.onnx or best.onnx",
+            dir.display()
+        );
+        let diffusion = if dif_path.exists() {
+            Some(pool(dif_path)?)
+        } else {
+            None
+        };
+        let best = if best_path.exists() {
+            Some(pool(best_path)?)
+        } else {
+            None
+        };
         let energy = pool(dir.join("energy.onnx"))?;
         let io = |p: &[Mutex<Session>], i: &str, o: &str| edges(&p[0].lock().unwrap(), i, o);
-        let (trunk_io, diffusion_io, energy_io) = (
-            io(&trunk, "planes", "h"),
-            io(&diffusion, "h", "logits"),
-            io(&energy, "h", "energy"),
-        );
+        let absent = Edges {
+            in16: false,
+            out16: false,
+        };
+        let (trunk_io, energy_io) = (io(&trunk, "planes", "h"), io(&energy, "h", "energy"));
+        let diffusion_io = diffusion
+            .as_deref()
+            .map_or(absent, |p| io(p, "h", "logits"));
+        let best_io = best.as_deref().map_or(absent, |p| io(p, "h", "logits"));
         let alt = dir.join("fp32");
         let fp32_alt = if alt.join("trunk.onnx").exists() {
             eprintln!("loaded the fp32 graph set in {} (A/B arm)", alt.display());
@@ -272,10 +296,12 @@ impl OrtNet {
         };
         Ok(Self {
             trunk: Some(trunk),
-            diffusion: Some(diffusion),
+            diffusion,
+            best,
             energy: Some(energy),
             trunk_io,
             diffusion_io,
+            best_io,
             energy_io,
             fp32_alt,
             rr: std::sync::atomic::AtomicUsize::new(0),
@@ -333,6 +359,29 @@ impl OrtNet {
         }
     }
 
+    /// The best-move head: `h` in, one row of outputs per position.
+    fn run_best(&self, h: &[f16], b: usize) -> anyhow::Result<Vec<f32>> {
+        let pool = self
+            .best
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this net has no best-move head (no best.onnx)"))?;
+        let c = crate::net::head_width(self.channels) as i64;
+        let hshape = vec![b as i64, c, N as i64, N as i64];
+        let io = self.best_io;
+        let mut sess = self.acquire(pool);
+        let out = if io.in16 {
+            let ht = TensorRef::from_array_view((hshape, h)).map_err(e2a)?;
+            let outputs = sess.run(ort::inputs!["h" => ht]).map_err(e2a)?;
+            take_f32!(outputs, "logits", io.out16)
+        } else {
+            let h32 = h.to_f32_vec();
+            let ht = TensorRef::from_array_view((hshape, &h32[..])).map_err(e2a)?;
+            let outputs = sess.run(ort::inputs!["h" => ht]).map_err(e2a)?;
+            take_f32!(outputs, "logits", io.out16)
+        };
+        Ok(out)
+    }
+
     /// The graph set this window runs: the fp32 sibling while an A/B has the
     /// fp16 set switched off, otherwise this one.
     fn active(&self) -> &OrtNet {
@@ -386,8 +435,22 @@ impl Backend for OrtNet {
         Ok(TrunkOut { h, value })
     }
 
+    fn has_best(&self) -> bool {
+        self.active().best.is_some()
+    }
+
+    fn best(&self, h: &[f16], b: usize) -> anyhow::Result<Vec<f32>> {
+        let out = self.active().run_best(h, b)?;
+        debug_assert_eq!(out.len(), b * NUM_CELLS * DECL_LOGITS);
+        Ok(out)
+    }
+
     fn diffusion(&self, h: &[f16], decl: &[f32], b: usize) -> anyhow::Result<Vec<f32>> {
         let net = self.active();
+        anyhow::ensure!(
+            net.diffusion.is_some(),
+            "this net has no diffusion head (it proposes with best.onnx)"
+        );
         let out = net.run_head(
             &net.diffusion,
             net.diffusion_io,
@@ -426,7 +489,9 @@ impl Backend for OrtNet {
         b: usize,
     ) -> anyhow::Result<Box<dyn DiffusionPass + 'a>> {
         let net = self.active();
-        let pool = net.diffusion.as_ref().expect("session outlives run");
+        let pool = net.diffusion.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("this net has no diffusion head (it proposes with best.onnx)")
+        })?;
         if !net.diffusion_io.in16 && pool.len() >= 2 && env_flag("MINIONS_ORT_BIND", false) {
             return Ok(Box::new(BoundPass::new(
                 net.acquire(pool),

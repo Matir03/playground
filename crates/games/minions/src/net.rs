@@ -206,6 +206,18 @@ pub trait Backend: Send + Sync {
     /// `(h, decl)` → `f(s, a)` per row.
     fn energy(&self, h: &[f16], decl: &[f32], b: usize) -> anyhow::Result<Vec<f32>>;
 
+    /// Whether this net proposes turns with a best-move head (`best.onnx`)
+    /// instead of the diffusion sampler.
+    fn has_best(&self) -> bool {
+        false
+    }
+    /// `h` → the best-move head's outputs `(b, NUM_CELLS, DECL_LOGITS)`: a
+    /// regression toward the one-hot of every declaration field of the
+    /// search's favourite turn, read back by argmax.
+    fn best(&self, _h: &[f16], _b: usize) -> anyhow::Result<Vec<f32>> {
+        anyhow::bail!("this net has no best-move head")
+    }
+
     /// Begin a `T`-step diffusion pass with `h` held fixed.
     ///
     /// The default re-sends `h` every step. `OrtNet` overrides it to bind `h`

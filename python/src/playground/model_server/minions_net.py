@@ -130,12 +130,19 @@ class GlobalPoolBias(nn.Module):
         return x + self.fc(pooled).view(b, c, 1, 1)
 
 
+PROPOSERS = ("diffusion", "best")
+
+
 class MinionsNet(nn.Module):
-    def __init__(self, channels: int = 96, blocks: int = 8, energy_blocks: int = 2):
+    def __init__(self, channels: int = 96, blocks: int = 8, energy_blocks: int = 2,
+                 proposer: str = "diffusion"):
         super().__init__()
+        if proposer not in PROPOSERS:
+            raise ValueError(f"proposer must be one of {PROPOSERS}, got {proposer!r}")
         self.channels = channels
         self.blocks_n = blocks
         self.energy_blocks_n = energy_blocks
+        self.proposer = proposer
 
         # ── shared trunk ──────────────────────────────────────────────────────
         self.stem = nn.Conv2d(IN_PLANES, channels, 3, padding=1)
@@ -243,11 +250,27 @@ class MinionsNet(nn.Module):
         # ~28% of the head's arithmetic — but measured *slower* end to end: these
         # heads are bound by data movement, not FLOPs, and the split doubled the
         # trunk's output transfer for a 4% gain on the head.
-        self.dif_in = nn.Conv2d(head_ch + DECL_PLANES, channels, 3, padding=1)
-        self.dif_bn = nn.BatchNorm2d(channels)
-        self.dif_block = _ResBlock(channels)
-        self.dif_gpool = GlobalPoolBias(channels)
-        self.dif_out = nn.Conv2d(channels, DECL_LOGITS, 1)
+        #
+        # Only with `proposer="diffusion"`. The alternative, "best", has no
+        # sampler at all: one forward pass regresses the search's favourite
+        # turn directly, and the search takes that single turn plus random
+        # playouts as a node's candidates.
+        if proposer == "diffusion":
+            self.dif_in = nn.Conv2d(head_ch + DECL_PLANES, channels, 3, padding=1)
+            self.dif_bn = nn.BatchNorm2d(channels)
+            self.dif_block = _ResBlock(channels)
+            self.dif_gpool = GlobalPoolBias(channels)
+            self.dif_out = nn.Conv2d(channels, DECL_LOGITS, 1)
+        else:
+            # ── best-move head ────────────────────────────────────────────────
+            # Unconditioned: no partial declaration comes in, so it commits
+            # every variable at once and gets two residual blocks where the
+            # diffusion head, which sees its own earlier rounds, has one.
+            self.best_in = nn.Conv2d(head_ch, channels, 3, padding=1)
+            self.best_bn = nn.BatchNorm2d(channels)
+            self.best_blocks = nn.ModuleList(_ResBlock(channels) for _ in range(2))
+            self.best_gpool = GlobalPoolBias(channels)
+            self.best_out = nn.Conv2d(channels, DECL_LOGITS, 1)
 
         # ── energy head ───────────────────────────────────────────────────────
         self.eng_in = nn.Conv2d(head_ch + ENERGY_PLANES, channels, 3, padding=1)
@@ -325,6 +348,21 @@ class MinionsNet(nn.Module):
         # (B, 46, N, N) -> (B, CELLS, 46) so each cell's logits are contiguous.
         out = self.dif_out(x).permute(0, 2, 3, 1).reshape(-1, CELLS, DECL_LOGITS)
         return torch.split(out, [N_OFFSETS, N_TARGETS, N_SPAWNS], dim=2)
+
+    def best_head(self, hh):
+        """The search's favourite turn, regressed: (B, CELLS, 46).
+
+        Same per-cell layout as the diffusion logits -- 37 move offsets, 3
+        target classes, 6 spawn classes -- but each output is trained by
+        squared error toward the one-hot of that field's value in the
+        most-visited child, and the turn is read back by argmax over each
+        field's legal classes.
+        """
+        x = F.relu(self.best_bn(self.best_in(hh)))
+        for blk in self.best_blocks:
+            x = blk(x)
+        x = self.best_gpool(x)
+        return self.best_out(x).permute(0, 2, 3, 1).reshape(-1, CELLS, DECL_LOGITS)
 
     def energy_head(self, hh, decl):
         """Scalar score for a whole declaration -> (B,).
@@ -439,6 +477,17 @@ class _DiffusionGraph(nn.Module):
         return torch.cat([mv, tg, sp], dim=2)
 
 
+class _BestGraph(nn.Module):
+    """h -> (B, CELLS, 46). The best-move head: one call per position."""
+
+    def __init__(self, net: "MinionsNet"):
+        super().__init__()
+        self.net = net
+
+    def forward(self, h):
+        return self.net.best_head(h)
+
+
 class _AuxGraph(nn.Module):
     """planes -> (hex-control logits, necromancer-hazard logits, log Z, score).
 
@@ -495,14 +544,31 @@ def export_onnx_atomic(net: MinionsNet, out_dir: str, f16_io: bool = True) -> No
     c = net.head_ch
     os.makedirs(out_dir, exist_ok=True)
 
-    specs = [
-        (
+    # The proposer graph is `diffusion.onnx` or `best.onnx`, never both: the
+    # Rust loader picks its sampler by which one is present, so the other
+    # proposer's graph left over from an earlier export would be ambiguous.
+    if net.proposer == "diffusion":
+        proposer = (
             "diffusion.onnx",
             _DiffusionGraph(net),
             (torch.zeros(1, c, N, N, device=dev), torch.zeros(1, DECL_PLANES, N, N, device=dev)),
             ["h", "decl"],
             ["logits"],
-        ),
+        )
+        stale = "best.onnx"
+    else:
+        proposer = (
+            "best.onnx",
+            _BestGraph(net),
+            (torch.zeros(1, c, N, N, device=dev),),
+            ["h"],
+            ["logits"],
+        )
+        stale = "diffusion.onnx"
+    if os.path.exists(os.path.join(out_dir, stale)):
+        os.remove(os.path.join(out_dir, stale))
+    specs = [
+        proposer,
         (
             "energy.onnx",
             _EnergyGraph(net),
@@ -557,6 +623,7 @@ def arch_of(net: MinionsNet) -> dict:
         "channels": net.channels,
         "blocks": net.blocks_n,
         "energy_blocks": net.energy_blocks_n,
+        "proposer": net.proposer,
     }
 
 
@@ -565,6 +632,7 @@ def build_model(arch: dict) -> MinionsNet:
         channels=int(arch.get("channels", 96)),
         blocks=int(arch.get("blocks", 8)),
         energy_blocks=int(arch.get("energy_blocks", 2)),
+        proposer=str(arch.get("proposer", "diffusion")),
     )
 
 

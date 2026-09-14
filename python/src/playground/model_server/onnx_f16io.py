@@ -25,6 +25,7 @@ from onnx import TensorProto, helper
 # Heads first and the trunk last: the actor reloads when `trunk.onnx` changes.
 NATIVE = {
     "diffusion.onnx": (("h", "decl"), ("logits",)),
+    "best.onnx": (("h",), ("logits",)),
     "energy.onnx": (("h", "decl"), ("energy",)),
     "trunk.onnx": (("planes",), ("h",)),
 }
