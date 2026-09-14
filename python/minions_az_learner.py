@@ -308,28 +308,35 @@ def energy_planes(spec: np.ndarray, committed: np.ndarray) -> np.ndarray:
     return np.concatenate([d[:, :2], d[:, 3:]], axis=1)
 
 
-def sample_tb_specs(batch: dict, idx: np.ndarray, k: int):
-    """Up to `k` stored candidates per position, for trajectory balance.
+def tb_trajectories(batch: dict, idx: np.ndarray, k: int, sampled: np.ndarray,
+                    full_rows: np.ndarray):
+    """The recorded turns trajectory balance replays, as ``(specs, rows)``.
 
-    TB replays *recorded* turns, and until now it replayed exactly one per
-    position — so the sampler was being fit to `exp f` on a single turn that
-    search had already favoured. The record already holds up to `TOP_K`
-    realized candidates per position at no extra cost, and realized is what
-    matters: the energy head is trained and evaluated on realized specs
-    (`sampler.rs` realizes before scoring), so freshly sampled declarations
-    would be out of distribution for the reward.
+    Full-search rows only. A fast row records no children (``n_cands == 0``),
+    so it has no turn to replay; it used to be replayed anyway -- as slot 0,
+    which is all zeros -- with its log P_F masked to 0, which left the residual
+    ``log Z(s) - f(s, empty)`` and trained the log Z head on a meaningless
+    target for most of every batch.
 
-    Returns `(specs, rows)` where `rows` indexes back into `idx`, so callers can
-    line up planes and live masks with the expanded candidate set.
+    ``k == 1`` replays the one turn ``sample_target_spec`` drew per row, in
+    proportion to the pruned visits. Larger ``k`` replays up to ``k`` of each
+    row's children in stored order (most visited first), so ``k >= TOP_K`` is
+    every child. The children are realized turns the search expanded, zero-visit
+    ones included, so the frozen energy head scores them in distribution -- a
+    freshly sampled declaration would not be -- and fitting several per state is
+    what pins P_F's *relative* mass across them to ``exp f``, not only its level
+    on the favourite.
+
+    ``rows`` indexes into ``idx``, to line up planes and live masks.
     """
     n = batch["n_cands"][idx].astype(np.int64)
-    specs, rows = [], []
-    for r, cnt in enumerate(n):
-        take = int(min(max(cnt, 1), k))
-        for c in range(take):
-            specs.append(batch["spec"][idx[r], c])
-            rows.append(r)
-    return np.stack(specs), np.asarray(rows, dtype=np.int64)
+    use = np.flatnonzero(full_rows & (n > 0))
+    if k <= 1:
+        return sampled[use], use
+    take = np.minimum(n[use], k)
+    rows = np.repeat(use, take)
+    cols = np.concatenate([np.arange(t) for t in take]) if len(take) else np.zeros(0, np.int64)
+    return batch["spec"][idx[rows], cols], rows
 
 
 def sample_target_spec(batch: dict, idx: np.ndarray, rng: np.random.Generator):
@@ -356,8 +363,9 @@ def committed_after(t: int, total_steps: int, n: int) -> int:
     return int(math.ceil(n * frac))
 
 
-def trajectory_balance_loss(net, h, hh, spec, live_f, reward, t_steps, rng, device):
-    """GFlowNet trajectory balance for the masked-diffusion sampler.
+def tb_residuals(net, h, hh, spec, live_f, reward, t_steps, rng, device):
+    """GFlowNet trajectory balance for the masked-diffusion sampler: the
+    per-trajectory residual ``log Z(s) + log P_F(a) - f(s, a)``.
 
     The sampler is already a constructive process over a DAG: each round commits
     a subset of the still-masked declaration variables, and a complete turn is a
@@ -390,7 +398,9 @@ def trajectory_balance_loss(net, h, hh, spec, live_f, reward, t_steps, rng, devi
     n_live = live_f.sum(axis=(1, 2))  # variables per example
 
     # One uniformly random commit order per example, as a permutation of the
-    # (cell, field) slots. Field-major flattening matches `live_f`'s layout.
+    # (cell, field) slots. `live_f` is (B, CELLS, 3), so the flattening is
+    # cell-major with the field innermost, and `_slot_log_probs` must read the
+    # mask back in that same layout.
     flat_live = live_f.reshape(b, -1)
     order = np.argsort(rng.random(flat_live.shape) - flat_live.astype(np.float64), axis=1)
 
@@ -423,8 +433,12 @@ def trajectory_balance_loss(net, h, hh, spec, live_f, reward, t_steps, rng, devi
         logpf = logpf + lp
         committed = np.maximum(committed, step_mask)
 
-    log_z = net.log_z(h)
-    return ((log_z + logpf - reward) ** 2).mean()
+    return net.log_z(h) + logpf - reward
+
+
+def trajectory_balance_loss(net, h, hh, spec, live_f, reward, t_steps, rng, device):
+    """Mean squared trajectory-balance residual; see ``tb_residuals``."""
+    return (tb_residuals(net, h, hh, spec, live_f, reward, t_steps, rng, device) ** 2).mean()
 
 
 def _slot_log_probs(logits, spec, step_mask, device):
@@ -433,9 +447,14 @@ def _slot_log_probs(logits, spec, step_mask, device):
     Each declaration field owns a contiguous block of the 46 logits, and each is
     normalised over *its own* classes — the fields are separate categoricals, not
     one 46-way choice.
+
+    ``step_mask`` is ``(B, CELLS * 3)`` flattened from ``(B, CELLS, 3)``. It was
+    read back as ``(B, 3, CELLS)``, which summed log-probs at scrambled slots --
+    dead cells included, at their clipped sentinel values -- so the "log P_F"
+    trajectory balance fit was not the probability of the recorded turn at all.
     """
     b = spec.shape[0]
-    sm = torch.from_numpy(step_mask.reshape(b, 3, CELLS)).to(device)
+    sm = torch.from_numpy(step_mask.reshape(b, CELLS, 3)).to(device)
     out = torch.zeros(b, device=device)
     blocks = (
         (0, N_OFFSETS, 0),                                   # moves
@@ -449,8 +468,56 @@ def _slot_log_probs(logits, spec, step_mask, device):
         tgt_t = torch.from_numpy(tgt).to(device)
         lsm = F.log_softmax(logits[:, :, off:off + width], dim=2)
         picked = lsm.gather(2, tgt_t.unsqueeze(-1)).squeeze(-1)  # (B, CELLS)
-        out = out + (picked * sm[:, field].float()).sum(dim=1)
+        out = out + (picked * sm[:, :, field].float()).sum(dim=1)
     return out
+
+
+@torch.no_grad()
+def calibrate_log_z(net, batch, rng, device, t_steps, tb_candidates, batches=8, bs=512):
+    """Shift the log Z head's output bias so the mean TB residual starts at 0.
+
+    Needed once after the slot-layout fix in ``_slot_log_probs``: log Z had
+    been fit against a scrambled log P_F and sat ~20 nats below the true
+    log-partition. Left to the optimiser at lr 1e-3 the output would take
+    thousands of steps to climb that far, and until it did every TB step would
+    be a large, uniform "raise every replayed turn" push on the sampler and the
+    shared trunk -- a transient that has nothing to do with matching exp f. A
+    constant offset is exactly what a bias absorbs, so it is moved there.
+
+    Returns the shift.
+    """
+    n = len(batch["value"])
+    res = []
+    for _ in range(batches):
+        idx = rng.integers(0, n, size=bs)
+        planes = torch.from_numpy(batch["planes"][idx].astype(np.float32)).to(device)
+        planes = planes.view(bs, IN_PLANES, N, N)
+        live = batch["live"][idx]
+        live_f = np.stack(
+            [(live & C_MOVE) > 0, (live & C_TARGET) > 0, (live & C_SPAWN) > 0], axis=2
+        )
+        full_rows = batch["is_full"][idx].astype(bool)
+        spec = sample_target_spec(batch, idx, rng)
+        tb_spec, rows = tb_trajectories(batch, idx, tb_candidates, spec, full_rows)
+        if not len(rows):
+            continue
+        rows_t = torch.from_numpy(rows).to(device)
+        h = net.trunk(planes)
+        hh = net.head_features(h)
+        tb_live = live_f[rows]
+        edecl = torch.from_numpy(energy_planes(tb_spec, tb_live)).to(device)
+        reward = net.energy_head(hh[rows_t], edecl).reshape(-1)
+        res.append(tb_residuals(net, h[rows_t], hh[rows_t], tb_spec, tb_live, reward,
+                                t_steps, rng, device))
+    if not res:
+        return 0.0
+    r = torch.cat(res)
+    shift = -float(r.mean())
+    net.logz_fc2.bias += shift
+    print(f"calibrated log Z: shifted by {shift:+.2f} over {len(r)} trajectories; "
+          f"TB loss {float((r ** 2).mean()):.1f} -> {float(((r + shift) ** 2).mean()):.1f}",
+          flush=True)
+    return shift
 
 
 def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux=0.15,
@@ -604,39 +671,27 @@ def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux
         opt.step()
 
         # ── phase 2: sampler by trajectory balance, energy frozen ─────────────
+        tb_rows = np.zeros(0, dtype=np.int64)
         if tb_weight > 0.0:
+            tb_spec, tb_rows = tb_trajectories(batch, idx, tb_candidates, spec, full_rows)
+        if len(tb_rows):
+            rows_t = torch.from_numpy(tb_rows).to(device)
+            tb_live = live_f[tb_rows]
             with torch.no_grad():
-                # The reward for the recorded turn, from the just-updated energy
-                # head. `no_grad` is what freezes it: TB shapes the sampler
-                # toward f, never f toward the sampler.
+                # Each replayed turn's own reward f(s, a), from the just-updated
+                # energy head. `no_grad` is what freezes it: TB shapes the
+                # sampler toward f, never f toward the sampler. (Scoring one turn
+                # per row and handing that score to every child of the row was
+                # the old `--tb-candidates` bug.)
                 h2 = net.trunk(planes)
                 hh2 = net.head_features(h2)
-                comm_all = live_f.astype(bool)
-                edecl = torch.from_numpy(energy_planes(spec, comm_all)).to(device)
-                reward = net.energy_head(hh2, edecl)
+                edecl = torch.from_numpy(energy_planes(tb_spec, tb_live)).to(device)
+                reward = net.energy_head(hh2[rows_t], edecl).reshape(-1)
             h2 = net.trunk(planes)
             hh2 = net.head_features(h2)
-            # Same restriction: TB replays a recorded turn, so it needs a real
-            # policy target behind it.
-            tb_live = live_f * full_rows[:, None, None]
-            if tb_candidates > 1:
-                # Expand to several stored candidates per position. Each is a
-                # realized turn the search actually looked at, so the frozen
-                # energy head scores them in-distribution; more of them per
-                # position simply gives TB more of the support it is meant to
-                # cover than the single best-visited turn does.
-                tb_spec, tb_rows = sample_tb_specs(batch, idx, tb_candidates)
-                rows_t = torch.from_numpy(tb_rows).to(device)
-                h2e, hh2e = h2[rows_t], hh2[rows_t]
-                reward_e = reward[rows_t] if reward.dim() == 1 else reward[rows_t].squeeze(-1)
-                loss_tb = trajectory_balance_loss(
-                    net, h2e, hh2e, tb_spec, tb_live[tb_rows], reward_e,
-                    t_steps, rng, device
-                )
-            else:
-                loss_tb = trajectory_balance_loss(
-                    net, h2, hh2, spec, tb_live, reward, t_steps, rng, device
-                )
+            loss_tb = trajectory_balance_loss(
+                net, h2[rows_t], hh2[rows_t], tb_spec, tb_live, reward, t_steps, rng, device
+            )
             opt.zero_grad(set_to_none=True)
             (tb_weight * loss_tb).backward()
             opt.step()
@@ -691,13 +746,18 @@ def main():
                          "--aux-weight: it is there to shape the trunk with a "
                          "signal the saturating value head loses, not to compete "
                          "with the value and policy objectives.")
-    ap.add_argument("--tb-candidates", type=int, default=1,
-                    help="stored candidates per position to run trajectory balance "
-                         "over. 1 replays only the best-visited turn, which is what "
-                         "TB was meant to avoid; up to TOP_K are available free.")
+    ap.add_argument("--tb-candidates", type=int, default=TOP_K,
+                    help="stored children per full-search position to run trajectory "
+                         "balance over, each against its own energy score. The "
+                         f"default, {TOP_K} (= TOP_K), is every child; 1 replays one "
+                         "turn drawn in proportion to the pruned visits.")
     ap.add_argument("--tb-weight", type=float, default=0.0,
                     help="weight on the GFlowNet trajectory-balance loss for the "
                          "sampler; 0 keeps the masked-CE-only behaviour")
+    ap.add_argument("--calibrate-log-z", action="store_true",
+                    help="before the first generation, shift the log Z head's output "
+                         "bias so the mean TB residual is 0. Use once on a net trained "
+                         "before the TB slot-layout fix, whose log Z sits ~20 nats low.")
     ap.add_argument("--t-steps", type=int, default=4,
                     help="commit rounds to replay in trajectory balance; must "
                          "match the actor's --t-steps")
@@ -777,6 +837,8 @@ def main():
         seen = size
 
         batch = buf.merged()
+        if args.calibrate_log_z and gens_done == 0 and args.tb_weight > 0:
+            calibrate_log_z(net, batch, rng, device, args.t_steps, args.tb_candidates)
         t0 = time.time()
         lv, hent, ld, le, la, hdecl, lsc, smae, ltb = train_block(
             net, opt, batch, args.steps, args.batch, device, rng,
