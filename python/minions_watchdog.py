@@ -51,9 +51,9 @@ P_OWN_REINF = slice(15, 20)
 # Unit index order (Unit::from_index): Necromancer, Zombie, Skeleton, Serpent,
 # Warg, Ghost. Costs must match `UnitStats::cost` in units.rs — `adjudicate`
 # values units at cost, so this does too.
-UNIT_COST = np.array([0, 2, 4, 4, 4, 3], dtype=np.float32)
+UNIT_COST = np.array([0, 2, 4, 4, 3, 3], dtype=np.float32)
 # BUYABLE order: Zombie, Skeleton, Serpent, Warg, Ghost.
-REINF_COST = np.array([2, 4, 4, 4, 3], dtype=np.float32)
+REINF_COST = np.array([2, 4, 4, 3, 3], dtype=np.float32)
 
 
 def main() -> int:

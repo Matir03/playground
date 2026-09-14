@@ -206,7 +206,8 @@ everything above it:
 
 Unit stats, the attack/spawn phase split, within-turn damage, `lumbering` /
 `flying` / `persistent`, unsummon bounces, rebates, and income of
-`graveyards + 3` are all as in the full game. A turn is a *sequence* of actions
+`graveyards + 3` are all as in the full game, except that the warg costs 3
+and rebates 1 (not 4 and 2). A turn is a *sequence* of actions
 ending in "end turn", the way an Arimaa turn is a sequence of steps, so the
 engine is asked for one action at a time. The full scope of the
 simplification is in the module docs of `crates/games/minions/src/game.rs`.

@@ -26,7 +26,8 @@
 //!
 //! ## What is kept, faithfully
 //!
-//! Unit stats and keywords; the attack/spawn phase split; damage that
+//! Unit stats and keywords (except the warg's price: cost 3, rebate 1, where
+//! the full game has 4 and 2); the attack/spawn phase split; damage that
 //! accumulates within a turn and clears at end of turn; `lumbering` barring
 //! move-then-attack; `flying` moving through enemies; `persistent` converting
 //! `Unsummon` into 1 damage; unsummoned units bouncing to reinforcements;
