@@ -49,6 +49,10 @@ const GROUPS: { title: string; note?: string; fields: [string, string][] }[] = [
       ["pw_chunk", "Candidates generated per widen. 0 = the whole set at once when a node expands."],
       ["pw_alpha", "Interior nodes hold ceil(pw_beta · n^pw_alpha) candidates after n visits."],
       ["pw_beta", "See pw_alpha. ≤ 0 disables widening."],
+      [
+        "draw_retries",
+        "Sampler draws in a row that may repeat at an interior node before the widen adds a random playout instead. 0 = keep drawing until the node's draws are spent. The root always makes all its draws.",
+      ],
     ],
   },
   {
@@ -60,7 +64,7 @@ const GROUPS: { title: string; note?: string; fields: [string, string][] }[] = [
       ],
       [
         "draws",
-        "Sampler draws per node (D), all made whether or not they repeat. Interior nodes draw their share as they widen: ceil(n·D/N) once they have earned n candidates.",
+        "Sampler draws per node (D). The root makes all D whether or not they repeat. Interior nodes draw their share as they widen, ceil(n·D/N) once they have earned n candidates, and fill early after draw_retries repeats in a row.",
       ],
       ["t_steps", "Diffusion rounds per proposal."],
       ["random_fraction", "Share of proposals drawn as random playouts (explore candidates)."],
@@ -92,6 +96,7 @@ const INTEGER = new Set([
   "forced_extra",
   "temp_moves",
   "pw_chunk",
+  "draw_retries",
   "candidates",
   "candidates_fast",
   "draws",

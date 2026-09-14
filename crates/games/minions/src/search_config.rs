@@ -37,6 +37,7 @@ struct Recorded {
     pw_alpha: f32,
     pw_beta: f32,
     pw_chunk: usize,
+    draw_retries: u32,
     kernel_sigma: f32,
     candidates: usize,
     candidates_fast: usize,
@@ -63,6 +64,7 @@ fn record(a: &ActorConfig, s: &SamplerConfig) -> Recorded {
         pw_alpha: a.pw_alpha,
         pw_beta: a.pw_beta,
         pw_chunk: a.pw_chunk,
+        draw_retries: a.draw_retries,
         kernel_sigma: a.kernel_sigma,
         candidates: s.k_candidates,
         candidates_fast: s.k_candidates_fast,
@@ -131,6 +133,7 @@ pub fn apply_json(
     actor.pw_alpha = r.pw_alpha;
     actor.pw_beta = r.pw_beta;
     actor.pw_chunk = r.pw_chunk;
+    actor.draw_retries = r.draw_retries;
     actor.kernel_sigma = r.kernel_sigma;
     sampler.k_candidates = r.candidates;
     sampler.k_candidates_fast = r.candidates_fast;

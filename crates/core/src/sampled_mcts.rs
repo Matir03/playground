@@ -187,12 +187,23 @@ pub struct SampledParams {
     /// Sampler draws per node (`D`). A node draws `D` proposals; the distinct
     /// ones become its candidates, and a shortfall to `k_candidates` is filled
     /// with exploration candidates (see [`SampledModel::widen_batch`]). The
-    /// sampler is asked exactly `D` times whether or not it repeats itself.
+    /// root is asked exactly `D` times whether or not the sampler repeats
+    /// itself.
     ///
     /// Pro-rated under progressive widening: a node that has earned `n` of its
     /// `k_candidates` draws `ceil(n * D / k_candidates)` before it fills, so
-    /// the root, which earns them all at once, draws exactly `D`.
+    /// the root, which earns them all at once, draws exactly `D`. An interior
+    /// node may fill sooner, after [`Self::draw_retries`] repeats in a row.
     pub k_draws: usize,
+    /// Sampler draws in a row that may add nothing at an interior node before
+    /// its widen falls back to a fill (a random playout) instead. 0 = keep
+    /// drawing until the node's draw budget is spent.
+    ///
+    /// A widen at an interior node holds up the simulation that asked for it
+    /// until something new arrives, and a sharp sampler can repeat itself for
+    /// the node's whole budget. The root is exempt: it draws its `D` once per
+    /// search, before any visit.
+    pub draw_retries: u32,
     /// KataGo forced-playout constant; 0 disables forced playouts.
     pub k_forced: f32,
     /// Visits guaranteed to every *explore*-origin root candidate, regardless of
@@ -272,6 +283,7 @@ impl Default for SampledParams {
             c_puct: 1.5,
             k_candidates: 32,
             k_draws: 32,
+            draw_retries: 3,
             k_forced: 2.0,
             min_explore_visits: 2.0,
             forced_visits: 30,
@@ -368,6 +380,9 @@ struct Node<G: SampledGame> {
     /// node's draw target (see [`SampledParams::k_draws`]), a node still short
     /// of candidates is filled instead.
     draws: u32,
+    /// Sampler draws in a row that brought nothing new; reset by anything that
+    /// does. See [`SampledParams::draw_retries`].
+    draw_misses: u32,
     /// Fills that brought nothing new. Random fills repeat themselves well
     /// before a position runs out of turns, so one miss is not the signal to
     /// stop; this many, against the node's candidate target, is.
@@ -589,6 +604,7 @@ fn new_node<G: SampledGame>(state: G::State) -> Node<G> {
         entries: Vec::new(),
         widen_exhausted: false,
         draws: 0,
+        draw_misses: 0,
         fill_misses: 0,
         kern: Vec::new(),
         total_n: 0,
@@ -994,11 +1010,15 @@ impl<G: SampledGame> Search<G> {
                         // draw while it has draws left, a fill once they are
                         // spent. The descent pauses here and resumes when the
                         // candidates arrive, so a draw that repeats is retried
-                        // by the same simulation.
+                        // by the same simulation -- `draw_retries` times at an
+                        // interior node, and then it fills.
                         if !self.tree[cur].widen_exhausted {
-                            let held = self.tree[cur].entries.len();
-                            let want = earned(&self.tree[cur], &self.params, cur == 0);
-                            let fill = self.tree[cur].draws >= draw_target(&self.params, want);
+                            let node = &self.tree[cur];
+                            let held = node.entries.len();
+                            let want = earned(node, &self.params, cur == 0);
+                            let retries = self.params.draw_retries;
+                            let fill = node.draws >= draw_target(&self.params, want)
+                                || (cur != 0 && retries > 0 && node.draw_misses >= retries);
                             // Unchunked, every draw came with the expansion, so
                             // a fill is the only widen there is.
                             if held < want && (self.params.pw_chunk > 0 || fill) {
@@ -1145,9 +1165,10 @@ impl<G: SampledGame> Search<G> {
     /// that fragment exactly the visits they should concentrate. Priors are
     /// renormalised over the grown set and the kernel matrix rebuilt.
     ///
-    /// A proposal widen spends the node's draws whatever it brings. A fill that
-    /// brings nothing new is a miss, and the node is exhausted once its misses
-    /// reach the candidates it has earned. See [`SampledParams::k_draws`].
+    /// A proposal widen spends the node's draws whatever it brings, and one that
+    /// brings nothing new counts toward [`SampledParams::draw_retries`]. A fill
+    /// that brings nothing new is a miss, and the node is exhausted once its
+    /// misses reach the candidates it has earned. See [`SampledParams::k_draws`].
     pub fn provide_widen(&mut self, candidates: Vec<(G::Move, f32, bool)>) {
         let (cur, fill) = self.pending_widen.take().expect("provide_widen without a pending widen");
         let mut seen: std::collections::HashMap<u128, usize> = Default::default();
@@ -1199,6 +1220,12 @@ impl<G: SampledGame> Search<G> {
             }
         } else {
             self.tree[cur].draws += chunk_k(&self.params) as u32;
+            if added.is_empty() {
+                self.tree[cur].draw_misses += 1;
+            }
+        }
+        if !added.is_empty() {
+            self.tree[cur].draw_misses = 0;
         }
         // Re-softmax over the grown set. Sorting inside is safe here because the
         // paused descent's `path` holds only this node's ancestors' edges.
@@ -1707,6 +1734,75 @@ mod tests {
                 vec![(1, d as u32, false), (2, 0, true), (3, 0, true)],
                 "D={d}: the one distinct proposal (drawn D times) and two fills"
             );
+        }
+    }
+
+    /// At an interior node, a draw that keeps repeating is retried
+    /// `draw_retries` times and then the widen fills, however much of the
+    /// node's draw budget is left. 0 turns the cap off, and only the budget
+    /// ends the run.
+    #[test]
+    fn repeated_draws_at_an_interior_node_fall_back_to_a_fill() {
+        for retries in [3u32, 1, 0] {
+            let params = SampledParams {
+                simulations: 80,
+                k_candidates: 3,
+                // A budget the misses never reach, so every early fill is the
+                // retry cap's doing.
+                k_draws: 60,
+                draw_retries: retries,
+                pw_chunk: 1,
+                forced_visits: 0,
+                temp_moves: 0,
+                seed: 4,
+                ..Default::default()
+            };
+            let model = Stuck::new(true);
+            let mut search = Search::<Count>::new(CountState { n: 21, side: 1 }, &params, 0);
+            // Per interior node: the current run of draws that added nothing,
+            // and the longest run seen.
+            let mut runs: std::collections::HashMap<usize, (u32, u32)> = Default::default();
+            // Fills the cap caused, as opposed to a spent draw budget.
+            let mut cap_fills = 0;
+            loop {
+                match search.step() {
+                    Step::NeedExpansion(st) => {
+                        let (v, c) = model.expand(&st, expansion_k(&params)).unwrap();
+                        search.provide(v, c);
+                    }
+                    Step::NeedWiden { state, fill } => {
+                        let (node, _) = search.pending_widen.expect("a widen names its node");
+                        let n = &search.tree[node];
+                        let before = n.entries.len();
+                        let spent = n.draws >= draw_target(&params, earned(n, &params, node == 0));
+                        search.provide_widen(widen(&model, &state, fill, chunk_k(&params)));
+                        if node == 0 {
+                            continue;
+                        }
+                        let grew = search.tree[node].entries.len() > before;
+                        let run = runs.entry(node).or_default();
+                        if fill && !spent {
+                            assert_eq!(
+                                run.0, retries,
+                                "retries={retries}: node {node} filled after {} misses",
+                                run.0
+                            );
+                            cap_fills += 1;
+                        }
+                        run.0 = if grew { 0 } else { run.0 + u32::from(!fill) };
+                        run.1 = run.1.max(run.0);
+                    }
+                    Step::Done => break,
+                }
+            }
+            let longest = runs.values().map(|r| r.1).max().unwrap_or(0);
+            if retries > 0 {
+                assert!(cap_fills > 5, "retries={retries}: only {cap_fills} fills from the cap");
+                assert_eq!(longest, retries, "retries={retries}: a run of {longest} misses");
+            } else {
+                assert_eq!(cap_fills, 0, "retries=0: filled before the draw budget ran out");
+                assert!(longest > 3, "retries=0: runs of misses should run on, got {longest}");
+            }
         }
     }
 

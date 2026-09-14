@@ -180,6 +180,11 @@ enum Cmd {
         /// alongside expansions because it is the same shape.
         #[arg(long, default_value_t = 1)]
         pw_chunk: usize,
+        /// Sampler draws in a row that may add nothing at an interior node
+        /// before its widen fills with a random playout instead. 0 = keep
+        /// drawing until the node's draw budget is spent.
+        #[arg(long, default_value_t = 3)]
+        draw_retries: u32,
         /// Write `search.json` for these settings into `--live` and exit
         /// without playing. Every run writes it on start anyway; this records
         /// the search without starting self-play, for eval and the UI.
@@ -408,7 +413,7 @@ async fn main() -> anyhow::Result<()> {
             candidates, candidates_fast, draws, draws_fast, t_steps, t_steps_fast, random_fraction,
             random_opening_max, random_opening_decay, min_explore_visits,
             forced_visits, forced_extra, workers, no_energy,
-            kernel_sigma, pw_chunk, write_search_config,
+            kernel_sigma, pw_chunk, draw_retries, write_search_config,
             chunk_secs, max_examples,
             max_chunks, target_examples, seed,
         } => {
@@ -416,7 +421,7 @@ async fn main() -> anyhow::Result<()> {
             let actor = minions_engine::selfplay::ActorConfig {
                 sims, fast_sims, full_search_prob, backend: kind, min_explore_visits,
                 forced_visits, forced_extra, workers,
-                random_opening_max, random_opening_decay, kernel_sigma, pw_chunk,
+                random_opening_max, random_opening_decay, kernel_sigma, pw_chunk, draw_retries,
                 ..Default::default()
             };
             let sampler = minions_engine::sampler::SamplerConfig {

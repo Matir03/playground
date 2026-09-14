@@ -138,6 +138,9 @@ pub struct ActorConfig {
     /// Candidates per model call. 1 matches the one-per-visit widening rate;
     /// 0 disables chunking.
     pub pw_chunk: usize,
+    /// Repeated sampler draws in a row before an interior widen fills with a
+    /// random playout instead; 0 = only when the draw budget is spent.
+    pub draw_retries: u32,
     pub fast_sims: u32,
     /// Probability a turn gets the full search — only full searches produce a
     /// policy target (KataGo's playout-cap randomization).
@@ -191,6 +194,7 @@ impl ActorConfig {
             c_puct: self.c_puct,
             k_candidates: sampler.k_for(full),
             k_draws: sampler.draws_for(full),
+            draw_retries: self.draw_retries,
             // Fast searches are not training data, so they get no forced
             // exploration to correct for either.
             k_forced: if full { self.k_forced } else { 0.0 },
@@ -227,6 +231,7 @@ impl Default for ActorConfig {
             pw_alpha: 0.5,
             pw_beta: 2.0,
             pw_chunk: 1,
+            draw_retries: 3,
             random_opening_max: 22,
             // Chosen so the truncated geometric on 0..=22 has mean 7.5 — a
             // quarter of `MAX_TURNS`, deep enough to reach genuinely mid-game
