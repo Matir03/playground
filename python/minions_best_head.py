@@ -34,7 +34,7 @@ import torch.nn.functional as F
 from safetensors.torch import load_file, save_file
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from minions_az_learner import C_MOVE, C_SPAWN, C_TARGET, TOP_K, read_chunk  # noqa: E402
+from minions_az_learner import C_MOVE, C_SPAWN, C_TARGET, read_chunk  # noqa: E402
 from playground.model_server.minions_net import (  # noqa: E402
     CELLS, IN_PLANES, N, N_OFFSETS, N_SPAWNS, N_TARGETS, arch_of, build_model,
     export_onnx_atomic,
@@ -62,12 +62,16 @@ def load_rows(paths):
         if d is None:
             continue
         n = d["n_cands"].astype(np.int64)
-        prob = np.where(np.arange(TOP_K)[None, :] < n[:, None], d["prob"], -1.0)
-        keep = np.flatnonzero((d["is_full"] > 0) & (n > 0) & (prob.max(axis=1) > 0))
-        best = prob[keep].argmax(axis=1)
+        if n.sum() == 0:
+            continue
+        # Children are stored strongest first and back to back, so a row's
+        # first child is its favourite.
+        first = np.cumsum(n) - n
+        keep = np.flatnonzero((d["is_full"] > 0) & (n > 0))
+        keep = keep[d["cand_prob"][first[keep]] > 0]
         planes.append(d["planes"][keep])
         live.append(d["live"][keep])
-        spec.append(d["spec"][keep, best])
+        spec.append(d["cand_spec"][first[keep]])
     return np.concatenate(planes), np.concatenate(live), np.concatenate(spec)
 
 

@@ -137,17 +137,21 @@ def validate_records(live: str) -> dict | None:
     check("n_cands within TOP_K", bool((b["n_cands"] <= TOP_K).all() and (b["n_cands"] >= 1).all()),
           f"range {b['n_cands'].min()}..{b['n_cands'].max()}")
 
-    # Pruned visit shares must be a distribution over the populated slots.
-    slot = np.arange(TOP_K)[None, :] < b["n_cands"][:, None]
-    mass = np.where(slot, b["prob"], 0.0).sum(axis=1)
+    n = b["n_cands"].astype(np.int64)
+    check("candidate block matches the counts", len(b["cand_prob"]) == int(n.sum()),
+          f"{len(b['cand_prob'])} children for counts summing to {int(n.sum())}")
+
+    # Pruned visit shares must be a distribution over each row's children.
+    rows = np.repeat(np.arange(len(n)), n)
+    mass = np.bincount(rows, weights=b["cand_prob"], minlength=len(n))[n > 0]
     check("policy target normalised", bool(np.abs(mass - 1.0).max() < 1e-4),
           f"worst |Σp − 1| = {np.abs(mass - 1.0).max():.2e}")
-    check("no mass in unused slots", bool(np.where(~slot, b["prob"], 0.0).max() == 0.0))
 
     # The live mask must actually cover the declarations recorded against it: a
     # move declared on a cell the mask calls dead would never be trained on.
-    live_move = (b["live"] & C_MOVE) > 0
-    declared_move = b["spec"][:, 0, :CELLS] != 255
+    has = np.flatnonzero(n > 0)
+    live_move = (b["live"][has] & C_MOVE) > 0
+    declared_move = b["cand_spec"][b["cand_off"][has], :CELLS] != 255
     orphan = int((declared_move & ~live_move).sum())
     check("declared moves lie inside the live mask", orphan == 0, f"{orphan} orphaned")
 

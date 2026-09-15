@@ -43,7 +43,7 @@ from playground.model_server.minions_net import (
 
 # ── record layout — must match crates/games/minions/src/selfplay.rs ────────────
 MAGIC = 0x4D494E33
-VERSION = 9  # must match selfplay::VERSION in Rust
+VERSION = 10  # must match selfplay::VERSION in Rust
 # v4 records are identical except that they predate the trailing "turns left"
 # feature plane, so they are one plane short. They are still usable: the plane is
 # appended last, and the stem weights that read it start at zero (see
@@ -60,13 +60,17 @@ VERSION = 9  # must match selfplay::VERSION in Rust
 #
 # The buffer holds a single generation, so this costs one cycle of data and
 # heals itself. `read_chunk` skips unknown versions rather than raising.
-COMPAT_VERSIONS = {VERSION: IN_PLANES}
-SCORELESS_VERSIONS = set()
-# Every child of a full-search root, zero targets included; must match
-# selfplay::TOP_K. v8 stored only the top 8 with non-zero targets, so v8 chunks
-# are not in COMPAT_VERSIONS -- same stride would not even be the question, the
-# candidate set means something different.
-TOP_K = 16
+#
+# v10 stores each record's children at their count, after every record's fixed
+# part (see `read_chunk`); v9 held 16 fixed-stride slots inside each record.
+# Same planes, same meaning -- v9 is the same search's children cut to the top
+# 16 -- so v9 is read and re-laid-out as v10.
+COMPAT_VERSIONS = {VERSION: IN_PLANES, 9: IN_PLANES}
+# Most children a record holds: the stable children of a full-search root,
+# strongest first, zero targets included; must match selfplay::TOP_K.
+TOP_K = 160
+# The fixed-stride slots each v9 record carried.
+V9_SLOTS = 16
 SPEC_BYTES = 3 * CELLS
 PLANE_BYTES = IN_PLANES * CELLS
 CAND_BYTES = SPEC_BYTES + 4
@@ -78,8 +82,9 @@ N_BUYABLE = 5
 HEX_BYTES = 2 * CELLS
 NECRO_BYTES = 2 * NECRO_HORIZON
 SCORE_BYTES = 4
+# The fixed-stride part of a record; its children follow every fixed part.
 EXAMPLE_BYTES = (
-    PLANE_BYTES + 1 + 4 + CELLS + 1 + TOP_K * CAND_BYTES
+    PLANE_BYTES + 1 + 4 + CELLS + 1
     + HEX_BYTES + NECRO_BYTES + 1 + SCORE_BYTES
 )
 
@@ -88,8 +93,7 @@ O_TOMOVE = PLANE_BYTES
 O_VALUE = O_TOMOVE + 1
 O_LIVE = O_VALUE + 4
 O_NCAND = O_LIVE + CELLS
-O_CANDS = O_NCAND + 1
-O_HEX = O_CANDS + TOP_K * CAND_BYTES
+O_HEX = O_NCAND + 1
 O_NECRO = O_HEX + HEX_BYTES
 O_ISFULL = O_NECRO + NECRO_BYTES
 O_SCORE = O_ISFULL + 1
@@ -193,36 +197,44 @@ def read_chunk(path: str) -> dict | None:
         )
         return None
     body = raw[16:]
-    # Older versions differ in the plane count, which shifts every offset, and
-    # in whether the trailing score field is present.
-    n_planes = COMPAT_VERSIONS[int(version)]
-    scoreless = int(version) in SCORELESS_VERSIONS
-    plane_bytes = n_planes * CELLS
-    stride = EXAMPLE_BYTES - (PLANE_BYTES - plane_bytes) - (SCORE_BYTES if scoreless else 0)
-    if body.size != count * stride:
-        raise ValueError(
-            f"{path}: expected {count * stride} body bytes for v{version}, got {body.size}"
-        )
-    rec = body.reshape(count, stride)
-    if scoreless:
-        # Append the missing score field so every downstream offset is the
-        # current layout's. `has_score` is what keeps these rows out of the
-        # score loss; the zeros here are never trained against.
-        rec = np.concatenate(
-            [rec, np.zeros((count, SCORE_BYTES), dtype=np.uint8)], axis=1
-        )
-    if plane_bytes != PLANE_BYTES:
-        # Pad the missing trailing plane(s) with zeros and re-align the rest.
-        pad = np.zeros((count, PLANE_BYTES - plane_bytes), dtype=np.uint8)
-        rec = np.concatenate([rec[:, :plane_bytes], pad, rec[:, plane_bytes:]], axis=1)
-    cands = rec[:, O_CANDS:O_HEX].reshape(count, TOP_K, CAND_BYTES)
+    if int(version) == 9:
+        # Sixteen slots inside each record, between the count and the hex
+        # targets. Cut them out, and the rest is the v10 fixed part.
+        o_slots, slot_bytes = O_NCAND + 1, V9_SLOTS * CAND_BYTES
+        stride = EXAMPLE_BYTES + slot_bytes
+        if body.size != count * stride:
+            raise ValueError(
+                f"{path}: expected {count * stride} body bytes for v9, got {body.size}"
+            )
+        rec9 = body.reshape(count, stride)
+        slots = rec9[:, o_slots:o_slots + slot_bytes].reshape(count, V9_SLOTS, CAND_BYTES)
+        rec = np.concatenate([rec9[:, :o_slots], rec9[:, o_slots + slot_bytes:]], axis=1)
+        n = rec[:, O_NCAND].astype(np.int64)
+        # Row-major, so each row's populated slots stay together and in order.
+        cands = slots[np.arange(V9_SLOTS)[None, :] < n[:, None]]
+    else:
+        # Every fixed part at one stride, then every row's children back to
+        # back, as many as its count says.
+        fixed = count * EXAMPLE_BYTES
+        if body.size < fixed:
+            raise ValueError(f"{path}: {body.size} body bytes, {fixed} of fixed parts alone")
+        rec = body[:fixed].reshape(count, EXAMPLE_BYTES)
+        n = rec[:, O_NCAND].astype(np.int64)
+        want = fixed + int(n.sum()) * CAND_BYTES
+        if body.size != want:
+            raise ValueError(
+                f"{path}: expected {want} body bytes for v{version}, got {body.size}"
+            )
+        cands = body[fixed:].reshape(-1, CAND_BYTES)
     return {
         "planes": rec[:, O_PLANES:O_TOMOVE].copy(),
         "value": rec[:, O_VALUE:O_VALUE + 4].copy().view("<f4").reshape(count),
         "live": rec[:, O_LIVE:O_LIVE + CELLS].copy(),
         "n_cands": rec[:, O_NCAND].copy(),
-        "spec": cands[:, :, :SPEC_BYTES].copy(),
-        "prob": cands[:, :, SPEC_BYTES:].copy().reshape(-1, 4).view("<f4").reshape(count, TOP_K),
+        # Every row's children back to back, in row order; `Buffer.merged`
+        # turns the counts into offsets.
+        "cand_spec": cands[:, :SPEC_BYTES].copy(),
+        "cand_prob": cands[:, SPEC_BYTES:].copy().view("<f4").reshape(-1),
         # Fractions stored as bytes; rescaled once here rather than per step.
         "hex_control": (
             rec[:, O_HEX:O_HEX + HEX_BYTES].astype(np.float32) / 255.0
@@ -234,7 +246,7 @@ def read_chunk(path: str) -> dict | None:
         "is_full": rec[:, O_ISFULL].copy(),
         # Terminal score in raw points, from the mover's seat.
         "score": rec[:, O_SCORE:O_SCORE + SCORE_BYTES].copy().view("<f4").reshape(count),
-        "has_score": np.full(count, 0 if scoreless else 1, dtype=np.uint8),
+        "has_score": np.ones(count, dtype=np.uint8),
     }
 
 
@@ -263,10 +275,16 @@ class Buffer:
         return sum(len(d["value"]) for d in self.cache.values())
 
     def merged(self) -> dict:
-        keys = ["planes", "value", "live", "n_cands", "spec", "prob",
+        keys = ["planes", "value", "live", "n_cands", "cand_spec", "cand_prob",
                 "hex_control", "necro_safety", "is_full", "score", "has_score"]
         parts = [self.cache[k] for k in sorted(self.cache)]
-        return {k: np.concatenate([p[k] for p in parts]) for k in keys}
+        out = {k: np.concatenate([p[k] for p in parts]) for k in keys}
+        # Row i's children are cand_*[cand_off[i]:cand_off[i + 1]]: the chunks'
+        # candidate blocks are concatenated in the same order as their rows.
+        out["cand_off"] = np.concatenate(
+            [[0], np.cumsum(out["n_cands"], dtype=np.int64)]
+        ).astype(np.int64)
+        return out
 
 
 def decl_planes(spec: np.ndarray, committed: np.ndarray) -> np.ndarray:
@@ -333,26 +351,57 @@ def tb_trajectories(batch: dict, idx: np.ndarray, k: int, sampled: np.ndarray,
     use = np.flatnonzero(full_rows & (n > 0))
     if k <= 1:
         return sampled[use], use
-    take = np.minimum(n[use], k)
-    rows = np.repeat(use, take)
-    cols = np.concatenate([np.arange(t) for t in take]) if len(take) else np.zeros(0, np.int64)
-    return batch["spec"][idx[rows], cols], rows
+    rows, flat, slot = candidate_rows(batch, idx, use)
+    keep = slot < k
+    return batch["cand_spec"][flat[keep]], rows[keep]
+
+
+def candidate_rows(batch: dict, idx: np.ndarray, rows: np.ndarray | None = None):
+    """The children of ``idx[rows]`` (default: all of ``idx``), flattened.
+
+    Returns ``(row, flat, slot)``, one entry per child: its position in ``idx``,
+    its index into ``cand_spec``/``cand_prob``, and its rank within its row
+    (0 = strongest). Rows follow ``rows``' order, each row's children together.
+    """
+    if rows is None:
+        rows = np.arange(len(idx))
+    # int64, not the record's uint8: fast rows have `n_cands == 0`, and any
+    # arithmetic on an unsigned count wraps silently.
+    lens = batch["n_cands"][idx[rows]].astype(np.int64)
+    starts = batch["cand_off"][idx[rows]]
+    run = np.repeat(np.cumsum(lens) - lens, lens)   # where each row's run begins
+    slot = np.arange(int(lens.sum()), dtype=np.int64) - run
+    return np.repeat(rows, lens), np.repeat(starts, lens) + slot, slot
 
 
 def sample_target_spec(batch: dict, idx: np.ndarray, rng: np.random.Generator):
-    """Pick one candidate per example, proportional to its pruned visit share."""
-    probs = batch["prob"][idx].astype(np.float64)
-    # int64, not the record's uint8: fast rows have `n_cands == 0`, and `n - 1`
-    # on an unsigned type wraps to 255, which silently defeats the clamp below.
-    n = batch["n_cands"][idx].astype(np.int64)
-    mask = np.arange(TOP_K)[None, :] < n[:, None]
-    probs = np.where(mask, np.maximum(probs, 0.0), 0.0)
-    total = probs.sum(axis=1, keepdims=True)
-    # A row with no mass falls back to uniform over its populated slots.
-    flat = np.where(total > 0, probs / np.maximum(total, 1e-12), mask / np.maximum(n[:, None], 1))
-    draw = (flat.cumsum(axis=1) < rng.random((len(idx), 1))).sum(axis=1)
-    draw = np.clip(draw, 0, np.maximum(n - 1, 0))
-    return batch["spec"][idx, draw]
+    """Pick one candidate per example, proportional to its pruned visit share.
+
+    A row with no mass falls back to uniform over its children. A row with no
+    children -- a fast row -- gets the empty turn, all zeros, as it always has;
+    nothing is masked for it, so it is never trained against.
+    """
+    bs = len(idx)
+    out = np.zeros((bs, SPEC_BYTES), dtype=np.uint8)
+    row, flat, _ = candidate_rows(batch, idx)
+    if len(flat) == 0:
+        return out
+    p = np.maximum(batch["cand_prob"][flat].astype(np.float64), 0.0)
+    lens = batch["n_cands"][idx].astype(np.int64)
+    total = np.bincount(row, weights=p, minlength=bs)
+    u = rng.random(bs)
+    has = np.flatnonzero(lens > 0)
+    first = (np.cumsum(lens) - lens)[has]   # each row's first child in `flat`
+    last = first + lens[has] - 1
+    # Inverse CDF within each row: the first child whose running mass passes
+    # u * total, clipped to the row against rounding at its edges.
+    cum = np.cumsum(p)
+    target = cum[first] - p[first] + u[has] * total[has]
+    pick = np.clip(np.searchsorted(cum, target, side="right"), first, last)
+    uniform = first + np.minimum((u[has] * lens[has]).astype(np.int64), lens[has] - 1)
+    pick = np.where(total[has] > 0, pick, uniform)
+    out[has] = batch["cand_spec"][flat[pick]]
+    return out
 
 
 def committed_after(t: int, total_steps: int, n: int) -> int:
@@ -598,21 +647,32 @@ def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux
         )
 
         # ── candidate-set CE for the energy head ──────────────────────────────
-        n_c = batch["n_cands"][idx]
-        specs = batch["spec"][idx].reshape(bs * TOP_K, SPEC_BYTES)
-        comm = np.repeat(live_f, TOP_K, axis=0)
-        decl_all = torch.from_numpy(energy_planes(specs, comm)).to(device)
-        h_rep = hh.repeat_interleave(TOP_K, dim=0)
-        scores = net.energy_head(h_rep, decl_all).view(bs, TOP_K)
-        slot_mask = torch.from_numpy(
-            (np.arange(TOP_K)[None, :] < n_c[:, None])
-        ).to(device)
-        scores = scores.masked_fill(~slot_mask, -1e9)
-        visits = torch.from_numpy(
-            np.where(np.arange(TOP_K)[None, :] < n_c[:, None], batch["prob"][idx], 0.0)
-        ).to(device)
-        usable = (visits.sum(dim=1) > 0) & full_t
-        loss_e = energy_loss(scores[usable], visits[usable]) if usable.any() else scores.sum() * 0
+        # Over every recorded child of each usable row -- all of the root's
+        # stable children, up to TOP_K -- each scored once, then laid out one
+        # row per position with the empty slots masked, so `energy_loss` sees
+        # the same padded shape as ever. Fast rows have no children and cost
+        # nothing here.
+        n_c = batch["n_cands"][idx].astype(np.int64)
+        row, flat, _ = candidate_rows(batch, idx)
+        mass = np.bincount(row, weights=batch["cand_prob"][flat], minlength=bs)
+        use = np.flatnonzero(full_rows & (n_c > 0) & (mass > 0))
+        if len(use):
+            row, flat, slot = candidate_rows(batch, idx, use)
+            dense = torch.from_numpy(np.searchsorted(use, row)).to(device)
+            slot_t = torch.from_numpy(slot).to(device)
+            decl_all = torch.from_numpy(
+                energy_planes(batch["cand_spec"][flat], live_f[row])
+            ).to(device)
+            flat_scores = net.energy_head(hh[torch.from_numpy(row).to(device)], decl_all).view(-1)
+            scores = flat_scores.new_full((len(use), int(n_c[use].max())), -1e9)
+            scores = scores.index_put((dense, slot_t), flat_scores)
+            visits = torch.zeros(scores.shape, device=device)
+            visits[dense, slot_t] = torch.from_numpy(
+                batch["cand_prob"][flat].astype(np.float32)
+            ).to(device)
+            loss_e = energy_loss(scores, visits)
+        else:
+            loss_e = hh.sum() * 0
         # `energy_loss` is the cross-entropy H(pi_hat, softmax f) = H(pi_hat) +
         # KL(pi_hat || softmax f). The entropy term is a property of the search
         # target, not of the net, and it is the floor the loss cannot go below —
@@ -621,9 +681,8 @@ def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux
         # Without it a "flat" energy loss is ambiguous between "not learning" and
         # "already at the floor".
         with torch.no_grad():
-            if usable.any():
-                v = visits[usable]
-                tgt = v / v.sum(dim=1, keepdim=True).clamp_min(1e-9)
+            if len(use):
+                tgt = visits / visits.sum(dim=1, keepdim=True).clamp_min(1e-9)
                 h_t = -(tgt * torch.log(tgt.clamp_min(1e-9))).sum(dim=1).mean()
             else:
                 h_t = torch.zeros((), device=device)

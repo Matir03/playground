@@ -60,14 +60,19 @@ MAX_BATCH="${MAX_BATCH:-768}"
 WORKERS="${WORKERS:-4}"
 SIMS="${SIMS:-400}"
 FAST_SIMS="${FAST_SIMS:-100}"
-CANDIDATES="${CANDIDATES:-16}"
+# 2026-09-15 (user): 16 diffusion candidates plus 8 random-playout explore
+# candidates per full-search node -- 24, with RANDOM_FRACTION 1/3. Each
+# candidate is random by a weighted coin, so a node gets 8 in expectation.
+CANDIDATES="${CANDIDATES:-24}"
 T_STEPS="${T_STEPS:-4}"
 # Fast (playout-cap) searches produce no training data, so they get a cheaper
 # sampler. Measured +13% end to end in a paired A/B (at T 2).
 #
-# 2026-09-15 (user): fast searches run the full search's settings -- 16
-# candidates and refinement -- with only the budget cut: 100 simulations, T 3
+# 2026-09-15 (user): fast searches run the full search's settings --
+# refinement included -- with only the budget cut: 100 simulations, T 3
 # (refinements redraw at RESAMPLE_T) and no forced visits (search_params).
+# They draw 16 diffusion candidates and no random ones: injection is
+# full-search only (the user kept it that way).
 T_STEPS_FAST="${T_STEPS_FAST:-3}"
 CANDIDATES_FAST="${CANDIDATES_FAST:-16}"
 # Refinement: every RESAMPLE_EVERY visits to a node, the visit re-masks a
@@ -93,7 +98,7 @@ KERNEL_SIGMA="${KERNEL_SIGMA:-0}"
 EVAL_CANDIDATES="${EVAL_CANDIDATES:-16}"
 EVAL_SIMS="${EVAL_SIMS:-400}"
 EVAL_T_STEPS="${EVAL_T_STEPS:-$T_STEPS}"
-RANDOM_FRACTION="${RANDOM_FRACTION:-0.25}"
+RANDOM_FRACTION="${RANDOM_FRACTION:-0.3333333}"
 # Random openings: N random legal turns before the search takes over, none of
 # them recorded. Keeps the training distribution moving when self-play comes
 # from one frozen net — a Hex run stalled at parity without this. Truncated
@@ -109,12 +114,15 @@ MIN_EXPLORE_VISITS="${MIN_EXPLORE_VISITS:-2.0}"
 # Flat forced-exploration quota, replacing the prior-proportional KataGo floor.
 # These visits are invisible to PUCT and subtracted from the policy target, so
 # they buy a value estimate and nothing else. Capped in the search at half the
-# simulation budget: at the measured 4.3 explore candidates per node plus the
-# extras below, 30 each would otherwise be ~250 of 400 simulations.
-FORCED_VISITS="${FORCED_VISITS:-30}"
-# Non-explore candidates drawn at random to also get a quota, so trustworthy
-# value estimates are not confined to the injected set.
-FORCED_EXTRA="${FORCED_EXTRA:-4}"
+# simulation budget.
+#
+# 2026-09-15 (user): 10 per random explore candidate (was 30), and only those:
+# ~8 of them is ~80 of 400 simulations.
+FORCED_VISITS="${FORCED_VISITS:-10}"
+# Non-explore candidates drawn at random to also get a quota. 0 since
+# 2026-09-15 (user): only the random explore candidates are forced. The root
+# sweep's one seeded visit per candidate stays (the user kept it).
+FORCED_EXTRA="${FORCED_EXTRA:-0}"
 # Five generations: one tournament round of the champion's own games, since
 # only the champion plays self-play between tournaments (SELFPLAY_NET).
 MAX_EXAMPLES="${MAX_EXAMPLES:-1000000}"

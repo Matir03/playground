@@ -13,18 +13,29 @@
 #[test]
 fn example_bytes_and_version_are_pinned() {
     // Update these together with, and only with:
-    //   * python/minions_az_learner.py  (EXAMPLE_BYTES, VERSION, the O_* offsets)
+    //   * python/minions_az_learner.py  (EXAMPLE_BYTES, VERSION, TOP_K,
+    //     CAND_BYTES, the O_* offsets)
     //   * python/minions_watchdog.py    (if it reads the new field)
     // then run scripts/check-record-layout.sh.
     assert_eq!(
         minions_engine::selfplay::EXAMPLE_BYTES,
-        3868,
+        1452,
         "record size changed; update the Python mirror and the offsets with it"
     );
     assert_eq!(
         minions_engine::selfplay::VERSION,
-        9,
+        10,
         "record version changed; the learner's COMPAT_VERSIONS must decide what \
          to do with chunks still in the sliding window"
+    );
+    assert_eq!(
+        minions_engine::selfplay::TOP_K,
+        160,
+        "record capacity changed; the learner's TOP_K must match"
+    );
+    assert_eq!(
+        minions_engine::selfplay::CAND_BYTES,
+        151,
+        "candidate size changed; the learner splits the candidate block by it"
     );
 }

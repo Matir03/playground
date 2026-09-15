@@ -39,20 +39,29 @@ use crate::sampler::{MinionsModel, SamplerConfig};
 use crate::turn::{MinionsTurns, TurnSpec};
 
 pub const MAGIC: u32 = 0x4d_49_4e_33; // "MIN3"
-pub const VERSION: u32 = 9;
+/// v10: children stored at their count after the fixed parts, up to `TOP_K`
+/// (160); v9 had 16 fixed-stride slots in each record.
+pub const VERSION: u32 = 10;
 /// Horizon for the necromancer-survival target, in side-turns.
 pub const NECRO_HORIZON: usize = 10;
 /// Buyable unit classes (zombie, skeleton, serpent, warg, ghost).
 pub const N_BUYABLE: usize = 5;
-/// Candidate slots stored per example: every child of a full-search root, zero
-/// targets included. The record is fixed-stride, so this is a capacity, not a
-/// selection -- it must be at least the full-search candidate count, which the
-/// actor checks at startup. It was 8, and recording kept only the top 8 children
-/// with non-zero targets: the energy head never saw a move the search declined,
-/// and on 89% of positions it also lost children that had earned visits (up to
-/// ~24% of the target's mass).
-pub const TOP_K: usize = 16;
+/// Most root children a record holds: the root's stable children, strongest
+/// first, zero targets included (`policy_record`). A capacity, not a selection --
+/// it must be at least the full-search candidate count, which the actor checks
+/// at startup.
+///
+/// It was 8, then 16, as fixed-stride slots. At 16 a refining root's ~100 stable
+/// children were cut to the top 16, so the energy head trained on a sixth of
+/// the children the search visited. Candidates are now stored at their actual
+/// count after the fixed part of the chunk (`write_chunk`), so unused capacity
+/// costs nothing -- fast rows store none -- and 160 would have cost ~24 KB per
+/// example at a fixed stride, 24 GB over the buffer.
+pub const TOP_K: usize = 160;
+const _: () = assert!(TOP_K <= u8::MAX as usize, "the record counts children in a u8");
 pub const SPEC_BYTES: usize = 3 * NUM_CELLS;
+/// One recorded child: its turn, then its target probability.
+pub const CAND_BYTES: usize = SPEC_BYTES + 4;
 pub const PLANE_BYTES: usize = crate::game::PLANES * NUM_CELLS;
 /// Auxiliary "rest of the game" targets, all in the canonical frame — index 0 is
 /// the side to move, index 1 the opponent — so they match the feature planes and
@@ -64,12 +73,13 @@ pub const PLANE_BYTES: usize = crate::game::PLANES * NUM_CELLS;
 pub const HEX_CONTROL_BYTES: usize = 2 * NUM_CELLS;
 pub const NECRO_SAFETY_BYTES: usize = 2 * NECRO_HORIZON;
 
+/// The fixed-stride part of a record: everything but its candidates, whose
+/// count it carries. The candidates follow every fixed part in the chunk.
 pub const EXAMPLE_BYTES: usize = PLANE_BYTES
     + 1
     + 4
     + NUM_CELLS
-    + 1
-    + TOP_K * (SPEC_BYTES + 4)
+    + 1 // n_cands
     + HEX_CONTROL_BYTES
     + NECRO_SAFETY_BYTES
     + 1 // is_full
@@ -102,27 +112,32 @@ pub struct Example {
 }
 
 impl Example {
+    /// The fixed-stride part, `EXAMPLE_BYTES` long.
     fn write(&self, out: &mut Vec<u8>) {
         let start = out.len();
         out.extend_from_slice(&self.planes);
         out.push(self.to_move);
         out.extend_from_slice(&self.value.to_le_bytes());
         out.extend_from_slice(&self.live);
-        out.push(self.candidates.len().min(TOP_K) as u8);
-        for i in 0..TOP_K {
-            match self.candidates.get(i) {
-                Some((spec, p)) => {
-                    out.extend_from_slice(&spec.to_bytes());
-                    out.extend_from_slice(&p.to_le_bytes());
-                }
-                None => out.extend(std::iter::repeat_n(0u8, SPEC_BYTES + 4)),
-            }
-        }
+        out.push(self.n_recorded() as u8);
         out.extend_from_slice(&self.hex_control);
         out.extend_from_slice(&self.necro_safety);
         out.push(u8::from(self.is_full));
         out.extend_from_slice(&self.score.to_le_bytes());
         debug_assert_eq!(out.len() - start, EXAMPLE_BYTES);
+    }
+
+    /// Children this record stores: all of them, up to `TOP_K`.
+    fn n_recorded(&self) -> usize {
+        self.candidates.len().min(TOP_K)
+    }
+
+    /// This record's children, `CAND_BYTES` each, in stored order.
+    fn write_candidates(&self, out: &mut Vec<u8>) {
+        for (spec, p) in &self.candidates[..self.n_recorded()] {
+            out.extend_from_slice(&spec.to_bytes());
+            out.extend_from_slice(&p.to_le_bytes());
+        }
     }
 }
 
@@ -894,6 +909,8 @@ pub struct PoolStats {
     pub root_stable: u64,
     /// Full searches finished: the per-root denominator for the two above.
     pub full_roots: u64,
+    /// Full roots with more stable children than a record holds (`TOP_K`).
+    pub root_truncated: u64,
     /// Head rows actually wanted, and head rows run. The gap is the padding
     /// waste in the most expensive phase.
     pub head_real: u64,
@@ -927,6 +944,7 @@ impl PoolStats {
         self.root_children += o.root_children;
         self.root_stable += o.root_stable;
         self.full_roots += o.full_roots;
+        self.root_truncated += o.root_truncated;
         self.head_real += o.head_real;
         self.head_run += o.head_run;
         self.cache_hits += o.cache_hits;
@@ -967,9 +985,11 @@ impl PoolStats {
         }
         if self.root_children > 0 {
             s += &format!(
-                "  |  targets over {:.1}% of root children (stable), {:.1} per full root",
+                "  |  targets over {:.1}% of root children (stable), {:.1} per full root, \
+                 {:.1}% of roots over TOP_K",
                 100.0 * self.root_stable as f64 / self.root_children as f64,
                 self.root_children as f64 / self.full_roots.max(1) as f64,
+                100.0 * self.root_truncated as f64 / self.full_roots.max(1) as f64,
             );
         }
         s
@@ -1128,6 +1148,9 @@ fn advance_turn(
         stats.root_children += result.candidates.len() as u64;
         stats.root_stable += stable.len() as u64;
         stats.full_roots += 1;
+        if stable.len() > TOP_K {
+            stats.root_truncated += 1;
+        }
         let scored = policy_record(stable.iter().map(|&(i, p)| (result.candidates[i].0, p)));
         let mut target = vec![0.0f32; result.candidates.len()];
         for &(i, p) in &stable {
@@ -1315,12 +1338,19 @@ fn examples_from(
 }
 
 fn write_chunk(dir: &Path, index: usize, examples: &[Example]) -> anyhow::Result<PathBuf> {
-    let mut buf = Vec::with_capacity(16 + examples.len() * EXAMPLE_BYTES);
+    let cands: usize = examples.iter().map(Example::n_recorded).sum();
+    let mut buf = Vec::with_capacity(16 + examples.len() * EXAMPLE_BYTES + cands * CAND_BYTES);
     buf.extend_from_slice(&MAGIC.to_le_bytes());
     buf.extend_from_slice(&VERSION.to_le_bytes());
     buf.extend_from_slice(&(examples.len() as u64).to_le_bytes());
+    // Every record's fixed part, then every record's children in the same
+    // order: the learner reads the first block at one stride and splits the
+    // second by the counts in it.
     for e in examples {
         e.write(&mut buf);
+    }
+    for e in examples {
+        e.write_candidates(&mut buf);
     }
     std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("chunk_{index:06}.bin"));
@@ -1707,6 +1737,7 @@ mod tests {
         assert_eq!(hex_late[5], 255, "held for all remaining turns");
     }
 
+    #[test]
     fn example_stride_matches_the_declared_layout() {
         let e = Example {
             is_full: true,
@@ -1722,13 +1753,13 @@ mod tests {
         let mut buf = Vec::new();
         e.write(&mut buf);
         assert_eq!(buf.len(), EXAMPLE_BYTES);
-        // The learner reads this stride, so pin the constant itself too:
-        // planes, to_move, value, ownership, live, n_cands, TOP_K candidate
-        // slots, then the auxiliary targets (hex control, necromancer survival,
-        // unit selection).
+        // The learner reads this stride, so pin the layout itself too: planes,
+        // to_move, value, live, n_cands, then the auxiliary targets (hex
+        // control, necromancer survival), is_full and the score. The children
+        // are not in it; they follow the fixed parts in the chunk.
         assert_eq!(
             EXAMPLE_BYTES,
-            3100 + 1 + 4 + 100 + 100 + 1 + 8 * 304 + 200 + 20 + 40
+            PLANE_BYTES + 1 + 4 + NUM_CELLS + 1 + 2 * NUM_CELLS + 2 * NECRO_HORIZON + 1 + 4
         );
     }
 
@@ -1796,24 +1827,32 @@ mod tests {
         }
     }
 
-    fn a_full_candidate_list_still_fits_one_stride() {
-        let e = Example {
+    /// A record's fixed part is one stride whatever it holds, and its children
+    /// follow at their count, capped at `TOP_K`.
+    #[test]
+    fn a_record_stores_every_child_up_to_top_k() {
+        let with = |n: usize| Example {
             is_full: true,
             planes: vec![0u8; PLANE_BYTES],
             to_move: 2,
             value: 1.0,
             live: vec![3u8; NUM_CELLS],
-            candidates: (0..TOP_K).map(|_| (TurnSpec::empty(), 1.0 / TOP_K as f32)).collect(),
+            candidates: (0..n).map(|_| (TurnSpec::empty(), 1.0 / n as f32)).collect(),
             hex_control: vec![0u8; HEX_CONTROL_BYTES],
             necro_safety: vec![0u8; NECRO_SAFETY_BYTES],
             score: 0.0,
         };
-        let mut buf = Vec::new();
-        e.write(&mut buf);
-        assert_eq!(buf.len(), EXAMPLE_BYTES);
+        for (n, kept) in [(0, 0), (24, 24), (TOP_K, TOP_K), (TOP_K + 5, TOP_K)] {
+            let e = with(n);
+            let (mut fixed, mut cands) = (Vec::new(), Vec::new());
+            e.write(&mut fixed);
+            e.write_candidates(&mut cands);
+            assert_eq!(fixed.len(), EXAMPLE_BYTES, "{n} children");
+            assert_eq!(fixed[PLANE_BYTES + 1 + 4 + NUM_CELLS] as usize, kept, "count byte");
+            assert_eq!(cands.len(), kept * CAND_BYTES, "{n} children");
+        }
     }
 
-    #[test]
     /// The chunk counter must continue past the highest surviving index, not
     /// restart at the file count.
     ///
@@ -1850,6 +1889,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The header, then every fixed part, then every child: the layout the
+    /// learner splits.
+    #[test]
     fn chunk_round_trips_through_the_header() {
         let dir = std::env::temp_dir().join(format!("minions_chunk_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1871,7 +1913,40 @@ mod tests {
         assert_eq!(u32::from_le_bytes(raw[0..4].try_into().unwrap()), MAGIC);
         assert_eq!(u32::from_le_bytes(raw[4..8].try_into().unwrap()), VERSION);
         assert_eq!(u64::from_le_bytes(raw[8..16].try_into().unwrap()), 3);
-        assert_eq!(raw.len(), 16 + 3 * EXAMPLE_BYTES);
+        assert_eq!(raw.len(), 16 + 3 * EXAMPLE_BYTES + 3 * CAND_BYTES);
+        // The first child starts right after the last fixed part.
+        let first = 16 + 3 * EXAMPLE_BYTES;
+        assert_eq!(&raw[first..first + SPEC_BYTES], &TurnSpec::empty().to_bytes()[..]);
+        let p = f32::from_le_bytes(raw[first + SPEC_BYTES..first + CAND_BYTES].try_into().unwrap());
+        assert_eq!(p, 1.0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Writes a chunk exercising the layout's edges -- no children, one, a full
+    /// 24, exactly `TOP_K`, and more than `TOP_K` -- for the Python reader to
+    /// check against (`MINIONS_LAYOUT_FIXTURE` names the directory). Every
+    /// field carries its row's number, so a wrong offset shows as a wrong value.
+    #[test]
+    #[ignore]
+    fn write_layout_fixture() {
+        let Ok(dir) = std::env::var("MINIONS_LAYOUT_FIXTURE") else {
+            return;
+        };
+        let ex: Vec<Example> = [0usize, 1, 24, TOP_K, TOP_K + 40]
+            .iter()
+            .enumerate()
+            .map(|(r, &n)| Example {
+                is_full: n > 0,
+                planes: vec![r as u8; PLANE_BYTES],
+                to_move: 1 + (r % 2) as u8,
+                value: r as f32 * 0.1 - 0.2,
+                live: vec![r as u8; NUM_CELLS],
+                candidates: (0..n).map(|i| (TurnSpec::empty(), (r * 1000 + i) as f32)).collect(),
+                hex_control: vec![(r * 3) as u8; HEX_CONTROL_BYTES],
+                necro_safety: vec![(r % 2) as u8; NECRO_SAFETY_BYTES],
+                score: r as f32 * 1.5,
+            })
+            .collect();
+        write_chunk(Path::new(&dir), 0, &ex).unwrap();
     }
 }
