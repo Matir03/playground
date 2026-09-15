@@ -39,6 +39,10 @@ struct Recorded {
     pw_chunk: usize,
     draw_retries: u32,
     kernel_sigma: f32,
+    resample_every: f32,
+    resample_max_depth: u32,
+    resample_t: usize,
+    resample_frac: f32,
     candidates: usize,
     candidates_fast: usize,
     draws: usize,
@@ -66,6 +70,10 @@ fn record(a: &ActorConfig, s: &SamplerConfig) -> Recorded {
         pw_chunk: a.pw_chunk,
         draw_retries: a.draw_retries,
         kernel_sigma: a.kernel_sigma,
+        resample_every: a.resample_every,
+        resample_max_depth: a.resample_max_depth,
+        resample_t: s.resample_t,
+        resample_frac: s.resample_frac,
         candidates: s.k_candidates,
         candidates_fast: s.k_candidates_fast,
         draws: s.k_draws,
@@ -138,6 +146,10 @@ pub fn apply_json(
     actor.pw_chunk = r.pw_chunk;
     actor.draw_retries = r.draw_retries;
     actor.kernel_sigma = r.kernel_sigma;
+    actor.resample_every = r.resample_every;
+    actor.resample_max_depth = r.resample_max_depth;
+    sampler.resample_t = r.resample_t;
+    sampler.resample_frac = r.resample_frac;
     sampler.k_candidates = r.candidates;
     sampler.k_candidates_fast = r.candidates_fast;
     sampler.k_draws = r.draws;
@@ -158,12 +170,14 @@ fn validate(r: &Recorded) -> anyhow::Result<()> {
         ("candidates_fast", r.candidates_fast),
         ("t_steps", r.t_steps),
         ("t_steps_fast", r.t_steps_fast),
+        ("resample_t", r.resample_t),
     ] {
         anyhow::ensure!(v > 0, "{name} must be at least 1");
     }
     for (name, v) in [
         ("full_search_prob", r.full_search_prob as f32),
         ("random_fraction", r.random_fraction),
+        ("resample_frac", r.resample_frac),
     ] {
         anyhow::ensure!(
             (0.0..=1.0).contains(&v),
@@ -176,6 +190,7 @@ fn validate(r: &Recorded) -> anyhow::Result<()> {
         ("min_explore_visits", r.min_explore_visits),
         ("pw_alpha", r.pw_alpha),
         ("kernel_sigma", r.kernel_sigma),
+        ("resample_every", r.resample_every),
     ] {
         anyhow::ensure!(
             v.is_finite() && v >= 0.0,

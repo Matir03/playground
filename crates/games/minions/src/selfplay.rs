@@ -141,6 +141,13 @@ pub struct ActorConfig {
     /// Repeated sampler draws in a row before an interior widen fills with a
     /// random playout instead; 0 = only when the draw budget is spent.
     pub draw_retries: u32,
+    /// Refinement (`SampledParams::resample_every`): every this many visits a
+    /// node redraws part of the turn PUCT picked instead of descending. 0 =
+    /// off. Full and fast searches share it; the sampler's `resample_t` and
+    /// `resample_frac` set how.
+    pub resample_every: f32,
+    /// Deepest node that refines; `u32::MAX` = every depth.
+    pub resample_max_depth: u32,
     pub fast_sims: u32,
     /// Probability a turn gets the full search — only full searches produce a
     /// policy target (KataGo's playout-cap randomization).
@@ -196,8 +203,8 @@ impl ActorConfig {
             k_draws: sampler.draws_for(full),
             draw_retries: self.draw_retries,
             fills: true,
-            resample_every: 0.0,
-            resample_max_depth: u32::MAX,
+            resample_every: self.resample_every,
+            resample_max_depth: self.resample_max_depth,
             // Fast searches are not training data, so they get no forced
             // exploration to correct for either.
             k_forced: if full { self.k_forced } else { 0.0 },
@@ -235,6 +242,8 @@ impl Default for ActorConfig {
             pw_beta: 2.0,
             pw_chunk: 1,
             draw_retries: 3,
+            resample_every: 0.0,
+            resample_max_depth: u32::MAX,
             random_opening_max: 22,
             // Chosen so the truncated geometric on 0..=22 has mean 7.5 — a
             // quarter of `MAX_TURNS`, deep enough to reach genuinely mid-game
@@ -496,6 +505,11 @@ fn drive_pool_worker(
         // Per request: a widen for a node whose proposals have repeated, which
         // takes exploration draws instead (`SampledModel::widen_batch`).
         let mut fills: Vec<bool> = Vec::with_capacity(max_batch);
+        // Refinement requests (`Step::NeedResample`), served after the wave's
+        // expansions and widens in a call of their own.
+        let mut rs_ids: Vec<usize> = Vec::new();
+        let mut rs_states: Vec<MinionsState> = Vec::new();
+        let mut rs_from: Vec<TurnSpec> = Vec::new();
         let mut scanned = 0usize;
         // Each kind gets its own fixed width, and the two sum to `max_batch`.
         // Padding both to the full width — which is what a single width forces —
@@ -528,7 +542,7 @@ fn drive_pool_worker(
                 ((n + shape_q - 1) / shape_q * shape_q).max(shape_q).min(max_batch)
             }
         };
-        while ids.len() < max_batch && scanned < pool_size {
+        while ids.len() + rs_ids.len() < max_batch && scanned < pool_size {
             let i = cursor % pool_size;
             cursor = cursor.wrapping_add(1);
             scanned += 1;
@@ -553,8 +567,11 @@ fn drive_pool_worker(
                         fills.push(fill);
                         break;
                     }
-                    Step::NeedResample { .. } => {
-                        unreachable!("self-play searches with resample_every = 0")
+                    Step::NeedResample { state, from } => {
+                        rs_ids.push(i);
+                        rs_states.push(state);
+                        rs_from.push(from);
+                        break;
                     }
                     Step::Done => {
                         // The tree this cache described is gone.
@@ -593,7 +610,7 @@ fn drive_pool_worker(
                 }
             }
         }
-        if ids.is_empty() {
+        if ids.is_empty() && rs_ids.is_empty() {
             // Nothing of this kind is ready; try the other before giving up.
             want_full = !want_full;
             if !gathered_either {
@@ -614,7 +631,10 @@ fn drive_pool_worker(
         let real = ids.len();
         stats.batches += 1;
         stats.expansions += real as u64;
-        stats.padded += (max_batch.saturating_sub(real)) as u64;
+        // A wave of refinement requests only has no expansion rows to pad.
+        if real > 0 {
+            stats.padded += (max_batch.saturating_sub(real)) as u64;
+        }
         // One `k` for the whole wave keeps the tensor shape fixed — the
         // constraint that killed an earlier overlap scheme, which set TensorRT
         // rebuilding an engine per shape and cost 97% of throughput.
@@ -690,6 +710,33 @@ fn drive_pool_worker(
                 slots[i].search.provide_widen(cands_for[n].take().unwrap_or_default());
             } else {
                 slots[i].search.provide(values[n], Vec::new());
+            }
+        }
+        // Refinement: redraw part of each picked turn (`resample_batch_seq`).
+        // Padded to `width_for` like the widens, so it reuses their shapes, and
+        // the trunk comes from the slot's cache: a node that has earned a
+        // refine was expanded long before, and its trunk output kept.
+        if !rs_ids.is_empty() {
+            let n = rs_ids.len();
+            stats.req_resample += n as u64;
+            let w = width_for(n);
+            while rs_states.len() < w {
+                rs_states.push(rs_states[n - 1].clone());
+                rs_from.push(rs_from[n - 1]);
+            }
+            let rkeys: Vec<u128> = if use_cache {
+                rs_states.iter().map(<MinionsTurns as SampledGame>::state_key).collect()
+            } else {
+                Vec::new()
+            };
+            let ridx: Vec<usize> = (0..n).collect();
+            let cached = if use_cache { cache_lookup(&*slots, &rs_ids, &rkeys, &ridx) } else { Vec::new() };
+            stats.cache_hits += cached.iter().filter(|c| c.is_some()).count() as u64;
+            let got = model.resample_batch_seq(&rs_states, &rs_from, *next_seed, &cached, &width_for)?;
+            drop(cached);
+            *next_seed = next_seed.wrapping_add(1);
+            for (i, c) in rs_ids.into_iter().zip(got) {
+                slots[i].search.provide_resample(c);
             }
         }
         // The next kind is chosen from supply at the top of the loop.
@@ -837,6 +884,12 @@ pub struct PoolStats {
     /// entirely on filler.
     pub req_expand: u64,
     pub req_widen: u64,
+    /// Refinement requests (`Step::NeedResample`).
+    pub req_resample: u64,
+    /// Root children of full searches, and how many of them were stable -- the
+    /// ones the policy target is built over.
+    pub root_children: u64,
+    pub root_stable: u64,
     /// Head rows actually wanted, and head rows run. The gap is the padding
     /// waste in the most expensive phase.
     pub head_real: u64,
@@ -866,6 +919,9 @@ impl PoolStats {
         self.explore_nodes += o.explore_nodes;
         self.req_expand += o.req_expand;
         self.req_widen += o.req_widen;
+        self.req_resample += o.req_resample;
+        self.root_children += o.root_children;
+        self.root_stable += o.root_stable;
         self.head_real += o.head_real;
         self.head_run += o.head_run;
         self.cache_hits += o.cache_hits;
@@ -878,16 +934,17 @@ impl PoolStats {
     /// work was filler. `head` padding is the expensive kind: the diffusion and
     /// energy heads are the bulk of the loop.
     pub fn split_report(&self) -> String {
-        let reqs = (self.req_expand + self.req_widen).max(1);
+        let reqs = (self.req_expand + self.req_widen + self.req_resample).max(1);
         let head_waste = if self.head_run == 0 {
             0.0
         } else {
             100.0 * (1.0 - self.head_real as f64 / self.head_run as f64)
         };
         let mut s = format!(
-            "requests: {:.0}% value-only, {:.0}% candidate  |  head rows {} of {} run ({:.0}% padding)",
+            "requests: {:.0}% value-only, {:.0}% candidate, {:.0}% refine  |  head rows {} of {} run ({:.0}% padding)",
             100.0 * self.req_expand as f64 / reqs as f64,
             100.0 * self.req_widen as f64 / reqs as f64,
+            100.0 * self.req_resample as f64 / reqs as f64,
             self.head_real,
             self.head_run,
             head_waste
@@ -901,6 +958,13 @@ impl PoolStats {
                 looked,
                 self.cache_full,
                 self.cache_peak_bytes as f64 / (1u64 << 20) as f64
+            );
+        }
+        if self.root_children > 0 {
+            s += &format!(
+                "  |  targets over {:.1}% of root children (stable), {:.1} per full root",
+                100.0 * self.root_stable as f64 / self.root_children as f64,
+                self.root_children as f64 / (self.turns.max(1)) as f64,
             );
         }
         s
@@ -1041,9 +1105,6 @@ fn advance_turn(
         &mut slot.search,
         Search::new(slot.state.clone(), &SampledParams { simulations: 0, ..Default::default() }, 0),
     );
-    // Taken from the search itself, so the target can only ever subtract the
-    // floor this search actually ran with.
-    let ran_with = *finished.params();
     let result = finished.finish();
     if result.candidates.is_empty() {
         return false;
@@ -1052,13 +1113,20 @@ fn advance_turn(
     // recorded for its value and auxiliary targets.
     let mut policy: Vec<(TurnSpec, f32)> = Vec::new();
     if slot.full {
-        // Subtract the floor this search actually granted, not a default one:
-        // selection and pruning must agree exactly, or forced visits survive into
-        // the target as if they were search's own judgement.
-        let target = result.policy_target_with(&ran_with);
-        let scored = policy_record(
-            result.candidates.iter().map(|(spec, _)| *spec).zip(target.iter().copied()),
-        );
+        // Over the root's stable children only (`stable_target`): a candidate
+        // that arrived late -- refinement adds most of a root's -- and was never
+        // scored below a stable one has visits that say when it came, not what
+        // it is worth. The counts are the search's own: forced visits already
+        // out, and with the kernel on, regressed over neighbours as KR-PUCT
+        // searched with.
+        let stable = result.stable_target();
+        stats.root_children += result.candidates.len() as u64;
+        stats.root_stable += stable.len() as u64;
+        let scored = policy_record(stable.iter().map(|&(i, p)| (result.candidates[i].0, p)));
+        let mut target = vec![0.0f32; result.candidates.len()];
+        for &(i, p) in &stable {
+            target[i] = p;
+        }
         // Promotion rate: did forced exploration actually contribute anything the
         // policy learns from? The pruning has already subtracted the guaranteed
         // visits, so surviving here means the candidate earned organic visits on
@@ -1259,34 +1327,28 @@ fn write_chunk(dir: &Path, index: usize, examples: &[Example]) -> anyhow::Result
 /// Drop oldest chunks until the buffer fits. Bounded by **examples first**: the
 /// Hex run learned the hard way that a chunk-count bound silently collapses the
 /// window when games get shorter, spiking reuse and with it the value loss.
-/// The policy target as recorded: every child of the root, strongest first,
-/// zero targets included.
+/// The policy target as recorded: the root's stable children, strongest first,
+/// zero targets included, at most `TOP_K` of them.
 ///
-/// Nothing is filtered and nothing is renormalised. `policy_target_with` already
-/// normalises over all children, and keeping the zeros is the point: a child the
-/// search examined and declined is the negative the energy head most needs, and
-/// dropping it made `softmax f` train over a set the search never considered.
-/// Order matters to the learner, whose trajectory-balance step takes the first
-/// *k* slots, so the strongest children must come first.
+/// Zeros are kept because a child the search examined and declined is the
+/// negative the energy head most needs. Order matters to the learner, whose
+/// trajectory-balance step takes the first *k* slots, so the strongest children
+/// come first.
 ///
-/// More children than `TOP_K` cannot happen -- `run_loop` refuses a full-search
-/// candidate count above it, and widening never touches the root -- so overflow
-/// is a bug: an assertion in debug, and in release a one-time `WARNING` (which
-/// the cycle monitor catches) rather than an actor that dies mid-generation.
+/// Refinement routinely leaves more stable children than the record has slots:
+/// the weakest are dropped and the rest renormalised, so what is recorded is
+/// still a distribution over exactly the children recorded.
 fn policy_record(children: impl Iterator<Item = (TurnSpec, f32)>) -> Vec<(TurnSpec, f32)> {
     let mut v: Vec<(TurnSpec, f32)> = children.collect();
     v.sort_by(|a, b| b.1.total_cmp(&a.1));
     if v.len() > TOP_K {
-        debug_assert!(false, "{} root children exceed TOP_K = {}", v.len(), TOP_K);
-        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            eprintln!(
-                "WARNING: {} root children exceed TOP_K = {}; the weakest are not recorded",
-                v.len(),
-                TOP_K
-            );
-        }
         v.truncate(TOP_K);
+        let sum: f32 = v.iter().map(|c| c.1).sum();
+        if sum > 0.0 {
+            for c in v.iter_mut() {
+                c.1 /= sum;
+            }
+        }
     }
     v
 }

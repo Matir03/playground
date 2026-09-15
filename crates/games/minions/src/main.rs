@@ -185,6 +185,19 @@ enum Cmd {
         /// drawing until the node's draw budget is spent.
         #[arg(long, default_value_t = 3)]
         draw_retries: u32,
+        /// Refine every this many visits to a node (full and fast searches):
+        /// redraw part of the picked turn instead of descending. 0 = off.
+        #[arg(long, default_value_t = 0.0)]
+        resample_every: f32,
+        /// Deepest node that refines, root = 0. Default: every depth.
+        #[arg(long)]
+        resample_depth: Option<u32>,
+        /// Diffusion rounds a refinement redraws with.
+        #[arg(long, default_value_t = 2)]
+        resample_t: usize,
+        /// Most of a turn a refinement masks again (share uniform in [0, this]).
+        #[arg(long, default_value_t = 0.5)]
+        resample_frac: f32,
         /// Write `search.json` for these settings into `--live` and exit
         /// without playing. Every run writes it on start anyway; this records
         /// the search without starting self-play, for eval and the UI.
@@ -495,6 +508,10 @@ async fn main() -> anyhow::Result<()> {
             kernel_sigma,
             pw_chunk,
             draw_retries,
+            resample_every,
+            resample_depth,
+            resample_t,
+            resample_frac,
             write_search_config,
             chunk_secs,
             max_examples,
@@ -517,6 +534,8 @@ async fn main() -> anyhow::Result<()> {
                 kernel_sigma,
                 pw_chunk,
                 draw_retries,
+                resample_every,
+                resample_max_depth: resample_depth.unwrap_or(u32::MAX),
                 ..Default::default()
             };
             let sampler = minions_engine::sampler::SamplerConfig {
@@ -528,6 +547,8 @@ async fn main() -> anyhow::Result<()> {
                 k_draws_fast: draws_fast.unwrap_or(candidates_fast),
                 random_fraction,
                 use_energy: !no_energy,
+                resample_t,
+                resample_frac,
                 seed,
                 ..Default::default()
             };

@@ -921,7 +921,8 @@ impl SampledModel<MinionsTurns> for AsSearch<'_> {
         states: &[MinionsState],
         from: &[TurnSpec],
     ) -> anyhow::Result<Vec<Vec<(TurnSpec, f32, bool)>>> {
-        self.model.resample_batch_seq(states, from, self.next_seq())
+        self.model
+            .resample_batch_seq(states, from, self.next_seq(), &[], &|n| n)
     }
 }
 
@@ -1365,6 +1366,10 @@ impl MinionsModel {
         states: &[MinionsState],
         from: &[TurnSpec],
         batch_seq: u64,
+        // Trunk rows the caller already holds, and the trunk batch width for
+        // the rest -- as `expand_batch_cached` takes them.
+        cached: &[Option<(f32, &[f16])>],
+        trunk_rows: &dyn Fn(usize) -> usize,
     ) -> anyhow::Result<Vec<Vec<(TurnSpec, f32, bool)>>> {
         let real = states.len();
         anyhow::ensure!(from.len() == real, "resample_batch: one turn per state");
@@ -1374,7 +1379,7 @@ impl MinionsModel {
         // Trunk rows, padded and canonical, exactly as a value-only expansion
         // gets them.
         let (_, tr) =
-            self.expand_batch_cached(states, 0, true, batch_seq, &[], &|n| n, false, &[])?;
+            self.expand_batch_cached(states, 0, true, batch_seq, cached, trunk_rows, false, &[])?;
         let g = tr.h.len() / tr.stride;
         let src = |i: usize| i.min(real - 1);
         let flipped: Vec<bool> = (0..g).map(|i| states[src(i)].side == 1).collect();
@@ -1835,7 +1840,7 @@ mod tests {
             .map(|st| realize(st, &TurnSpec::random_playout(st, &mut rng)).spec)
             .collect();
         for seq in 0..4 {
-            let out = m.resample_batch_seq(&states, &from, seq).unwrap();
+            let out = m.resample_batch_seq(&states, &from, seq, &[], &|n| n).unwrap();
             assert_eq!(out.len(), states.len());
             for (st, cands) in states.iter().zip(&out) {
                 assert_eq!(cands.len(), 1, "one candidate per position");
