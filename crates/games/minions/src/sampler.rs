@@ -1424,11 +1424,13 @@ impl MinionsModel {
                 p.committed[ci] &= !f;
             }
             // The hexes the kept moves already claim, as `commit_round` would
-            // have recorded them.
+            // have recorded them. A realized turn can hold `NO_MOVE` for a
+            // unit that did not act; it claims nothing, as `write_planes`
+            // gives it no offset.
             let mut cl: Bb = 0;
             for c in bitboard::cells(cx.live.moves) {
                 let v = p.spec.moves[c as usize];
-                if p.is_committed(c, C_MOVE) && v != 0 {
+                if p.is_committed(c, C_MOVE) && v != 0 && (v as usize) < N_OFFSETS {
                     let d = MOVE_DEST[c as usize][v as usize];
                     if d != NO_CELL {
                         cl |= bit(d);
@@ -1803,6 +1805,49 @@ mod tests {
                 "{} should be affordable",
                 u.stats().name
             );
+        }
+    }
+
+    /// A resample of a realized turn -- which can hold `NO_MOVE` for a unit
+    /// that did not act -- returns one legal, scored candidate per position,
+    /// from either seat, whatever share it masks.
+    #[test]
+    fn resampling_realized_turns_is_legal() {
+        let Some(m) = model(SamplerConfig {
+            seed: 5,
+            ..Default::default()
+        }) else {
+            eprintln!("MINIONS_PARITY_DIR unset — skipping");
+            return;
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(5);
+        let mut states = Vec::new();
+        let mut s = Minions::initial_state();
+        for _ in 0..24 {
+            if Minions::outcome(&s).is_terminal() {
+                break;
+            }
+            states.push(s.clone());
+            s = realize(&s, &TurnSpec::random_playout(&s, &mut rng)).next;
+        }
+        let from: Vec<TurnSpec> = states
+            .iter()
+            .map(|st| realize(st, &TurnSpec::random_playout(st, &mut rng)).spec)
+            .collect();
+        for seq in 0..4 {
+            let out = m.resample_batch_seq(&states, &from, seq).unwrap();
+            assert_eq!(out.len(), states.len());
+            for (st, cands) in states.iter().zip(&out) {
+                assert_eq!(cands.len(), 1, "one candidate per position");
+                let (spec, energy, explore) = cands[0];
+                assert!(energy.is_finite() && !explore);
+                let r = realize(st, &spec);
+                let mut check = st.clone();
+                for mv in &r.actions {
+                    assert!(Minions::legal_moves(&check).contains(mv), "illegal {mv}");
+                    check = Minions::apply(&check, mv);
+                }
+            }
         }
     }
 
