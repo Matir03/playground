@@ -399,6 +399,13 @@ struct Entry<G: SampledGame> {
     eval: Option<f32>,
     /// Added by a resample ([`SampledParams::resample_every`]).
     resampled: bool,
+    /// Arrival order at this node, dense from 0: the kernel's index, which
+    /// survives `renormalise` re-sorting the entries.
+    id: u32,
+    /// Whether this entry's visits are fit to train on (see [`mark_stable`]):
+    /// set for the node's initial candidates, and for a later one once PUCT has
+    /// scored it below a stable one.
+    stable: bool,
 }
 
 impl<G: SampledGame> Entry<G> {
@@ -439,12 +446,14 @@ struct Node<G: SampledGame> {
     /// has asked for.
     resampled_at: u32,
     resample_count: u32,
-    /// Row-major `k x k` kernel matrix over `entries`, empty when the kernel is
-    /// disabled. Built once at expansion: the distances depend only on the
-    /// candidates and the state, neither of which changes afterwards, so paying
-    /// `O(k^2)` distance evaluations per *node* keeps selection down to a plain
-    /// `O(k^2)` weighted sum with no geometry in the inner loop.
+    /// Kernel over `entries`, as a packed lower triangle indexed by entry
+    /// `id` (see [`kern_at`]); empty when the kernel is disabled. Distances
+    /// depend only on the candidates and the state, so each entry's row is
+    /// computed once, when it arrives, and selection is a plain weighted sum
+    /// with no geometry in the inner loop.
     kern: Vec<f32>,
+    /// Entries (by id) `kern` has rows for.
+    kern_rows: usize,
     total_n: u32,
     w_sum: f32,
     visited_p: f32,
@@ -594,6 +603,13 @@ pub struct SampledSearchResult<G: SampledGame> {
     /// parallel to `candidates`. Counted as they happened rather than estimated,
     /// so the target knows exactly what forced exploration bought.
     pub forced: Vec<u32>,
+    /// Which candidates are stable (see [`mark_stable`]), parallel to
+    /// `candidates`: the ones whose visits are fit to train on.
+    pub stable: Vec<bool>,
+    /// The chosen visits the target is built from, parallel to `candidates`:
+    /// visits less forced ones, and with the kernel on, regressed over each
+    /// candidate's neighbours exactly as KR-PUCT's `n_hat` is.
+    pub target_counts: Vec<f32>,
     /// Index into `candidates` of the move to play.
     pub chosen: usize,
     /// Candidate-budget accounting over the whole tree, not just the root.
@@ -670,6 +686,30 @@ impl<G: SampledGame> SampledSearchResult<G> {
         counts.iter_mut().for_each(|c| *c /= sum);
         counts
     }
+
+    /// The training target over the root's *stable* children only, as
+    /// `(candidate index, probability)`: [`Self::target_counts`] normalised
+    /// over the stable set. Unstable children are left out entirely rather
+    /// than targeted at 0 -- a child that arrived late and was never scored
+    /// below a stable one has visits that say when it came, not what it is
+    /// worth. If no stable child earned a chosen visit, the most-visited
+    /// stable child takes the whole target, so a row is never all zeros.
+    pub fn stable_target(&self) -> Vec<(usize, f32)> {
+        let idx: Vec<usize> = (0..self.candidates.len())
+            .filter(|&i| self.stable.get(i).copied().unwrap_or(false))
+            .collect();
+        let sum: f32 = idx.iter().map(|&i| self.target_counts[i]).sum();
+        if sum > 0.0 {
+            return idx
+                .into_iter()
+                .map(|i| (i, self.target_counts[i] / sum))
+                .collect();
+        }
+        let best = idx.iter().copied().max_by_key(|&i| self.candidates[i].1);
+        idx.into_iter()
+            .map(|i| (i, if Some(i) == best { 1.0 } else { 0.0 }))
+            .collect()
+    }
 }
 
 fn new_node<G: SampledGame>(state: G::State) -> Node<G> {
@@ -685,6 +725,7 @@ fn new_node<G: SampledGame>(state: G::State) -> Node<G> {
         resample_count: 0,
         nn_value: None,
         kern: Vec::new(),
+        kern_rows: 0,
         total_n: 0,
         w_sum: 0.0,
         visited_p: 0.0,
@@ -758,6 +799,55 @@ fn quota_budget(params: &SampledParams) -> u32 {
     (params.simulations / 2).max(params.forced_visits)
 }
 
+/// Kernel value between the entries with ids `a` and `b`, from a node's packed
+/// lower triangle ([`Node::kern`]).
+#[inline]
+fn kern_at(kern: &[f32], a: u32, b: u32) -> f32 {
+    let (i, j) = if a >= b {
+        (a as usize, b as usize)
+    } else {
+        (b as usize, a as usize)
+    };
+    kern[i * (i + 1) / 2 + j]
+}
+
+/// `node`'s kernel as a dense row-major matrix in entry order, for export;
+/// empty when the kernel is off.
+fn full_kernel<G: SampledGame>(node: &Node<G>) -> Vec<f32> {
+    let m = node.entries.len();
+    if m == 0 || node.kern_rows != m {
+        return Vec::new();
+    }
+    let mut out = vec![0.0f32; m * m];
+    for (i, a) in node.entries.iter().enumerate() {
+        for (j, b) in node.entries.iter().enumerate() {
+            out[i * m + j] = kern_at(&node.kern, a.id, b.id);
+        }
+    }
+    out
+}
+
+/// The stability rule for training targets. A candidate that joined the node
+/// late (a resample, a later widen) has had less chance to collect visits than
+/// the initial set, so its count is not yet comparable. It becomes stable the
+/// first time PUCT scores it *below* some stable candidate: search has by then
+/// visited it up to what it thinks of it, and its count means what the others'
+/// do. `scores` are this selection's, parallel to the visible prefix.
+fn mark_stable<G: SampledGame>(node: &mut Node<G>, scores: &[f32]) {
+    let top = node
+        .entries
+        .iter()
+        .zip(scores)
+        .filter(|(e, _)| e.stable)
+        .map(|(_, &s)| s)
+        .fold(f32::NEG_INFINITY, f32::max);
+    for (e, &s) in node.entries.iter_mut().zip(scores) {
+        if !e.stable && s < top {
+            e.stable = true;
+        }
+    }
+}
+
 /// Visits from a node's `j`-th refine (counting from zero, the first measured
 /// from no visits) to its next: consecutive differences of `floor(i * every)`,
 /// so a fractional interval alternates whole gaps averaging `every`, and a
@@ -813,7 +903,11 @@ fn draw_target(params: &SampledParams, n: usize) -> u32 {
 /// Select a child by PUCT, with root-only forced playouts.
 /// Returns `(index, forced)` — `forced` when a floor demanded this visit
 /// rather than PUCT choosing it, so the target can subtract exactly those.
-fn select<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool) -> (usize, bool) {
+fn select<G: SampledGame>(
+    node: &mut Node<G>,
+    params: &SampledParams,
+    is_root: bool,
+) -> (usize, bool) {
     let n = visible(node, params, is_root);
     debug_assert!(n > 0);
 
@@ -863,23 +957,25 @@ fn select<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool)
     // candidate, including ones not yet selectable — a hidden neighbour's visits
     // are perfectly good evidence about a visible candidate.
     let m = node.entries.len();
-    if params.kernel_sigma > 0.0 && node.kern.len() == m * m {
+    if params.kernel_sigma > 0.0 && node.kern_rows == m {
         let mut n_hat = vec![0.0f32; n];
         let mut nq_hat = vec![0.0f32; n];
         let mut w_hat = vec![0.0f32; n];
         for i in 0..n {
-            let row = &node.kern[i * m..(i + 1) * m];
-            for (j, e) in node.entries.iter().enumerate() {
+            let id = node.entries[i].id;
+            for e in node.entries.iter() {
+                let k = kern_at(&node.kern, id, e.id);
                 // Two different visit counts on purpose: `n_hat` drives the
                 // exploration term and so excludes forced visits, while
                 // `q_hat`'s denominator is the full count that `w` was
                 // accumulated over.
-                n_hat[i] += row[j] * e.n_eff() as f32;
-                nq_hat[i] += row[j] * e.n as f32;
-                w_hat[i] += row[j] * e.w;
+                n_hat[i] += k * e.n_eff() as f32;
+                nq_hat[i] += k * e.n as f32;
+                w_hat[i] += k * e.w;
             }
         }
         let sqrt_total: f32 = n_hat.iter().sum::<f32>().max(1.0).sqrt();
+        let mut scores = Vec::with_capacity(n);
         let mut best = 0usize;
         let mut best_score = f32::NEG_INFINITY;
         for i in 0..n {
@@ -893,11 +989,13 @@ fn select<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool)
             };
             let u = params.c_puct * node.entries[i].p * sqrt_total / (1.0 + n_hat[i]);
             let s = q + u;
+            scores.push(s);
             if s > best_score {
                 best_score = s;
                 best = i;
             }
         }
+        mark_stable(node, &scores);
         return (best, false);
     }
 
@@ -907,6 +1005,7 @@ fn select<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool)
     // should say so.
     let eff_total: u32 = node.entries.iter().map(|e| e.n_eff()).sum();
     let sqrt_total = (eff_total as f32).max(1.0).sqrt();
+    let mut scores = Vec::with_capacity(n);
     let mut best = 0usize;
     let mut best_score = f32::NEG_INFINITY;
     for (i, e) in node.entries.iter().enumerate().take(n) {
@@ -917,11 +1016,13 @@ fn select<G: SampledGame>(node: &Node<G>, params: &SampledParams, is_root: bool)
         let q = if e.n > 0 { e.w / e.n as f32 } else { fpu };
         let u = params.c_puct * e.p * sqrt_total / (1.0 + e.n_eff() as f32);
         let s = q + u;
+        scores.push(s);
         if s > best_score {
             best_score = s;
             best = i;
         }
     }
+    mark_stable(node, &scores);
     (best, false)
 }
 
@@ -1070,7 +1171,7 @@ impl<G: SampledGame> Search<G> {
                             manual: e.manual,
                         })
                         .collect(),
-                    kernel: node.kern.clone(),
+                    kernel: full_kernel(node),
                 }
             })
             .collect()
@@ -1213,6 +1314,8 @@ impl<G: SampledGame> Search<G> {
         if let Some(i) = find(&self.tree[node].entries) {
             return Ok((i, false));
         }
+        let id = self.tree[node].entries.len() as u32;
+        let stable = self.tree[node].total_n == 0;
         self.tree[node].entries.push(Entry {
             mv,
             energy,
@@ -1227,6 +1330,8 @@ impl<G: SampledGame> Search<G> {
             manual: true,
             eval,
             resampled: false,
+            id,
+            stable,
         });
         renormalise(&mut self.tree[node].entries);
         // Every prior moved, so the visited mass FPU reads must be re-summed.
@@ -1407,7 +1512,7 @@ impl<G: SampledGame> Search<G> {
                             // on value alone.
                             break 0.0;
                         }
-                        let (pick, forced) = select(&self.tree[cur], &self.params, cur == 0);
+                        let (pick, forced) = select(&mut self.tree[cur], &self.params, cur == 0);
                         // Every `resample_every` visits, refine instead of
                         // descending: redraw part of the picked turn and visit
                         // the result. Not on a forced visit, which exists to
@@ -1502,6 +1607,9 @@ impl<G: SampledGame> Search<G> {
                         manual: false,
                         eval: None,
                         resampled: false,
+                        // Numbered below, once the set is final.
+                        id: 0,
+                        stable: true,
                     });
                 }
             }
@@ -1520,6 +1628,9 @@ impl<G: SampledGame> Search<G> {
         // the random extras -- the draw would no longer be uniform over the set
         // it was specified against, and re-drawing would revoke quotas already
         // being paid.
+        for (i, e) in entries.iter_mut().enumerate() {
+            e.id = i as u32;
+        }
         assign_forced_quotas(&mut entries, &self.params, &mut self.rng);
         self.tree[cur].entries = entries;
         self.tree[cur].expanded = true;
@@ -1609,6 +1720,10 @@ impl<G: SampledGame> Search<G> {
                 None => {
                     seen.insert(key, self.tree[cur].entries.len());
                     added.push(key);
+                    let id = self.tree[cur].entries.len() as u32;
+                    // Initial candidates are the ones the node holds before
+                    // its first visit; the root draws its whole set then.
+                    let stable = self.tree[cur].total_n == 0;
                     self.tree[cur].entries.push(Entry {
                         mv,
                         energy: p,
@@ -1623,6 +1738,8 @@ impl<G: SampledGame> Search<G> {
                         manual: false,
                         eval: None,
                         resampled: false,
+                        id,
+                        stable,
                     });
                 }
             }
@@ -1700,6 +1817,7 @@ impl<G: SampledGame> Search<G> {
             target = key_of(&mv);
             let entries = &mut self.tree[cur].entries;
             if !entries.iter().any(|e| key_of(&e.mv) == target) {
+                let id = entries.len() as u32;
                 entries.push(Entry {
                     mv,
                     energy,
@@ -1714,6 +1832,8 @@ impl<G: SampledGame> Search<G> {
                     manual: false,
                     eval: None,
                     resampled: true,
+                    id,
+                    stable: false,
                 });
                 renormalise(entries);
                 self.build_kernel(cur);
@@ -1726,30 +1846,41 @@ impl<G: SampledGame> Search<G> {
             .map(|i| (cur, i));
     }
 
-    /// Precompute the node's kernel matrix. A no-op when the kernel is off, so
-    /// the disabled path allocates nothing and costs nothing.
+    /// Extend the node's kernel with rows for the entries added since it was
+    /// last built. A no-op when the kernel is off, so the disabled path
+    /// allocates nothing and costs nothing.
+    ///
+    /// Rows are indexed by entry id, not position -- `renormalise` re-sorts the
+    /// entries whenever the set grows -- so a new candidate costs one row of
+    /// distances instead of the whole matrix again. At a root that refines
+    /// every couple of visits that is ~200 rows against ~1M distance
+    /// evaluations per search.
     fn build_kernel(&mut self, node: usize) {
         let sigma = self.params.kernel_sigma;
         if sigma <= 0.0 {
             return;
         }
-        let n = self.tree[node].entries.len();
-        let mut kern = vec![0.0f32; n * n];
+        let m = self.tree[node].entries.len();
+        if self.tree[node].kern_rows >= m {
+            return;
+        }
+        let mut by_id = vec![usize::MAX; m];
+        for (i, e) in self.tree[node].entries.iter().enumerate() {
+            by_id[e.id as usize] = i;
+        }
         let denom = 2.0 * sigma * sigma;
-        for i in 0..n {
-            kern[i * n + i] = 1.0;
-            for j in (i + 1)..n {
-                let d = G::move_distance(
-                    &self.tree[node].state,
-                    &self.tree[node].entries[i].mv,
-                    &self.tree[node].entries[j].mv,
-                );
-                let k = (-(d * d) / denom).exp();
-                kern[i * n + j] = k;
-                kern[j * n + i] = k;
+        let mut kern = std::mem::take(&mut self.tree[node].kern);
+        let nd = &self.tree[node];
+        for r in nd.kern_rows..m {
+            let a = &nd.entries[by_id[r]].mv;
+            for &s in &by_id[..r] {
+                let d = G::move_distance(&nd.state, a, &nd.entries[s].mv);
+                kern.push((-(d * d) / denom).exp());
             }
+            kern.push(1.0);
         }
         self.tree[node].kern = kern;
+        self.tree[node].kern_rows = m;
     }
 
     pub fn finish(self) -> SampledSearchResult<G> {
@@ -1774,6 +1905,23 @@ impl<G: SampledGame> Search<G> {
         let priors: Vec<f32> = root.entries.iter().map(|e| e.p).collect();
         let explore: Vec<bool> = root.entries.iter().map(|e| e.explore).collect();
         let forced: Vec<u32> = root.entries.iter().map(|e| e.forced_n).collect();
+        let stable: Vec<bool> = root.entries.iter().map(|e| e.stable).collect();
+        let chosen_n: Vec<f32> = root.entries.iter().map(|e| e.n_eff() as f32).collect();
+        let target_counts: Vec<f32> =
+            if self.params.kernel_sigma > 0.0 && root.kern_rows == root.entries.len() {
+                root.entries
+                    .iter()
+                    .map(|a| {
+                        root.entries
+                            .iter()
+                            .zip(&chosen_n)
+                            .map(|(b, &c)| kern_at(&root.kern, a.id, b.id) * c)
+                            .sum()
+                    })
+                    .collect()
+            } else {
+                chosen_n
+            };
         let value = self.root_value();
         let chosen = self.pick(&mut self.rng.clone());
         stats.chosen_resampled = root.entries.get(chosen).map_or(0, |e| e.resampled as u64);
@@ -1782,6 +1930,8 @@ impl<G: SampledGame> Search<G> {
             priors,
             explore,
             forced,
+            stable,
+            target_counts,
             chosen,
             value,
             nodes: self.nodes,
@@ -2374,6 +2524,104 @@ mod tests {
         );
     }
 
+    /// The kernel is built a row at a time as candidates arrive (resamples
+    /// here) and indexed by arrival id, while `renormalise` keeps re-sorting
+    /// the entries. Read back in entry order it must still be the kernel of
+    /// the entries' own moves.
+    #[test]
+    fn incremental_kernel_matches_the_full_matrix() {
+        let params = SampledParams {
+            simulations: 60,
+            k_candidates: 3,
+            k_draws: 1,
+            pw_chunk: 1,
+            fills: false,
+            resample_every: 2.0,
+            kernel_sigma: 0.8,
+            k_forced: 0.0,
+            min_explore_visits: 0.0,
+            forced_visits: 0,
+            temp_moves: 0,
+            seed: 7,
+            ..Default::default()
+        };
+        let mut search = Search::<Count>::new(CountState { n: 21, side: 1 }, &params, 0);
+        drive(&Refiner, &mut search).unwrap();
+        let mut checked = 0;
+        for node in search.tree.iter().filter(|n| n.entries.len() > 1) {
+            let m = node.entries.len();
+            let got = full_kernel(node);
+            assert_eq!(got.len(), m * m);
+            for (i, a) in node.entries.iter().enumerate() {
+                for (j, b) in node.entries.iter().enumerate() {
+                    // The diagonal is 1 by construction, whatever the metric
+                    // says of a move and itself (Count's default says 1).
+                    let d = Count::move_distance(&node.state, &a.mv, &b.mv);
+                    let want = if i == j {
+                        1.0
+                    } else {
+                        (-(d * d) / (2.0 * 0.8 * 0.8)).exp()
+                    };
+                    assert!((got[i * m + j] - want).abs() < 1e-6, "entry {i},{j}");
+                }
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "some node grew past one candidate");
+    }
+
+    /// A late candidate turns stable once PUCT scores it below a stable one,
+    /// and not before.
+    #[test]
+    fn a_late_candidate_turns_stable_when_scored_below_a_stable_one() {
+        let mk = |mv: u32, stable: bool| Entry::<Count> {
+            mv,
+            energy: 0.0,
+            p: 1.0 / 3.0,
+            n: 0,
+            w: 0.0,
+            child: -1,
+            explore: false,
+            forced_n: 0,
+            forced_quota: 0,
+            draws: 1,
+            manual: false,
+            eval: None,
+            resampled: !stable,
+            id: mv - 1,
+            stable,
+        };
+        let mut node = new_node::<Count>(CountState { n: 21, side: 1 });
+        node.entries = vec![mk(1, true), mk(2, false), mk(3, false)];
+        mark_stable(&mut node, &[1.0, 0.5, 2.0]);
+        let stable: Vec<bool> = node.entries.iter().map(|e| e.stable).collect();
+        assert_eq!(stable, vec![true, true, false]);
+    }
+
+    /// The stable target normalises over stable children and leaves the
+    /// others out entirely.
+    #[test]
+    fn the_stable_target_covers_stable_children_only() {
+        let r = SampledSearchResult::<Count> {
+            candidates: vec![(1, 30), (2, 50), (3, 20)],
+            priors: vec![0.4, 0.3, 0.3],
+            explore: vec![false; 3],
+            forced: vec![0; 3],
+            stats: SearchStats::default(),
+            stable: vec![true, false, true],
+            target_counts: vec![30.0, 50.0, 10.0],
+            chosen: 1,
+            value: 0.0,
+            nodes: 0,
+        };
+        let t = r.stable_target();
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0].0, 0);
+        assert!((t[0].1 - 0.75).abs() < 1e-6, "{t:?}");
+        assert_eq!(t[1].0, 2);
+        assert!((t[1].1 - 0.25).abs() < 1e-6, "{t:?}");
+    }
+
     /// A whole interval refines exactly that often; a fraction alternates
     /// whole gaps that average it.
     #[test]
@@ -2964,6 +3212,8 @@ mod tests {
                 manual: false,
                 eval: None,
                 resampled: false,
+                id: 0,
+                stable: true,
             })
             .collect();
 
@@ -3028,6 +3278,8 @@ mod tests {
                     manual: false,
                     eval: None,
                     resampled: false,
+                    id: 0,
+                    stable: true,
                 })
                 .collect();
             let mut prev = 0usize;
@@ -3552,6 +3804,8 @@ mod tests {
         let r = SampledSearchResult::<Count> {
             forced: vec![1, 1, 4],
             stats: SearchStats::default(),
+            stable: Vec::new(),
+            target_counts: Vec::new(),
             candidates: vec![(1, 40), (2, 20), (3, 4)],
             priors: vec![0.5, 0.4, 0.1],
             explore: vec![false, false, true],
@@ -3574,6 +3828,8 @@ mod tests {
         let r2 = SampledSearchResult::<Count> {
             forced: vec![1, 1, 4],
             stats: SearchStats::default(),
+            stable: Vec::new(),
+            target_counts: Vec::new(),
             candidates: vec![(1, 40), (2, 20), (3, 25)],
             priors: vec![0.5, 0.4, 0.1],
             explore: vec![false, false, true],
@@ -3697,6 +3953,8 @@ mod tests {
         let r = SampledSearchResult::<Count> {
             forced: vec![1, 3, 4],
             stats: SearchStats::default(),
+            stable: Vec::new(),
+            target_counts: Vec::new(),
             candidates: vec![(1, 93), (2, 3), (3, 4)],
             priors: vec![0.9, 0.05, 0.05],
             explore: vec![false; 8],
@@ -3722,6 +3980,8 @@ mod tests {
         let r = SampledSearchResult::<Count> {
             forced: vec![30, 0],
             stats: SearchStats::default(),
+            stable: Vec::new(),
+            target_counts: Vec::new(),
             candidates: vec![(1, 60), (2, 60)],
             priors: vec![0.5, 0.5],
             explore: vec![true, false],
@@ -3742,6 +4002,8 @@ mod tests {
             let r = SampledSearchResult::<Count> {
                 forced: vec![forced; k],
                 stats: SearchStats::default(),
+                stable: Vec::new(),
+                target_counts: Vec::new(),
                 candidates: (0..k).map(|i| (i as u32, visits)).collect(),
                 priors: vec![1.0 / k as f32; k],
                 explore: vec![false; k],
@@ -3883,6 +4145,8 @@ mod tests {
         let r = SampledSearchResult::<Count> {
             forced: vec![],
             stats: SearchStats::default(),
+            stable: Vec::new(),
+            target_counts: Vec::new(),
             candidates: vec![(1, 1), (2, 1)],
             priors: vec![0.5, 0.5],
             explore: vec![false; 8],
@@ -3955,6 +4219,8 @@ mod forced_quota_tests {
             manual: false,
             eval: None,
             resampled: false,
+            id: 0,
+            stable: true,
         }
     }
 
@@ -4051,6 +4317,8 @@ mod forced_quota_tests {
             value: 0.0,
             nodes: 0,
             stats: SearchStats::default(),
+            stable: Vec::new(),
+            target_counts: Vec::new(),
         };
         let t = r.policy_target_with(&SampledParams::default());
         assert_eq!(
@@ -4074,6 +4342,8 @@ mod forced_quota_tests {
             value: 0.0,
             nodes: 0,
             stats: SearchStats::default(),
+            stable: Vec::new(),
+            target_counts: Vec::new(),
         };
         let t = r.policy_target_with(&SampledParams::default());
         assert!((t[0] - 0.8).abs() < 1e-6, "{t:?}");
