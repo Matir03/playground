@@ -108,6 +108,10 @@ pub enum Step<G: SampledGame> {
     /// ([`SampledParams::k_draws`]) and is still short: the request is for
     /// exploration candidates to make up the shortfall, not another proposal.
     NeedWiden { state: G::State, fill: bool },
+    /// This visit refines rather than descends: answer with
+    /// [`SampledModel::resample_batch`] on `from` and feed the result to
+    /// [`Search::provide_resample`]. See [`SampledParams::resample_every`].
+    NeedResample { state: G::State, from: G::Move },
     /// The search reached an unexpanded node and needs its value and candidates.
     /// Feed them back with [`Search::provide`].
     NeedExpansion(G::State),
@@ -184,6 +188,18 @@ pub trait SampledModel<G: SampledGame>: Send + Sync {
             })
             .collect()
     }
+
+    /// A candidate near each `from[i]` at `states[i]`: part of the turn kept,
+    /// the rest redrawn. The default has no way to do that and returns
+    /// nothing, and the visit then descends into `from` as it would have.
+    fn resample_batch(
+        &self,
+        states: &[G::State],
+        from: &[G::Move],
+    ) -> anyhow::Result<Vec<Vec<(G::Move, f32, bool)>>> {
+        let _ = from;
+        Ok(states.iter().map(|_| Vec::new()).collect())
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -216,6 +232,11 @@ pub struct SampledParams {
     /// once its draws are spent. Off, the node keeps only what its sampler
     /// draws brought and stops widening there.
     pub fills: bool,
+    /// Every this many visits to a node, a visit refines instead of
+    /// descending: it takes the candidate selection picked, asks the model to
+    /// redraw part of it ([`SampledModel::resample_batch`]), adds what comes
+    /// back and visits that. 0 = off.
+    pub resample_every: u32,
     /// KataGo forced-playout constant; 0 disables forced playouts.
     pub k_forced: f32,
     /// Visits guaranteed to every *explore*-origin root candidate, regardless of
@@ -297,6 +318,7 @@ impl Default for SampledParams {
             k_draws: 32,
             draw_retries: 3,
             fills: true,
+            resample_every: 0,
             k_forced: 2.0,
             min_explore_visits: 2.0,
             forced_visits: 30,
@@ -371,6 +393,8 @@ struct Entry<G: SampledGame> {
     /// hand-added candidate has one: the search learns a child's value by
     /// expanding it, but a reader adding a turn wants to see it at once.
     eval: Option<f32>,
+    /// Added by a resample ([`SampledParams::resample_every`]).
+    resampled: bool,
 }
 
 impl<G: SampledGame> Entry<G> {
@@ -407,6 +431,8 @@ struct Node<G: SampledGame> {
     /// before a position runs out of turns, so one miss is not the signal to
     /// stop; this many, against the node's candidate target, is.
     fill_misses: u32,
+    /// `total_n` when this node last asked for a resample.
+    resampled_at: u32,
     /// Row-major `k x k` kernel matrix over `entries`, empty when the kernel is
     /// disabled. Built once at expansion: the distances depend only on the
     /// candidates and the state, neither of which changes afterwards, so paying
@@ -496,6 +522,14 @@ pub struct SearchStats {
     /// Expanded nodes bucketed by total visits:
     /// `1, 2, 3-4, 5-8, 9-16, 17-32, 33-64, 65+`.
     pub visit_hist: [u32; 8],
+    /// Searches counted here.
+    pub searches: u64,
+    /// Resample requests (see [`SampledParams::resample_every`]), and the new
+    /// candidates they added.
+    pub resamples: u64,
+    pub resample_new: u64,
+    /// Searches whose played move was a candidate a resample added.
+    pub chosen_resampled: u64,
 }
 
 impl SearchStats {
@@ -518,6 +552,10 @@ impl SearchStats {
         self.nodes += other.nodes;
         self.candidates += other.candidates;
         self.unvisited += other.unvisited;
+        self.searches += other.searches;
+        self.resamples += other.resamples;
+        self.resample_new += other.resample_new;
+        self.chosen_resampled += other.chosen_resampled;
         for (a, b) in self.visit_hist.iter_mut().zip(other.visit_hist.iter()) {
             *a += b;
         }
@@ -635,6 +673,7 @@ fn new_node<G: SampledGame>(state: G::State) -> Node<G> {
         draws: 0,
         draw_misses: 0,
         fill_misses: 0,
+        resampled_at: 0,
         nn_value: None,
         kern: Vec::new(),
         total_n: 0,
@@ -895,6 +934,10 @@ pub struct Search<G: SampledGame> {
     /// `(node, entry)`: the candidate a widen just added to an interior node,
     /// which the resumed descent visits next.
     visit_new: Option<(usize, usize)>,
+    /// `(node, entry)` a pending `NeedResample` started from.
+    pending_resample: Option<(usize, usize)>,
+    /// Resample requests made, for [`SearchStats::resamples`].
+    resamples: u64,
     /// Entry indices, root first, the next simulation must descend through
     /// before PUCT takes over: a visit forced by hand (`force_line`).
     forced_line: std::collections::VecDeque<usize>,
@@ -1161,6 +1204,7 @@ impl<G: SampledGame> Search<G> {
             draws: 0,
             manual: true,
             eval,
+            resampled: false,
         });
         renormalise(&mut self.tree[node].entries);
         // Every prior moved, so the visited mass FPU reads must be re-summed.
@@ -1258,6 +1302,8 @@ impl<G: SampledGame> Search<G> {
             pending_widen: None,
             resume_at: None,
             visit_new: None,
+            pending_resample: None,
+            resamples: 0,
             forced_line: Default::default(),
         }
     }
@@ -1338,7 +1384,25 @@ impl<G: SampledGame> Search<G> {
                             // on value alone.
                             break 0.0;
                         }
-                        select(&self.tree[cur], &self.params, cur == 0)
+                        let (pick, forced) = select(&self.tree[cur], &self.params, cur == 0);
+                        // Every `resample_every` visits, refine instead of
+                        // descending: redraw part of the picked turn and visit
+                        // the result. Not on a forced visit, which exists to
+                        // measure the candidate it was given.
+                        let every = self.params.resample_every;
+                        let node = &self.tree[cur];
+                        if every > 0 && !forced && node.total_n >= node.resampled_at + every {
+                            let from = node.entries[pick].mv.clone();
+                            let state = node.state.clone();
+                            self.tree[cur].resampled_at = self.tree[cur].total_n;
+                            self.pending_resample = Some((cur, pick));
+                            self.resamples += 1;
+                            // As for a widen: `path` holds only ancestors'
+                            // edges, so `provide_resample` may re-sort `cur`.
+                            self.resume_at = Some(cur);
+                            return Step::NeedResample { state, from };
+                        }
+                        (pick, forced)
                     }
                 };
                 // Tallied in `backup`, with the visit itself, so a quota is
@@ -1402,6 +1466,7 @@ impl<G: SampledGame> Search<G> {
                         draws: 1,
                         manual: false,
                         eval: None,
+                        resampled: false,
                     });
                 }
             }
@@ -1522,6 +1587,7 @@ impl<G: SampledGame> Search<G> {
                         draws: draw,
                         manual: false,
                         eval: None,
+                        resampled: false,
                     });
                 }
             }
@@ -1580,6 +1646,51 @@ impl<G: SampledGame> Search<G> {
         self.build_kernel(cur);
     }
 
+    /// Add what a resample brought and send the paused visit to it.
+    ///
+    /// Merged like a widen: a resample that lands on a position the node
+    /// already holds visits that candidate instead, and one that brought
+    /// nothing visits the candidate it started from -- the descent it
+    /// replaced. Not capped by `k_candidates`: the point is to grow the set
+    /// around the turns the search is spending its visits on.
+    pub fn provide_resample(&mut self, candidates: Vec<(G::Move, f32, bool)>) {
+        let (cur, from) = self
+            .pending_resample
+            .take()
+            .expect("provide_resample without a pending resample");
+        let state = self.tree[cur].state.clone();
+        let key_of = |mv: &G::Move| G::state_key(&G::apply(&state, mv));
+        let mut target = key_of(&self.tree[cur].entries[from].mv);
+        if let Some((mv, energy, explore)) = candidates.into_iter().next() {
+            target = key_of(&mv);
+            let entries = &mut self.tree[cur].entries;
+            if !entries.iter().any(|e| key_of(&e.mv) == target) {
+                entries.push(Entry {
+                    mv,
+                    energy,
+                    p: 0.0,
+                    n: 0,
+                    w: 0.0,
+                    child: -1,
+                    explore,
+                    forced_n: 0,
+                    forced_quota: 0,
+                    draws: 1,
+                    manual: false,
+                    eval: None,
+                    resampled: true,
+                });
+                renormalise(entries);
+                self.build_kernel(cur);
+            }
+        }
+        self.visit_new = self.tree[cur]
+            .entries
+            .iter()
+            .position(|e| key_of(&e.mv) == target)
+            .map(|i| (cur, i));
+    }
+
     /// Precompute the node's kernel matrix. A no-op when the kernel is off, so
     /// the disabled path allocates nothing and costs nothing.
     fn build_kernel(&mut self, node: usize) {
@@ -1616,7 +1727,10 @@ impl<G: SampledGame> Search<G> {
             stats.candidates += node.entries.len() as u64;
             stats.unvisited += node.entries.iter().filter(|e| e.n == 0).count() as u64;
             stats.visit_hist[SearchStats::bucket(node.total_n)] += 1;
+            stats.resample_new += node.entries.iter().filter(|e| e.resampled).count() as u64;
         }
+        stats.searches = 1;
+        stats.resamples = self.resamples;
 
         let root = &self.tree[0];
         let candidates: Vec<(G::Move, u32)> =
@@ -1626,6 +1740,7 @@ impl<G: SampledGame> Search<G> {
         let forced: Vec<u32> = root.entries.iter().map(|e| e.forced_n).collect();
         let value = self.root_value();
         let chosen = self.pick(&mut self.rng.clone());
+        stats.chosen_resampled = root.entries.get(chosen).map_or(0, |e| e.resampled as u64);
         SampledSearchResult {
             candidates,
             priors,
@@ -1698,6 +1813,13 @@ pub fn drive<G: SampledGame, M: SampledModel<G>>(
                     .unwrap_or_default();
                 s.provide_widen(cands);
             }
+            Step::NeedResample { state, from } => {
+                let cands = model
+                    .resample_batch(std::slice::from_ref(&state), std::slice::from_ref(&from))?
+                    .pop()
+                    .unwrap_or_default();
+                s.provide_resample(cands);
+            }
             Step::Done => return Ok(()),
         }
     }
@@ -1745,6 +1867,7 @@ pub fn search_lockstep<G: SampledGame, M: SampledModel<G>>(
         let mut widen: Vec<bool> = Vec::with_capacity(searches.len());
         let mut fills: Vec<bool> = Vec::new();
         let mut states: Vec<G::State> = Vec::with_capacity(searches.len());
+        let mut resample: Vec<(usize, G::State, G::Move)> = Vec::new();
         for (i, s) in searches.iter_mut().enumerate() {
             if done[i] {
                 continue;
@@ -1761,11 +1884,26 @@ pub fn search_lockstep<G: SampledGame, M: SampledModel<G>>(
                     fills.push(fill);
                     states.push(state);
                 }
+                Step::NeedResample { state, from } => resample.push((i, state, from)),
                 Step::Done => done[i] = true,
             }
         }
-        if want.is_empty() {
+        if want.is_empty() && resample.is_empty() {
             break;
+        }
+        if !resample.is_empty() {
+            let (ids, (rs, rf)): (Vec<usize>, (Vec<G::State>, Vec<G::Move>)) =
+                resample.into_iter().map(|(i, s, m)| (i, (s, m))).unzip();
+            let res = model.resample_batch(&rs, &rf)?;
+            anyhow::ensure!(
+                res.len() == ids.len(),
+                "resample_batch returned {} results for {} states",
+                res.len(),
+                ids.len()
+            );
+            for (i, cands) in ids.into_iter().zip(res) {
+                searches[i].provide_resample(cands);
+            }
         }
         // Split by need: expansions want a value (`k = 0`, trunk only), widens
         // want a candidate. Only widens pay for the generative heads.
@@ -2020,6 +2158,7 @@ mod tests {
                         }
                         search.provide_widen(widen(&model, &state, fill, chunk_k(&params)));
                     }
+                    Step::NeedResample { .. } => unreachable!("resampling is off"),
                     Step::Done => break,
                 }
             }
@@ -2071,6 +2210,7 @@ mod tests {
                     assert!(!fill, "a fill was requested with fills off");
                     search.provide_widen(widen(&model, &state, fill, chunk_k(&params)));
                 }
+                Step::NeedResample { .. } => unreachable!("resampling is off"),
                 Step::Done => break,
             }
         }
@@ -2099,6 +2239,102 @@ mod tests {
         assert_eq!(
             search.tree[0].entries[pick].mv, 1,
             "the highest-energy child"
+        );
+    }
+
+    /// Proposes move 1 only; a resample of move `m` answers `m % 3 + 1`.
+    struct Refiner;
+    impl SampledModel<Count> for Refiner {
+        fn expand(&self, _s: &CountState, k: usize) -> anyhow::Result<Expansion<Count>> {
+            Ok((
+                0.0,
+                if k == 0 {
+                    Vec::new()
+                } else {
+                    vec![(1, 0.0, false)]
+                },
+            ))
+        }
+        fn resample_batch(
+            &self,
+            states: &[CountState],
+            from: &[u32],
+        ) -> anyhow::Result<Vec<Vec<(u32, f32, bool)>>> {
+            Ok(states
+                .iter()
+                .zip(from)
+                .map(|(s, &m)| {
+                    let r = m % 3 + 1;
+                    if r <= s.n {
+                        vec![(r, 0.0, false)]
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect())
+        }
+    }
+
+    /// Every `resample_every` visits a node refines instead of descending: the
+    /// resampled turn joins the node and takes that visit.
+    #[test]
+    fn resampling_adds_and_visits_a_neighbour() {
+        let params = SampledParams {
+            simulations: 40,
+            k_candidates: 3,
+            k_draws: 1,
+            pw_chunk: 1,
+            fills: false,
+            resample_every: 10,
+            k_forced: 0.0,
+            min_explore_visits: 0.0,
+            forced_visits: 0,
+            temp_moves: 0,
+            seed: 4,
+            ..Default::default()
+        };
+        let mut search = Search::<Count>::new(CountState { n: 21, side: 1 }, &params, 0);
+        let mut at_root = Vec::new();
+        loop {
+            match search.step() {
+                Step::NeedExpansion(st) => {
+                    let (v, c) = Refiner.expand(&st, expansion_k(&params)).unwrap();
+                    search.provide(v, c);
+                }
+                Step::NeedWiden { state, fill } => {
+                    search.provide_widen(widen(&Refiner, &state, fill, chunk_k(&params)));
+                }
+                Step::NeedResample { state, from } => {
+                    let (node, _) = search.pending_resample.expect("a resample names its node");
+                    if node == 0 {
+                        at_root.push(search.tree[0].total_n);
+                    }
+                    let c = Refiner
+                        .resample_batch(&[state], &[from])
+                        .unwrap()
+                        .pop()
+                        .unwrap();
+                    search.provide_resample(c);
+                }
+                Step::Done => {
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            at_root,
+            vec![10, 20, 30],
+            "the root refines every 10 visits"
+        );
+        let added: Vec<&Entry<Count>> = search.tree[0]
+            .entries
+            .iter()
+            .filter(|e| e.resampled)
+            .collect();
+        assert!(!added.is_empty(), "a resample added a candidate");
+        assert!(
+            added.iter().all(|e| e.n > 0),
+            "and each one added was visited"
         );
     }
 
@@ -2157,6 +2393,7 @@ mod tests {
                         run.0 = if grew { 0 } else { run.0 + u32::from(!fill) };
                         run.1 = run.1.max(run.0);
                     }
+                    Step::NeedResample { .. } => unreachable!("resampling is off"),
                     Step::Done => break,
                 }
             }
@@ -2677,6 +2914,7 @@ mod tests {
                 draws: 1,
                 manual: false,
                 eval: None,
+                resampled: false,
             })
             .collect();
 
@@ -2740,6 +2978,7 @@ mod tests {
                     draws: 1,
                     manual: false,
                     eval: None,
+                    resampled: false,
                 })
                 .collect();
             let mut prev = 0usize;
@@ -2823,6 +3062,7 @@ mod tests {
                 Step::NeedWiden { state, fill } => {
                     search.provide_widen(widen(&model, &state, fill, chunk_k(&params)));
                 }
+                Step::NeedResample { .. } => unreachable!("resampling is off"),
                 Step::Done => break,
             }
         }
@@ -2953,6 +3193,7 @@ mod tests {
                         ),
                     }
                 }
+                Step::NeedResample { .. } => unreachable!("resampling is off"),
                 Step::Done => break,
             }
         }
@@ -3041,6 +3282,7 @@ mod tests {
                     widens += 1;
                     search.provide_widen(widen(&model, &state, fill, chunk_k(&params)));
                 }
+                Step::NeedResample { .. } => unreachable!("resampling is off"),
                 Step::Done => break,
             }
         }
@@ -3224,6 +3466,7 @@ mod tests {
                         .collect();
                     search.provide_widen(cands);
                 }
+                Step::NeedResample { .. } => unreachable!("resampling is off"),
                 Step::Done => break,
             }
         }
@@ -3662,6 +3905,7 @@ mod forced_quota_tests {
             draws: 1,
             manual: false,
             eval: None,
+            resampled: false,
         }
     }
 

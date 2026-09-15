@@ -316,6 +316,8 @@ pub fn run_match(
     // score is coming from adjudication, not from play.
     let (mut win_turns, mut loss_turns) = (0u32, 0u32);
     let mut search_stats = playground_core::SearchStats::default();
+    // Per seat too, for what only one seat may be doing (resampling).
+    let mut seat_stats = [playground_core::SearchStats::default(); 2];
     let (mut necro, mut gy, mut adj, mut turn_sum) = (0u32, 0u32, 0u32, 0u32);
     // Both seats bid once; the handicap and the seats follow from the bids, so
     // a match is no longer decided by who happens to sit where.
@@ -421,6 +423,7 @@ pub fn run_match(
             p.seed = params_a.seed ^ ((round as u64) << 32) ^ u64::from(want_a);
             let (specs, st) = pick_many(seat, &states, &plies, &p)?;
             search_stats.merge(&st);
+            seat_stats[usize::from(!want_a)].merge(&st);
 
             for (&i, spec) in idxs.iter().zip(specs) {
                 let prev_state = live[i].state.clone();
@@ -559,6 +562,14 @@ pub fn run_match(
         "node visits: 1:{} 2:{} 3-4:{} 5-8:{} 9-16:{} 17-32:{} 33-64:{} 65+:{}",
         h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]
     );
+    for (seat, st) in ["A", "B"].iter().zip(&seat_stats) {
+        if st.resamples > 0 {
+            eprintln!(
+                "resamples ({seat}): {} requests, {} new candidates; played a resampled turn in {} of {} turns",
+                st.resamples, st.resample_new, st.chosen_resampled, st.searches
+            );
+        }
+    }
     Ok((score, wins, losses, draws, margin, game_score))
 }
 

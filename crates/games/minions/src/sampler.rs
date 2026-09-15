@@ -90,6 +90,12 @@ pub struct SamplerConfig {
     pub random_fraction: f32,
     /// Softmax temperature on the declaration logits.
     pub temperature: f32,
+    /// Diffusion rounds that redraw the masked part of a turn when the search
+    /// resamples (`SampledParams::resample_every`).
+    pub resample_t: usize,
+    /// Most of a turn a resample masks again: the share is uniform in
+    /// `[0, resample_frac]` of its live variables, and at least one.
+    pub resample_frac: f32,
     /// Score candidates with the energy head. Off = uniform priors, which is the
     /// P1 configuration before `f` has been trained.
     pub use_energy: bool,
@@ -115,6 +121,8 @@ impl Default for SamplerConfig {
             k_draws_fast: 6,
             random_fraction: 0.25,
             temperature: 1.0,
+            resample_t: 2,
+            resample_frac: 0.5,
             use_energy: true,
             pad_to: 0,
             seed: 0,
@@ -907,6 +915,14 @@ impl SampledModel<MinionsTurns> for AsSearch<'_> {
         )?;
         Ok(out.into_iter().map(|(_, c)| c).collect())
     }
+
+    fn resample_batch(
+        &self,
+        states: &[MinionsState],
+        from: &[TurnSpec],
+    ) -> anyhow::Result<Vec<Vec<(TurnSpec, f32, bool)>>> {
+        self.model.resample_batch_seq(states, from, self.next_seq())
+    }
 }
 
 impl SampledModel<MinionsTurns> for MinionsModel {
@@ -941,6 +957,18 @@ impl SampledModel<MinionsTurns> for MinionsModel {
             full: true,
         }
         .widen_batch(states, fill, k)
+    }
+
+    fn resample_batch(
+        &self,
+        states: &[MinionsState],
+        from: &[TurnSpec],
+    ) -> anyhow::Result<Vec<Vec<(TurnSpec, f32, bool)>>> {
+        AsSearch {
+            model: self,
+            full: true,
+        }
+        .resample_batch(states, from)
     }
 }
 
@@ -1235,48 +1263,7 @@ impl MinionsModel {
         Phases::add(&self.phases.realize_ns, t);
 
         // ── one energy forward over every candidate of every game ─────────────
-        let priors: Vec<Vec<f32>> = if self.cfg.use_energy {
-            let total: usize = specs.iter().map(|s| s.len()).sum();
-            let dstride = crate::turn::ENERGY_PLANES * NUM_CELLS;
-            let mut decl = vec![0f32; total * dstride];
-            let mut h_b = Vec::with_capacity(total * hstride);
-            let mut at = 0usize;
-            for (gi, list) in specs.iter().enumerate() {
-                let live = LiveMask::of(&states[gi]);
-                let src = &h[gi * hstride..(gi + 1) * hstride];
-                for (spec, _) in list {
-                    Partial::fully_committed(spec, &live)
-                        .write_energy_planes(&mut decl[at * dstride..(at + 1) * dstride]);
-                    h_b.extend_from_slice(src);
-                    at += 1;
-                }
-            }
-            // Pad to a fixed `g * k` rows. Candidate counts vary after merging,
-            // and TensorRT builds (and caches) a separate engine per input
-            // shape — a ragged batch would rebuild constantly. The padding is a
-            // few percent of wasted work against seconds per rebuild.
-            let padded = g * k;
-            let energies = if total == 0 {
-                Vec::new()
-            } else {
-                decl.resize(padded * dstride, 0.0);
-                h_b.resize(padded * hstride, f16::ZERO);
-                let clk = Instant::now();
-                let mut e = self.net.energy(&h_b, &decl, padded)?;
-                Phases::add(&self.phases.energy_ns, clk);
-                e.truncate(total);
-                e
-            };
-            let mut out = Vec::with_capacity(g);
-            let mut off = 0usize;
-            for list in &specs {
-                out.push(self.priors_from(&energies[off..off + list.len()]));
-                off += list.len();
-            }
-            out
-        } else {
-            specs.iter().map(|l| vec![1.0; l.len()]).collect()
-        };
+        let priors = self.score_lists(states, &h, &specs, g * k)?;
 
         let mut out: Vec<Expansion<MinionsTurns>> = specs
             .into_iter()
@@ -1311,6 +1298,200 @@ impl MinionsModel {
                 fresh,
             },
         ))
+    }
+
+    /// Raw energies for every candidate of every game, in one energy forward.
+    /// `states` and `h` (one trunk row per state) are in the canonical frame.
+    fn score_lists(
+        &self,
+        states: &[MinionsState],
+        h: &[f16],
+        specs: &[Vec<(TurnSpec, bool)>],
+        padded: usize,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        if !self.cfg.use_energy {
+            return Ok(specs.iter().map(|l| vec![1.0; l.len()]).collect());
+        }
+        let hstride = self.net.channels() * NUM_CELLS;
+        let total: usize = specs.iter().map(|s| s.len()).sum();
+        let dstride = crate::turn::ENERGY_PLANES * NUM_CELLS;
+        let mut decl = vec![0f32; total * dstride];
+        let mut h_b = Vec::with_capacity(total * hstride);
+        let mut at = 0usize;
+        for (gi, list) in specs.iter().enumerate() {
+            let live = LiveMask::of(&states[gi]);
+            let src = &h[gi * hstride..(gi + 1) * hstride];
+            for (spec, _) in list {
+                Partial::fully_committed(spec, &live)
+                    .write_energy_planes(&mut decl[at * dstride..(at + 1) * dstride]);
+                h_b.extend_from_slice(src);
+                at += 1;
+            }
+        }
+        // Pad to a fixed `padded` rows. Candidate counts vary after merging,
+        // and TensorRT builds (and caches) a separate engine per input shape —
+        // a ragged batch would rebuild constantly. The padding is a few
+        // percent of wasted work against seconds per rebuild.
+        let energies = if total == 0 {
+            Vec::new()
+        } else {
+            decl.resize(padded * dstride, 0.0);
+            h_b.resize(padded * hstride, f16::ZERO);
+            let clk = Instant::now();
+            let mut e = self.net.energy(&h_b, &decl, padded)?;
+            Phases::add(&self.phases.energy_ns, clk);
+            e.truncate(total);
+            e
+        };
+        let mut out = Vec::with_capacity(specs.len());
+        let mut off = 0usize;
+        for list in specs {
+            out.push(self.priors_from(&energies[off..off + list.len()]));
+            off += list.len();
+        }
+        Ok(out)
+    }
+
+    /// A partial resample of each `from[i]` at `states[i]`: the search's
+    /// refinement step (`SampledParams::resample_every`).
+    ///
+    /// A share drawn uniformly from `[0, resample_frac]` of the turn's live
+    /// variables (at least one) is masked again and redrawn by `resample_t`
+    /// diffusion rounds conditioned on the rest; the result is realized and
+    /// scored like any candidate. One chain per position, so every forward has
+    /// the shape a one-candidate widen already built.
+    pub fn resample_batch_seq(
+        &self,
+        states: &[MinionsState],
+        from: &[TurnSpec],
+        batch_seq: u64,
+    ) -> anyhow::Result<Vec<Vec<(TurnSpec, f32, bool)>>> {
+        let real = states.len();
+        anyhow::ensure!(from.len() == real, "resample_batch: one turn per state");
+        if real == 0 {
+            return Ok(Vec::new());
+        }
+        // Trunk rows, padded and canonical, exactly as a value-only expansion
+        // gets them.
+        let (_, tr) =
+            self.expand_batch_cached(states, 0, true, batch_seq, &[], &|n| n, false, &[])?;
+        let g = tr.h.len() / tr.stride;
+        let src = |i: usize| i.min(real - 1);
+        let flipped: Vec<bool> = (0..g).map(|i| states[src(i)].side == 1).collect();
+        let canon: Vec<MinionsState> = (0..g).map(|i| states[src(i)].canonical()).collect();
+        let ctx: Vec<GameCtx> = canon.iter().map(Self::context).collect();
+        let mut rng = ChaCha8Rng::seed_from_u64(
+            self.seed ^ batch_seq.wrapping_mul(0xD1B5_4A32_D192_ED03) ^ 0x5E5A,
+        );
+
+        let mut chains = Vec::with_capacity(g);
+        let mut claimed: Vec<Bb> = Vec::with_capacity(g);
+        let mut kept = Vec::with_capacity(g);
+        let mut masked = Vec::with_capacity(g);
+        let mut rngs: Vec<ChaCha8Rng> = Vec::with_capacity(g);
+        for gi in 0..g {
+            let cx = &ctx[gi];
+            let spec = if flipped[gi] {
+                from[src(gi)].rotated()
+            } else {
+                from[src(gi)]
+            };
+            let mut p = Partial::fully_committed(&spec, &cx.live);
+            let mut vars: Vec<(u8, u8)> = bitboard::cells(cx.live.moves)
+                .map(|c| (c, C_MOVE))
+                .chain(bitboard::cells(cx.live.targets).map(|c| (c, C_TARGET)))
+                .chain(bitboard::cells(cx.live.spawns).map(|c| (c, C_SPAWN)))
+                .collect();
+            let n = vars.len();
+            let m = if n == 0 {
+                0
+            } else {
+                let share = rng.gen::<f32>() * self.cfg.resample_frac;
+                ((share * n as f32).round() as usize).clamp(1, n)
+            };
+            for i in 0..m {
+                let j = i + rng.gen_range(0..n - i);
+                vars.swap(i, j);
+            }
+            let empty = TurnSpec::empty();
+            for &(c, f) in &vars[..m] {
+                let ci = c as usize;
+                match f {
+                    C_MOVE => p.spec.moves[ci] = empty.moves[ci],
+                    C_TARGET => p.spec.targets[ci] = empty.targets[ci],
+                    _ => p.spec.spawns[ci] = empty.spawns[ci],
+                }
+                p.committed[ci] &= !f;
+            }
+            // The hexes the kept moves already claim, as `commit_round` would
+            // have recorded them.
+            let mut cl: Bb = 0;
+            for c in bitboard::cells(cx.live.moves) {
+                let v = p.spec.moves[c as usize];
+                if p.is_committed(c, C_MOVE) && v != 0 {
+                    let d = MOVE_DEST[c as usize][v as usize];
+                    if d != NO_CELL {
+                        cl |= bit(d);
+                    }
+                }
+            }
+            chains.push(p);
+            claimed.push(cl);
+            kept.push(n - m);
+            masked.push(m);
+            rngs.push(ChaCha8Rng::seed_from_u64(rng.gen::<u64>() ^ gi as u64));
+        }
+
+        let steps = self.cfg.resample_t.max(1);
+        let stride = DECL_PLANES * NUM_CELLS;
+        let width = NUM_CELLS * DECL_LOGITS;
+        let mut decl = vec![0f32; g * stride];
+        let mut pass = self.net.diffusion_pass(&tr.h, g)?;
+        let mut picks: Vec<(u8, u8, u8)> = Vec::with_capacity(NUM_CELLS);
+        for t in 1..=steps {
+            for (i, c) in chains.iter().enumerate() {
+                c.write_planes(&mut decl[i * stride..(i + 1) * stride]);
+            }
+            let clk = Instant::now();
+            let logits = pass.step(&decl)?;
+            Phases::add(&self.phases.diffusion_ns, clk);
+            let clk = Instant::now();
+            for row in 0..g {
+                if masked[row] == 0 {
+                    continue;
+                }
+                let want = kept[row] + Self::committed_after(t, steps, masked[row]);
+                commit_round(
+                    &mut chains[row],
+                    &mut claimed[row],
+                    &ctx[row],
+                    &logits[row * width..(row + 1) * width],
+                    want,
+                    self.cfg.temperature,
+                    &mut rngs[row],
+                    &mut picks,
+                );
+            }
+            Phases::add(&self.phases.commit_ns, clk);
+        }
+
+        let specs: Vec<Vec<(TurnSpec, bool)>> = (0..g)
+            .map(|gi| self.finish_candidates(&canon[gi], vec![(chains[gi].spec, false)]))
+            .collect();
+        let energies = self.score_lists(&canon, &tr.h, &specs, g)?;
+        let mut out: Vec<Vec<(TurnSpec, f32, bool)>> = specs
+            .into_iter()
+            .zip(energies)
+            .enumerate()
+            .map(|(gi, (list, es))| {
+                list.into_iter()
+                    .zip(es)
+                    .map(|((s, x), e)| (if flipped[gi] { s.rotated() } else { s }, e, x))
+                    .collect()
+            })
+            .collect();
+        out.truncate(real);
+        Ok(out)
     }
 }
 

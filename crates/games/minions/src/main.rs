@@ -233,6 +233,13 @@ enum Cmd {
         /// Simulations per turn for seat B; defaults to A's (`--sims`).
         #[arg(long)]
         sims_b: Option<u32>,
+        /// Seat A refines every this many visits to a node: the visit redraws
+        /// part of the picked turn and visits the result. 0 = off.
+        #[arg(long, default_value_t = 0)]
+        resample_every: u32,
+        /// As `--resample-every`, for seat B; defaults to A's.
+        #[arg(long)]
+        resample_every_b: Option<u32>,
         /// Both seats: no forced visits, no explore quotas and no random
         /// fills -- every candidate is a sampler draw, chosen by plain PUCT.
         #[arg(long)]
@@ -529,6 +536,8 @@ async fn main() -> anyhow::Result<()> {
             t_steps_b,
             candidates_b,
             sims_b,
+            resample_every,
+            resample_every_b,
             no_explore,
             backend,
             ep,
@@ -578,11 +587,13 @@ async fn main() -> anyhow::Result<()> {
             };
             let pa = SampledParams {
                 kernel_sigma,
+                resample_every,
                 ..params
             };
             let pb = SampledParams {
                 simulations: sims_b.unwrap_or(sims),
                 kernel_sigma: kernel_sigma_b.unwrap_or(kernel_sigma),
+                resample_every: resample_every_b.unwrap_or(resample_every),
                 ..params
             };
             let rf = render_file.as_ref().map(std::path::PathBuf::from);

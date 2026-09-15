@@ -196,6 +196,7 @@ impl ActorConfig {
             k_draws: sampler.draws_for(full),
             draw_retries: self.draw_retries,
             fills: true,
+            resample_every: 0,
             // Fast searches are not training data, so they get no forced
             // exploration to correct for either.
             k_forced: if full { self.k_forced } else { 0.0 },
@@ -550,6 +551,9 @@ fn drive_pool_worker(
                         is_widen.push(true);
                         fills.push(fill);
                         break;
+                    }
+                    Step::NeedResample { .. } => {
+                        unreachable!("self-play searches with resample_every = 0")
                     }
                     Step::Done => {
                         // The tree this cache described is gone.
