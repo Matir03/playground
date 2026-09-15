@@ -406,6 +406,13 @@ struct Entry<G: SampledGame> {
     /// set for the node's initial candidates, and for a later one once PUCT has
     /// scored it below a stable one.
     stable: bool,
+    /// Visits handed to this entry because a refinement created or reached it
+    /// (`Search::provide_resample`) rather than because PUCT picked it.
+    /// Counted in `n` like any visit; taken out of the training target only.
+    auto_n: u32,
+    /// Visits a refinement handed elsewhere after PUCT picked *this* entry to
+    /// redraw. The training target credits them here.
+    credit_n: u32,
 }
 
 impl<G: SampledGame> Entry<G> {
@@ -419,6 +426,14 @@ impl<G: SampledGame> Entry<G> {
     /// search had chosen to buy, and stop looking.
     fn n_eff(&self) -> u32 {
         self.n.saturating_sub(self.forced_n)
+    }
+
+    /// Visits the training target gives this entry: the ones PUCT chose, with
+    /// each refinement's hand-over credited to the candidate PUCT picked rather
+    /// than the one the refinement produced. Total mass is unchanged, and PUCT
+    /// itself never sees this count.
+    fn target_n(&self) -> u32 {
+        self.n_eff().saturating_sub(self.auto_n) + self.credit_n
     }
 }
 
@@ -1326,6 +1341,8 @@ impl<G: SampledGame> Search<G> {
             explore: false,
             forced_n: 0,
             forced_quota: 0,
+            auto_n: 0,
+            credit_n: 0,
             draws: 0,
             manual: true,
             eval,
@@ -1603,6 +1620,8 @@ impl<G: SampledGame> Search<G> {
                         explore,
                         forced_n: 0,
                         forced_quota: 0,
+                        auto_n: 0,
+                        credit_n: 0,
                         draws: 1,
                         manual: false,
                         eval: None,
@@ -1734,6 +1753,8 @@ impl<G: SampledGame> Search<G> {
                         explore,
                         forced_n: 0,
                         forced_quota: 0,
+                        auto_n: 0,
+                        credit_n: 0,
                         draws: draw,
                         manual: false,
                         eval: None,
@@ -1810,6 +1831,9 @@ impl<G: SampledGame> Search<G> {
             .pending_resample
             .take()
             .expect("provide_resample without a pending resample");
+        // By id: adding a candidate re-sorts the entries, so `from` stops
+        // naming the pick once one arrives.
+        let origin = self.tree[cur].entries[from].id;
         let state = self.tree[cur].state.clone();
         let key_of = |mv: &G::Move| G::state_key(&G::apply(&state, mv));
         let mut target = key_of(&self.tree[cur].entries[from].mv);
@@ -1828,6 +1852,8 @@ impl<G: SampledGame> Search<G> {
                     explore,
                     forced_n: 0,
                     forced_quota: 0,
+                    auto_n: 0,
+                    credit_n: 0,
                     draws: 1,
                     manual: false,
                     eval: None,
@@ -1839,11 +1865,18 @@ impl<G: SampledGame> Search<G> {
                 self.build_kernel(cur);
             }
         }
-        self.visit_new = self.tree[cur]
-            .entries
-            .iter()
-            .position(|e| key_of(&e.mv) == target)
-            .map(|i| (cur, i));
+        let entries = &mut self.tree[cur].entries;
+        let visit = entries.iter().position(|e| key_of(&e.mv) == target);
+        // The visit handed over here is the search's choice of `origin`, which
+        // the refinement only redrew: the training target credits it back
+        // there (`Entry::target_n`). PUCT sees it where it lands, as ever.
+        if let Some(i) = visit {
+            entries[i].auto_n += 1;
+            if let Some(o) = entries.iter_mut().find(|e| e.id == origin) {
+                o.credit_n += 1;
+            }
+        }
+        self.visit_new = visit.map(|i| (cur, i));
     }
 
     /// Extend the node's kernel with rows for the entries added since it was
@@ -1906,7 +1939,9 @@ impl<G: SampledGame> Search<G> {
         let explore: Vec<bool> = root.entries.iter().map(|e| e.explore).collect();
         let forced: Vec<u32> = root.entries.iter().map(|e| e.forced_n).collect();
         let stable: Vec<bool> = root.entries.iter().map(|e| e.stable).collect();
-        let chosen_n: Vec<f32> = root.entries.iter().map(|e| e.n_eff() as f32).collect();
+        // What the search chose, with each refinement's hand-over credited to
+        // the candidate PUCT picked (`Entry::target_n`).
+        let chosen_n: Vec<f32> = root.entries.iter().map(|e| e.target_n() as f32).collect();
         let target_counts: Vec<f32> =
             if self.params.kernel_sigma > 0.0 && root.kern_rows == root.entries.len() {
                 root.entries
@@ -2461,6 +2496,62 @@ mod tests {
         }
     }
 
+    /// The visit a refinement hands its new candidate is the search's choice of
+    /// the candidate it redrew: the training target credits it there, and the
+    /// target's total mass is unchanged.
+    #[test]
+    fn a_refinement_visit_is_credited_to_the_pick() {
+        let params = SampledParams {
+            simulations: 60,
+            k_candidates: 3,
+            k_draws: 1,
+            pw_chunk: 1,
+            fills: false,
+            resample_every: 2.0,
+            k_forced: 0.0,
+            min_explore_visits: 0.0,
+            forced_visits: 0,
+            temp_moves: 0,
+            seed: 4,
+            ..Default::default()
+        };
+        let mut search = Search::<Count>::new(CountState { n: 21, side: 1 }, &params, 0);
+        loop {
+            match search.step() {
+                Step::NeedExpansion(st) => {
+                    let (v, c) = Refiner.expand(&st, expansion_k(&params)).unwrap();
+                    search.provide(v, c);
+                }
+                Step::NeedWiden { state, fill } => {
+                    search.provide_widen(widen(&Refiner, &state, fill, chunk_k(&params)));
+                }
+                Step::NeedResample { state, from } => {
+                    let c = Refiner
+                        .resample_batch(&[state], &[from])
+                        .unwrap()
+                        .pop()
+                        .unwrap();
+                    search.provide_resample(c);
+                }
+                Step::Done => break,
+            }
+        }
+        let root = &search.tree[0];
+        let auto: u32 = root.entries.iter().map(|e| e.auto_n).sum();
+        let credit: u32 = root.entries.iter().map(|e| e.credit_n).sum();
+        assert!(auto > 0, "the root must have refined");
+        assert_eq!(auto, credit, "every hand-over is credited exactly once");
+        let want: Vec<f32> = root.entries.iter().map(|e| e.target_n() as f32).collect();
+        let eff: u32 = root.entries.iter().map(|e| e.n_eff()).sum();
+        let result = search.finish();
+        assert_eq!(result.target_counts, want);
+        assert_eq!(
+            result.target_counts.iter().sum::<f32>(),
+            eff as f32,
+            "crediting moves visits, it never adds or drops them"
+        );
+    }
+
     /// Every `resample_every` visits a node refines instead of descending: the
     /// resampled turn joins the node and takes that visit.
     #[test]
@@ -2584,6 +2675,8 @@ mod tests {
             explore: false,
             forced_n: 0,
             forced_quota: 0,
+            auto_n: 0,
+            credit_n: 0,
             draws: 1,
             manual: false,
             eval: None,
@@ -3208,6 +3301,8 @@ mod tests {
                 explore: false,
                 forced_n: 0,
                 forced_quota: 0,
+                auto_n: 0,
+                credit_n: 0,
                 draws: 1,
                 manual: false,
                 eval: None,
@@ -3274,6 +3369,8 @@ mod tests {
                     explore: false,
                     forced_n: 0,
                     forced_quota: 0,
+                    auto_n: 0,
+                    credit_n: 0,
                     draws: 1,
                     manual: false,
                     eval: None,
@@ -4215,6 +4312,8 @@ mod forced_quota_tests {
             explore,
             forced_n: 0,
             forced_quota: 0,
+            auto_n: 0,
+            credit_n: 0,
             draws: 1,
             manual: false,
             eval: None,
