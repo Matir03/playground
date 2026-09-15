@@ -631,10 +631,6 @@ fn drive_pool_worker(
         let real = ids.len();
         stats.batches += 1;
         stats.expansions += real as u64;
-        // A wave of refinement requests only has no expansion rows to pad.
-        if real > 0 {
-            stats.padded += (max_batch.saturating_sub(real)) as u64;
-        }
         // One `k` for the whole wave keeps the tensor shape fixed — the
         // constraint that killed an earlier overlap scheme, which set TensorRT
         // rebuilding an engine per shape and cost 97% of throughput.
@@ -656,6 +652,12 @@ fn drive_pool_worker(
         let wid_idx: Vec<usize> = (0..real).filter(|&i| is_widen[i]).collect();
         stats.req_expand += exp_idx.len() as u64;
         stats.req_widen += wid_idx.len() as u64;
+        // Rows the two calls actually pad: each rounds up to `width_for`.
+        for n in [exp_idx.len(), wid_idx.len()] {
+            if n > 0 {
+                stats.padded += (width_for(n) - n) as u64;
+            }
+        }
         if !wid_idx.is_empty() {
             stats.head_real += wid_idx.len() as u64;
             stats.head_run += width_for(wid_idx.len()) as u64;
