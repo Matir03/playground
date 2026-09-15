@@ -235,11 +235,18 @@ enum Cmd {
         sims_b: Option<u32>,
         /// Seat A refines every this many visits to a node: the visit redraws
         /// part of the picked turn and visits the result. 0 = off.
-        #[arg(long, default_value_t = 0)]
-        resample_every: u32,
+        #[arg(long, default_value_t = 0.0)]
+        resample_every: f32,
         /// As `--resample-every`, for seat B; defaults to A's.
         #[arg(long)]
-        resample_every_b: Option<u32>,
+        resample_every_b: Option<f32>,
+        /// Progressive-widening `beta` for seat A; 0 turns widening off (every
+        /// candidate a node earns is selectable at once). Default: eval's.
+        #[arg(long)]
+        pw_beta: Option<f32>,
+        /// As `--pw-beta`, for seat B; defaults to A's.
+        #[arg(long)]
+        pw_beta_b: Option<f32>,
         /// Diffusion rounds a resample redraws with (both seats).
         #[arg(long, default_value_t = 2)]
         resample_t: usize,
@@ -562,6 +569,8 @@ async fn main() -> anyhow::Result<()> {
             resample_t_b,
             resample_frac_b,
             resample_depth_b,
+            pw_beta,
+            pw_beta_b,
             no_explore,
             backend,
             ep,
@@ -618,12 +627,14 @@ async fn main() -> anyhow::Result<()> {
                 kernel_sigma,
                 resample_every,
                 resample_max_depth: resample_depth.unwrap_or(u32::MAX),
+                pw_beta: pw_beta.unwrap_or(params.pw_beta),
                 ..params
             };
             let pb = SampledParams {
                 simulations: sims_b.unwrap_or(sims),
                 kernel_sigma: kernel_sigma_b.unwrap_or(kernel_sigma),
                 resample_every: resample_every_b.unwrap_or(resample_every),
+                pw_beta: pw_beta_b.or(pw_beta).unwrap_or(params.pw_beta),
                 resample_max_depth: resample_depth_b.or(resample_depth).unwrap_or(u32::MAX),
                 ..params
             };

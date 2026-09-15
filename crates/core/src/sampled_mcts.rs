@@ -235,8 +235,9 @@ pub struct SampledParams {
     /// Every this many visits to a node, a visit refines instead of
     /// descending: it takes the candidate selection picked, asks the model to
     /// redraw part of it ([`SampledModel::resample_batch`]), adds what comes
-    /// back and visits that. 0 = off.
-    pub resample_every: u32,
+    /// back and visits that. 0 = off. A fraction spreads refines evenly: 1.5
+    /// alternates gaps of 1 and 2 visits (see [`resample_gap`]).
+    pub resample_every: f32,
     /// Deepest node that refines (the root is depth 0); `u32::MAX` = all.
     pub resample_max_depth: u32,
     /// KataGo forced-playout constant; 0 disables forced playouts.
@@ -320,7 +321,7 @@ impl Default for SampledParams {
             k_draws: 32,
             draw_retries: 3,
             fills: true,
-            resample_every: 0,
+            resample_every: 0.0,
             resample_max_depth: u32::MAX,
             k_forced: 2.0,
             min_explore_visits: 2.0,
@@ -434,8 +435,10 @@ struct Node<G: SampledGame> {
     /// before a position runs out of turns, so one miss is not the signal to
     /// stop; this many, against the node's candidate target, is.
     fill_misses: u32,
-    /// `total_n` when this node last asked for a resample.
+    /// `total_n` when this node last asked for a resample, and how many it
+    /// has asked for.
     resampled_at: u32,
+    resample_count: u32,
     /// Row-major `k x k` kernel matrix over `entries`, empty when the kernel is
     /// disabled. Built once at expansion: the distances depend only on the
     /// candidates and the state, neither of which changes afterwards, so paying
@@ -679,6 +682,7 @@ fn new_node<G: SampledGame>(state: G::State) -> Node<G> {
         draw_misses: 0,
         fill_misses: 0,
         resampled_at: 0,
+        resample_count: 0,
         nn_value: None,
         kern: Vec::new(),
         total_n: 0,
@@ -752,6 +756,17 @@ fn assign_forced_quotas<G: SampledGame>(
 /// top-ups a widen adds, so candidates arriving later cannot overdraw it.
 fn quota_budget(params: &SampledParams) -> u32 {
     (params.simulations / 2).max(params.forced_visits)
+}
+
+/// Visits from a node's `j`-th refine (counting from zero, the first measured
+/// from no visits) to its next: consecutive differences of `floor(i * every)`,
+/// so a fractional interval alternates whole gaps averaging `every`, and a
+/// whole one is exactly `every` every time. At least 1: one refine per visit
+/// at most.
+fn resample_gap(every: f32, j: u32) -> u32 {
+    let e = every as f64;
+    let gap = ((j as f64 + 1.0) * e).floor() - (j as f64 * e).floor();
+    (gap as u32).max(1)
 }
 
 /// How many of a node's candidates are selectable at `n` visits.
@@ -1402,10 +1417,11 @@ impl<G: SampledGame> Search<G> {
                         // is `cur`'s depth (the root is 0).
                         let shallow = self.path.len() as u32 <= self.params.resample_max_depth;
                         let node = &self.tree[cur];
-                        if every > 0
+                        if every > 0.0
                             && shallow
                             && !forced
-                            && node.total_n >= node.resampled_at + every
+                            && node.total_n
+                                >= node.resampled_at + resample_gap(every, node.resample_count)
                         {
                             if cur == 0 {
                                 self.resamples_root += 1;
@@ -1413,6 +1429,7 @@ impl<G: SampledGame> Search<G> {
                             let from = node.entries[pick].mv.clone();
                             let state = node.state.clone();
                             self.tree[cur].resampled_at = self.tree[cur].total_n;
+                            self.tree[cur].resample_count += 1;
                             self.pending_resample = Some((cur, pick));
                             self.resamples += 1;
                             // As for a widen: `path` holds only ancestors'
@@ -2304,7 +2321,7 @@ mod tests {
             k_draws: 1,
             pw_chunk: 1,
             fills: false,
-            resample_every: 10,
+            resample_every: 10.0,
             k_forced: 0.0,
             min_explore_visits: 0.0,
             forced_visits: 0,
@@ -2355,6 +2372,19 @@ mod tests {
             added.iter().all(|e| e.n > 0),
             "and each one added was visited"
         );
+    }
+
+    /// A whole interval refines exactly that often; a fraction alternates
+    /// whole gaps that average it.
+    #[test]
+    fn resample_gaps_average_the_interval() {
+        let gaps = |every: f32| (0..6).map(|j| resample_gap(every, j)).collect::<Vec<_>>();
+        assert_eq!(gaps(2.0), vec![2, 2, 2, 2, 2, 2]);
+        assert_eq!(gaps(10.0), vec![10; 6]);
+        assert_eq!(gaps(1.5), vec![1, 2, 1, 2, 1, 2]);
+        assert_eq!(gaps(2.5), vec![2, 3, 2, 3, 2, 3]);
+        assert_eq!(gaps(1.25), vec![1, 1, 1, 2, 1, 1]);
+        assert_eq!(gaps(0.5), vec![1; 6], "never more than one per visit");
     }
 
     /// At an interior node, a draw that keeps repeating is retried

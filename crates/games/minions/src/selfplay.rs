@@ -196,7 +196,7 @@ impl ActorConfig {
             k_draws: sampler.draws_for(full),
             draw_retries: self.draw_retries,
             fills: true,
-            resample_every: 0,
+            resample_every: 0.0,
             resample_max_depth: u32::MAX,
             // Fast searches are not training data, so they get no forced
             // exploration to correct for either.
