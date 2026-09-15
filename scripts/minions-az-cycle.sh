@@ -63,12 +63,25 @@ FAST_SIMS="${FAST_SIMS:-100}"
 CANDIDATES="${CANDIDATES:-16}"
 T_STEPS="${T_STEPS:-4}"
 # Fast (playout-cap) searches produce no training data, so they get a cheaper
-# sampler. Measured +13% end to end in a paired A/B.
-T_STEPS_FAST="${T_STEPS_FAST:-2}"
-# Same argument applied to the candidate count, which multiplies T in the
-# diffusion cost. At FAST_SIMS visits a 32-wide candidate set is spread far too
-# thin to form a tree anyway, so this is cheaper *and* better shaped.
-CANDIDATES_FAST="${CANDIDATES_FAST:-8}"
+# sampler. Measured +13% end to end in a paired A/B (at T 2).
+#
+# 2026-09-15 (user): fast searches run the full search's settings -- 16
+# candidates and refinement -- with only the budget cut: 100 simulations, T 3
+# (refinements redraw at RESAMPLE_T) and no forced visits (search_params).
+T_STEPS_FAST="${T_STEPS_FAST:-3}"
+CANDIDATES_FAST="${CANDIDATES_FAST:-16}"
+# Refinement: every RESAMPLE_EVERY visits to a node, the visit re-masks a
+# uniform share in [0, RESAMPLE_FRAC] of PUCT's pick and redraws it with
+# RESAMPLE_T diffusion rounds instead of descending. Converged by head-to-head
+# on gen343 (400 sims, 16 candidates): every 2 / frac 1.0 / T 2 at every depth
+# beat plain search 75-5, and plain search at twice the simulations 72-8.
+RESAMPLE_EVERY="${RESAMPLE_EVERY:-2}"
+RESAMPLE_FRAC="${RESAMPLE_FRAC:-1.0}"
+RESAMPLE_T="${RESAMPLE_T:-2}"
+# KR-PUCT bandwidth. 0 = plain PUCT. Every sigma tried lost to 0 on top of
+# refinement, less the smaller it got: 0.25 0.275, 0.1 0.425, 0.05 0.425,
+# 0.03 0.475 (80 games each).
+KERNEL_SIGMA="${KERNEL_SIGMA:-0}"
 # Eval is a *yardstick*, so its search is pinned independently of self-play's.
 # Deliberately stronger than self-play: the question a match answers is "which
 # net is better", and a deeper search reads that off the weights with less noise
@@ -139,7 +152,10 @@ LR="${LR:-1e-3}"
 EVAL_LAG="${EVAL_LAG:-5}"
 # GFlowNet trajectory-balance weight for the sampler. TB settles around 7-9
 # while the other losses sit at 0.5-3, so 1.0 would swamp them.
-TB_WEIGHT="${TB_WEIGHT:-0.3}"
+#
+# 0 since 2026-09-15: the TB objective damaged the sampler's conditionals, and
+# stays off until it is replaced.
+TB_WEIGHT="${TB_WEIGHT:-0}"
 EVAL_GAMES="${EVAL_GAMES:-40}"
 # Promotion mode, see the eval step. 0: no gate, a tournament every
 # MEASURE_EVERY generations. 1: the per-generation gate.
@@ -235,6 +251,8 @@ while true; do
     --sims "$SIMS" --fast-sims "$FAST_SIMS" --candidates "$CANDIDATES" \
     --candidates-fast "$CANDIDATES_FAST" \
     --t-steps "$T_STEPS" --t-steps-fast "$T_STEPS_FAST" \
+    --resample-every "$RESAMPLE_EVERY" --resample-frac "$RESAMPLE_FRAC" \
+    --resample-t "$RESAMPLE_T" --kernel-sigma "$KERNEL_SIGMA" \
     --random-fraction "$RANDOM_FRACTION" \
     --random-opening-max "$RANDOM_OPENING_MAX" \
     --random-opening-decay "$RANDOM_OPENING_DECAY" \
