@@ -246,6 +246,11 @@ gen=0
 while true; do
   gen=$((gen + 1))
   echo "== cycle $gen: generate =="
+  # Seed from the run's generation, not this script's counter: `gen` restarts
+  # at 1 on every launch, and self-play on an unchanged champion is
+  # deterministic in the seed, so a relaunch replayed the first cycle's games
+  # into the buffer as exact duplicates.
+  seed=$(grep -o '"generation": *[0-9]*' "$LIVE/config.json" | grep -o '[0-9]*$')
   "$ENGINE" selfplay-loop --live "$LIVE" \
     --concurrency "$CONCURRENCY" --max-batch "$MAX_BATCH" --workers "$WORKERS" \
     --sims "$SIMS" --fast-sims "$FAST_SIMS" --candidates "$CANDIDATES" \
@@ -259,7 +264,7 @@ while true; do
     --min-explore-visits "$MIN_EXPLORE_VISITS" \
     --forced-visits "$FORCED_VISITS" --forced-extra "$FORCED_EXTRA" \
     --max-examples "$MAX_EXAMPLES" --target-examples "$TARGET_EXAMPLES" \
-    --seed "$gen" --backend "$BACKEND" --ep "$EP" $FP16_FLAG $CUDA_FLAG
+    --seed "${seed:-$gen}" --backend "$BACKEND" --ep "$EP" $FP16_FLAG $CUDA_FLAG
 
   echo "== cycle $gen: train =="
   "$PYTHON" "$repo/python/minions_az_learner.py" --live "$LIVE" \
