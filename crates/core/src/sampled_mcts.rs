@@ -237,6 +237,8 @@ pub struct SampledParams {
     /// redraw part of it ([`SampledModel::resample_batch`]), adds what comes
     /// back and visits that. 0 = off.
     pub resample_every: u32,
+    /// Deepest node that refines (the root is depth 0); `u32::MAX` = all.
+    pub resample_max_depth: u32,
     /// KataGo forced-playout constant; 0 disables forced playouts.
     pub k_forced: f32,
     /// Visits guaranteed to every *explore*-origin root candidate, regardless of
@@ -319,6 +321,7 @@ impl Default for SampledParams {
             draw_retries: 3,
             fills: true,
             resample_every: 0,
+            resample_max_depth: u32::MAX,
             k_forced: 2.0,
             min_explore_visits: 2.0,
             forced_visits: 30,
@@ -527,6 +530,7 @@ pub struct SearchStats {
     /// Resample requests (see [`SampledParams::resample_every`]), and the new
     /// candidates they added.
     pub resamples: u64,
+    pub resamples_root: u64,
     pub resample_new: u64,
     /// Searches whose played move was a candidate a resample added.
     pub chosen_resampled: u64,
@@ -554,6 +558,7 @@ impl SearchStats {
         self.unvisited += other.unvisited;
         self.searches += other.searches;
         self.resamples += other.resamples;
+        self.resamples_root += other.resamples_root;
         self.resample_new += other.resample_new;
         self.chosen_resampled += other.chosen_resampled;
         for (a, b) in self.visit_hist.iter_mut().zip(other.visit_hist.iter()) {
@@ -936,8 +941,10 @@ pub struct Search<G: SampledGame> {
     visit_new: Option<(usize, usize)>,
     /// `(node, entry)` a pending `NeedResample` started from.
     pending_resample: Option<(usize, usize)>,
-    /// Resample requests made, for [`SearchStats::resamples`].
+    /// Resample requests made, for [`SearchStats::resamples`], and how many
+    /// of them were at the root.
     resamples: u64,
+    resamples_root: u64,
     /// Entry indices, root first, the next simulation must descend through
     /// before PUCT takes over: a visit forced by hand (`force_line`).
     forced_line: std::collections::VecDeque<usize>,
@@ -1304,6 +1311,7 @@ impl<G: SampledGame> Search<G> {
             visit_new: None,
             pending_resample: None,
             resamples: 0,
+            resamples_root: 0,
             forced_line: Default::default(),
         }
     }
@@ -1390,8 +1398,18 @@ impl<G: SampledGame> Search<G> {
                         // the result. Not on a forced visit, which exists to
                         // measure the candidate it was given.
                         let every = self.params.resample_every;
+                        // `path` holds the edges above `cur`, so its length
+                        // is `cur`'s depth (the root is 0).
+                        let shallow = self.path.len() as u32 <= self.params.resample_max_depth;
                         let node = &self.tree[cur];
-                        if every > 0 && !forced && node.total_n >= node.resampled_at + every {
+                        if every > 0
+                            && shallow
+                            && !forced
+                            && node.total_n >= node.resampled_at + every
+                        {
+                            if cur == 0 {
+                                self.resamples_root += 1;
+                            }
                             let from = node.entries[pick].mv.clone();
                             let state = node.state.clone();
                             self.tree[cur].resampled_at = self.tree[cur].total_n;
@@ -1731,6 +1749,7 @@ impl<G: SampledGame> Search<G> {
         }
         stats.searches = 1;
         stats.resamples = self.resamples;
+        stats.resamples_root = self.resamples_root;
 
         let root = &self.tree[0];
         let candidates: Vec<(G::Move, u32)> =

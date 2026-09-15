@@ -565,8 +565,8 @@ pub fn run_match(
     for (seat, st) in ["A", "B"].iter().zip(&seat_stats) {
         if st.resamples > 0 {
             eprintln!(
-                "resamples ({seat}): {} requests, {} new candidates; played a resampled turn in {} of {} turns",
-                st.resamples, st.resample_new, st.chosen_resampled, st.searches
+                "resamples ({seat}): {} requests ({} at roots), {} new candidates; played a resampled turn in {} of {} turns",
+                st.resamples, st.resamples_root, st.resample_new, st.chosen_resampled, st.searches
             );
         }
     }

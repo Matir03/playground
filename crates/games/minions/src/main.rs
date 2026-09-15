@@ -240,6 +240,16 @@ enum Cmd {
         /// As `--resample-every`, for seat B; defaults to A's.
         #[arg(long)]
         resample_every_b: Option<u32>,
+        /// Diffusion rounds a resample redraws with (both seats).
+        #[arg(long, default_value_t = 2)]
+        resample_t: usize,
+        /// Most of a turn a resample masks again: the share is uniform in
+        /// `[0, this]` (both seats).
+        #[arg(long, default_value_t = 0.5)]
+        resample_frac: f32,
+        /// Deepest node that refines, root = 0 (both seats). Default: all.
+        #[arg(long)]
+        resample_depth: Option<u32>,
         /// Both seats: no forced visits, no explore quotas and no random
         /// fills -- every candidate is a sampler draw, chosen by plain PUCT.
         #[arg(long)]
@@ -538,6 +548,9 @@ async fn main() -> anyhow::Result<()> {
             sims_b,
             resample_every,
             resample_every_b,
+            resample_t,
+            resample_frac,
+            resample_depth,
             no_explore,
             backend,
             ep,
@@ -554,7 +567,10 @@ async fn main() -> anyhow::Result<()> {
             // finish. Padding to the full match width keeps one tensor shape
             // for the whole match instead of letting TensorRT rebuild an
             // engine each time a game ends.
-            let (sampler, params) = match_search(sims, candidates, t_steps, games as usize, seed);
+            let (mut sampler, params) =
+                match_search(sims, candidates, t_steps, games as usize, seed);
+            sampler.resample_t = resample_t;
+            sampler.resample_frac = resample_frac;
             let kind = minions_engine::net::BackendKind::parse(&backend, &ep, fp16, cuda)?;
             let sa = load_seat(std::path::Path::new(&a), &kind, sampler)?;
             let tb = t_steps_b.unwrap_or(t_steps);
@@ -588,12 +604,14 @@ async fn main() -> anyhow::Result<()> {
             let pa = SampledParams {
                 kernel_sigma,
                 resample_every,
+                resample_max_depth: resample_depth.unwrap_or(u32::MAX),
                 ..params
             };
             let pb = SampledParams {
                 simulations: sims_b.unwrap_or(sims),
                 kernel_sigma: kernel_sigma_b.unwrap_or(kernel_sigma),
                 resample_every: resample_every_b.unwrap_or(resample_every),
+                resample_max_depth: resample_depth.unwrap_or(u32::MAX),
                 ..params
             };
             let rf = render_file.as_ref().map(std::path::PathBuf::from);
