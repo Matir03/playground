@@ -250,6 +250,14 @@ enum Cmd {
         /// Deepest node that refines, root = 0 (both seats). Default: all.
         #[arg(long)]
         resample_depth: Option<u32>,
+        /// Seat B's `--resample-t`, `--resample-frac` and `--resample-depth`;
+        /// each defaults to A's.
+        #[arg(long)]
+        resample_t_b: Option<usize>,
+        #[arg(long)]
+        resample_frac_b: Option<f32>,
+        #[arg(long)]
+        resample_depth_b: Option<u32>,
         /// Both seats: no forced visits, no explore quotas and no random
         /// fills -- every candidate is a sampler draw, chosen by plain PUCT.
         #[arg(long)]
@@ -551,6 +559,9 @@ async fn main() -> anyhow::Result<()> {
             resample_t,
             resample_frac,
             resample_depth,
+            resample_t_b,
+            resample_frac_b,
+            resample_depth_b,
             no_explore,
             backend,
             ep,
@@ -582,6 +593,8 @@ async fn main() -> anyhow::Result<()> {
                 k_candidates_fast: cb,
                 k_draws: cb,
                 k_draws_fast: cb,
+                resample_t: resample_t_b.unwrap_or(resample_t),
+                resample_frac: resample_frac_b.unwrap_or(resample_frac),
                 ..sampler
             };
             let sb = match &b {
@@ -611,7 +624,7 @@ async fn main() -> anyhow::Result<()> {
                 simulations: sims_b.unwrap_or(sims),
                 kernel_sigma: kernel_sigma_b.unwrap_or(kernel_sigma),
                 resample_every: resample_every_b.unwrap_or(resample_every),
-                resample_max_depth: resample_depth.unwrap_or(u32::MAX),
+                resample_max_depth: resample_depth_b.or(resample_depth).unwrap_or(u32::MAX),
                 ..params
             };
             let rf = render_file.as_ref().map(std::path::PathBuf::from);
