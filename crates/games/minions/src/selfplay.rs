@@ -890,6 +890,8 @@ pub struct PoolStats {
     /// ones the policy target is built over.
     pub root_children: u64,
     pub root_stable: u64,
+    /// Full searches finished: the per-root denominator for the two above.
+    pub full_roots: u64,
     /// Head rows actually wanted, and head rows run. The gap is the padding
     /// waste in the most expensive phase.
     pub head_real: u64,
@@ -922,6 +924,7 @@ impl PoolStats {
         self.req_resample += o.req_resample;
         self.root_children += o.root_children;
         self.root_stable += o.root_stable;
+        self.full_roots += o.full_roots;
         self.head_real += o.head_real;
         self.head_run += o.head_run;
         self.cache_hits += o.cache_hits;
@@ -964,7 +967,7 @@ impl PoolStats {
             s += &format!(
                 "  |  targets over {:.1}% of root children (stable), {:.1} per full root",
                 100.0 * self.root_stable as f64 / self.root_children as f64,
-                self.root_children as f64 / (self.turns.max(1)) as f64,
+                self.root_children as f64 / self.full_roots.max(1) as f64,
             );
         }
         s
@@ -1122,6 +1125,7 @@ fn advance_turn(
         let stable = result.stable_target();
         stats.root_children += result.candidates.len() as u64;
         stats.root_stable += stable.len() as u64;
+        stats.full_roots += 1;
         let scored = policy_record(stable.iter().map(|&(i, p)| (result.candidates[i].0, p)));
         let mut target = vec![0.0f32; result.candidates.len()];
         for &(i, p) in &stable {
