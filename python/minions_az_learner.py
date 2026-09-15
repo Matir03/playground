@@ -571,7 +571,7 @@ def calibrate_log_z(net, batch, rng, device, t_steps, tb_candidates, batches=8, 
 
 def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux=0.15,
                 tb_weight=0.0, t_steps=4, move_smoothing=0.0, tb_candidates=1,
-                w_score=0.15):
+                w_score=0.15, energy_children=8192):
     """One generation of updates.
 
     With ``tb_weight > 0`` this runs the two-phase schedule: every step first
@@ -656,6 +656,16 @@ def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux
         row, flat, _ = candidate_rows(batch, idx)
         mass = np.bincount(row, weights=batch["cand_prob"][flat], minlength=bs)
         use = np.flatnonzero(full_rows & (n_c > 0) & (mass > 0))
+        # Cap the children scored per step. The energy head's activations grow
+        # with them, and a batch of v10 rows (~130 children each) passes 15k.
+        # That is past what the 8 GB card holds, so the Windows driver spills
+        # into shared system memory and the step runs ~20x slower: 14 GB
+        # reserved, p90 step 6.9 s against a 335 ms median. The cap drops whole
+        # rows, never children within one, so every scored row still sees all
+        # its visits. `idx` is a random draw, so a prefix of `use` is a random
+        # subset. 8192 is what v9's 512 x 16 slots cost, which always fitted.
+        if energy_children:
+            use = use[np.cumsum(n_c[use]) <= energy_children]
         if len(use):
             row, flat, slot = candidate_rows(batch, idx, use)
             dense = torch.from_numpy(np.searchsorted(use, row)).to(device)
@@ -824,6 +834,9 @@ def main():
     ap.add_argument("--gen-examples", type=int, default=0,
                     help="wait for this many fresh examples before training")
     ap.add_argument("--exit-after-gens", type=int, default=0)
+    ap.add_argument("--energy-children", type=int, default=8192,
+                    help="most children the energy loss scores per step, "
+                         "by whole rows; 0 = no cap")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -906,6 +919,7 @@ def main():
             move_smoothing=args.move_smoothing,
             tb_candidates=args.tb_candidates,
             w_score=args.score_weight,
+            energy_children=args.energy_children,
         )
         generation += 1
         gens_done += 1
