@@ -660,22 +660,26 @@ def run_diagnostic(args, live, scores, scores_path) -> None:
     else:
         print(f"gen {gen}: no snapshot at generation {want}, skipping the lag match")
 
-    # ...and against greedy, the fixed external yardstick.
-    try:
-        g, gm, ggs = run_match(
-            args.engine, ckpt, None, args.greedy_games, args.sims, args.candidates,
-            args.t_steps, args.backend, args.ep, args.fp16, seed=1000 + gen,
-            render_file=os.path.join(games_dir, f"gen_{gen:04d}_vs_greedy.txt"),
-            render_games=args.render_games)
-        entry["vs_greedy"] = g
-        if gm is not None:
-            entry["vs_greedy_margin"] = round(gm, 3)
-        if ggs is not None:
-            entry["vs_greedy_score"] = round(ggs, 2)
-        if _LAST_TURNS is not None:
-            entry["greedy_turns_win"], entry["greedy_turns_loss"] = _LAST_TURNS
-    except Exception as exc:  # noqa: BLE001
-        entry["vs_greedy_error"] = str(exc)[:200]
+    # ...and against greedy, the fixed external yardstick -- while it is still
+    # being played. `--greedy-games 0` turns it off, as the tournament path in
+    # `play_all` already does. Without the guard a 0 reaches `run_match` and is
+    # recorded as `vs_greedy_error` rather than simply skipped.
+    if args.greedy_games > 0:
+        try:
+            g, gm, ggs = run_match(
+                args.engine, ckpt, None, args.greedy_games, args.sims, args.candidates,
+                args.t_steps, args.backend, args.ep, args.fp16, seed=1000 + gen,
+                render_file=os.path.join(games_dir, f"gen_{gen:04d}_vs_greedy.txt"),
+                render_games=args.render_games)
+            entry["vs_greedy"] = g
+            if gm is not None:
+                entry["vs_greedy_margin"] = round(gm, 3)
+            if ggs is not None:
+                entry["vs_greedy_score"] = round(ggs, 2)
+            if _LAST_TURNS is not None:
+                entry["greedy_turns_win"], entry["greedy_turns_loss"] = _LAST_TURNS
+        except Exception as exc:  # noqa: BLE001
+            entry["vs_greedy_error"] = str(exc)[:200]
 
     metrics = os.path.join(snaps[-1], "metrics.json")
     if os.path.exists(metrics):

@@ -186,7 +186,10 @@ EVAL_PARALLEL="${EVAL_PARALLEL:-10}"
 # unit of Fisher information, so rating them added noise and -- landing after
 # the promotion decision -- made the fit a candidate was judged on differ from
 # the one recorded for it.
-GREEDY_GAMES="${GREEDY_GAMES:-30}"
+# 0 since 2026-09-15: the greedy yardstick stopped carrying signal -- the
+# champions beat it 0.90-1.00 and every game costs eval time -- so it is no
+# longer played. Set GREEDY_GAMES to a positive number to bring it back.
+GREEDY_GAMES="${GREEDY_GAMES:-0}"
 # A pre-filter, not the decision, since the rating gate landed. It exists only
 # to avoid paying four ladder matches for a candidate that is plainly worse, so
 # it sits below parity: a candidate that lost the head-to-head 0.45 has said
