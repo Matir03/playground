@@ -28,7 +28,10 @@ BLOCKS="${BLOCKS:-8}"
 # stretches self-play to ~40 min against a fixed eval cost, putting eval near 8%.
 #
 # 250000 -> 200000 (user, 2026-09-13), with the buffer at five generations.
-TARGET_EXAMPLES="${TARGET_EXAMPLES:-200000}"
+# 100k since 2026-09-16: at 800 sims with no fast searches a position costs
+# ~4.6x what it did (800 against a ~175 average), so 200k would take ~2 h per
+# generation. At 100k over a 500k buffer an example still lives five gens.
+TARGET_EXAMPLES="${TARGET_EXAMPLES:-100000}"
 # Batch sizing, measured on the 7x7 net (ABBA pairs, quiet machine).
 #
 # The heads run at `MAX_BATCH * CANDIDATES` rows, but the *trunk* runs at
@@ -58,8 +61,16 @@ MAX_BATCH="${MAX_BATCH:-768}"
 # GPU throughput. At CONCURRENCY 1024 each of 4 workers holds 256 slots, exactly
 # the 2 * MAX_BATCH `pick_mode` needs to keep padding at zero — verified 0%.
 WORKERS="${WORKERS:-4}"
-SIMS="${SIMS:-400}"
+# 800 since 2026-09-16 (was 400): deeper search per position, at roughly double
+# the self-play wall clock. EVAL_SIMS stays 400 so tournament ratings remain
+# comparable with the whole ladder from gen362 on.
+SIMS="${SIMS:-800}"
 FAST_SIMS="${FAST_SIMS:-100}"
+# 1.0 since 2026-09-16 (user): no playout-cap randomization -- every position
+# gets the full search and a policy target. The actor's own default is 0.25,
+# which is what produced the ~24% full rows before this. FAST_SIMS,
+# CANDIDATES_FAST and T_STEPS_FAST are dead while this is 1.0.
+FULL_SEARCH_PROB="${FULL_SEARCH_PROB:-1.0}"
 # 2026-09-15 (user): 16 diffusion candidates plus 8 random-playout explore
 # candidates per full-search node -- 24, with RANDOM_FRACTION 1/3. Each
 # candidate is random by a weighted coin, so a node gets 8 in expectation.
@@ -125,7 +136,11 @@ FORCED_VISITS="${FORCED_VISITS:-10}"
 FORCED_EXTRA="${FORCED_EXTRA:-0}"
 # Five generations: one tournament round of the champion's own games, since
 # only the champion plays self-play between tournaments (SELFPLAY_NET).
-MAX_EXAMPLES="${MAX_EXAMPLES:-1000000}"
+# 500k since 2026-09-16, halved with FULL_SEARCH_PROB at 1.0: every row now
+# carries its root's children (~103 at 17.0 KB/row, against 5.2 KB when three
+# quarters of the rows were fast and stored none). 1M all-full rows would be
+# 15.8 GiB of buffer, and the learner holds it all in RAM on a 24 GB box.
+MAX_EXAMPLES="${MAX_EXAMPLES:-500000}"
 # 488 * 512 = 250k samples per generation -- a quarter of the buffer -- so each
 # example is drawn about 1.25 times over its five-generation life.
 #
@@ -145,7 +160,7 @@ STEPS="${STEPS:-488}"
 # 250000 and a MIN_SAMPLES of exactly 250000 would wait for data no completed
 # generate phase will ever produce.
 # Must stay below TARGET_EXAMPLES.
-MIN_SAMPLES="${MIN_SAMPLES:-150000}"
+MIN_SAMPLES="${MIN_SAMPLES:-75000}"
 # 512 measured 1.30x the samples/s of 128 (paired ABBA on a cooled, idle GPU:
 # 1273 -> 1657). 1024 was 0.98x of 512, so this is the knee, not a ceiling.
 BATCH="${BATCH:-512}"
@@ -269,6 +284,7 @@ while true; do
   "$ENGINE" selfplay-loop --live "$LIVE" \
     --concurrency "$CONCURRENCY" --max-batch "$MAX_BATCH" --workers "$WORKERS" \
     --sims "$SIMS" --fast-sims "$FAST_SIMS" --candidates "$CANDIDATES" \
+    --full-search-prob "$FULL_SEARCH_PROB" \
     --candidates-fast "$CANDIDATES_FAST" \
     --t-steps "$T_STEPS" --t-steps-fast "$T_STEPS_FAST" \
     --resample-every "$RESAMPLE_EVERY" --resample-frac "$RESAMPLE_FRAC" \
