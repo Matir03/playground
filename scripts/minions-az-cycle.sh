@@ -170,7 +170,11 @@ EVAL_GAMES="${EVAL_GAMES:-40}"
 GATE="${GATE:-0}"
 MEASURE_EVERY="${MEASURE_EVERY:-5}"
 # Who plays self-play between tournaments: the champion, or each new generation.
-SELFPLAY_NET="${SELFPLAY_NET:-champion}"
+# newest since 2026-09-15: strength was flat for three tournaments (gen371
+# onward) while the losses kept improving. Five generations of self-play on
+# one frozen champion give the buffer a single net's distribution, the same
+# shape of stall seen in the Hex run. Tournaments still rate and crown.
+SELFPLAY_NET="${SELFPLAY_NET:-newest}"
 # Tournament matches at once, at most. Each eval-match process holds ~2 GB, so
 # on this 23 GB box the eval loop's RAM floor usually binds first.
 EVAL_PARALLEL="${EVAL_PARALLEL:-10}"
