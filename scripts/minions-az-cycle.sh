@@ -136,11 +136,11 @@ FORCED_VISITS="${FORCED_VISITS:-10}"
 FORCED_EXTRA="${FORCED_EXTRA:-0}"
 # Five generations: one tournament round of the champion's own games, since
 # only the champion plays self-play between tournaments (SELFPLAY_NET).
-# 500k since 2026-09-16, halved with FULL_SEARCH_PROB at 1.0: every row now
-# carries its root's children (~103 at 17.0 KB/row, against 5.2 KB when three
-# quarters of the rows were fast and stored none). 1M all-full rows would be
-# 15.8 GiB of buffer, and the learner holds it all in RAM on a 24 GB box.
-MAX_EXAMPLES="${MAX_EXAMPLES:-500000}"
+# 250k since 2026-09-16. At 800 sims a root has ~300 stable children, so 87-91%
+# of rows hit the TOP_K 160 cap and cost ~22 KB each: 500k rows is over 10 GiB of
+# buffer and the learner holds it all in RAM on a 24 GB box. The user accepted
+# the truncation (top 160 by visits) rather than raising the cap.
+MAX_EXAMPLES="${MAX_EXAMPLES:-250000}"
 # 488 * 512 = 250k samples per generation -- a quarter of the buffer -- so each
 # example is drawn about 1.25 times over its five-generation life.
 #
