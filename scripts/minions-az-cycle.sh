@@ -61,21 +61,31 @@ MAX_BATCH="${MAX_BATCH:-768}"
 # GPU throughput. At CONCURRENCY 1024 each of 4 workers holds 256 slots, exactly
 # the 2 * MAX_BATCH `pick_mode` needs to keep padding at zero — verified 0%.
 WORKERS="${WORKERS:-4}"
-# Trunk feature cache: deliberately NOT set here, so the actor and every eval
-# engine use the 8192 MB default compiled into the binary.
+# Trunk feature cache: 12288 MB, set on the actor invocation below and
+# deliberately NOT exported, so the ten concurrent tournament eval engines keep
+# the binary's 8192 MB default.
 #
-# 12288 was tried on 2026-09-16 (ad9be77) and reverted on 2026-09-17 as a NULL
-# RESULT. It does eliminate eviction at steady state (220k-273k entries per
-# window -> 0, hit rate 55.4% -> 57.1%), but throughput is unchanged: both arms
-# mean ~1.42M expansions/60s at matched game phase. The costs were real -- actor
-# RSS 17.4 -> 22 GB left under 3 GB free, two cargo builds were killed for low
-# memory, and because this was exported, the ten concurrent tournament engines
-# each inherited the raised ceiling and the eval phase fell to 1.28 GB available,
-# the thinnest margin of any round.
+# History: set 2026-09-16 (ad9be77), reverted 2026-09-17 (2a92a3b) as a null
+# result, restored the same day at the user's call -- throughput matters more
+# here than the memory headroom. The evidence is genuinely mixed:
+#   - The in-generation ABBA, the only design that controls for net AND power
+#     state, read ~1.42M expansions/60s for BOTH arms.
+#   - A cross-run comparison of gen402 (12288) vs gen403 (8192), matched on
+#     children-per-full-root and refine share, separated with no overlap:
+#     plateau windows 1.527-1.647M (n=49) vs 1.389-1.504M (n=20), ~9% apart.
+#   - End-to-end generate duration agreed in sign: 109.9 vs 116.3 min per
+#     100k examples, ~6%.
+# Both cross-run measures are confounded the same way (different nets, and a
+# documented between-run power-state gap). To settle it, run the in-generation
+# ABBA; do NOT collect more cross-run windows, no quantity of them resolves a
+# between-run confound.
+#
+# Cost of the raised cap: actor RSS ~17.4 -> 22 GB, leaving under 3 GB free.
+# Scoping it to the actor is what keeps the eval phase off the 1.28 GB floor it
+# hit when this was exported.
 #
 # The early-generation phase evicts under any cap this box can hold (853k-1016k
-# at 8192, 196k-530k at 12288), so raising the cap does not fix that either.
-# If this is ever set again, scope it to the actor invocation, do not export it.
+# at 8192, 196k-530k at 12288), so raising the cap does not fix that.
 # 800 since 2026-09-16 (was 400): deeper search per position, at roughly double
 # the self-play wall clock. EVAL_SIMS stays 400 so tournament ratings remain
 # comparable with the whole ladder from gen362 on.
@@ -296,6 +306,7 @@ while true; do
   # deterministic in the seed, so a relaunch replayed the first cycle's games
   # into the buffer as exact duplicates.
   seed=$(grep -o '"generation": *[0-9]*' "$LIVE/config.json" | grep -o '[0-9]*$')
+  MINIONS_TRUNK_CACHE_MB="${MINIONS_TRUNK_CACHE_MB:-12288}" \
   "$ENGINE" selfplay-loop --live "$LIVE" \
     --concurrency "$CONCURRENCY" --max-batch "$MAX_BATCH" --workers "$WORKERS" \
     --sims "$SIMS" --fast-sims "$FAST_SIMS" --candidates "$CANDIDATES" \
