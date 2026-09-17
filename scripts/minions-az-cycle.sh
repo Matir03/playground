@@ -61,6 +61,16 @@ MAX_BATCH="${MAX_BATCH:-768}"
 # GPU throughput. At CONCURRENCY 1024 each of 4 workers holds 256 slots, exactly
 # the 2 * MAX_BATCH `pick_mode` needs to keep padding at zero — verified 0%.
 WORKERS="${WORKERS:-4}"
+# Trunk feature cache, MB (the actor's own default is 8192). 12288 since
+# 2026-09-16: at 800 sims with all-full searches the 8 GB cache pins at its
+# ceiling and evicts 200k-278k entries per reporting window, holding the hit
+# rate at ~55%. At 400 sims the same cache peaked at 7893 MB and evicted
+# nothing, so the ceiling only started binding with the deeper search.
+#
+# This spends most of the remaining RAM: the actor sits at ~17.4 GB RSS of
+# 24.6 GB total, so +4 GB leaves ~2.7 GB. If MemAvailable falls under ~1.5 GB
+# during generate, drop this to 10240 -- an OOM costs a whole generation.
+export MINIONS_TRUNK_CACHE_MB="${MINIONS_TRUNK_CACHE_MB:-12288}"
 # 800 since 2026-09-16 (was 400): deeper search per position, at roughly double
 # the self-play wall clock. EVAL_SIMS stays 400 so tournament ratings remain
 # comparable with the whole ladder from gen362 on.
