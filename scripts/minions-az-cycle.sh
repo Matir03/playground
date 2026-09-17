@@ -61,16 +61,21 @@ MAX_BATCH="${MAX_BATCH:-768}"
 # GPU throughput. At CONCURRENCY 1024 each of 4 workers holds 256 slots, exactly
 # the 2 * MAX_BATCH `pick_mode` needs to keep padding at zero — verified 0%.
 WORKERS="${WORKERS:-4}"
-# Trunk feature cache, MB (the actor's own default is 8192). 12288 since
-# 2026-09-16: at 800 sims with all-full searches the 8 GB cache pins at its
-# ceiling and evicts 200k-278k entries per reporting window, holding the hit
-# rate at ~55%. At 400 sims the same cache peaked at 7893 MB and evicted
-# nothing, so the ceiling only started binding with the deeper search.
+# Trunk feature cache: deliberately NOT set here, so the actor and every eval
+# engine use the 8192 MB default compiled into the binary.
 #
-# This spends most of the remaining RAM: the actor sits at ~17.4 GB RSS of
-# 24.6 GB total, so +4 GB leaves ~2.7 GB. If MemAvailable falls under ~1.5 GB
-# during generate, drop this to 10240 -- an OOM costs a whole generation.
-export MINIONS_TRUNK_CACHE_MB="${MINIONS_TRUNK_CACHE_MB:-12288}"
+# 12288 was tried on 2026-09-16 (ad9be77) and reverted on 2026-09-17 as a NULL
+# RESULT. It does eliminate eviction at steady state (220k-273k entries per
+# window -> 0, hit rate 55.4% -> 57.1%), but throughput is unchanged: both arms
+# mean ~1.42M expansions/60s at matched game phase. The costs were real -- actor
+# RSS 17.4 -> 22 GB left under 3 GB free, two cargo builds were killed for low
+# memory, and because this was exported, the ten concurrent tournament engines
+# each inherited the raised ceiling and the eval phase fell to 1.28 GB available,
+# the thinnest margin of any round.
+#
+# The early-generation phase evicts under any cap this box can hold (853k-1016k
+# at 8192, 196k-530k at 12288), so raising the cap does not fix that either.
+# If this is ever set again, scope it to the actor invocation, do not export it.
 # 800 since 2026-09-16 (was 400): deeper search per position, at roughly double
 # the self-play wall clock. EVAL_SIMS stays 400 so tournament ratings remain
 # comparable with the whole ladder from gen362 on.
