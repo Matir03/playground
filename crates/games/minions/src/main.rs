@@ -169,6 +169,16 @@ enum Cmd {
         /// against the same net.
         #[arg(long, default_value_t = 0.0)]
         kernel_sigma: f32,
+        /// Which visits back up into a candidate's value: `all` (default),
+        /// `true-only`, or `node-gate`.
+        ///
+        /// Forced visits and refinement hand-overs are bought, not chosen.
+        /// `all` folds them into the value as the search has always done;
+        /// `true-only` counts none of them; `node-gate` ignores a candidate
+        /// whose visits are *all* bought but keeps the whole count once one is
+        /// earned. **`all` reproduces the previous search bit-for-bit.**
+        #[arg(long, default_value = "all")]
+        value_visits: playground_core::sampled_mcts::ValueVisits,
         /// Candidates generated per model call. 0 (default) produces a node's
         /// whole set in one call.
         ///
@@ -299,6 +309,15 @@ enum Cmd {
         /// the same way unless you ask for the flat-vs-KR comparison.
         #[arg(long)]
         kernel_sigma_b: Option<f32>,
+        /// Value-visit mode for seat A: `all` (default), `true-only` or
+        /// `node-gate`. See the selfplay flag of the same name.
+        #[arg(long, default_value = "all")]
+        value_visits: playground_core::sampled_mcts::ValueVisits,
+        /// Value-visit mode for seat B; defaults to A's. Set only this to play
+        /// one mode against another on a single checkpoint, which is the whole
+        /// point of the knob.
+        #[arg(long)]
+        value_visits_b: Option<playground_core::sampled_mcts::ValueVisits>,
         /// Write a turn-by-turn transcript of the first N games here. These are
         /// the very games the promotion gate scored, so the sample and the
         /// number always agree.
@@ -506,6 +525,7 @@ async fn main() -> anyhow::Result<()> {
             workers,
             no_energy,
             kernel_sigma,
+            value_visits,
             pw_chunk,
             draw_retries,
             resample_every,
@@ -532,6 +552,7 @@ async fn main() -> anyhow::Result<()> {
                 random_opening_max,
                 random_opening_decay,
                 kernel_sigma,
+                value_visits,
                 pw_chunk,
                 draw_retries,
                 resample_every,
@@ -600,6 +621,8 @@ async fn main() -> anyhow::Result<()> {
             seed,
             kernel_sigma,
             kernel_sigma_b,
+            value_visits,
+            value_visits_b,
             render_file,
             render_games,
         } => {
@@ -646,6 +669,7 @@ async fn main() -> anyhow::Result<()> {
             };
             let pa = SampledParams {
                 kernel_sigma,
+                value_visits,
                 resample_every,
                 resample_max_depth: resample_depth.unwrap_or(u32::MAX),
                 pw_beta: pw_beta.unwrap_or(params.pw_beta),
@@ -654,6 +678,7 @@ async fn main() -> anyhow::Result<()> {
             let pb = SampledParams {
                 simulations: sims_b.unwrap_or(sims),
                 kernel_sigma: kernel_sigma_b.unwrap_or(kernel_sigma),
+                value_visits: value_visits_b.unwrap_or(value_visits),
                 resample_every: resample_every_b.unwrap_or(resample_every),
                 pw_beta: pw_beta_b.or(pw_beta).unwrap_or(params.pw_beta),
                 resample_max_depth: resample_depth_b.or(resample_depth).unwrap_or(u32::MAX),

@@ -30,7 +30,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use playground_core::sampled_mcts::{SampledGame, SampledParams, Search, Step};
+use playground_core::sampled_mcts::{SampledGame, SampledParams, Search, Step, ValueVisits};
 use playground_core::{Game, Outcome};
 
 use crate::game::{Minions, MinionsState};
@@ -146,6 +146,11 @@ pub struct ActorConfig {
     pub sims: u32,
     /// KR-PUCT kernel bandwidth; 0 keeps the flat PUCT search (the default).
     pub kernel_sigma: f32,
+    /// Which visits back up into a candidate's value. `All` (the default) is
+    /// the search as it has always behaved; the other modes drop forced visits
+    /// and refinement hand-overs from the value, leaving them to buy an
+    /// estimate without moving the parent's.
+    pub value_visits: ValueVisits,
     /// Progressive widening at interior nodes; `pw_beta = 0` disables it, and
     /// `ceil(pw_beta)` is the count a node starts with.
     pub pw_alpha: f32,
@@ -235,6 +240,7 @@ impl ActorConfig {
             pw_beta: self.pw_beta,
             pw_chunk: self.pw_chunk,
             kernel_sigma: self.kernel_sigma,
+            value_visits: self.value_visits,
             seed,
         }
     }
@@ -253,6 +259,7 @@ impl Default for ActorConfig {
             forced_extra: 4,
             workers: 4,
             kernel_sigma: 0.0,
+            value_visits: ValueVisits::All,
             pw_alpha: 0.5,
             pw_beta: 2.0,
             pw_chunk: 1,

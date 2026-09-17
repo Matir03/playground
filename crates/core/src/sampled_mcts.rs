@@ -309,7 +309,97 @@ pub struct SampledParams {
     /// which is what keeps the flat search available as a mode rather than being
     /// replaced. Asserted by `zero_bandwidth_matches_plain_puct`.
     pub kernel_sigma: f32,
+    /// Which visits are folded into a candidate's value estimate.
+    ///
+    /// **`All` reproduces the pre-existing search bit-for-bit**, which is what
+    /// keeps this a mode rather than a replacement. Asserted by
+    /// `all_value_visits_matches_the_old_backup`.
+    pub value_visits: ValueVisits,
     pub seed: u64,
+}
+
+/// Which visits back up into `Entry::w`, and so into the parent's `q`.
+///
+/// Two visits reach a candidate without PUCT having chosen it: a *forced* one
+/// bought by a quota ([`SampledParams::forced_visits`]), and a *hand-over*,
+/// where a refinement redrew the candidate PUCT picked and visited the result
+/// instead ([`Search::provide_resample`]). Both are deliberate purchases of a
+/// value estimate. The question this knob asks is whether that estimate should
+/// also move the *parent's* evaluation, given the search never chose to spend
+/// a visit there on merit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ValueVisits {
+    /// Every visit counts, forced and hand-overs included — the behaviour
+    /// before this knob existed. `Entry::n_eff` already removes forced visits
+    /// from the *exploration* term; this leaves them in the value.
+    #[default]
+    All,
+    /// Only visits PUCT chose. Forced visits and hand-overs still happen, are
+    /// still counted in `n`, and still expand their child; they just do not
+    /// move any value estimate.
+    TrueOnly,
+    /// Per-candidate gate: a candidate whose visits are *all* bought is
+    /// invisible to the parent's value (it reads as unvisited and falls back to
+    /// FPU), but one that earns a single chosen visit keeps its whole count,
+    /// bought visits included. The same "earned even one visit keeps the whole
+    /// count" rule the policy target already uses.
+    NodeGate,
+}
+
+impl std::str::FromStr for ValueVisits {
+    type Err = String;
+
+    /// Parsed by hand rather than through `clap::ValueEnum`, which would put a
+    /// clap dependency in `playground-core` for the sake of one flag.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', '_'], "")
+            .as_str()
+        {
+            "all" => Ok(ValueVisits::All),
+            "trueonly" | "true" => Ok(ValueVisits::TrueOnly),
+            "nodegate" | "gate" => Ok(ValueVisits::NodeGate),
+            other => Err(format!(
+                "unknown value-visits mode {other:?}: expected all, true-only or node-gate"
+            )),
+        }
+    }
+}
+
+/// How a visit arrived at a candidate, carried on the descent path so that
+/// [`Search::backup`] can tell a purchase from a choice.
+///
+/// `auto_n` already records hand-overs, but it is incremented in
+/// `provide_resample`, and only the path reaches `backup` — hence a second
+/// record of the same fact rather than a lookup.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VisitKind {
+    /// PUCT picked this edge on merit.
+    Chosen,
+    /// A quota demanded it: `forced_visits`, `min_explore_visits`, the root
+    /// sweep, or a hand-driven `force_line`.
+    Forced,
+    /// A refinement redrew the candidate PUCT picked and visited the result
+    /// instead (`Search::provide_resample`).
+    Handover,
+}
+
+impl VisitKind {
+    /// Whether the search chose to spend this visit here, as opposed to being
+    /// made to. The single place the three kinds collapse to the two that
+    /// [`ValueVisits`] cares about.
+    fn chosen(self) -> bool {
+        matches!(self, VisitKind::Chosen)
+    }
+
+    /// Forced visits are the ones `Entry::forced_n` counts and `n_eff` removes
+    /// from PUCT's exploration term. A hand-over is *not* forced: PUCT did pick
+    /// an edge, the refinement only moved where the visit landed.
+    fn forced(self) -> bool {
+        matches!(self, VisitKind::Forced)
+    }
 }
 
 impl Default for SampledParams {
@@ -332,6 +422,7 @@ impl Default for SampledParams {
             pw_beta: 2.0,
             pw_chunk: 1,
             kernel_sigma: 0.0,
+            value_visits: ValueVisits::All,
             seed: 0,
         }
     }
@@ -413,6 +504,16 @@ struct Entry<G: SampledGame> {
     /// Visits a refinement handed elsewhere after PUCT picked *this* entry to
     /// redraw. The training target credits them here.
     credit_n: u32,
+    /// Visits PUCT actually chose: `n` less forced visits and less refinement
+    /// hand-overs. Distinct from `n_eff()`, which only removes the forced ones,
+    /// and from `target_n()`, which re-credits hand-overs to the entry PUCT
+    /// picked instead of dropping them.
+    ///
+    /// Always maintained, whatever [`SampledParams::value_visits`] says, so the
+    /// three modes differ only in which accumulator they *read*.
+    true_n: u32,
+    /// `w` restricted to the visits counted in `true_n`.
+    true_w: f32,
 }
 
 impl<G: SampledGame> Entry<G> {
@@ -434,6 +535,29 @@ impl<G: SampledGame> Entry<G> {
     /// itself never sees this count.
     fn target_n(&self) -> u32 {
         self.n_eff().saturating_sub(self.auto_n) + self.credit_n
+    }
+
+    /// The `(numerator, denominator)` this entry contributes to a value
+    /// estimate under the run's [`ValueVisits`] mode. A zero denominator means
+    /// "no opinion" and the caller falls back to FPU.
+    ///
+    /// `All` returns `(w, n)` — byte for byte what the search read before this
+    /// knob existed. `TrueOnly` narrows to the chosen visits. `NodeGate` keeps
+    /// the *whole* count once one chosen visit exists and reports nothing
+    /// before that, so a candidate that has only ever been bought reads as
+    /// unvisited instead of injecting a purchased estimate into its parent.
+    fn value_wn(&self, mode: ValueVisits) -> (f32, u32) {
+        match mode {
+            ValueVisits::All => (self.w, self.n),
+            ValueVisits::TrueOnly => (self.true_w, self.true_n),
+            ValueVisits::NodeGate => {
+                if self.true_n > 0 {
+                    (self.w, self.n)
+                } else {
+                    (0.0, 0)
+                }
+            }
+        }
     }
 }
 
@@ -471,6 +595,13 @@ struct Node<G: SampledGame> {
     kern_rows: usize,
     total_n: u32,
     w_sum: f32,
+    /// `total_n` and `w_sum` restricted to visits PUCT chose, mirroring
+    /// `Entry::true_n`/`true_w`. Feeds the FPU's parent value under
+    /// [`ValueVisits::TrueOnly`] and [`ValueVisits::NodeGate`], so a node whose
+    /// visits were mostly bought does not hand its children a parent estimate
+    /// built from purchases.
+    true_total_n: u32,
+    true_w_sum: f32,
     visited_p: f32,
     expanded: bool,
     terminal: bool,
@@ -743,6 +874,8 @@ fn new_node<G: SampledGame>(state: G::State) -> Node<G> {
         kern_rows: 0,
         total_n: 0,
         w_sum: 0.0,
+        true_total_n: 0,
+        true_w_sum: 0.0,
         visited_p: 0.0,
         expanded: false,
         terminal: tv.is_some(),
@@ -956,11 +1089,14 @@ fn select<G: SampledGame>(
         }
     }
 
-    let parent_q = if node.total_n > 0 {
-        node.w_sum / node.total_n as f32
-    } else {
-        0.0
+    // Under `TrueOnly`/`NodeGate` the FPU's anchor narrows too: a node whose
+    // visits were mostly bought should not hand its children a parent estimate
+    // built from purchases. `All` keeps the raw sums exactly as before.
+    let (par_w, par_n) = match params.value_visits {
+        ValueVisits::All => (node.w_sum, node.total_n),
+        ValueVisits::TrueOnly | ValueVisits::NodeGate => (node.true_w_sum, node.true_total_n),
     };
+    let parent_q = if par_n > 0 { par_w / par_n as f32 } else { 0.0 };
     let fpu = puct::fpu(parent_q, node.visited_p);
 
     // KR-PUCT (docs/algorithm.md "Selection"): regress each candidate's value
@@ -985,8 +1121,9 @@ fn select<G: SampledGame>(
                 // `q_hat`'s denominator is the full count that `w` was
                 // accumulated over.
                 n_hat[i] += k * e.n_eff() as f32;
-                nq_hat[i] += k * e.n as f32;
-                w_hat[i] += k * e.w;
+                let (ew, en) = e.value_wn(params.value_visits);
+                nq_hat[i] += k * en as f32;
+                w_hat[i] += k * ew;
             }
         }
         let sqrt_total: f32 = n_hat.iter().sum::<f32>().max(1.0).sqrt();
@@ -1028,7 +1165,8 @@ fn select<G: SampledGame>(
         // negates on the way up), so it is used as-is here. `q` deliberately
         // uses the *full* visit count: the forced visits were spent measuring
         // exactly this, and discarding them would throw the estimate away.
-        let q = if e.n > 0 { e.w / e.n as f32 } else { fpu };
+        let (ew, en) = e.value_wn(params.value_visits);
+        let q = if en > 0 { ew / en as f32 } else { fpu };
         let u = params.c_puct * e.p * sqrt_total / (1.0 + e.n_eff() as f32);
         let s = q + u;
         scores.push(s);
@@ -1059,7 +1197,7 @@ pub struct Search<G: SampledGame> {
     /// (node, entry, forced) for each edge descended through in the current
     /// simulation. `forced` rides along to `backup` instead of being tallied
     /// at selection, so a quota is only charged for a visit that is backed up.
-    path: Vec<(usize, usize, bool)>,
+    path: Vec<(usize, usize, VisitKind)>,
     /// Node awaiting expansion, if `step` returned `NeedExpansion`.
     pending: Option<usize>,
     /// Node awaiting more candidates, if `step` returned `NeedWiden`, and
@@ -1343,6 +1481,8 @@ impl<G: SampledGame> Search<G> {
             forced_quota: 0,
             auto_n: 0,
             credit_n: 0,
+            true_n: 0,
+            true_w: 0.0,
             draws: 0,
             manual: true,
             eval,
@@ -1371,13 +1511,20 @@ impl<G: SampledGame> Search<G> {
     /// position at 0.36, which `an_immediate_win_is_taken` caught.
     pub fn root_value(&self) -> f64 {
         let root = &self.tree[0];
+        let mode = self.params.value_visits;
         let eff_n: u32 = root.entries.iter().map(|e| e.n_eff()).sum();
         if eff_n > 0 {
+            // Weighted by `n_eff` as before -- that is the visit-mass statement
+            // -- but each candidate's own q now comes from whichever visits the
+            // mode counts. Under `All` the filter is `e.n > 0` and the term is
+            // `e.w / e.n`, which is exactly the previous expression.
             let acc: f64 = root
                 .entries
                 .iter()
-                .filter(|e| e.n > 0)
-                .map(|e| e.n_eff() as f64 * (e.w as f64 / e.n as f64))
+                .filter_map(|e| {
+                    let (w, n) = e.value_wn(mode);
+                    (n > 0).then(|| e.n_eff() as f64 * (w as f64 / n as f64))
+                })
                 .sum();
             acc / eff_n as f64
         } else if root.total_n > 0 {
@@ -1481,14 +1628,18 @@ impl<G: SampledGame> Search<G> {
                 // the child already being searched, and at a small `c_puct` it
                 // was never tried at all -- nodes of 200 visits held 16
                 // candidates and had visited one.
-                let (pick, forced) = match self.visit_new.take() {
-                    Some((node, entry)) if node == cur => (entry, false),
+                let (pick, kind) = match self.visit_new.take() {
+                    // A refinement's hand-over. PUCT did pick an edge here --
+                    // the refinement redrew it and moved where the visit landed
+                    // -- so this is not `Forced`, and `n_eff` must keep seeing
+                    // it. Only the value accounting distinguishes it.
+                    Some((node, entry)) if node == cur => (entry, VisitKind::Handover),
                     // A visit forced by hand (`force_line`) goes where it was
                     // told, widening nothing on the way: the reader is asking
                     // about this line, not about more candidates.
                     None if !self.forced_line.is_empty() => {
                         let pick = self.forced_line.pop_front().expect("checked non-empty");
-                        (pick, true)
+                        (pick, VisitKind::Forced)
                     }
                     _ => {
                         // Ask for the next chunk before selecting, if this node
@@ -1559,12 +1710,19 @@ impl<G: SampledGame> Search<G> {
                             self.resume_at = Some(cur);
                             return Step::NeedResample { state, from };
                         }
-                        (pick, forced)
+                        (
+                            pick,
+                            if forced {
+                                VisitKind::Forced
+                            } else {
+                                VisitKind::Chosen
+                            },
+                        )
                     }
                 };
                 // Tallied in `backup`, with the visit itself, so a quota is
                 // only ever charged for a visit that happened.
-                self.path.push((cur, pick, forced));
+                self.path.push((cur, pick, kind));
                 let child = self.tree[cur].entries[pick].child;
                 if child >= 0 {
                     cur = child as usize;
@@ -1622,6 +1780,8 @@ impl<G: SampledGame> Search<G> {
                         forced_quota: 0,
                         auto_n: 0,
                         credit_n: 0,
+                        true_n: 0,
+                        true_w: 0.0,
                         draws: 1,
                         manual: false,
                         eval: None,
@@ -1665,7 +1825,7 @@ impl<G: SampledGame> Search<G> {
     /// Negamax backup along the descent path. `value` is from the leaf's side.
     fn backup(&mut self, value: f32) {
         let mut v = value;
-        for &(node, entry, forced) in self.path.iter().rev() {
+        for &(node, entry, kind) in self.path.iter().rev() {
             // Negate only when the side to move actually changed across this
             // edge. Negating unconditionally assumes strict alternation, which
             // does not hold for every game: Minions ends a game the instant a
@@ -1690,12 +1850,21 @@ impl<G: SampledGame> Search<G> {
                 nd.visited_p += e.p;
             }
             e.n += 1;
-            if forced {
+            if kind.forced() {
                 e.forced_n += 1;
             }
             e.w += v;
             nd.total_n += 1;
             nd.w_sum += v;
+            // Maintained in every mode, so `value_visits` only changes which
+            // accumulator is *read*. That keeps `All` exactly the old numbers
+            // rather than an algebraically equal rebuild of them.
+            if kind.chosen() {
+                e.true_n += 1;
+                e.true_w += v;
+                nd.true_total_n += 1;
+                nd.true_w_sum += v;
+            }
         }
     }
 
@@ -1755,6 +1924,8 @@ impl<G: SampledGame> Search<G> {
                         forced_quota: 0,
                         auto_n: 0,
                         credit_n: 0,
+                        true_n: 0,
+                        true_w: 0.0,
                         draws: draw,
                         manual: false,
                         eval: None,
@@ -1854,6 +2025,8 @@ impl<G: SampledGame> Search<G> {
                     forced_quota: 0,
                     auto_n: 0,
                     credit_n: 0,
+                    true_n: 0,
+                    true_w: 0.0,
                     draws: 1,
                     manual: false,
                     eval: None,
@@ -2677,6 +2850,8 @@ mod tests {
             forced_quota: 0,
             auto_n: 0,
             credit_n: 0,
+            true_n: 0,
+            true_w: 0.0,
             draws: 1,
             manual: false,
             eval: None,
@@ -3239,6 +3414,84 @@ mod tests {
         }
     }
 
+    /// `ValueVisits::All` must leave the search exactly as it was: same tree,
+    /// same chosen move, same policy target. This is the load-bearing test for
+    /// the knob being a *mode* rather than a change — if it ever fails, the
+    /// live run's behaviour has silently moved.
+    ///
+    /// Written against a search that actually exercises all three visit kinds:
+    /// forced quotas (`forced_visits`), a refinement that hands its visit to a
+    /// candidate it creates (`resample_every`), and ordinary PUCT picks.
+    #[test]
+    fn all_value_visits_matches_the_old_backup() {
+        struct Spread;
+        impl SampledModel<Count> for Spread {
+            fn expand(&self, _s: &CountState, _k: usize) -> anyhow::Result<Expansion<Count>> {
+                Ok((0.1, (1..=3).map(|m| (m, -(m as f32), m == 3)).collect()))
+            }
+        }
+        let base = SampledParams {
+            simulations: 120,
+            k_forced: 2.0,
+            min_explore_visits: 2.0,
+            forced_visits: 30,
+            forced_extra: 4,
+            temp_moves: 0,
+            seed: 7,
+            ..Default::default()
+        };
+        assert_eq!(
+            base.value_visits,
+            ValueVisits::All,
+            "All must be the default, or every existing run changes meaning"
+        );
+
+        let run = |p: &SampledParams| {
+            search::<Count, _>(&Spread, CountState { n: 21, side: 1 }, p, 0).expect("search")
+        };
+        let a = run(&base);
+        let b = run(&SampledParams {
+            value_visits: ValueVisits::All,
+            ..base
+        });
+        assert_eq!(
+            a.candidates
+                .iter()
+                .map(|(m, n)| (*m, *n))
+                .collect::<Vec<_>>(),
+            b.candidates
+                .iter()
+                .map(|(m, n)| (*m, *n))
+                .collect::<Vec<_>>(),
+            "explicit All must equal the default"
+        );
+        assert_eq!(a.chosen, b.chosen);
+        assert_eq!(a.policy_target_with(&base), b.policy_target_with(&base));
+
+        // And the other two modes must actually do something, or the test
+        // above is vacuous and the experiment would measure nothing.
+        let differs = [ValueVisits::TrueOnly, ValueVisits::NodeGate]
+            .into_iter()
+            .any(|mode| {
+                let c = run(&SampledParams {
+                    value_visits: mode,
+                    ..base
+                });
+                c.candidates
+                    .iter()
+                    .map(|(m, n)| (*m, *n))
+                    .collect::<Vec<_>>()
+                    != a.candidates
+                        .iter()
+                        .map(|(m, n)| (*m, *n))
+                        .collect::<Vec<_>>()
+            });
+        assert!(
+            differs,
+            "neither TrueOnly nor NodeGate changed the search -- the knob is not wired up"
+        );
+    }
+
     /// The seeded visit is the search asking, not choosing, so it must not
     /// survive into the training target.
     #[test]
@@ -3303,6 +3556,8 @@ mod tests {
                 forced_quota: 0,
                 auto_n: 0,
                 credit_n: 0,
+                true_n: 0,
+                true_w: 0.0,
                 draws: 1,
                 manual: false,
                 eval: None,
@@ -3371,6 +3626,8 @@ mod tests {
                     forced_quota: 0,
                     auto_n: 0,
                     credit_n: 0,
+                    true_n: 0,
+                    true_w: 0.0,
                     draws: 1,
                     manual: false,
                     eval: None,
@@ -4314,6 +4571,8 @@ mod forced_quota_tests {
             forced_quota: 0,
             auto_n: 0,
             credit_n: 0,
+            true_n: 0,
+            true_w: 0.0,
             draws: 1,
             manual: false,
             eval: None,
