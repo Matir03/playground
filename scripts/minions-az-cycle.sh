@@ -67,22 +67,30 @@ WORKERS="${WORKERS:-4}"
 #
 # History: set 2026-09-16 (ad9be77), reverted 2026-09-17 (2a92a3b) as a null
 # result, restored the same day at the user's call -- throughput matters more
-# here than the memory headroom. The evidence is genuinely mixed:
-#   - The in-generation ABBA, the only design that controls for net AND power
-#     state, read ~1.42M expansions/60s for BOTH arms.
-#   - A cross-run comparison of gen402 (12288) vs gen403 (8192), matched on
-#     children-per-full-root and refine share, separated with no overlap:
-#     plateau windows 1.527-1.647M (n=49) vs 1.389-1.504M (n=20), ~9% apart.
-#   - End-to-end generate duration agreed in sign: 109.9 vs 116.3 min per
-#     100k examples, ~6%.
-# Both cross-run measures are confounded the same way (different nets, and a
-# documented between-run power-state gap). To settle it, run the in-generation
-# ABBA; do NOT collect more cross-run windows, no quantity of them resolves a
-# between-run confound.
+# here than the memory headroom.
 #
-# Cost of the raised cap: actor RSS ~17.4 -> 22 GB, leaving under 3 GB free.
-# Scoping it to the actor is what keeps the eval phase off the 1.28 GB floor it
-# hit when this was exported.
+# THE EFFECT IS UNRESOLVED. Every measurement that appeared to settle it failed
+# on the next sample. End-to-end min per 100k examples, actor start -> last chunk:
+#   gen402 12288 109.7 | gen403 8192 115.8 | gen404 12288 110.9
+#   gen405 12288 111.7 | gen406 12288 128.8
+# The four 12288 runs span 109.7-128.8 (17.4%) and bracket the lone 8192 point.
+# Run-level drift here is ~17%, so NO cross-run A/B on this box can resolve a ~5%
+# effect. Matched-window analysis is worse still: it filters on per-full-root and
+# refine share, both downstream of the treatment, which biases the comparison.
+# The in-generation ABBA read ~1.42M for both arms, but it flips the switch
+# mid-generate WITHOUT re-warming the cache, so its raised arm never reaches the
+# steady state a real run holds. To settle this, flip the arm many times within a
+# single generate; otherwise leave it open. The verdict flipped four times in one
+# afternoon before this was understood.
+#
+# Cost of the raised cap: actor RSS ~17.4 -> 20.8 GB, leaving ~3 GB free.
+#
+# Scoping to the actor does NOT protect the eval phase, contrary to what this
+# comment used to claim. Measured during the gen406 tournament: each of the ten
+# eval engines held ~2920 MB RSS (28.5 GB total), far below either cap, and
+# available memory was 1.35-1.45 GB scoped against 1.28 GB exported -- noise, not
+# a win. Ten concurrent engines squeeze this box regardless of the ceiling. If the
+# eval phase ever needs headroom, cut EVAL_PARALLEL, not the cache.
 #
 # The early-generation phase evicts under any cap this box can hold (853k-1016k
 # at 8192, 196k-530k at 12288), so raising the cap does not fix that.
