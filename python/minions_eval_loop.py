@@ -490,10 +490,12 @@ def tournament(args, live, scores, best, gen, last, entry):
     of the `--champions` best-rated nets on the current leaderboard
     (`leaderboard`), `--tournament-games` games a pairing, all in parallel
     (`play_all`); greedy plays the newest net as a regression check. Then the
-    run resumes from the best-rated fp16 net in the whole record
-    (`ladder_top`) -- self-play *and* the learner. User's rules, 2026-09-12:
-    "resume from the best net after each tournament", and the previous
-    champions are "the 5 prev best rated nets on the current leaderboard".
+    best-rated fp16 net in the whole record (`ladder_top`) is crowned and
+    becomes the net self-play runs on -- but **not** the learner's starting
+    point: training runs forward continuously (user, 2026-09-18). The previous
+    champions are "the 5 prev best rated nets on the current leaderboard"
+    (user's rule, 2026-09-12; the "resume from the best net after each
+    tournament" half of that rule no longer applies).
     """
     E = elo_mod()
     lo = last + 1 if last is not None else gen - args.measure_every + 1
@@ -549,8 +551,16 @@ def tournament(args, live, scores, best, gen, last, entry):
     # Always: under `--self-play-net champion` the newest generation never
     # entered self-play, so even a win by `gen` itself has to be copied in.
     promote_snapshot(ck, live, best)
-    if top_gen != gen:
-        resume_learner_from(ck, live)
+    # The learner is NOT reset to the crowned net (user, 2026-09-18: "don't
+    # reset after eval either"). This used to call `resume_learner_from(ck)`
+    # whenever an older net held the top spot, so training snapped back to
+    # gen405 after both the gen406 and gen411 rounds, making gen407-411 and
+    # gen412-416 two excursions from identical weights while the ladder sat
+    # flat. Training now runs forward continuously; the tournament rates and
+    # crowns, and `promote_snapshot` above still decides who self-plays.
+    # Supersedes the 2026-09-12 rule "resume from the best net after each
+    # tournament". `resume_learner_from` has no call site now, kept for the
+    # gated path and for restoring this behaviour.
     entry["promoted"] = top_gen == gen
     scores["best_gen"] = top_gen
 
