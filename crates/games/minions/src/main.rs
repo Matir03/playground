@@ -978,7 +978,7 @@ fn bench(
     use minions_engine::game::Minions;
     use minions_engine::map::NUM_CELLS;
     use minions_engine::net::{load_backend, repeat_trunk, BackendKind};
-    use minions_engine::turn::{LiveMask, Partial, TurnSpec, DECL_PLANES};
+    use minions_engine::turn::{LiveMask, Partial, TurnSpec, DECL_PLANES, ENERGY_PLANES};
     use playground_core::Game;
     use std::time::{Duration, Instant};
 
@@ -1002,11 +1002,21 @@ fn bench(
     let live_mask = LiveMask::of(&state);
     let mut rng = <rand_chacha::ChaCha8Rng as rand::SeedableRng>::seed_from_u64(1);
     let stride = DECL_PLANES * NUM_CELLS;
+    // The energy head takes the declaration planes *minus* plane 2, the
+    // move-commit flag (`ENERGY_PLANES`; see `turn.rs` -- with everything
+    // committed that flag degenerates into a liveness mask `h` already
+    // carries). So it needs its own buffer, written by `write_energy_planes`,
+    // exactly as production does in `sampler.rs`. Feeding it the 12-plane
+    // buffer made every `bench` run die at the energy step with
+    // "shape [k, 11, 7, 7] ... larger than the length of the data provided".
+    let estride = ENERGY_PLANES * NUM_CELLS;
     let mut decl = vec![0f32; k * stride];
+    let mut edecl = vec![0f32; k * estride];
     for i in 0..k {
         let spec = TurnSpec::random_plausible(&state, &mut rng);
-        Partial::fully_committed(&spec, &live_mask)
-            .write_planes(&mut decl[i * stride..(i + 1) * stride]);
+        let p = Partial::fully_committed(&spec, &live_mask);
+        p.write_planes(&mut decl[i * stride..(i + 1) * stride]);
+        p.write_energy_planes(&mut edecl[i * estride..(i + 1) * estride]);
     }
 
     let tr = net.trunk(&planes, 1)?;
@@ -1040,9 +1050,13 @@ fn bench(
             let planes_b = repeat_trunk(&planes, b);
             let h_b = repeat_trunk(&tr.h, b);
             let mut decl_b = vec![0f32; b * stride];
+            let mut edecl_b = vec![0f32; b * estride];
             for i in 0..b {
                 let src = (i % k) * stride;
                 decl_b[i * stride..(i + 1) * stride].copy_from_slice(&decl[src..src + stride]);
+                let esrc = (i % k) * estride;
+                edecl_b[i * estride..(i + 1) * estride]
+                    .copy_from_slice(&edecl[esrc..esrc + estride]);
             }
             let rate = |f: &dyn Fn() -> anyhow::Result<()>| -> anyhow::Result<f64> {
                 f()?;
@@ -1057,7 +1071,7 @@ fn bench(
             };
             let rt = rate(&|| net.trunk(&planes_b, b).map(|_| ()))?;
             let rd = rate(&|| net.diffusion(&h_b, &decl_b, b).map(|_| ()))?;
-            let re = rate(&|| net.energy(&h_b, &decl_b, b).map(|_| ()))?;
+            let re = rate(&|| net.energy(&h_b, &edecl_b, b).map(|_| ()))?;
             println!("  {b:>6}  {rt:>12.0}  {rd:>12.0}  {re:>12.0}");
         }
         return Ok(());
@@ -1066,7 +1080,7 @@ fn bench(
     println!("timing (trunk at batch 1, heads at batch {k}, {secs}s each):");
     let t_trunk = timed("trunk", &|| net.trunk(&planes, 1).map(|_| ()))?;
     let t_diff = timed("diffusion", &|| net.diffusion(&h_k, &decl, k).map(|_| ()))?;
-    let t_energy = timed("energy", &|| net.energy(&h_k, &decl, k).map(|_| ()))?;
+    let t_energy = timed("energy", &|| net.energy(&h_k, &edecl, k).map(|_| ()))?;
 
     let per_expansion = t_trunk + t_steps as f64 * t_diff + t_energy;
     println!(

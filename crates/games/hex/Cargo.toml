@@ -36,7 +36,8 @@ candle-core = "0.10"
 candle-nn = "0.10"
 # ONNX Runtime backend (CUDA / TensorRT EP) for fast self-play; the shared lib is
 # located at runtime via ORT_DYLIB_PATH.
-ort = { version = "=2.0.0-rc.12", features = ["load-dynamic", "cuda", "tensorrt"] }
+# api-26 matches the installed libonnxruntime.so.1.26.0; see minions/Cargo.toml.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "tracing", "api-26", "load-dynamic", "cuda", "tensorrt"] }
 
 [features]
 # Build candle with CUDA kernels for GPU self-play (needs nvcc at build time).

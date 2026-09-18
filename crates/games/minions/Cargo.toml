@@ -36,7 +36,11 @@ candle-core = "0.10"
 candle-nn = "0.10"
 # ONNX Runtime backend (CUDA / TensorRT EP) for fast self-play; the shared lib is
 # located at runtime via ORT_DYLIB_PATH.
-ort = { version = "=2.0.0-rc.12", features = ["load-dynamic", "cuda", "tensorrt", "half"] }
+# api-26 pins the ONNX Runtime C API level to the runtime actually installed
+# (python/.venv ships libonnxruntime.so.1.26.0). rc.13's default features would
+# request api-27 from a 1.26 library. `download-binaries` is dropped because
+# `load-dynamic` resolves the library at runtime via ORT_DYLIB_PATH.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "tracing", "api-26", "load-dynamic", "cuda", "tensorrt", "half"] }
 half = "2"
 
 [features]
