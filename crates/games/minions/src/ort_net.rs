@@ -186,6 +186,32 @@ pub(crate) fn build(path: &Path, ep: &str, fp16: bool, cache_dir: &str) -> anyho
                 TensorRT::default()
                     .with_device_id(0)
                     .with_fp16(fp16)
+                    // CUDA graph capture: replay one captured launch sequence
+                    // instead of re-issuing every kernel. Self-play is
+                    // launch-bound -- ~500 launches/s, >=8 per wave, with the
+                    // device only ~35% busy -- so this is the targeted fix.
+                    //
+                    // OFF by default because it is NOT known to work here yet.
+                    // ORT's CUDA-EP documents three requirements: fixed input
+                    // shapes, fixed input/output *addresses* (i.e. `IoBinding`),
+                    // and a session that is not shared between threads. All
+                    // three are violated today: `width_for` feeds ~48 distinct
+                    // row counts per graph, `IoBinding` is broken on
+                    // ort 2.0.0-rc.12 (see `BoundPass`), and `acquire()` hands
+                    // any free pooled session to any worker.
+                    //
+                    // MEASURED 2026-09-18, and it settles the open question:
+                    // the TensorRT flag does NOT sidestep `IoBinding`. With
+                    // capture on, the very first inference panics inside ort --
+                    // `value/mod.rs:353: expected typeinfo_ptr to not be null`
+                    // -- before a single trunk call completes, while the same
+                    // binary with capture off ran 9205 trunk and 13019
+                    // diffusion calls. A null output typeinfo is what a session
+                    // that requires pre-bound, pre-allocated outputs produces.
+                    // So this is blocked on the same broken `IoBinding` as
+                    // `BoundPass`, and needs an ort upgrade before it is worth
+                    // any further work. Leave it off.
+                    .with_cuda_graph(env_flag("MINIONS_TRT_CUDA_GRAPH", false))
                     .with_engine_cache(true)
                     .with_engine_cache_path(cache_dir.to_string())
                     .build(),
