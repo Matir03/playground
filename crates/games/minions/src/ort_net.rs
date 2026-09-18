@@ -523,7 +523,15 @@ impl Backend for OrtNet {
                 net.acquire(pool),
                 &h.to_f32_vec(),
                 b,
-                net.channels,
+                // `h` is the *head-conditioning* width, not the trunk width:
+                // `trunk.onnx` emits `head_features(h)`, which is what
+                // `Backend::channels()` reports. Passing the raw `self.channels`
+                // field described a 48-wide buffer with a 96-wide shape and made
+                // the bound pass fail before it bound anything -- so the guard
+                // test could never reach the IoBinding behaviour it exists to
+                // check. Latent since the per-head neck refactor narrowed the
+                // head inputs below the trunk.
+                crate::net::head_width(net.channels),
             )?));
         }
         Ok(Box::new(NaivePass { net, h, b }))
