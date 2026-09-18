@@ -218,11 +218,21 @@ EVAL_GAMES="${EVAL_GAMES:-40}"
 GATE="${GATE:-0}"
 MEASURE_EVERY="${MEASURE_EVERY:-5}"
 # Who plays self-play between tournaments: the champion, or each new generation.
-# newest since 2026-09-15: strength was flat for three tournaments (gen371
-# onward) while the losses kept improving. Five generations of self-play on
-# one frozen champion give the buffer a single net's distribution, the same
-# shape of stall seen in the Hex run. Tournaments still rate and crown.
-SELFPLAY_NET="${SELFPLAY_NET:-newest}"
+# champion since 2026-09-18, the user's call: "we shouldn't change champions
+# between Evals". Under `newest` the champion pointer walked every generation --
+# `ungated_step` (python/minions_eval_loop.py) calls `promote_snapshot` and sets
+# `best_gen = gen` on every non-tournament generation, so best.* advanced five
+# times between evals and "champion" stopped meaning "best-rated net" (the loss
+# table then marks every row promoted). Under `champion` only a tournament moves
+# it, and that branch goes dead.
+# History: newest from 2026-09-15, because strength was flat for three
+# tournaments (gen371 onward) while the losses kept improving -- five
+# generations on one frozen champion give the buffer a single net's
+# distribution, the shape of stall seen in the Hex run. It then bought four
+# large gains (+145, +216, +205, +213) and a flat round (gen407-411, no new
+# crown), so that argument is no longer clear-cut in either direction.
+# Tournaments rate and crown either way; this only decides who generates.
+SELFPLAY_NET="${SELFPLAY_NET:-champion}"
 # Tournament matches at once, at most. Each eval-match process holds ~2 GB, so
 # on this 23 GB box the eval loop's RAM floor usually binds first.
 EVAL_PARALLEL="${EVAL_PARALLEL:-10}"
