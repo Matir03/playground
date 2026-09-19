@@ -315,6 +315,8 @@ pub struct SampledParams {
     /// keeps this a mode rather than a replacement. Asserted by
     /// `all_value_visits_matches_the_old_backup`.
     pub value_visits: ValueVisits,
+    /// Mean of the subtree (`Avg`, the default) or the best child (`Minimax`).
+    pub value_backup: ValueBackup,
     pub seed: u64,
 }
 
@@ -354,6 +356,49 @@ pub enum ValueVisits {
     /// most children at the fringe never earn a second — so under `All` a
     /// parent's `q` is dominated by estimates that are a single sample each.
     MinTwo,
+}
+
+/// How a node's value estimate is formed from what came back below it.
+///
+/// `Avg` is standard MCTS: a node is worth the mean of every value backed up
+/// through it. `Minimax` makes a node worth its *best* child instead — the
+/// negamax of the edge values — so one refutation is not diluted by the
+/// siblings that happened to be sampled alongside it.
+///
+/// The trade is the usual one. Averaging is robust to a single bad leaf
+/// evaluation and biased toward the mean of a subtree the search may never
+/// actually enter; max backup commits to the line it currently believes and
+/// inherits the full variance of that one estimate, which is why plain MCTS
+/// averages in the first place. Whether the net's leaf values are accurate
+/// enough here to afford max backup is exactly what a match decides.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ValueBackup {
+    /// Mean of the values backed up through the node. The default, and the
+    /// behaviour every existing run has.
+    #[default]
+    Avg,
+    /// The node is worth its best edge; an edge is worth the child's value,
+    /// negated when the side to move flips across it.
+    Minimax,
+}
+
+impl std::str::FromStr for ValueBackup {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', '_'], "")
+            .as_str()
+        {
+            "avg" | "average" | "mean" => Ok(ValueBackup::Avg),
+            "minimax" | "max" | "negamax" => Ok(ValueBackup::Minimax),
+            other => Err(format!(
+                "unknown value-backup mode {other:?}: expected avg or minimax"
+            )),
+        }
+    }
 }
 
 impl std::str::FromStr for ValueVisits {
@@ -434,6 +479,7 @@ impl Default for SampledParams {
             pw_chunk: 1,
             kernel_sigma: 0.0,
             value_visits: ValueVisits::All,
+            value_backup: ValueBackup::Avg,
             seed: 0,
         }
     }
@@ -525,6 +571,16 @@ struct Entry<G: SampledGame> {
     true_n: u32,
     /// `w` restricted to the visits counted in `true_n`.
     true_w: f32,
+    /// This edge's negamax value, in the *owning node's* perspective: the
+    /// child's `Node::mm_v` with the sign flipped iff the side to move changes
+    /// across the edge. `None` until the edge has been backed up through once.
+    ///
+    /// Cached here rather than looked up through `child` because `select` is
+    /// handed a single `&Node` and cannot reach the tree. Backup runs
+    /// leaf-to-root, so the child is always already updated when the parent's
+    /// edge is reached. Maintained in both modes, so `Avg` reads exactly the
+    /// numbers it always did.
+    mm: Option<f32>,
 }
 
 impl<G: SampledGame> Entry<G> {
@@ -627,6 +683,10 @@ struct Node<G: SampledGame> {
     /// The value head at this position, from its side to move: what its
     /// expansion backed up. `None` until expanded.
     nn_value: Option<f32>,
+    /// This node's negamax value from its own side to move: the best of its
+    /// edges' `Entry::mm`, seeded at expansion with the leaf evaluation.
+    /// `None` until the node has been evaluated.
+    mm_v: Option<f32>,
 }
 
 /// Recompute every entry's prior as `softmax` over the node's energies.
@@ -888,6 +948,7 @@ fn new_node<G: SampledGame>(state: G::State) -> Node<G> {
         resampled_at: 0,
         resample_count: 0,
         nn_value: None,
+        mm_v: None,
         kern: Vec::new(),
         kern_rows: 0,
         total_n: 0,
@@ -1186,7 +1247,21 @@ fn select<G: SampledGame>(
         // uses the *full* visit count: the forced visits were spent measuring
         // exactly this, and discarding them would throw the estimate away.
         let (ew, en) = e.value_wn(params.value_visits);
-        let q = if en > 0 { ew / en as f32 } else { fpu };
+        let q = match params.value_backup {
+            ValueBackup::Avg => {
+                if en > 0 {
+                    ew / en as f32
+                } else {
+                    fpu
+                }
+            }
+            // The visit gate still applies: a candidate `value_visits` says has
+            // nothing to report has nothing to report under either backup.
+            ValueBackup::Minimax => match (en > 0).then_some(e.mm).flatten() {
+                Some(mm) => mm,
+                None => fpu,
+            },
+        };
         let u = params.c_puct * e.p * sqrt_total / (1.0 + e.n_eff() as f32);
         let s = q + u;
         scores.push(s);
@@ -1509,6 +1584,7 @@ impl<G: SampledGame> Search<G> {
             resampled: false,
             id,
             stable,
+            mm: None,
         });
         renormalise(&mut self.tree[node].entries);
         // Every prior moved, so the visited mass FPU reads must be re-summed.
@@ -1531,6 +1607,14 @@ impl<G: SampledGame> Search<G> {
     /// position at 0.36, which `an_immediate_win_is_taken` caught.
     pub fn root_value(&self) -> f64 {
         let root = &self.tree[0];
+        // Under minimax the root's value *is* its best edge, and reporting the
+        // visit-weighted mean instead would have a seat bid on one rule and
+        // play by another -- `bid_of` prices the handicap with this number.
+        if self.params.value_backup == ValueBackup::Minimax {
+            if let Some(mm) = root.mm_v {
+                return mm as f64;
+            }
+        }
         let mode = self.params.value_visits;
         let eff_n: u32 = root.entries.iter().map(|e| e.n_eff()).sum();
         if eff_n > 0 {
@@ -1809,6 +1893,7 @@ impl<G: SampledGame> Search<G> {
                         // Numbered below, once the set is final.
                         id: 0,
                         stable: true,
+                        mm: None,
                     });
                 }
             }
@@ -1834,6 +1919,9 @@ impl<G: SampledGame> Search<G> {
         self.tree[cur].entries = entries;
         self.tree[cur].expanded = true;
         self.tree[cur].nn_value = Some(value);
+        // Seed the negamax value with the leaf evaluation; backup replaces it
+        // with the best edge as soon as this node has one.
+        self.tree[cur].mm_v = Some(value);
         self.tree[cur].draws = expansion_k(&self.params) as u32;
         self.build_kernel(cur);
 
@@ -1864,6 +1952,13 @@ impl<G: SampledGame> Search<G> {
             if flipped {
                 v = -v;
             }
+            // Read before the node is borrowed mutably. Leaf-to-root order
+            // means the child already holds this simulation's result.
+            let child_mm = if child >= 0 {
+                self.tree[child as usize].mm_v
+            } else {
+                None
+            };
             let nd = &mut self.tree[node];
             let e = &mut nd.entries[entry];
             if e.n == 0 {
@@ -1885,6 +1980,31 @@ impl<G: SampledGame> Search<G> {
                 nd.true_total_n += 1;
                 nd.true_w_sum += v;
             }
+            // This edge is worth the child's negamax value; a child with no
+            // value of its own (unexpanded or terminal) is worth what just came
+            // back through it. Then the node is worth its best edge.
+            //
+            // Maintained in both modes so `Avg` only changes which number is
+            // *read*, never how the old ones are computed.
+            e.mm = Some(match child_mm {
+                Some(cv) => {
+                    if flipped {
+                        -cv
+                    } else {
+                        cv
+                    }
+                }
+                None => v,
+            });
+            // A full scan, not an incremental max: an edge's value can *fall*
+            // when its subtree is refuted, and an incremental maximum cannot
+            // take back the value it already absorbed.
+            let best = nd
+                .entries
+                .iter()
+                .filter_map(|x| x.mm)
+                .fold(f32::NEG_INFINITY, f32::max);
+            nd.mm_v = best.is_finite().then_some(best);
         }
     }
 
@@ -1946,6 +2066,7 @@ impl<G: SampledGame> Search<G> {
                         credit_n: 0,
                         true_n: 0,
                         true_w: 0.0,
+                        mm: None,
                         draws: draw,
                         manual: false,
                         eval: None,
@@ -2053,6 +2174,7 @@ impl<G: SampledGame> Search<G> {
                     resampled: true,
                     id,
                     stable: false,
+                    mm: None,
                 });
                 renormalise(entries);
                 self.build_kernel(cur);
@@ -2862,6 +2984,7 @@ mod tests {
             mv,
             energy: 0.0,
             p: 1.0 / 3.0,
+            mm: None,
             n: 0,
             w: 0.0,
             child: -1,
@@ -3542,6 +3665,7 @@ mod tests {
             resampled: false,
             id: 0,
             stable: false,
+            mm: None,
         };
         assert_eq!(e.value_wn(ValueVisits::MinTwo), (0.0, 0), "unvisited");
 
@@ -3566,6 +3690,54 @@ mod tests {
             e.value_wn(ValueVisits::MinTwo),
             (1.4, 2),
             "from the second visit the whole count counts, first included"
+        );
+    }
+
+    /// `Avg` must be the default, and `Minimax` must actually change the
+    /// search -- otherwise a match between the two measures nothing at all.
+    #[test]
+    fn minimax_backup_changes_the_search_and_avg_is_the_default() {
+        struct Spread;
+        impl SampledModel<Count> for Spread {
+            fn expand(&self, _s: &CountState, _k: usize) -> anyhow::Result<Expansion<Count>> {
+                Ok((0.1, (1..=3).map(|m| (m, -(m as f32), m == 3)).collect()))
+            }
+        }
+        let base = SampledParams {
+            simulations: 120,
+            temp_moves: 0,
+            seed: 7,
+            ..Default::default()
+        };
+        assert_eq!(
+            base.value_backup,
+            ValueBackup::Avg,
+            "Avg must be the default, or every existing run changes meaning"
+        );
+        assert_eq!("minimax".parse::<ValueBackup>(), Ok(ValueBackup::Minimax));
+        assert_eq!("avg".parse::<ValueBackup>(), Ok(ValueBackup::Avg));
+
+        let run = |p: &SampledParams| {
+            search::<Count, _>(&Spread, CountState { n: 21, side: 1 }, p, 0).expect("search")
+        };
+        let a = run(&base);
+        let m = run(&SampledParams {
+            value_backup: ValueBackup::Minimax,
+            ..base
+        });
+        let ca = a
+            .candidates
+            .iter()
+            .map(|(mv, n)| (*mv, *n))
+            .collect::<Vec<_>>();
+        let cm = m
+            .candidates
+            .iter()
+            .map(|(mv, n)| (*mv, *n))
+            .collect::<Vec<_>>();
+        assert_ne!(
+            ca, cm,
+            "Minimax did not change the search -- the knob is not wired up"
         );
     }
 
@@ -3625,6 +3797,7 @@ mod tests {
                 mv: i,
                 energy: 0.0,
                 p: 1.0 / 12.0,
+                mm: None,
                 n: 0,
                 w: 0.0,
                 child: -1,
@@ -3695,6 +3868,7 @@ mod tests {
                     mv: i,
                     energy: 0.0,
                     p: 1.0 / 64.0,
+                    mm: None,
                     n: 0,
                     w: 0.0,
                     child: -1,
@@ -4637,6 +4811,7 @@ mod forced_quota_tests {
 
     fn entry(explore: bool) -> Entry<G0> {
         Entry {
+            mm: None,
             mv: 1,
             energy: 0.0,
             p: 0.25,

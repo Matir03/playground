@@ -151,6 +151,8 @@ pub struct ActorConfig {
     /// and refinement hand-overs from the value, leaving them to buy an
     /// estimate without moving the parent's.
     pub value_visits: ValueVisits,
+    /// Mean of the subtree (`Avg`) or the best child (`Minimax`).
+    pub value_backup: playground_core::sampled_mcts::ValueBackup,
     /// Progressive widening at interior nodes; `pw_beta = 0` disables it, and
     /// `ceil(pw_beta)` is the count a node starts with.
     pub pw_alpha: f32,
@@ -241,6 +243,7 @@ impl ActorConfig {
             pw_chunk: self.pw_chunk,
             kernel_sigma: self.kernel_sigma,
             value_visits: self.value_visits,
+            value_backup: self.value_backup,
             seed,
         }
     }
@@ -260,6 +263,7 @@ impl Default for ActorConfig {
             workers: 4,
             kernel_sigma: 0.0,
             value_visits: ValueVisits::All,
+            value_backup: playground_core::sampled_mcts::ValueBackup::Avg,
             pw_alpha: 0.5,
             pw_beta: 2.0,
             pw_chunk: 1,

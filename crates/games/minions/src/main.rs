@@ -188,6 +188,12 @@ enum Cmd {
         /// **`all` reproduces the previous search bit-for-bit.**
         #[arg(long, default_value = "all")]
         value_visits: playground_core::sampled_mcts::ValueVisits,
+        /// How a node's value is formed: `avg` (default) averages every value
+        /// backed up through it; `minimax` makes it the best child instead, so
+        /// one refutation is not diluted by the siblings sampled beside it.
+        /// **`avg` reproduces the previous search bit-for-bit.**
+        #[arg(long, default_value = "avg")]
+        value_backup: playground_core::sampled_mcts::ValueBackup,
         /// Candidates generated per model call. 0 (default) produces a node's
         /// whole set in one call.
         ///
@@ -322,6 +328,13 @@ enum Cmd {
         /// `node-gate` or `min-two`. See the selfplay flag of the same name.
         #[arg(long, default_value = "all")]
         value_visits: playground_core::sampled_mcts::ValueVisits,
+        /// Value-backup mode for seat A: `avg` (default) or `minimax`.
+        #[arg(long, default_value = "avg")]
+        value_backup: playground_core::sampled_mcts::ValueBackup,
+        /// Value-backup mode for seat B; defaults to A's. Set only this to play
+        /// averaging against minimax on a single checkpoint.
+        #[arg(long)]
+        value_backup_b: Option<playground_core::sampled_mcts::ValueBackup>,
         /// Value-visit mode for seat B; defaults to A's. Set only this to play
         /// one mode against another on a single checkpoint, which is the whole
         /// point of the knob.
@@ -573,6 +586,7 @@ async fn main() -> anyhow::Result<()> {
             no_energy,
             kernel_sigma,
             value_visits,
+            value_backup,
             pw_chunk,
             draw_retries,
             resample_every,
@@ -601,6 +615,7 @@ async fn main() -> anyhow::Result<()> {
                 random_opening_decay,
                 kernel_sigma,
                 value_visits,
+                value_backup,
                 pw_chunk,
                 draw_retries,
                 resample_every,
@@ -671,6 +686,8 @@ async fn main() -> anyhow::Result<()> {
             kernel_sigma_b,
             value_visits,
             value_visits_b,
+            value_backup,
+            value_backup_b,
             render_file,
             render_games,
         } => {
@@ -718,6 +735,7 @@ async fn main() -> anyhow::Result<()> {
             let pa = SampledParams {
                 kernel_sigma,
                 value_visits,
+                value_backup,
                 resample_every,
                 resample_max_depth: resample_depth.unwrap_or(u32::MAX),
                 pw_beta: pw_beta.unwrap_or(params.pw_beta),
@@ -727,6 +745,7 @@ async fn main() -> anyhow::Result<()> {
                 simulations: sims_b.unwrap_or(sims),
                 kernel_sigma: kernel_sigma_b.unwrap_or(kernel_sigma),
                 value_visits: value_visits_b.unwrap_or(value_visits),
+                value_backup: value_backup_b.unwrap_or(value_backup),
                 resample_every: resample_every_b.unwrap_or(resample_every),
                 pw_beta: pw_beta_b.or(pw_beta).unwrap_or(params.pw_beta),
                 resample_max_depth: resample_depth_b.or(resample_depth).unwrap_or(u32::MAX),
