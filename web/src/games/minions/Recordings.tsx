@@ -26,11 +26,47 @@ import {
   Outcome,
   type GameState,
 } from "../../gen/playground/game/game_pb";
+import {
+  AnalyzeEdgeSchema,
+  AnalyzeNodeSchema,
+  type AnalyzeNode,
+} from "../../gen/playground/engine/engine_pb";
 import { decode, px, py, HEX_POINTS, SVG_W, SVG_H, Piece, SIDE_FILL } from "./Board";
+import { AnalysisTree, type SortKey } from "./Analysis";
 import { MoveList } from "./MoveList";
 import * as H from "./history";
 
 // ── the on-disk record (crates/games/minions/src/eval.rs) ────────────────────
+
+/** One root candidate, as `--record-search` wrote it. The names are the search's
+ *  own, so they line up with `AnalyzeEdge` field for field — see `toAnalysis`. */
+interface RootEdge {
+  label: string;
+  visits: number;
+  forced: number;
+  draws: number;
+  explore: boolean;
+  prior: number;
+  energy: number;
+  value: number;
+  prior_value: number;
+  /** The turn actually played. NOT always the most-visited edge: `pick`
+   *  maximises visits *net of forced* ones, so a candidate held up by an
+   *  exploration floor can top the visit column without being chosen. */
+  chosen: boolean;
+}
+
+interface RootSearch {
+  /** Which seat searched, "a" or "b" — the two may use different settings. */
+  mover: string;
+  total_visits: number;
+  /** The search's value for the position, from the mover's seat. */
+  value: number;
+  /** The value head alone, before any search. */
+  nn_value: number;
+  /** Top candidates by visits, truncated by `TOP_K` in eval.rs. */
+  edges: RootEdge[];
+}
 
 interface GameRecord {
   game: number;
@@ -43,6 +79,10 @@ interface GameRecord {
    *  Length is NOT always `turns + 1` — a game ends the instant a necromancer
    *  dies, part-way through a turn — so this is walked, never indexed by turn. */
   states: string[];
+  /** Present only with `--record-search`. Index `k` is the search run *at*
+   *  `states[k]`, which chose the turn leading to `states[k + 1]` — so it is
+   *  one shorter than `states` and the final position has none. */
+  search?: RootSearch[];
 }
 
 interface MatchRecord {
@@ -93,7 +133,11 @@ const turnInfo: H.TurnInfo = (st) => {
   return { turn: d.turn, side: d.side };
 };
 
-function buildHistory(r: GameRecord): H.History {
+/** The history, plus which state index each node holds. The index is what
+ *  `search` is keyed by, and node ids are not it — `push` allocates them from a
+ *  running counter — so the mapping is recorded as the game is built rather
+ *  than reconstructed by walking parents afterwards. */
+function buildHistory(r: GameRecord): { hist: H.History; stateOf: Map<number, number> } {
   const last = r.states.length - 1;
   // Only the final position is terminal. This matters: `isBoundary` treats any
   // non-IN_PROGRESS node as a boundary, so marking them all would collapse the
@@ -102,14 +146,112 @@ function buildHistory(r: GameRecord): H.History {
     mkState(hx, k === last ? terminalOutcome(r) : Outcome.IN_PROGRESS),
   );
   let h = H.newHistory(states[0]);
+  const stateOf = new Map<number, number>([[h.root, 0]]);
   for (let k = 1; k < states.length; k++) {
     // A distinct synthetic move per turn: `push` merges siblings that share
     // (kind, move), so a constant payload would fold the whole game into one
     // node the moment any two turns hung off the same parent.
     const mv = new Uint8Array([k & 0xff, (k >> 8) & 0xff]);
     h = H.push(h, mv, states[k], "turn", `turn ${decode(states[k].payload).turn}`);
+    stateOf.set(h.current, k);
   }
-  return { ...h, current: h.root };
+  return { hist: { ...h, current: h.root }, stateOf };
+}
+
+// ── search → the analysis view's own types ───────────────────────────────────
+
+/** Nothing expands, so one shared empty set rather than a new one per render. */
+const NO_EXPAND: Set<string> = new Set();
+
+/** The recorded root, as the `AnalyzeNode` list the live analysis view renders.
+ *
+ * One node and no children: a recording keeps the root's candidates only, so
+ * `maxDepth` is 0 and every edge's `child` is unset, which greys out the expand
+ * handle on its own. `turn` is a synthetic per-edge id, not a real encoding —
+ * `AnalysisTree` uses it only for row keys and the on-board line comparison,
+ * and neither leaves this panel.
+ *
+ * The field names line up one-for-one because both sides came from the same
+ * search; the only translations are `prior_value` → `priorValue` and the
+ * `chosen` flag, which the tree wants as an index into `edges`. */
+function toAnalysis(rs: RootSearch): { nodes: AnalyzeNode[]; chosen?: number } {
+  const edges = rs.edges.map((e, i) =>
+    create(AnalyzeEdgeSchema, {
+      turn: new Uint8Array([i & 0xff, (i >> 8) & 0xff]),
+      prior: e.prior,
+      energy: e.energy,
+      visits: e.visits,
+      value: e.value,
+      explore: e.explore,
+      forced: e.forced,
+      label: e.label,
+      draws: e.draws,
+      priorValue: e.prior_value,
+      manual: false,
+    }),
+  );
+  const node = create(AnalyzeNodeSchema, {
+    totalVisits: rs.total_visits,
+    value: rs.value,
+    terminal: false,
+    termValue: 0,
+    edges,
+    kernel: [],
+    priorValue: rs.nn_value,
+  });
+  const chosen = rs.edges.findIndex((e) => e.chosen);
+  return { nodes: [node], chosen: chosen < 0 ? undefined : chosen };
+}
+
+function SearchPanel({
+  rs,
+  sort,
+  onSort,
+}: {
+  rs: RootSearch;
+  sort: SortKey;
+  onSort: (k: SortKey) => void;
+}) {
+  const { nodes, chosen } = useMemo(() => toAnalysis(rs), [rs]);
+  return (
+    <div style={{ marginTop: "1rem" }}>
+      <div
+        style={{
+          display: "flex",
+          gap: "1rem",
+          alignItems: "baseline",
+          flexWrap: "wrap",
+          marginBottom: "0.35rem",
+        }}
+      >
+        <strong style={{ fontSize: "0.9rem" }}>Search at this position</strong>
+        {/* Both values are from the mover's seat, not from a fixed side. */}
+        <span style={{ fontSize: "0.85rem", color: "#555" }}>
+          seat {rs.mover.toUpperCase()} · {rs.total_visits} visits · search{" "}
+          {rs.value.toFixed(3)} · net {rs.nn_value.toFixed(3)}
+        </span>
+        <label style={{ fontSize: "0.85rem", color: "#555" }}>
+          sort{" "}
+          <select value={sort} onChange={(e) => onSort(e.target.value as SortKey)}>
+            <option value="visits">visits</option>
+            <option value="prior">prior</option>
+            <option value="value">value</option>
+          </select>
+        </label>
+      </div>
+      <div style={{ background: "#20242b", borderRadius: 8, padding: "0.35rem 0.5rem", color: "#ccc" }}>
+        <AnalysisTree
+          nodes={nodes}
+          chosen={chosen}
+          sort={sort}
+          expanded={NO_EXPAND}
+          onToggle={() => {}}
+          onPlay={() => {}}
+          maxDepth={0}
+        />
+      </div>
+    </div>
+  );
 }
 
 // ── board ────────────────────────────────────────────────────────────────────
@@ -136,6 +278,8 @@ export function Recordings({ onBack }: { onBack: () => void }) {
   const [match, setMatch] = useState<MatchRecord | null>(null);
   const [gameIdx, setGameIdx] = useState(0);
   const [hist, setHist] = useState<H.History | null>(null);
+  const [stateOf, setStateOf] = useState<Map<number, number>>(new Map());
+  const [sort, setSort] = useState<SortKey>("visits");
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -171,7 +315,9 @@ export function Recordings({ onBack }: { onBack: () => void }) {
 
   const game = match?.records[gameIdx] ?? null;
   useEffect(() => {
-    setHist(game ? buildHistory(game) : null);
+    const built = game ? buildHistory(game) : null;
+    setHist(built?.hist ?? null);
+    setStateOf(built?.stateOf ?? new Map());
   }, [game]);
 
   const goto = useCallback((id: number) => {
@@ -200,6 +346,15 @@ export function Recordings({ onBack }: { onBack: () => void }) {
 
   const cur = hist ? H.node(hist, hist.current) : undefined;
   const info = useMemo(() => (cur ? decode(cur.state.payload) : null), [cur]);
+
+  // The search run *at* this position — the one that chose the move out of it,
+  // not the one that led into it. The final position has none, which is why
+  // `search` is one shorter than `states`.
+  const search = useMemo(() => {
+    if (!cur || !game?.search) return undefined;
+    const k = stateOf.get(cur.id);
+    return k === undefined ? undefined : game.search[k];
+  }, [cur, game, stateOf]);
 
   return (
     <>
@@ -289,6 +444,16 @@ export function Recordings({ onBack }: { onBack: () => void }) {
               )}
             </div>
           </div>
+
+          {search ? (
+            <SearchPanel rs={search} sort={sort} onSort={setSort} />
+          ) : (
+            <p style={{ fontSize: "0.85rem", color: "#777", marginTop: "1rem" }}>
+              {game.search
+                ? "No search recorded for this position — the game ends here."
+                : "This recording has no search data. Re-record with --record-search."}
+            </p>
+          )}
         </>
       )}
     </>

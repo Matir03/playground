@@ -2378,18 +2378,18 @@ pub fn search_analyzed<G: SampledGame, M: SampledModel<G>>(
     Ok((s.finish(), tree))
 }
 
-/// Drive `n` independent searches in lockstep so their expansions batch.
+/// Shared body of [`search_lockstep`] and [`search_lockstep_analyzed`].
 ///
-/// Every game holds at most one outstanding expansion, so each one's tree
-/// statistics are bit-identical to running it alone — the batching is purely an
-/// inference-scheduling change. Games that finish early simply drop out, and the
-/// batch narrows.
-pub fn search_lockstep<G: SampledGame, M: SampledModel<G>>(
+/// `want_trees` is threaded rather than always exporting because `finish`
+/// consumes the search: the tree has to be taken before it, and a caller that
+/// does not want one should not pay to build it.
+fn search_lockstep_inner<G: SampledGame, M: SampledModel<G>>(
     model: &M,
     roots: Vec<G::State>,
     params: &SampledParams,
     plies: &[u32],
-) -> anyhow::Result<Vec<SampledSearchResult<G>>> {
+    want_trees: bool,
+) -> anyhow::Result<Vec<(SampledSearchResult<G>, Option<Vec<TreeNode<G>>>)>> {
     let mut searches: Vec<Search<G>> = roots
         .into_iter()
         .enumerate()
@@ -2485,7 +2485,49 @@ pub fn search_lockstep<G: SampledGame, M: SampledModel<G>>(
             }
         }
     }
-    Ok(searches.into_iter().map(|s| s.finish()).collect())
+    Ok(searches
+        .into_iter()
+        .map(|s| {
+            // Before `finish`, which consumes the search.
+            let tree = want_trees.then(|| s.export_tree());
+            (s.finish(), tree)
+        })
+        .collect())
+}
+
+/// Drive `n` independent searches in lockstep so their expansions batch.
+///
+/// Every game holds at most one outstanding expansion, so each one's tree
+/// statistics are bit-identical to running it alone — the batching is purely an
+/// inference-scheduling change. Games that finish early simply drop out, and the
+/// batch narrows.
+pub fn search_lockstep<G: SampledGame, M: SampledModel<G>>(
+    model: &M,
+    roots: Vec<G::State>,
+    params: &SampledParams,
+    plies: &[u32],
+) -> anyhow::Result<Vec<SampledSearchResult<G>>> {
+    Ok(search_lockstep_inner(model, roots, params, plies, false)?
+        .into_iter()
+        .map(|(r, _)| r)
+        .collect())
+}
+
+/// As [`search_lockstep`], but also returns the tree each search built.
+///
+/// The lockstep counterpart of [`search_analyzed`], and for the same reason:
+/// a caller that wants both the played move and the search behind it cannot
+/// get them from [`search_lockstep`] alone.
+pub fn search_lockstep_analyzed<G: SampledGame, M: SampledModel<G>>(
+    model: &M,
+    roots: Vec<G::State>,
+    params: &SampledParams,
+    plies: &[u32],
+) -> anyhow::Result<Vec<(SampledSearchResult<G>, Vec<TreeNode<G>>)>> {
+    Ok(search_lockstep_inner(model, roots, params, plies, true)?
+        .into_iter()
+        .map(|(r, t)| (r, t.unwrap_or_default()))
+        .collect())
 }
 
 #[cfg(test)]

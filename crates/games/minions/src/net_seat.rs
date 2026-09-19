@@ -736,7 +736,7 @@ pub fn decode_turn(bytes: &[u8]) -> anyhow::Result<TurnSpec> {
 }
 
 /// Render a turn as the sequence of actions it realizes to.
-fn label_turn(state: &MinionsState, spec: &TurnSpec) -> String {
+pub(crate) fn label_turn(state: &MinionsState, spec: &TurnSpec) -> String {
     let actions = realize(state, spec).actions;
     if actions.is_empty() {
         return "pass".to_string();

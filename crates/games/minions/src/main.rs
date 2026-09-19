@@ -354,6 +354,12 @@ enum Cmd {
         /// machine-readable record the web viewer replays.
         #[arg(long)]
         record_file: Option<String>,
+        /// Also record each turn's search: the root's top candidates with the
+        /// visits, priors, energies and values the search actually selected
+        /// on, so a recorded game can be read the way the analysis view reads
+        /// a live one. Roughly 2 MB per 80 games on top of the positions.
+        #[arg(long)]
+        record_search: bool,
     },
     /// Time the three graphs on a backend, at the batch sizes the sampler
     /// actually uses. Far quicker than a self-play chunk, and it isolates
@@ -698,6 +704,7 @@ async fn main() -> anyhow::Result<()> {
             render_file,
             render_games,
             record_file,
+            record_search,
         } => {
             use minions_engine::eval::{load_seat, match_search, run_match, Seat};
             // Every game advances together, so the live count falls as games
@@ -762,8 +769,15 @@ async fn main() -> anyhow::Result<()> {
             let rf = render_file.as_ref().map(std::path::PathBuf::from);
             let render = rf.as_deref().map(|p| (p, render_games));
             let cf = record_file.as_ref().map(std::path::PathBuf::from);
-            let (score, w, l, d, margin, game_score) =
-                run_match(&sa, &sb, games, (&pa, &pb), render, cf.as_deref())?;
+            let (score, w, l, d, margin, game_score) = run_match(
+                &sa,
+                &sb,
+                games,
+                (&pa, &pb),
+                render,
+                cf.as_deref(),
+                record_search,
+            )?;
             println!("A_wins {w} B_wins {l} draws {d}");
             println!("A_score {score:.4}");
             // Mean net-worth margin from A's seat. Reported alongside the score

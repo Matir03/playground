@@ -322,8 +322,11 @@ export function AnalysisTree({
   onToggle: (key: string) => void;
   /** The sequence of turn encodings from the root down to the clicked edge. */
   onPlay: (line: Uint8Array[], labels: string[]) => void;
-  /** Commit a root candidate to the real game. */
-  onCommit: (turn: Uint8Array, label?: string) => void;
+  /** Commit a root candidate to the real game. Absent when the tree is a
+   *  record of a search that already happened — a recorded game has no move to
+   *  make, and a no-op here would leave a live-looking button that does
+   *  nothing. */
+  onCommit?: (turn: Uint8Array, label?: string) => void;
   /** Force one simulation down the line to an edge. Absent without a session. */
   onForce?: (line: Uint8Array[]) => void;
   maxDepth: number;
@@ -364,7 +367,9 @@ export function AnalysisTree({
           expanded={isOpen}
           onToggle={() => onToggle(key)}
           onPlay={() => onPlay(nextLine, nextLabels)}
-          onCommit={depth === 0 ? () => onCommit(edge.turn, edge.label || "pass") : undefined}
+          onCommit={
+            depth === 0 && onCommit ? () => onCommit(edge.turn, edge.label || "pass") : undefined
+          }
           onForce={onForce ? () => onForce(nextLine) : undefined}
           path={nextLabels.join("  →  ")}
           onBoard={!!shown && sameLine(nextLine, shown)}

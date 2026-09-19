@@ -199,28 +199,52 @@ fn pick_many(
     states: &[MinionsState],
     plies: &[u32],
     params: &SampledParams,
-) -> anyhow::Result<(Vec<TurnSpec>, playground_core::SearchStats)> {
+    want_search: bool,
+) -> anyhow::Result<(
+    Vec<TurnSpec>,
+    playground_core::SearchStats,
+    Vec<Option<RootSearch>>,
+)> {
     let mut stats = playground_core::SearchStats::default();
     match seat {
         Seat::Net(m) => {
-            let results = playground_core::sampled_mcts::search_lockstep::<MinionsTurns, _>(
-                &**m,
-                states.to_vec(),
-                // A best-move seat draws once per node; see `tune_params`.
-                &m.tune_params(params),
-                plies,
-            )?;
+            let tuned = m.tune_params(params);
+            // A best-move seat draws once per node; see `tune_params`.
+            let results = if want_search {
+                playground_core::sampled_mcts::search_lockstep_analyzed::<MinionsTurns, _>(
+                    &**m,
+                    states.to_vec(),
+                    &tuned,
+                    plies,
+                )?
+            } else {
+                playground_core::sampled_mcts::search_lockstep::<MinionsTurns, _>(
+                    &**m,
+                    states.to_vec(),
+                    &tuned,
+                    plies,
+                )?
+                .into_iter()
+                .map(|r| (r, Vec::new()))
+                .collect()
+            };
+            let mut roots = Vec::with_capacity(results.len());
             let specs = results
                 .into_iter()
-                .map(|r| {
+                .enumerate()
+                .map(|(j, (r, tree))| {
                     stats.merge(&r.stats);
+                    roots.push(
+                        tree.first()
+                            .map(|root| root_search(&states[j], root, r.chosen, r.value)),
+                    );
                     r.candidates
                         .get(r.chosen)
                         .map(|(s, _)| *s)
                         .unwrap_or_default()
                 })
                 .collect();
-            Ok((specs, stats))
+            Ok((specs, stats, roots))
         }
         Seat::Greedy => Ok((
             states
@@ -235,7 +259,59 @@ fn pick_many(
                 })
                 .collect(),
             stats,
+            vec![None; states.len()],
         )),
+    }
+}
+
+/// Round to four decimals. These are display numbers; full `f32` precision
+/// would roughly double the recording for digits no one reads.
+fn r4(x: f32) -> f32 {
+    (x * 1e4).round() / 1e4
+}
+
+/// The root of one search, shaped like `AnalyzeNode`/`AnalyzeEdge` so the
+/// recorded view can render it with the same component as live analysis.
+///
+/// Root only, and capped: the full tree for a match this size would be tens of
+/// megabytes, and the analysis panel shows the root's candidate list anyway.
+fn root_search(
+    state: &MinionsState,
+    root: &playground_core::sampled_mcts::TreeNode<MinionsTurns>,
+    chosen: usize,
+    value: f64,
+) -> RootSearch {
+    /// Edges kept, by visits. The search draws 24; the tail is all single
+    /// visits and carries no information worth the bytes.
+    const TOP_K: usize = 16;
+    let mut idx: Vec<usize> = (0..root.edges.len()).collect();
+    // `chosen` indexes the entry order, which `export_tree` preserves, so the
+    // flag is set before sorting rather than by matching moves back up.
+    idx.sort_by_key(|&i| std::cmp::Reverse(root.edges[i].visits));
+    idx.truncate(TOP_K);
+    RootSearch {
+        mover: String::new(),
+        total_visits: root.total_visits,
+        value: Some(r4(value as f32)),
+        nn_value: root.nn_value.map(r4),
+        edges: idx
+            .into_iter()
+            .map(|i| {
+                let e = &root.edges[i];
+                RootEdge {
+                    label: crate::net_seat::label_turn(state, &e.mv),
+                    visits: e.visits,
+                    forced: e.forced,
+                    draws: e.draws,
+                    explore: e.explore,
+                    prior: r4(e.prior),
+                    energy: r4(e.energy),
+                    value: e.value.map(r4),
+                    prior_value: e.prior_value.map(r4),
+                    chosen: i == chosen,
+                }
+            })
+            .collect(),
     }
 }
 
@@ -300,6 +376,33 @@ fn hex_state(s: &MinionsState) -> String {
     out
 }
 
+/// One root candidate, mirroring `AnalyzeEdge`.
+#[derive(serde::Serialize, Clone)]
+struct RootEdge {
+    label: String,
+    visits: u32,
+    forced: u32,
+    draws: u32,
+    explore: bool,
+    prior: f32,
+    energy: f32,
+    value: Option<f32>,
+    prior_value: Option<f32>,
+    /// The turn actually played from this position.
+    chosen: bool,
+}
+
+/// One turn's search at its root, mirroring `AnalyzeNode`.
+#[derive(serde::Serialize, Clone)]
+struct RootSearch {
+    /// Which seat searched this turn: "a" or "b".
+    mover: String,
+    total_visits: u32,
+    value: Option<f32>,
+    nn_value: Option<f32>,
+    edges: Vec<RootEdge>,
+}
+
 /// One game: how it was set up, how it ended, and every position along the way.
 #[derive(serde::Serialize)]
 struct GameRecord {
@@ -320,6 +423,10 @@ struct GameRecord {
     /// 30 turns/31 states, but 16 turns/18 states. Walk the list; do not index
     /// it by turn number.
     states: Vec<String>,
+    /// The search behind each turn, parallel to `states[1..]`. Empty unless
+    /// `--record-search` was given.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    search: Vec<RootSearch>,
 }
 
 /// A whole match, self-contained: the viewer needs no engine to replay it.
@@ -343,6 +450,7 @@ pub fn run_match(
     params: (&SampledParams, &SampledParams),
     render: Option<(&std::path::Path, u32)>,
     record: Option<&std::path::Path>,
+    record_search: bool,
 ) -> anyhow::Result<(f64, u32, u32, u32, f64, f64)> {
     // Each seat searches with its own params (sims, kernel, exploration); the
     // match's seed is A's.
@@ -398,6 +506,8 @@ pub fn run_match(
         /// regardless of `render_games`: the transcript is a human sample, but
         /// a recording the viewer replays should be the whole match.
         states: Vec<String>,
+        /// The search behind each turn, parallel to `states[1..]`.
+        search: Vec<RootSearch>,
     }
     let mut live: Vec<Live> = (0..games)
         .map(|g| {
@@ -429,6 +539,7 @@ pub fn run_match(
                 } else {
                     Vec::new()
                 },
+                search: Vec::new(),
                 state: st,
                 a_first: a_yellow,
                 bid,
@@ -483,11 +594,13 @@ pub fn run_match(
             let plies: Vec<u32> = idxs.iter().map(|&i| live[i].state.turn as u32).collect();
             let mut p = if want_a { *params_a } else { *params_b };
             p.seed = params_a.seed ^ ((round as u64) << 32) ^ u64::from(want_a);
-            let (specs, st) = pick_many(seat, &states, &plies, &p)?;
+            let (specs, st, roots) = pick_many(seat, &states, &plies, &p, record_search)?;
             search_stats.merge(&st);
             seat_stats[usize::from(!want_a)].merge(&st);
 
-            for (&i, spec) in idxs.iter().zip(specs) {
+            // `j` indexes this round's live games, which is what `roots` is
+            // parallel to; `i` indexes `live`.
+            for (j, (&i, spec)) in idxs.iter().zip(specs).enumerate() {
                 let prev_state = live[i].state.clone();
                 let next = realize(&prev_state, &spec).next;
                 // A declaration that changes nothing would loop forever; end
@@ -501,6 +614,11 @@ pub fn run_match(
                 if record.is_some() {
                     let h = hex_state(&live[i].state);
                     live[i].states.push(h);
+                    // The mover is known here, not inside the search.
+                    if let Some(mut rs) = roots.get(j).cloned().flatten() {
+                        rs.mover = if want_a { "a" } else { "b" }.to_string();
+                        live[i].search.push(rs);
+                    }
                 }
                 if sink.is_some() && live[i].g < render_games {
                     use std::fmt::Write as _;
@@ -562,6 +680,7 @@ pub fn run_match(
                 turns: state.turn,
                 result: result.to_string(),
                 states: l.states.clone(),
+                search: l.search.clone(),
             });
         }
         if l.g < render_games {
