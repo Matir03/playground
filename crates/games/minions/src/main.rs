@@ -347,6 +347,13 @@ enum Cmd {
         render_file: Option<String>,
         #[arg(long, default_value_t = 5)]
         render_games: u32,
+        /// Record *every* game to this path as JSON: per game the settled bid,
+        /// which seat had yellow, the outcome, and the position after each
+        /// turn as a hex-encoded `GameState.payload`. Unlike `--render-file`,
+        /// which writes a human transcript of the first few games, this is the
+        /// machine-readable record the web viewer replays.
+        #[arg(long)]
+        record_file: Option<String>,
     },
     /// Time the three graphs on a backend, at the batch sizes the sampler
     /// actually uses. Far quicker than a self-play chunk, and it isolates
@@ -690,6 +697,7 @@ async fn main() -> anyhow::Result<()> {
             value_backup_b,
             render_file,
             render_games,
+            record_file,
         } => {
             use minions_engine::eval::{load_seat, match_search, run_match, Seat};
             // Every game advances together, so the live count falls as games
@@ -753,8 +761,9 @@ async fn main() -> anyhow::Result<()> {
             };
             let rf = render_file.as_ref().map(std::path::PathBuf::from);
             let render = rf.as_deref().map(|p| (p, render_games));
+            let cf = record_file.as_ref().map(std::path::PathBuf::from);
             let (score, w, l, d, margin, game_score) =
-                run_match(&sa, &sb, games, (&pa, &pb), render)?;
+                run_match(&sa, &sb, games, (&pa, &pb), render, cf.as_deref())?;
             println!("A_wins {w} B_wins {l} draws {d}");
             println!("A_score {score:.4}");
             // Mean net-worth margin from A's seat. Reported alongside the score

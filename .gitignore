@@ -20,6 +20,9 @@ python/build/
 web/node_modules/
 web/dist/
 web/.vite/
+# Match recordings served statically to the replay viewer. Data, not source:
+# a single 80-game match is ~0.5 MB of hex state payloads.
+web/public/recordings/
 # tsc --build incremental cache
 *.tsbuildinfo
 

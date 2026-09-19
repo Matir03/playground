@@ -285,12 +285,64 @@ pub fn match_search(
 /// and is guaranteed to be *the games the promotion gate actually scored* — a
 /// standalone renderer has to reload both checkpoints, contend with the running
 /// trainer for the GPU, and still only reproduces a different sample.
+/// `GameState.payload` as hex — the exact bytes `Minions::encode_state` emits,
+/// which is what the web board already decodes.
+///
+/// Hex rather than base64 because no base64 crate is in the tree, and the
+/// doubling costs about half a megabyte on an 80-game match. Not worth a
+/// dependency, and not worth a fourth hand-rolled copy of the state format.
+fn hex_state(s: &MinionsState) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(266);
+    for b in Minions::encode_state(s) {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// One game: how it was set up, how it ended, and every position along the way.
+#[derive(serde::Serialize)]
+struct GameRecord {
+    game: u32,
+    /// Settled handicap, and whether seat A took yellow (and so moved first).
+    bid: i16,
+    a_first: bool,
+    turns: u16,
+    /// From A's seat: "a", "b" or "draw".
+    result: String,
+    /// Index 0 is the opening position; each later entry is the position after
+    /// one applied turn. One entry per turn, which is the unit the move list
+    /// groups by -- positions inside a turn are never offered to anything.
+    ///
+    /// `states.len()` is NOT always `turns + 1`. A game ends the instant a
+    /// necromancer dies, part-way through a turn, so the final applied turn
+    /// need not advance the counter. Measured on the first two recorded games:
+    /// 30 turns/31 states, but 16 turns/18 states. Walk the list; do not index
+    /// it by turn number.
+    states: Vec<String>,
+}
+
+/// A whole match, self-contained: the viewer needs no engine to replay it.
+#[derive(serde::Serialize)]
+struct MatchRecord {
+    games: u32,
+    a_wins: u32,
+    b_wins: u32,
+    draws: u32,
+    a_score: f64,
+    /// Free-form description of what each seat was, written by the caller.
+    a_label: String,
+    b_label: String,
+    records: Vec<GameRecord>,
+}
+
 pub fn run_match(
     a: &Seat,
     b: &Seat,
     games: u32,
     params: (&SampledParams, &SampledParams),
     render: Option<(&std::path::Path, u32)>,
+    record: Option<&std::path::Path>,
 ) -> anyhow::Result<(f64, u32, u32, u32, f64, f64)> {
     // Each seat searches with its own params (sims, kernel, exploration); the
     // match's seed is A's.
@@ -342,6 +394,10 @@ pub fn run_match(
         /// moves into an unreadable stream; each game's log is emitted whole
         /// once the match ends.
         log: String,
+        /// The position after each turn, hex-encoded. Kept for every game
+        /// regardless of `render_games`: the transcript is a human sample, but
+        /// a recording the viewer replays should be the whole match.
+        states: Vec<String>,
     }
     let mut live: Vec<Live> = (0..games)
         .map(|g| {
@@ -365,9 +421,15 @@ pub fn run_match(
                 (None, Some(y)) => (settle_bids(y, y, &mut r).0, g % 2 == 0),
                 (None, None) => (crate::game::START_MONEY_SECOND as i16, g % 2 == 0),
             };
+            let st = MinionsState::with_bid(bid);
             Live {
                 g,
-                state: MinionsState::with_bid(bid),
+                states: if record.is_some() {
+                    vec![hex_state(&st)]
+                } else {
+                    Vec::new()
+                },
+                state: st,
                 a_first: a_yellow,
                 bid,
                 done: false,
@@ -436,6 +498,10 @@ pub fn run_match(
                     } else {
                         next
                     };
+                if record.is_some() {
+                    let h = hex_state(&live[i].state);
+                    live[i].states.push(h);
+                }
                 if sink.is_some() && live[i].g < render_games {
                     use std::fmt::Write as _;
                     let r = realize(&prev_state, &spec);
@@ -465,9 +531,39 @@ pub fn run_match(
     }
 
     // ── score, once each game has finished ────────────────────────────────
+    let mut records: Vec<GameRecord> = Vec::new();
     for l in live.iter() {
         let state = &l.state;
         let a_first = l.a_first;
+        // Built here, before the draw arm below `continue`s -- a recording that
+        // silently dropped drawn games would misnumber every game after one.
+        if record.is_some() {
+            let result = match Minions::outcome(state) {
+                Outcome::FirstWins => {
+                    if a_first {
+                        "a"
+                    } else {
+                        "b"
+                    }
+                }
+                Outcome::SecondWins => {
+                    if a_first {
+                        "b"
+                    } else {
+                        "a"
+                    }
+                }
+                _ => "draw",
+            };
+            records.push(GameRecord {
+                game: l.g,
+                bid: l.bid,
+                a_first,
+                turns: state.turn,
+                result: result.to_string(),
+                states: l.states.clone(),
+            });
+        }
         if l.g < render_games {
             if let Some(w) = sink.as_mut() {
                 write!(w, "{}", l.log)?;
@@ -569,6 +665,31 @@ pub fn run_match(
                 st.resamples, st.resamples_root, st.resample_new, st.chosen_resampled, st.searches
             );
         }
+    }
+    if let Some(path) = record {
+        if let Some(dir) = path.parent() {
+            if !dir.as_os_str().is_empty() {
+                std::fs::create_dir_all(dir)?;
+            }
+        }
+        let rec = MatchRecord {
+            games,
+            a_wins: wins,
+            b_wins: losses,
+            draws,
+            a_score: score,
+            // Self-describing: what actually differs between the seats in
+            // these experiments is the value rule, so the recording carries it
+            // rather than making the viewer be told out of band.
+            a_label: format!("{:?}/{:?}", params_a.value_backup, params_a.value_visits),
+            b_label: format!("{:?}/{:?}", params_b.value_backup, params_b.value_visits),
+            records,
+        };
+        // Written whole at the end rather than streamed: a half-written file
+        // from an interrupted match decodes as corrupt, and the viewer has no
+        // way to tell that from a bug in the format.
+        std::fs::write(path, serde_json::to_vec(&rec)?)?;
+        eprintln!("recorded {} games to {}", rec.records.len(), path.display());
     }
     Ok((score, wins, losses, draws, margin, game_score))
 }

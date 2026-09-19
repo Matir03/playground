@@ -135,7 +135,7 @@ const O_REINF = O_MONEY + 4;
 const O_NW_HIST = O_REINF + 10;
 const O_SIDE = O_NW_HIST + 2 * ADJ_WINDOW;
 
-function decode(p: Uint8Array): Decoded {
+export function decode(p: Uint8Array): Decoded {
   const dv = new DataView(p.buffer, p.byteOffset, p.byteLength);
   return {
     cells: p.subarray(0, CELLS),
@@ -250,7 +250,7 @@ const SEAT_PLAYER: Record<"solver" | "net", EnginePlayer> = {
 };
 
 const SIDE_NAME = ["Yellow (first)", "Blue (second)"];
-const SIDE_FILL = ["#e0a72c", "#3f74d8"];
+export const SIDE_FILL = ["#e0a72c", "#3f74d8"];
 const SIDE_INK = ["#4a3506", "#ffffff"];
 
 /**
@@ -306,12 +306,12 @@ const HEX_H = Math.sqrt(3) * R; // flat-to-flat height of one hex
 const PAD = 10;
 /** Rows of "half-height steps" spanned by the whole rhombus: (N-1)/2 + (N-1). */
 const V_SPAN = (N - 1) / 2 + (N - 1);
-const px = (i: number) => PAD + R + 1.5 * R * cellX(i);
-const py = (i: number) => PAD + HEX_H / 2 + HEX_H * (V_SPAN - (cellX(i) / 2 + cellY(i)));
-const SVG_W = PAD * 2 + 2 * R + 1.5 * R * (N - 1);
-const SVG_H = PAD * 2 + HEX_H * (V_SPAN + 1);
+export const px = (i: number) => PAD + R + 1.5 * R * cellX(i);
+export const py = (i: number) => PAD + HEX_H / 2 + HEX_H * (V_SPAN - (cellX(i) / 2 + cellY(i)));
+export const SVG_W = PAD * 2 + 2 * R + 1.5 * R * (N - 1);
+export const SVG_H = PAD * 2 + HEX_H * (V_SPAN + 1);
 
-const HEX_POINTS = Array.from({ length: 6 }, (_, k) => {
+export const HEX_POINTS = Array.from({ length: 6 }, (_, k) => {
   const a = (Math.PI / 180) * 60 * k;
   return `${(R * Math.cos(a)).toFixed(2)},${(R * Math.sin(a)).toFixed(2)}`;
 }).join(" ");
@@ -1592,7 +1592,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
   );
 }
 
-function Piece({ cell, pstate }: { cell: number; pstate: number }) {
+export function Piece({ cell, pstate }: { cell: number; pstate: number }) {
   const side = pieceSide(cell);
   const def = UNITS[pieceUnit(cell)];
   const dmg = damageOf(pstate);

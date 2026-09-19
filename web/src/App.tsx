@@ -5,6 +5,7 @@ import { Go9Board } from "./games/go9/Board";
 import { AmazonsBoard } from "./games/amazons/Board";
 import { HexBoard } from "./games/hex/Board";
 import { MinionsBoard } from "./games/minions/Board";
+import { Recordings } from "./games/minions/Recordings";
 
 // Engines are reached under same-origin proxy paths (see vite.config.ts), so the
 // whole app works behind one origin without CORS.
@@ -55,6 +56,10 @@ const clients: Partial<Record<GameId, ReturnType<typeof engineClientFor>>> = {
 
 export function App() {
   const [selected, setSelected] = useState<GameId | null>(null);
+  // Recorded matches are not an engine, so they are a sibling view rather than
+  // a `GAMES` entry: everything in GAMES gets health-checked against an engine
+  // URL and given a client, and a static recording needs neither.
+  const [recordings, setRecordings] = useState(false);
   const [healths, setHealths] = useState<Record<string, EngineHealth>>(
     Object.fromEntries(GAMES.map((g) => [g.id, { status: "unknown" }])),
   );
@@ -78,9 +83,11 @@ export function App() {
     // Wider while a game is open: a board with an analysis panel beside it
     // does not fit in 720px, and wrapping the panel underneath puts the board
     // off screen exactly when the panel is driving it.
-    <main style={{ fontFamily: "system-ui, sans-serif", padding: "2rem", maxWidth: game == null ? 720 : 1400 }}>
-      {game == null ? (
-        <Menu healths={healths} onPick={setSelected} />
+    <main style={{ fontFamily: "system-ui, sans-serif", padding: "2rem", maxWidth: game == null && !recordings ? 720 : 1400 }}>
+      {recordings ? (
+        <Recordings onBack={() => setRecordings(false)} />
+      ) : game == null ? (
+        <Menu healths={healths} onPick={setSelected} onRecordings={() => setRecordings(true)} />
       ) : (
         <GameView game={game} health={healths[game.id]} onBack={() => setSelected(null)} />
       )}
@@ -91,9 +98,11 @@ export function App() {
 function Menu({
   healths,
   onPick,
+  onRecordings,
 }: {
   healths: Record<string, EngineHealth>;
   onPick: (id: GameId) => void;
+  onRecordings: () => void;
 }) {
   return (
     <>
@@ -128,6 +137,19 @@ function Menu({
           );
         })}
       </div>
+      <button
+        onClick={onRecordings}
+        style={{
+          marginTop: "1.5rem", textAlign: "left", padding: "1rem 1.25rem", borderRadius: 10,
+          border: "1px solid #ddd", background: "#fff", cursor: "pointer", font: "inherit", width: "100%",
+        }}
+      >
+        <strong style={{ fontSize: "1.1rem" }}>Recorded matches</strong>
+        <div style={{ color: "#666", fontSize: "0.9rem", marginTop: 4 }}>
+          Replay games from an <code>eval-match</code> run, turn by turn. Served from static
+          JSON, so no engine has to be running.
+        </div>
+      </button>
     </>
   );
 }
