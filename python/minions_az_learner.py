@@ -571,7 +571,7 @@ def calibrate_log_z(net, batch, rng, device, t_steps, tb_candidates, batches=8, 
 
 def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux=0.15,
                 tb_weight=0.0, t_steps=4, move_smoothing=0.0, tb_candidates=1,
-                w_score=0.15, energy_children=8192):
+                w_score=0.15, energy_children=8192, w_unmask=0.0):
     """One generation of updates.
 
     With ``tb_weight > 0`` this runs the two-phase schedule: every step first
@@ -585,7 +585,7 @@ def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux
     regression is stationary within the generation.
     """
     n = len(batch["value"])
-    tally = np.zeros(8)
+    tally = np.zeros(9)
     tb_tally = 0.0
     net.train()
     for _ in range(steps):
@@ -645,6 +645,65 @@ def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux
             + masked_declaration_loss(tg_l, tg_t.to(device), ht)
             + masked_declaration_loss(sp_l, sp_t.to(device), hs)
         )
+
+        # ── unmasking consistency ─────────────────────────────────────────────
+        #
+        # The masked CE above trains *hidden* positions only. A committed
+        # position's logits are completely unconstrained, so today they carry no
+        # usable signal. This term makes the output at a committed field equal
+        # the distribution the model would give if that one field were
+        # uncommitted — which is what lets a single forward pass report "here is
+        # what I would have proposed instead" for every committed field at once,
+        # instead of one forward pass per field.
+        #
+        # **Exactly one field moves.** Pass B commits `committed | {j}`, so "B
+        # with j uncommitted" is precisely pass A's input, and A's distribution
+        # at j is the exact target. Move two fields and the two contexts differ
+        # by more than j, and the target quietly stops being the thing it claims
+        # to be — the loss would still fall, and it would be measuring nothing.
+        #
+        # Training this toward the ground truth instead would collapse to the
+        # identity: the committed value is *in* the input, so echoing it is a
+        # zero-loss solution that says nothing about alternatives. The target has
+        # to be the model's own belief, which is why this is self-distillation.
+        loss_u = mv_l.sum() * 0.0
+        if w_unmask > 0.0:
+            flat_hidden = hidden.reshape(bs, -1)
+            has_hidden = flat_hidden.any(axis=1)
+            if has_hidden.any():
+                # A uniformly random hidden slot per row: hidden slots land in
+                # [-1, 0) and the rest in [0, 1), so argmin picks among hidden.
+                jsel = np.argmin(
+                    rng.random(flat_hidden.shape) - flat_hidden.astype(np.float64), axis=1
+                )
+                rows_h = np.flatnonzero(has_hidden)
+                committed_b = committed.reshape(bs, -1).copy()
+                # Only touch rows that *have* a hidden slot; for the rest `jsel`
+                # is meaningless and writing it would un-commit a real field.
+                committed_b[rows_h, jsel[rows_h]] = True
+                decl_b = torch.from_numpy(
+                    decl_planes(spec, committed_b.reshape(live_f.shape))
+                ).to(device)
+                mv_b, tg_b, sp_b = net.diffusion_head(hh, decl_b)
+                # live_f is (B, CELLS, 3) flattened cell-major: slot = cell*3 + field.
+                cell, field = jsel // 3, jsel % 3
+                ces = []
+                for fi, (la_, lb_) in enumerate(((mv_l, mv_b), (tg_l, tg_b), (sp_l, sp_b))):
+                    sel = np.flatnonzero(has_hidden & (field == fi))
+                    if not len(sel):
+                        continue
+                    st = torch.from_numpy(sel).to(device)
+                    ct = torch.from_numpy(cell[sel]).to(device)
+                    # detach: the target is pass A's belief, held fixed. Without
+                    # it both sides drift toward each other and the pair can
+                    # satisfy the objective by agreeing on anything at all.
+                    tgt = F.softmax(la_[st, ct].detach(), dim=-1)
+                    ces.append(-(tgt * F.log_softmax(lb_[st, ct], dim=-1)).sum(dim=-1))
+                if ces:
+                    # One mean over every supervised position, not a sum over
+                    # field groups: which fields appear varies per batch, and
+                    # summing would make the term's scale depend on that.
+                    loss_u = torch.cat(ces).mean()
 
         # ── candidate-set CE for the energy head ──────────────────────────────
         # Over every recorded child of each usable row -- all of the root's
@@ -734,6 +793,7 @@ def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux
         loss = (
             loss_v + w_diff * loss_d + w_energy * loss_e
             + w_aux * loss_aux + w_score * loss_score
+            + w_unmask * loss_u
         )
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -779,6 +839,7 @@ def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux
             float(
                 (score_p[has_s] - score_t[has_s]).abs().mean().detach() * SCORE_SCALE
             ) if bool(has_s.any()) else 0.0,
+            float(loss_u.detach()),
         ]
     return np.append(tally / max(steps, 1), tb_tally / max(steps, 1))
 
@@ -820,6 +881,13 @@ def main():
                          "balance over, each against its own energy score. The "
                          f"default, {TOP_K} (= TOP_K), is every child; 1 replays one "
                          "turn drawn in proportion to the pruned visits.")
+    ap.add_argument("--w-unmask", type=float, default=0.0,
+                    help="weight on the unmasking-consistency loss: a committed "
+                         "field's logits are trained toward the distribution the "
+                         "model gives with that one field uncommitted (its own "
+                         "belief, stop-gradient). 0 = exactly today's behaviour. "
+                         "Costs one extra diffusion-head forward per step, and "
+                         "supervises one committed field per row per step.")
     ap.add_argument("--tb-weight", type=float, default=0.0,
                     help="weight on the GFlowNet trajectory-balance loss for the "
                          "sampler; 0 keeps the masked-CE-only behaviour")
@@ -912,7 +980,7 @@ def main():
         if args.calibrate_log_z and gens_done == 0 and args.tb_weight > 0:
             calibrate_log_z(net, batch, rng, device, args.t_steps, args.tb_candidates)
         t0 = time.time()
-        lv, hent, ld, le, la, hdecl, lsc, smae, ltb = train_block(
+        lv, hent, ld, le, la, hdecl, lsc, smae, lu, ltb = train_block(
             net, opt, batch, args.steps, args.batch, device, rng,
             args.w_diff, args.w_energy, args.aux_weight,
             tb_weight=args.tb_weight, t_steps=args.t_steps,
@@ -920,6 +988,7 @@ def main():
             tb_candidates=args.tb_candidates,
             w_score=args.score_weight,
             energy_children=args.energy_children,
+            w_unmask=args.w_unmask,
         )
         generation += 1
         gens_done += 1
@@ -947,6 +1016,10 @@ def main():
             # so the numbers stay comparable with every generation trained so far.
             "decl_entropy": hdecl, "decl_kl": ld - hdecl,
             "loss_tb": ltb,
+            # Self-distillation CE at one committed field per row: how far the
+            # committed-position output is from what the model would say with
+            # that field uncommitted. 0 when --w-unmask is 0.
+            "loss_unmask": lu,
             # MSE on the /SCORE_SCALE target, plus the same error in points,
             # which is the readable one.
             "loss_score": lsc, "score_mae": round(smae, 2),

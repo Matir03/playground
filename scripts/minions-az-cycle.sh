@@ -212,6 +212,19 @@ EVAL_LAG="${EVAL_LAG:-5}"
 # 0 since 2026-09-15: the TB objective damaged the sampler's conditionals, and
 # stays off until it is replaced.
 TB_WEIGHT="${TB_WEIGHT:-0}"
+# Unmasking-consistency weight for the sampler. Trains a *committed* field's
+# logits toward the distribution the model gives with that one field
+# uncommitted — its own belief, stop-gradient — so one forward pass reports
+# what it would have proposed instead, at every committed field at once. That
+# is the signal a reroll heuristic would read.
+#
+# 0 = committed positions stay unconstrained. Costs one extra diffusion-head
+# forward per step when on.
+#
+# 0.5 since 2026-09-19 (user's call): large enough to actually shape the
+# committed-position outputs, small enough not to compete with
+# `loss_declaration`, which sits around 1.05-1.10.
+W_UNMASK="${W_UNMASK:-0.5}"
 EVAL_GAMES="${EVAL_GAMES:-40}"
 # Promotion mode, see the eval step. 0: no gate, a tournament every
 # MEASURE_EVERY generations. 1: the per-generation gate.
@@ -336,6 +349,7 @@ while true; do
     --channels "$CHANNELS" --blocks "$BLOCKS" \
     --steps "$STEPS" --batch "$BATCH" --lr "$LR" --min-samples "$MIN_SAMPLES" \
     --tb-weight "$TB_WEIGHT" --t-steps "$T_STEPS" \
+    --w-unmask "$W_UNMASK" \
     --exit-after-gens 1
 
   # Losses for this generation beside the recent ones and the last few
