@@ -440,6 +440,43 @@ enum Cmd {
         #[arg(long)]
         verbose: bool,
     },
+    /// Generate random positions for the small value net's distillation set.
+    ///
+    /// Same opening law as self-play — a bid, then uniformly random *legal*
+    /// turns — but the turn count is drawn from a normal truncated above rather
+    /// than self-play's decaying geometric. Planes are written in the replay
+    /// buffer's own encoding so the buffer can validate a net trained on this.
+    GenPositions {
+        #[arg(long, default_value = "data/minions_nnue/positions")]
+        out: String,
+        #[arg(long, default_value_t = 10_000_000)]
+        count: usize,
+        #[arg(long, default_value_t = 20.0)]
+        mean: f64,
+        #[arg(long, default_value_t = 5.0)]
+        stdev: f64,
+        /// Draws longer than this are rejected, not clamped.
+        #[arg(long, default_value_t = 20)]
+        max_turns: u32,
+        #[arg(long, default_value_t = 250_000)]
+        shard_size: usize,
+        #[arg(long, default_value_t = 8)]
+        threads: usize,
+        #[arg(long, default_value_t = 20260918)]
+        seed: u64,
+    },
+    /// Measure the small value net's evaluation rate in the language it would
+    /// ship in. Both Python harnesses were overhead-bound — they reported rates
+    /// flat across an 8x change in hidden width — so neither could answer
+    /// whether the 100k/s design target is reachable.
+    NnueBench {
+        /// Active features per position. Generated positions measure 27.1 of
+        /// 588 (range 14–41), so 27 is the realistic operating point.
+        #[arg(long, default_value_t = 27)]
+        active: usize,
+        #[arg(long, default_value_t = 200_000)]
+        reps: usize,
+    },
 }
 
 #[tokio::main]
@@ -834,6 +871,30 @@ async fn main() -> anyhow::Result<()> {
             )?;
         }
         Cmd::GreedyGame { games, verbose } => greedy_games(games, verbose),
+        Cmd::GenPositions {
+            out,
+            count,
+            mean,
+            stdev,
+            max_turns,
+            shard_size,
+            threads,
+            seed,
+        } => {
+            minions_engine::genpos::generate(
+                &out,
+                minions_engine::genpos::GenConfig {
+                    count,
+                    mean,
+                    stdev,
+                    max_turns,
+                    shard_size,
+                    threads,
+                    seed,
+                },
+            )?;
+        }
+        Cmd::NnueBench { active, reps } => minions_engine::nnue::bench_sweep(active, reps),
     }
     Ok(())
 }
