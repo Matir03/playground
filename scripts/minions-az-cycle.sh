@@ -167,6 +167,11 @@ FORCED_VISITS="${FORCED_VISITS:-10}"
 # 2026-09-15 (user): only the random explore candidates are forced. The root
 # sweep's one seeded visit per candidate stays (the user kept it).
 FORCED_EXTRA="${FORCED_EXTRA:-0}"
+# KataGo's prior-scaled forced-playout floor at the root. 0 since 2026-09-19
+# (user): root forced playouts off. The root sweep's one seeded visit per
+# candidate is a separate mechanism and stays on, so every root candidate is
+# still tried once; what goes away is the extra sqrt(k*P*N) floor on top.
+K_FORCED="${K_FORCED:-0}"
 # Five generations: one tournament round of the champion's own games, since
 # only the champion plays self-play between tournaments (SELFPLAY_NET).
 # 250k since 2026-09-16. At 800 sims a root has ~300 stable children, so 87-91%
@@ -341,6 +346,7 @@ while true; do
     --random-opening-decay "$RANDOM_OPENING_DECAY" \
     --min-explore-visits "$MIN_EXPLORE_VISITS" \
     --forced-visits "$FORCED_VISITS" --forced-extra "$FORCED_EXTRA" \
+    --k-forced "$K_FORCED" \
     --max-examples "$MAX_EXAMPLES" --target-examples "$TARGET_EXAMPLES" \
     --seed "${seed:-$gen}" --backend "$BACKEND" --ep "$EP" $FP16_FLAG $CUDA_FLAG
 

@@ -160,6 +160,12 @@ enum Cmd {
         /// of every explore candidate.
         #[arg(long, default_value_t = 4)]
         forced_extra: u32,
+        /// KataGo forced-playout constant, applied at the root: a low-prior
+        /// candidate cannot be starved before it is tried. 0 disables root
+        /// forced playouts, leaving the root sweep's one seeded visit per
+        /// candidate as the only guarantee of a first look.
+        #[arg(long, default_value_t = 2.0)]
+        k_forced: f32,
         /// KR-PUCT kernel bandwidth over the turn metric (`turn::distance`).
         /// Candidates within roughly this distance share visit counts and
         /// values instead of being scored as unrelated actions.
@@ -176,7 +182,10 @@ enum Cmd {
         /// `all` folds them into the value as the search has always done;
         /// `true-only` counts none of them; `node-gate` ignores a candidate
         /// whose visits are *all* bought but keeps the whole count once one is
-        /// earned. **`all` reproduces the previous search bit-for-bit.**
+        /// earned. `min-two` ignores provenance and gates on thinness instead:
+        /// a candidate with a single visit says nothing to its parent, and from
+        /// the second on it contributes its whole count.
+        /// **`all` reproduces the previous search bit-for-bit.**
         #[arg(long, default_value = "all")]
         value_visits: playground_core::sampled_mcts::ValueVisits,
         /// Candidates generated per model call. 0 (default) produces a node's
@@ -309,8 +318,8 @@ enum Cmd {
         /// the same way unless you ask for the flat-vs-KR comparison.
         #[arg(long)]
         kernel_sigma_b: Option<f32>,
-        /// Value-visit mode for seat A: `all` (default), `true-only` or
-        /// `node-gate`. See the selfplay flag of the same name.
+        /// Value-visit mode for seat A: `all` (default), `true-only`,
+        /// `node-gate` or `min-two`. See the selfplay flag of the same name.
         #[arg(long, default_value = "all")]
         value_visits: playground_core::sampled_mcts::ValueVisits,
         /// Value-visit mode for seat B; defaults to A's. Set only this to play
@@ -559,6 +568,7 @@ async fn main() -> anyhow::Result<()> {
             min_explore_visits,
             forced_visits,
             forced_extra,
+            k_forced,
             workers,
             no_energy,
             kernel_sigma,
@@ -585,6 +595,7 @@ async fn main() -> anyhow::Result<()> {
                 min_explore_visits,
                 forced_visits,
                 forced_extra,
+                k_forced,
                 workers,
                 random_opening_max,
                 random_opening_decay,

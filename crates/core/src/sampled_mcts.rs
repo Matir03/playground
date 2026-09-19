@@ -344,6 +344,16 @@ pub enum ValueVisits {
     /// bought visits included. The same "earned even one visit keeps the whole
     /// count" rule the policy target already uses.
     NodeGate,
+    /// A candidate with exactly one visit says nothing to its parent; from the
+    /// second visit on it contributes its whole count, that first visit
+    /// included.
+    ///
+    /// Unlike the two above, this ignores *provenance*: one visit is treated as
+    /// too thin to move a parent whether PUCT chose it, a quota bought it, or a
+    /// refinement handed it over. One visit is one noisy leaf evaluation, and
+    /// most children at the fringe never earn a second — so under `All` a
+    /// parent's `q` is dominated by estimates that are a single sample each.
+    MinTwo,
 }
 
 impl std::str::FromStr for ValueVisits {
@@ -361,8 +371,9 @@ impl std::str::FromStr for ValueVisits {
             "all" => Ok(ValueVisits::All),
             "trueonly" | "true" => Ok(ValueVisits::TrueOnly),
             "nodegate" | "gate" => Ok(ValueVisits::NodeGate),
+            "mintwo" => Ok(ValueVisits::MinTwo),
             other => Err(format!(
-                "unknown value-visits mode {other:?}: expected all, true-only or node-gate"
+                "unknown value-visits mode {other:?}: expected all, true-only, node-gate or min-two"
             )),
         }
     }
@@ -552,6 +563,13 @@ impl<G: SampledGame> Entry<G> {
             ValueVisits::TrueOnly => (self.true_w, self.true_n),
             ValueVisits::NodeGate => {
                 if self.true_n > 0 {
+                    (self.w, self.n)
+                } else {
+                    (0.0, 0)
+                }
+            }
+            ValueVisits::MinTwo => {
+                if self.n >= 2 {
                     (self.w, self.n)
                 } else {
                     (0.0, 0)
@@ -1093,7 +1111,9 @@ fn select<G: SampledGame>(
     // visits were mostly bought should not hand its children a parent estimate
     // built from purchases. `All` keeps the raw sums exactly as before.
     let (par_w, par_n) = match params.value_visits {
-        ValueVisits::All => (node.w_sum, node.total_n),
+        // `MinTwo` gates on how *thin* a child's evidence is, not on whether it
+        // was bought, so the parent anchor stays the raw sums as under `All`.
+        ValueVisits::All | ValueVisits::MinTwo => (node.w_sum, node.total_n),
         ValueVisits::TrueOnly | ValueVisits::NodeGate => (node.true_w_sum, node.true_total_n),
     };
     let parent_q = if par_n > 0 { par_w / par_n as f32 } else { 0.0 };
@@ -3470,25 +3490,82 @@ mod tests {
 
         // And the other two modes must actually do something, or the test
         // above is vacuous and the experiment would measure nothing.
-        let differs = [ValueVisits::TrueOnly, ValueVisits::NodeGate]
-            .into_iter()
-            .any(|mode| {
-                let c = run(&SampledParams {
-                    value_visits: mode,
-                    ..base
-                });
-                c.candidates
+        let differs = [
+            ValueVisits::TrueOnly,
+            ValueVisits::NodeGate,
+            ValueVisits::MinTwo,
+        ]
+        .into_iter()
+        .any(|mode| {
+            let c = run(&SampledParams {
+                value_visits: mode,
+                ..base
+            });
+            c.candidates
+                .iter()
+                .map(|(m, n)| (*m, *n))
+                .collect::<Vec<_>>()
+                != a.candidates
                     .iter()
                     .map(|(m, n)| (*m, *n))
                     .collect::<Vec<_>>()
-                    != a.candidates
-                        .iter()
-                        .map(|(m, n)| (*m, *n))
-                        .collect::<Vec<_>>()
-            });
+        });
         assert!(
             differs,
-            "neither TrueOnly nor NodeGate changed the search -- the knob is not wired up"
+            "no non-default value-visits mode changed the search -- the knob is not wired up"
+        );
+    }
+
+    /// The rule `MinTwo` encodes, stated directly: one visit is invisible, two
+    /// or more contribute *everything*, the first visit included. The second
+    /// half is the part worth pinning -- a gate that dropped the first visit's
+    /// value permanently would be a different experiment.
+    #[test]
+    fn min_two_hides_a_single_visit_then_counts_the_whole_thing() {
+        let mut e: Entry<Count> = Entry {
+            mv: 1,
+            energy: 0.0,
+            p: 0.0,
+            n: 0,
+            w: 0.0,
+            child: -1,
+            explore: false,
+            forced_n: 0,
+            forced_quota: 0,
+            auto_n: 0,
+            credit_n: 0,
+            true_n: 0,
+            true_w: 0.0,
+            draws: 0,
+            manual: false,
+            eval: None,
+            resampled: false,
+            id: 0,
+            stable: false,
+        };
+        assert_eq!(e.value_wn(ValueVisits::MinTwo), (0.0, 0), "unvisited");
+
+        e.n = 1;
+        e.w = 0.9;
+        e.true_n = 1;
+        e.true_w = 0.9;
+        assert_eq!(
+            e.value_wn(ValueVisits::MinTwo),
+            (0.0, 0),
+            "a single visit must not reach the parent"
+        );
+        assert_eq!(
+            e.value_wn(ValueVisits::All),
+            (0.9, 1),
+            "All must be untouched by the new mode"
+        );
+
+        e.n = 2;
+        e.w = 1.4;
+        assert_eq!(
+            e.value_wn(ValueVisits::MinTwo),
+            (1.4, 2),
+            "from the second visit the whole count counts, first included"
         );
     }
 
