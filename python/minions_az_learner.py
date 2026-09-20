@@ -585,7 +585,7 @@ def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux
     regression is stationary within the generation.
     """
     n = len(batch["value"])
-    tally = np.zeros(9)
+    tally = np.zeros(12)
     tb_tally = 0.0
     net.train()
     for _ in range(steps):
@@ -667,6 +667,9 @@ def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux
         # zero-loss solution that says nothing about alternatives. The target has
         # to be the model's own belief, which is why this is self-distillation.
         loss_u = mv_l.sum() * 0.0
+        # Diagnostics for the term above, 0 when it is off. These are what make
+        # `loss_unmask` readable at all -- see where they are filled below.
+        h_unmask = p_com_b = p_com_a = 0.0
         if w_unmask > 0.0:
             flat_hidden = hidden.reshape(bs, -1)
             has_hidden = flat_hidden.any(axis=1)
@@ -687,7 +690,7 @@ def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux
                 mv_b, tg_b, sp_b = net.diffusion_head(hh, decl_b)
                 # live_f is (B, CELLS, 3) flattened cell-major: slot = cell*3 + field.
                 cell, field = jsel // 3, jsel % 3
-                ces = []
+                ces, ents, p_b, p_a = [], [], [], []
                 for fi, (la_, lb_) in enumerate(((mv_l, mv_b), (tg_l, tg_b), (sp_l, sp_b))):
                     sel = np.flatnonzero(has_hidden & (field == fi))
                     if not len(sel):
@@ -699,11 +702,32 @@ def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux
                     # satisfy the objective by agreeing on anything at all.
                     tgt = F.softmax(la_[st, ct].detach(), dim=-1)
                     ces.append(-(tgt * F.log_softmax(lb_[st, ct], dim=-1)).sum(dim=-1))
+                    # CE >= H(A), so what this objective actually learns is
+                    # `loss_unmask - unmask_entropy`. Logging the CE alone hides
+                    # a head that is merely sharpening *both* passes: trained
+                    # standalone, the KL reached ~0 by step 600 while the CE went
+                    # on falling for another 5400 steps.
+                    ents.append(-(tgt * torch.log(tgt.clamp_min(1e-12))).sum(dim=-1))
+                    # Mass each pass puts on the value actually committed at the
+                    # supervised field. Pass B has that value in its input, so
+                    # near 1.0 means it is echoing the input and the "what would
+                    # I have proposed instead" signal is vacuous. Pass A, which
+                    # has the field hidden, is the reference to read it against.
+                    tv = (moves_t, tg_t, sp_t)[fi].to(device)[st, ct]
+                    p_b.append(
+                        F.softmax(lb_[st, ct].detach(), dim=-1)
+                        .gather(-1, tv[:, None])
+                        .squeeze(-1)
+                    )
+                    p_a.append(tgt.gather(-1, tv[:, None]).squeeze(-1))
                 if ces:
                     # One mean over every supervised position, not a sum over
                     # field groups: which fields appear varies per batch, and
                     # summing would make the term's scale depend on that.
                     loss_u = torch.cat(ces).mean()
+                    h_unmask = float(torch.cat(ents).mean())
+                    p_com_b = float(torch.cat(p_b).mean())
+                    p_com_a = float(torch.cat(p_a).mean())
 
         # ── candidate-set CE for the energy head ──────────────────────────────
         # Over every recorded child of each usable row -- all of the root's
@@ -840,6 +864,9 @@ def train_block(net, opt, batch, steps, bs, device, rng, w_diff, w_energy, w_aux
                 (score_p[has_s] - score_t[has_s]).abs().mean().detach() * SCORE_SCALE
             ) if bool(has_s.any()) else 0.0,
             float(loss_u.detach()),
+            h_unmask,
+            p_com_b,
+            p_com_a,
         ]
     return np.append(tally / max(steps, 1), tb_tally / max(steps, 1))
 
@@ -980,7 +1007,7 @@ def main():
         if args.calibrate_log_z and gens_done == 0 and args.tb_weight > 0:
             calibrate_log_z(net, batch, rng, device, args.t_steps, args.tb_candidates)
         t0 = time.time()
-        lv, hent, ld, le, la, hdecl, lsc, smae, lu, ltb = train_block(
+        lv, hent, ld, le, la, hdecl, lsc, smae, lu, hu, pcb, pca, ltb = train_block(
             net, opt, batch, args.steps, args.batch, device, rng,
             args.w_diff, args.w_energy, args.aux_weight,
             tb_weight=args.tb_weight, t_steps=args.t_steps,
@@ -1020,6 +1047,13 @@ def main():
             # committed-position output is from what the model would say with
             # that field uncommitted. 0 when --w-unmask is 0.
             "loss_unmask": lu,
+            # CE >= H(A), so the consistency actually learned is the KL. A
+            # falling loss_unmask alongside falling entropy is the head
+            # sharpening both passes, not agreeing better -- read this first.
+            "unmask_entropy": hu, "unmask_kl": lu - hu,
+            # Mass on the committed value: pass B has it in its input, so ~1.0
+            # means echoing and a vacuous reroll signal; pass A is the reference.
+            "unmask_p_committed": pcb, "unmask_p_own": pca,
             # MSE on the /SCORE_SCALE target, plus the same error in points,
             # which is the readable one.
             "loss_score": lsc, "score_mae": round(smae, 2),
