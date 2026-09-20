@@ -2221,11 +2221,19 @@ impl<G: SampledGame> Search<G> {
         // its whole set before its first visit and then sweeps every candidate
         // once (see `select`), which gives each its visit anyway.
         if cur != 0 && !added.is_empty() {
+            // The candidate the model returned *first*, not the first in the
+            // node's sorted order. Identical whenever a widen adds a single
+            // candidate -- every widen at `pw_chunk = 1` -- and it matters only
+            // when one brings several: the model orders them, so the leading
+            // one is its pick. Scanning the sorted entries instead would hand
+            // the visit to whichever addition had the best energy prior,
+            // quietly overriding that choice.
+            let first = added[0];
             let state = &self.tree[cur].state;
             self.visit_new = self.tree[cur]
                 .entries
                 .iter()
-                .position(|e| added.contains(&G::state_key(&G::apply(state, &e.mv))))
+                .position(|e| G::state_key(&G::apply(state, &e.mv)) == first)
                 .map(|i| (cur, i));
         }
         // Top up only: an explore candidate that arrived by widening still needs

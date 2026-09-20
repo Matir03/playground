@@ -96,6 +96,15 @@ pub struct SamplerConfig {
     /// Most of a turn a resample masks again: the share is uniform in
     /// `[0, resample_frac]` of its live variables, and at least one.
     pub resample_frac: f32,
+    /// Completions drawn from the *final* diffusion step instead of one.
+    ///
+    /// 1 (default) is the existing sampler. Above 1, the last round is replayed
+    /// this many times from the same partial declaration against the same
+    /// logits — CPU only, so no extra network call and, critically, no new
+    /// tensor shape — and the NNUE picks which completion the chain keeps. The
+    /// others are handed back as extra candidates, so they cost their
+    /// realization once and are never re-evaluated.
+    pub last_stage_samples: usize,
     /// Score candidates with the energy head. Off = uniform priors, which is the
     /// P1 configuration before `f` has been trained.
     pub use_energy: bool,
@@ -123,6 +132,7 @@ impl Default for SamplerConfig {
             temperature: 1.0,
             resample_t: 2,
             resample_frac: 0.5,
+            last_stage_samples: 1,
             use_energy: true,
             pad_to: 0,
             seed: 0,
@@ -390,6 +400,13 @@ pub struct Phases {
     /// position-dependent — 28µs at mid-game against 83µs late, since both the
     /// `legal_moves` enumeration and the playout length scale with unit count.
     pub playout_ns: AtomicU64,
+    /// Drawing extra completions at the last diffusion step and scoring them
+    /// with the NNUE (`SamplerConfig::last_stage_samples`).
+    ///
+    /// Counted apart from `commit` and `realize` even though it is made of
+    /// both: the whole question this feature asks is what the extra draws
+    /// cost, and folding them into the phases they resemble would hide it.
+    pub last_stage_ns: AtomicU64,
 }
 
 impl Phases {
@@ -416,7 +433,8 @@ impl Phases {
             + g(&self.commit_ns)
             + g(&self.realize_ns)
             + g(&self.energy_ns)
-            + g(&self.playout_ns);
+            + g(&self.playout_ns)
+            + g(&self.last_stage_ns);
         let worker_ms = secs * 1000.0 * workers.max(1) as f64;
         if worker_ms <= 0.0 {
             return body;
@@ -427,7 +445,7 @@ impl Phases {
 
     pub fn report(&self) -> String {
         let g = |c: &AtomicU64| c.load(Ordering::Relaxed) as f64 / 1e6;
-        let (f, t, w, d, c, r, e, p) = (
+        let (f, t, w, d, c, r, e, p, l) = (
             g(&self.features_ns),
             g(&self.trunk_ns),
             g(&self.decl_write_ns),
@@ -436,12 +454,14 @@ impl Phases {
             g(&self.realize_ns),
             g(&self.energy_ns),
             g(&self.playout_ns),
+            g(&self.last_stage_ns),
         );
-        let total = (f + t + w + d + c + r + e + p).max(1e-9);
+        let total = (f + t + w + d + c + r + e + p + l).max(1e-9);
         let pct = |x: f64| 100.0 * x / total;
         format!(
             "features {:.0}% trunk {:.0}% decl-write {:.0}% diffusion {:.0}% \
-commit {:.0}% realize {:.0}% playout {:.0}% energy {:.0}%  (GPU {:.0}%, CPU {:.0}%)",
+commit {:.0}% realize {:.0}% playout {:.0}% energy {:.0}% last-stage {:.0}%  \
+(GPU {:.0}%, CPU {:.0}%)",
             pct(f),
             pct(t),
             pct(w),
@@ -450,8 +470,9 @@ commit {:.0}% realize {:.0}% playout {:.0}% energy {:.0}%  (GPU {:.0}%, CPU {:.0
             pct(r),
             pct(p),
             pct(e),
+            pct(l),
             pct(t + d + e),
-            pct(f + w + c + r + p),
+            pct(f + w + c + r + p + l),
         )
     }
 }
@@ -461,6 +482,14 @@ pub struct MinionsModel {
     pub net: Box<dyn Backend>,
     pub cfg: SamplerConfig,
     pub phases: Phases,
+    /// Distilled value net used *only* to order candidates at the last
+    /// diffusion step (`SamplerConfig::last_stage_samples`).
+    ///
+    /// Behind `&self` and scored into caller-owned scratch, so the worker
+    /// threads do not contend. Its values never reach `w`, `q`, a prior or a
+    /// training target: a second, weaker evaluator inside the backup would be
+    /// a silent regression in everything the search reports.
+    nnue: Option<crate::nnue::Evaluator>,
     /// Rounds the next `expand_batch` should use. The actor sets this to match
     /// the search mode of the batch it has gathered; there is a single GPU
     /// consumer, so batches never interleave.
@@ -490,9 +519,17 @@ impl MinionsModel {
             net,
             cfg,
             phases: Phases::default(),
+            nnue: None,
             seed,
             expand_seq: AtomicU64::new(0),
         }
+    }
+
+    /// Attach the candidate-ordering NNUE. Separate from `new` so the five
+    /// construction sites that do not want it stay unchanged.
+    pub fn with_nnue(mut self, nnue: Option<crate::nnue::Evaluator>) -> Self {
+        self.nnue = nnue;
+        self
     }
 
     /// Legal move offsets per cell, as a 64-bit mask over [`crate::turn::OFFSETS`].
@@ -648,6 +685,16 @@ impl MinionsModel {
         let mut pass = self.net.diffusion_pass(&h_b, rows)?;
         // Reused by every `commit_round` call across all rows and steps.
         let mut picks: Vec<(u8, u8, u8)> = Vec::with_capacity(NUM_CELLS);
+        // Completions the last step drew but did not keep, per game.
+        let mut extras: Vec<Vec<TurnSpec>> = vec![Vec::new(); g];
+        let n_last = self.cfg.last_stage_samples.max(1);
+        // One scratch for the whole batch: the evaluator is behind `&self` so
+        // worker threads never contend for it.
+        let mut scratch = self
+            .nnue
+            .as_ref()
+            .filter(|_| n_last > 1)
+            .map(|e| e.scratch());
         for t in 1..=steps {
             let clk = Instant::now();
             for (i, c) in chains.iter().enumerate() {
@@ -660,28 +707,124 @@ impl MinionsModel {
             Phases::add(&self.phases.diffusion_ns, clk);
 
             let clk = Instant::now();
+            // Only the final round has anything to choose between: every
+            // earlier one leaves fields uncommitted, so its completions are not
+            // turns yet.
+            let best_of = t == steps && scratch.is_some();
             for row in 0..rows {
                 let cx = &ctx[row / k];
                 if cx.n_live == 0 {
                     continue;
                 }
                 let want = Self::committed_after(t, steps, cx.n_live);
-                commit_round(
-                    &mut chains[row],
-                    &mut claimed[row],
-                    cx,
-                    &logits[row * width..(row + 1) * width],
-                    want,
-                    temp,
-                    &mut rngs[row],
-                    &mut picks,
-                );
+                let lg = &logits[row * width..(row + 1) * width];
+                if !best_of {
+                    commit_round(
+                        &mut chains[row],
+                        &mut claimed[row],
+                        cx,
+                        lg,
+                        want,
+                        temp,
+                        &mut rngs[row],
+                        &mut picks,
+                    );
+                    continue;
+                }
+                let t_last = Instant::now();
+                let gi = row / k;
+                let nnue = self.nnue.as_ref().expect("best_of implies an evaluator");
+                let sc = scratch.as_mut().expect("best_of implies scratch");
+                // The chain as it stands, replayed from here `n_last` times.
+                // `Partial` and the claim mask are both `Copy`, so a completion
+                // costs a stack copy and a commit -- no network call, and no new
+                // tensor shape for TensorRT to build an engine for.
+                let base_chain = chains[row];
+                let base_claimed = claimed[row];
+                let mut seen: std::collections::HashSet<Vec<u8>> = Default::default();
+                let mut best: Option<(f32, Partial)> = None;
+                let mut rest: Vec<TurnSpec> = Vec::new();
+                for _ in 0..n_last {
+                    let mut ch = base_chain;
+                    let mut cl = base_claimed;
+                    commit_round(
+                        &mut ch,
+                        &mut cl,
+                        cx,
+                        lg,
+                        want,
+                        temp,
+                        &mut rngs[row],
+                        &mut picks,
+                    );
+                    let r = realize(&states[gi], &ch.spec);
+                    // Repeats are expected and cost only their realization --
+                    // the point of drawing many is that the distribution, not
+                    // the draw, decides.
+                    if !seen.insert(Minions::encode_state(&r.next)) {
+                        continue;
+                    }
+                    let outcome = Minions::outcome(&r.next);
+                    let v = if outcome.is_terminal() {
+                        // A finished game is worth its result, not a guess. The
+                        // student never trained on terminal positions, and
+                        // scoring a winning turn by approximation is how you
+                        // throw away the only turns that are certain.
+                        let first_to_move = states[gi].side == 0;
+                        match outcome {
+                            playground_core::Outcome::Draw => 0.0,
+                            playground_core::Outcome::FirstWins => {
+                                if first_to_move {
+                                    1.0
+                                } else {
+                                    -1.0
+                                }
+                            }
+                            playground_core::Outcome::SecondWins => {
+                                if first_to_move {
+                                    -1.0
+                                } else {
+                                    1.0
+                                }
+                            }
+                            playground_core::Outcome::InProgress => unreachable!("terminal"),
+                        }
+                    } else {
+                        // `to_features` is canonical to the side to move, and a
+                        // realized turn hands the move over -- so the student's
+                        // value is the *opponent's*. Negated, or this would
+                        // pick the turn that helps them most.
+                        -nnue.value_with(&Minions::to_features(&r.next), sc)
+                    };
+                    match best {
+                        Some((bv, bp)) if bv >= v => rest.push(ch.spec),
+                        Some((_, bp)) => {
+                            rest.push(bp.spec);
+                            best = Some((v, ch));
+                        }
+                        None => best = Some((v, ch)),
+                    }
+                }
+                if let Some((_, bp)) = best {
+                    chains[row] = bp;
+                }
+                // Capped at what a node can hold: `provide_widen` stops adding
+                // at `k_candidates`, so anything past that is realized, scored
+                // and thrown away.
+                let room = self.cfg.k_candidates.saturating_sub(extras[gi].len());
+                extras[gi].extend(rest.into_iter().take(room));
+                Phases::add(&self.phases.last_stage_ns, t_last);
             }
-            Phases::add(&self.phases.commit_ns, clk);
+            if !best_of {
+                Phases::add(&self.phases.commit_ns, clk);
+            }
         }
+        // Kept specs first, then the extras: the leading candidate is the one
+        // the search visits (see `provide_widen`), and it must be the pick.
         Ok(chains
             .chunks(k)
-            .map(|c| c.iter().map(|p| p.spec).collect())
+            .zip(extras)
+            .map(|(c, ex)| c.iter().map(|p| p.spec).chain(ex).collect())
             .collect())
     }
 
@@ -1264,7 +1407,17 @@ impl MinionsModel {
         Phases::add(&self.phases.realize_ns, t);
 
         // ── one energy forward over every candidate of every game ─────────────
-        let priors = self.score_lists(states, &h, &specs, g * k)?;
+        // The energy pad comes from the config, never from this batch's
+        // candidate counts: best-of-N appends up to `k_candidates` extras per
+        // game, and a ceiling that moved with the data would give TensorRT a
+        // fresh shape per wave -- the failure mode measured at 1605 -> 52
+        // expansions/s. Fixed per configuration, so still one engine.
+        let extra_cap = if self.cfg.last_stage_samples > 1 && self.nnue.is_some() {
+            self.cfg.k_candidates
+        } else {
+            0
+        };
+        let priors = self.score_lists(states, &h, &specs, g * (k + extra_cap))?;
 
         let mut out: Vec<Expansion<MinionsTurns>> = specs
             .into_iter()
@@ -1315,6 +1468,14 @@ impl MinionsModel {
         }
         let hstride = self.net.channels() * NUM_CELLS;
         let total: usize = specs.iter().map(|s| s.len()).sum();
+        // A ceiling, not a hint: the rows below are resized *down* to `padded`
+        // and every candidate is then assumed to have an energy. A caller that
+        // grows its candidate lists past this silently loses the tail and the
+        // per-list slicing indexes off the end.
+        debug_assert!(
+            padded >= total,
+            "score_lists: padded {padded} < {total} candidates"
+        );
         let dstride = crate::turn::ENERGY_PLANES * NUM_CELLS;
         let mut decl = vec![0f32; total * dstride];
         let mut h_b = Vec::with_capacity(total * hstride);

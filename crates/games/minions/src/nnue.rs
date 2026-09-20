@@ -39,6 +39,16 @@ pub const N_UNIT_PLANES: usize = 12;
 pub const N_FEATURES: usize = N_UNIT_PLANES * CELLS; // 588
 pub const N_SCALARS: usize = 13;
 
+/// First scalar plane in the 26-plane encoding.
+///
+/// Planes 0..12 are unit occupancy (own side first, six units each) and make
+/// up the 588 features. **Plane 12 is the graveyard mask**, which is why the
+/// scalars start at 13 rather than 12 -- it varies across cells, so it is not
+/// a scalar, and the student never saw it. Planes 13..26 are money (2),
+/// reinforcements (2 sides x 5 slots) and turns remaining, each constant
+/// across cells, which is why one cell is enough to read them.
+pub const I_SCALARS: usize = 13;
+
 #[inline(always)]
 fn crelu(x: f32) -> f32 {
     x.clamp(0.0, 1.0)
@@ -180,6 +190,30 @@ impl Nnue {
         Ok((net, scale))
     }
 
+    /// Split `Minions::to_features` output into the student's two inputs.
+    ///
+    /// `planes` is the 26x49 canonical-frame encoding; the student trained on
+    /// exactly these bytes, through the same split, so this must not "improve"
+    /// on it. Scalars are divided by `scale` here because training divided
+    /// them here.
+    pub fn inputs_from_planes(
+        planes: &[u8],
+        scale: &[f32; N_SCALARS],
+    ) -> (Vec<u16>, [f32; N_SCALARS]) {
+        debug_assert_eq!(planes.len(), crate::game::PLANES * CELLS);
+        let active: Vec<u16> = planes[..N_FEATURES]
+            .iter()
+            .enumerate()
+            .filter(|(_, &b)| b != 0)
+            .map(|(i, _)| i as u16)
+            .collect();
+        let mut scalars = [0f32; N_SCALARS];
+        for (j, s) in scalars.iter_mut().enumerate() {
+            *s = f32::from(planes[(I_SCALARS + j) * CELLS]) / scale[j];
+        }
+        (active, scalars)
+    }
+
     pub fn params(&self) -> usize {
         self.ft.len()
             + self.ft_bias.len()
@@ -291,6 +325,57 @@ impl Nnue {
             v += scratch.b3[i] * self.out[i];
         }
         v.tanh()
+    }
+}
+
+/// A loaded student with everything one evaluation needs.
+///
+/// Holds its own scratch, so scoring a list of turns allocates nothing per
+/// turn. **The value this returns is for ordering candidates only.** It is a
+/// distilled approximation of the value head, and letting it reach `w`, `q` or
+/// a training target would put a second, worse evaluator inside the search.
+pub struct Evaluator {
+    net: Nnue,
+    scale: [f32; N_SCALARS],
+    scratch: Scratch,
+}
+
+impl Evaluator {
+    pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
+        let (net, scale) = Nnue::load(path)?;
+        let scratch = Scratch::new(net.shape);
+        Ok(Self {
+            net,
+            scale,
+            scratch,
+        })
+    }
+
+    /// The student's value for a position, from the mover's seat.
+    pub fn value_from_planes(&mut self, planes: &[u8]) -> f32 {
+        let (active, scalars) = Nnue::inputs_from_planes(planes, &self.scale);
+        self.net.eval_sparse(&active, &scalars, &mut self.scratch)
+    }
+
+    /// As [`Self::value_from_planes`], but borrowing the evaluator immutably
+    /// and scoring into caller-owned scratch.
+    ///
+    /// This is the form the sampler needs: it holds the evaluator behind
+    /// `&self` and runs on several worker threads, so an internal scratch
+    /// would force a `Mutex` and serialise exactly the phase this feature adds
+    /// work to. One `Scratch` per batch, reused across every candidate in it.
+    pub fn value_with(&self, planes: &[u8], scratch: &mut Scratch) -> f32 {
+        let (active, scalars) = Nnue::inputs_from_planes(planes, &self.scale);
+        self.net.eval_sparse(&active, &scalars, scratch)
+    }
+
+    /// A scratch sized for this evaluator, for [`Self::value_with`].
+    pub fn scratch(&self) -> Scratch {
+        Scratch::new(self.net.shape)
+    }
+
+    pub fn shape(&self) -> Shape {
+        self.net.shape
     }
 }
 
@@ -636,5 +721,31 @@ mod tests {
                 "active {active:?}: got {got}, torch says {want}"
             );
         }
+    }
+
+    /// The split must take features from the unit planes and scalars from
+    /// plane 13 on, skipping the graveyard mask at 12. Getting that offset
+    /// wrong shifts every scalar by one plane and is invisible downstream.
+    #[test]
+    fn the_plane_split_skips_the_graveyard_mask() {
+        let scale: [f32; N_SCALARS] = [
+            30.0, 30.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 30.0,
+        ];
+        let mut planes = vec![0u8; crate::game::PLANES * CELLS];
+        planes[3] = 1; // a unit feature
+        planes[N_FEATURES - 1] = 1; // the last unit feature
+        planes[12 * CELLS] = 1; // graveyard mask: must NOT become a feature
+        planes[I_SCALARS * CELLS] = 30; // own money -> 30/30
+        planes[(I_SCALARS + 12) * CELLS] = 15; // turns left -> 15/30
+
+        let (active, scalars) = Nnue::inputs_from_planes(&planes, &scale);
+        assert_eq!(
+            active,
+            vec![3u16, (N_FEATURES - 1) as u16],
+            "the graveyard mask at plane 12 must not be read as a feature"
+        );
+        assert_eq!(scalars[0], 1.0, "money divided by its own scale");
+        assert_eq!(scalars[12], 0.5, "turns remaining divided by 30");
+        assert!(scalars[1..12].iter().all(|&s| s == 0.0));
     }
 }

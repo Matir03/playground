@@ -307,6 +307,20 @@ enum Cmd {
         /// the two widening schedules against each other on one checkpoint.
         #[arg(long)]
         widen_by_b: Option<playground_core::sampled_mcts::WidenBy>,
+        /// Completions drawn from the last diffusion step for seat A, the best
+        /// by NNUE kept and the rest offered as extra candidates. 1 = the
+        /// ordinary sampler. Needs `--nnue-weights`.
+        #[arg(long, default_value_t = 1)]
+        last_stage_samples: usize,
+        /// As `--last-stage-samples`, for seat B; defaults to A's. Set only
+        /// this to play best-of-N against the ordinary sampler on one
+        /// checkpoint.
+        #[arg(long)]
+        last_stage_samples_b: Option<usize>,
+        /// Distilled value net used to order those completions. Required by
+        /// `--last-stage-samples` above 1; never reaches the search's values.
+        #[arg(long, default_value = "data/minions_nnue/student_512_long.bin")]
+        nnue_weights: String,
         /// Diffusion rounds a resample redraws with (both seats).
         #[arg(long, default_value_t = 2)]
         resample_t: usize,
@@ -715,6 +729,9 @@ async fn main() -> anyhow::Result<()> {
             pw_beta_b,
             widen_by,
             widen_by_b,
+            last_stage_samples,
+            last_stage_samples_b,
+            nnue_weights,
             no_explore,
             backend,
             ep,
@@ -741,8 +758,25 @@ async fn main() -> anyhow::Result<()> {
                 match_search(sims, candidates, t_steps, games as usize, seed);
             sampler.resample_t = resample_t;
             sampler.resample_frac = resample_frac;
+            sampler.last_stage_samples = last_stage_samples;
             let kind = minions_engine::net::BackendKind::parse(&backend, &ep, fp16, cuda)?;
-            let sa = load_seat(std::path::Path::new(&a), &kind, sampler)?;
+            // One evaluator per seat: it owns its scratch, and the whole point
+            // of the match is that the seats differ in exactly this.
+            let load_nnue = |n: usize| -> anyhow::Result<Option<minions_engine::nnue::Evaluator>> {
+                if n > 1 {
+                    Ok(Some(minions_engine::nnue::Evaluator::load(
+                        std::path::Path::new(&nnue_weights),
+                    )?))
+                } else {
+                    Ok(None)
+                }
+            };
+            let sa = load_seat(
+                std::path::Path::new(&a),
+                &kind,
+                sampler,
+                load_nnue(last_stage_samples)?,
+            )?;
             let tb = t_steps_b.unwrap_or(t_steps);
             let cb = candidates_b.unwrap_or(candidates);
             let sampler_b = minions_engine::sampler::SamplerConfig {
@@ -754,10 +788,16 @@ async fn main() -> anyhow::Result<()> {
                 k_draws_fast: cb,
                 resample_t: resample_t_b.unwrap_or(resample_t),
                 resample_frac: resample_frac_b.unwrap_or(resample_frac),
+                last_stage_samples: last_stage_samples_b.unwrap_or(last_stage_samples),
                 ..sampler
             };
             let sb = match &b {
-                Some(p) => load_seat(std::path::Path::new(p), &kind, sampler_b)?,
+                Some(p) => load_seat(
+                    std::path::Path::new(p),
+                    &kind,
+                    sampler_b,
+                    load_nnue(sampler_b.last_stage_samples)?,
+                )?,
                 None => Seat::Greedy,
             };
             use playground_core::sampled_mcts::SampledParams;
@@ -861,12 +901,12 @@ async fn main() -> anyhow::Result<()> {
             // the most-visited turn.
             let (sampler, params) = match_search(sims, candidates, t_steps, 0, seed);
             let kind = minions_engine::net::BackendKind::parse(&backend, &ep, fp16, cuda)?;
-            let seat = load_seat(std::path::Path::new(&live), &kind, sampler)?;
+            let seat = load_seat(std::path::Path::new(&live), &kind, sampler, None)?;
             // Second seat: the net again, or the heuristic. Yellow is the net.
             let foe = match opponent.as_str() {
                 "greedy" => Seat::Greedy,
-                "net" => load_seat(std::path::Path::new(&live), &kind, sampler)?,
-                path => load_seat(std::path::Path::new(path), &kind, sampler)?,
+                "net" => load_seat(std::path::Path::new(&live), &kind, sampler, None)?,
+                path => load_seat(std::path::Path::new(path), &kind, sampler, None)?,
             };
             for g in 0..games.max(1) {
                 // Alternate colours between games. Minions is not symmetric — the

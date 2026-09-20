@@ -182,7 +182,7 @@ fn plan_turn(
 
     let mut guard = MODEL.lock().unwrap();
     if guard.is_none() {
-        let seat = crate::eval::load_seat(&cfg.dir, &cfg.kind, cfg.sampler.clone())?;
+        let seat = crate::eval::load_seat(&cfg.dir, &cfg.kind, cfg.sampler.clone(), None)?;
         match seat {
             crate::eval::Seat::Net(m) => *guard = Some(m),
             crate::eval::Seat::Greedy => anyhow::bail!("load_seat returned the greedy seat"),
@@ -788,7 +788,7 @@ fn ensure_model<'a>(
     cfg: &NetSeatConfig,
 ) -> anyhow::Result<&'a MinionsModel> {
     if guard.is_none() {
-        match crate::eval::load_seat(&cfg.dir, &cfg.kind, cfg.sampler.clone())? {
+        match crate::eval::load_seat(&cfg.dir, &cfg.kind, cfg.sampler.clone(), None)? {
             crate::eval::Seat::Net(m) => *guard = Some(m),
             crate::eval::Seat::Greedy => anyhow::bail!("load_seat returned the greedy seat"),
         }

@@ -469,6 +469,10 @@ pub fn run_match(
         _ => None,
     };
     let render_games = render.map_or(0, |(_, n)| n);
+    // Started before the bids, not after: bidding runs a real search on each
+    // seat, so a profile that skipped it would undercount the very work an A/B
+    // is trying to price.
+    let t_match = std::time::Instant::now();
     let (mut wins, mut losses, mut draws) = (0u32, 0u32, 0u32);
     let mut margin_sum = 0.0f64;
     let mut score_sum = 0.0f64;
@@ -780,6 +784,37 @@ pub fn run_match(
         "node visits: 1:{} 2:{} 3-4:{} 5-8:{} 9-16:{} 17-32:{} 33-64:{} 65+:{}",
         h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]
     );
+    // Per-seat phase profile. Self-play reports this through `report_wall`; a
+    // head-to-head needs it too, because a seat can buy strength with time and
+    // the score alone will not say so. Absolute milliseconds as well as shares:
+    // what an A/B wants to know is what the extra work *cost*, and a percentage
+    // of measured work cannot answer that — a seat doing twice the work reports
+    // the same 100%. Both seats share one wall clock (games run in lockstep),
+    // so compare the measured totals, not the wall time.
+    let match_secs = t_match.elapsed().as_secs_f64();
+    eprintln!("match wall: {match_secs:.1}s over {games} games");
+    for (seat, s) in ["A", "B"].iter().zip([a, b]) {
+        if let Seat::Net(m) = s {
+            let p = &m.phases;
+            let g = |c: &std::sync::atomic::AtomicU64| {
+                c.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6
+            };
+            let measured = g(&p.features_ns)
+                + g(&p.trunk_ns)
+                + g(&p.decl_write_ns)
+                + g(&p.diffusion_ns)
+                + g(&p.commit_ns)
+                + g(&p.realize_ns)
+                + g(&p.energy_ns)
+                + g(&p.playout_ns)
+                + g(&p.last_stage_ns);
+            eprintln!(
+                "phases ({seat}): measured {measured:.0}ms, last-stage {:.0}ms — {}",
+                g(&p.last_stage_ns),
+                p.report_wall(match_secs, 1)
+            );
+        }
+    }
     for (seat, st) in ["A", "B"].iter().zip(&seat_stats) {
         if st.resamples > 0 {
             eprintln!(
@@ -821,6 +856,10 @@ pub fn load_seat(
     path: &Path,
     kind: &crate::net::BackendKind,
     sampler: SamplerConfig,
+    // Candidate-ordering net for `SamplerConfig::last_stage_samples`. Per
+    // seat, not shared: the evaluator owns scratch, and a match runs both
+    // seats against one checkpoint where only this differs.
+    nnue: Option<crate::nnue::Evaluator>,
 ) -> anyhow::Result<Seat> {
     let net: Box<dyn crate::net::Backend> = match kind {
         crate::net::BackendKind::Candle { cuda } => Box::new(LocalNet::load(path, *cuda)?),
@@ -834,7 +873,9 @@ pub fn load_seat(
             Box::new(crate::ort_net::OrtNet::new(dir, ep, *fp16, &cache)?)
         }
     };
-    Ok(Seat::Net(Box::new(MinionsModel::new(net, sampler))))
+    Ok(Seat::Net(Box::new(
+        MinionsModel::new(net, sampler).with_nnue(nnue),
+    )))
 }
 
 #[cfg(test)]
@@ -860,8 +901,8 @@ mod tests {
         // Padded to eval's width so the cached TensorRT engines serve it.
         let (sampler, params) = match_search(400, 16, 4, 40, 11);
         let kind = crate::net::BackendKind::parse("ort", "trt", true, false).unwrap();
-        let best = load_seat(Path::new(best_dir), &kind, sampler).unwrap();
-        let dif = load_seat(Path::new(dif_dir), &kind, sampler).unwrap();
+        let best = load_seat(Path::new(best_dir), &kind, sampler, None).unwrap();
+        let dif = load_seat(Path::new(dif_dir), &kind, sampler, None).unwrap();
         for (name, seat) in [("best", &best), ("diffusion", &dif)] {
             let curve: Vec<String> = (crate::game::BID_MIN..=crate::game::BID_MAX)
                 .map(|b| {
