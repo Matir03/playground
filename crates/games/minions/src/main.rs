@@ -298,6 +298,14 @@ enum Cmd {
         /// As `--pw-beta`, for seat B; defaults to A's.
         #[arg(long)]
         pw_beta_b: Option<f32>,
+        /// What seat A's widening budget counts: `children` or `attempts`.
+        /// Default: eval's.
+        #[arg(long)]
+        widen_by: Option<playground_core::sampled_mcts::WidenBy>,
+        /// As `--widen-by`, for seat B; defaults to A's. Set only this to play
+        /// the two widening schedules against each other on one checkpoint.
+        #[arg(long)]
+        widen_by_b: Option<playground_core::sampled_mcts::WidenBy>,
         /// Diffusion rounds a resample redraws with (both seats).
         #[arg(long, default_value_t = 2)]
         resample_t: usize,
@@ -704,6 +712,8 @@ async fn main() -> anyhow::Result<()> {
             resample_depth_b,
             pw_beta,
             pw_beta_b,
+            widen_by,
+            widen_by_b,
             no_explore,
             backend,
             ep,
@@ -769,6 +779,7 @@ async fn main() -> anyhow::Result<()> {
                 resample_every,
                 resample_max_depth: resample_depth.unwrap_or(u32::MAX),
                 pw_beta: pw_beta.unwrap_or(params.pw_beta),
+                widen_by: widen_by.unwrap_or(params.widen_by),
                 ..params
             };
             let pb = SampledParams {
@@ -778,6 +789,7 @@ async fn main() -> anyhow::Result<()> {
                 value_backup: value_backup_b.unwrap_or(value_backup),
                 resample_every: resample_every_b.unwrap_or(resample_every),
                 pw_beta: pw_beta_b.or(pw_beta).unwrap_or(params.pw_beta),
+                widen_by: widen_by_b.or(widen_by).unwrap_or(params.widen_by),
                 resample_max_depth: resample_depth_b.or(resample_depth).unwrap_or(u32::MAX),
                 ..params
             };
