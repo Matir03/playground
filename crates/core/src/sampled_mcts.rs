@@ -463,6 +463,17 @@ impl std::str::FromStr for WidenBy {
     }
 }
 
+/// Widens in a row that may bring nothing back, under [`WidenBy::Attempts`],
+/// before the node gives up on widening for good.
+///
+/// `Children` needs no such limit: a widen that adds nothing leaves the count
+/// it budgets where it was, so the node keeps its place in the schedule and its
+/// existing miss counters decide when to stop. `Attempts` spends budget on
+/// every request and the budget grows with visits, so a position with no more
+/// distinct turns to offer would otherwise be asked again every few visits,
+/// costing a model call each time and never adding anything.
+const WIDEN_MISS_LIMIT: u32 = 3;
+
 impl std::str::FromStr for ValueVisits {
     type Err = String;
 
@@ -722,6 +733,10 @@ struct Node<G: SampledGame> {
     /// before a position runs out of turns, so one miss is not the signal to
     /// stop; this many, against the node's candidate target, is.
     fill_misses: u32,
+    /// Widens in a row that brought nothing new, whether draw or fill; reset by
+    /// anything that adds. Only [`WidenBy::Attempts`] acts on it, at
+    /// [`WIDEN_MISS_LIMIT`].
+    widen_misses: u32,
     /// `total_n` when this node last asked for a resample, and how many it
     /// has asked for.
     resampled_at: u32,
@@ -1013,6 +1028,7 @@ fn new_node<G: SampledGame>(state: G::State) -> Node<G> {
         draws: 0,
         draw_misses: 0,
         fill_misses: 0,
+        widen_misses: 0,
         resampled_at: 0,
         resample_count: 0,
         nn_value: None,
@@ -2178,6 +2194,19 @@ impl<G: SampledGame> Search<G> {
         if !added.is_empty() {
             self.tree[cur].draw_misses = 0;
         }
+        // Give up after enough widens in a row bring nothing back. See
+        // [`WIDEN_MISS_LIMIT`] for why only `Attempts` needs this; leaving
+        // `Children` alone is what keeps it bit-for-bit identical.
+        if added.is_empty() {
+            self.tree[cur].widen_misses += 1;
+            if self.params.widen_by == WidenBy::Attempts
+                && self.tree[cur].widen_misses >= WIDEN_MISS_LIMIT
+            {
+                self.tree[cur].widen_exhausted = true;
+            }
+        } else {
+            self.tree[cur].widen_misses = 0;
+        }
         // Re-softmax over the grown set. Sorting inside is safe here because the
         // paused descent's `path` holds only this node's ancestors' edges.
         renormalise(&mut self.tree[cur].entries);
@@ -2902,6 +2931,50 @@ mod tests {
             "attempts asked {attempts} times, children {children}: charging for a \
              duplicate must ask strictly less often against a model that only repeats"
         );
+    }
+
+    /// A position with nothing new to offer must be abandoned, not asked again
+    /// every time the budget grows. `Stuck` without fills proposes move 1 and
+    /// nothing else ever, so after the one widen that lands it, every further
+    /// widen is a wasted model call.
+    #[test]
+    fn widening_by_attempts_gives_up_on_a_node_that_keeps_bringing_nothing() {
+        let params = SampledParams {
+            simulations: 200,
+            k_candidates: 3,
+            k_draws: 3,
+            pw_chunk: 1,
+            forced_visits: 0,
+            temp_moves: 0,
+            widen_by: WidenBy::Attempts,
+            seed: 4,
+            ..Default::default()
+        };
+        let model = Stuck::new(false);
+        let mut search = Search::<Count>::new(CountState { n: 21, side: 1 }, &params, 0);
+        loop {
+            match search.step() {
+                Step::NeedExpansion(st) => {
+                    let (v, c) = model.expand(&st, expansion_k(&params)).unwrap();
+                    search.provide(v, c);
+                }
+                Step::NeedWiden { state, fill } => {
+                    search.provide_widen(widen(&model, &state, fill, chunk_k(&params)));
+                }
+                Step::NeedResample { .. } => unreachable!("resampling is off"),
+                Step::Done => break,
+            }
+        }
+        // One widen brings move 1, then three bring nothing and the node quits:
+        // four is the most any node may have asked, over 200 simulations whose
+        // growing budget would otherwise keep asking forever.
+        for i in 0..search.tree.len() {
+            assert!(
+                search.tree[i].widens <= 1 + WIDEN_MISS_LIMIT,
+                "node {i} made {} widens against a model that only ever repeats",
+                search.tree[i].widens
+            );
+        }
     }
 
     /// With `fills` off a node never asks for a fill: once its draws are spent
