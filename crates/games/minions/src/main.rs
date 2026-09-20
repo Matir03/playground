@@ -194,6 +194,19 @@ enum Cmd {
         /// **`avg` reproduces the previous search bit-for-bit.**
         #[arg(long, default_value = "avg")]
         value_backup: playground_core::sampled_mcts::ValueBackup,
+        /// What an interior node's widening budget `ceil(pw_beta * n^pw_alpha)`
+        /// counts: `children` (default) the candidates it holds, or `attempts`
+        /// the widen requests it has made.
+        ///
+        /// `children` budgets results -- a widen that brings back a duplicate
+        /// costs nothing and the node simply asks again, and candidates arriving
+        /// from draws, fills or explore injection count against the budget and
+        /// hold growth back. `attempts` budgets requests: each widen spends one
+        /// whatever it returns, so the rate follows how often the node was asked
+        /// to grow rather than what came of it.
+        /// **`children` reproduces the previous search bit-for-bit.**
+        #[arg(long, default_value = "children")]
+        widen_by: playground_core::sampled_mcts::WidenBy,
         /// Candidates generated per model call. 0 (default) produces a node's
         /// whole set in one call.
         ///
@@ -601,6 +614,7 @@ async fn main() -> anyhow::Result<()> {
             value_visits,
             value_backup,
             pw_chunk,
+            widen_by,
             draw_retries,
             resample_every,
             resample_depth,
@@ -630,6 +644,7 @@ async fn main() -> anyhow::Result<()> {
                 value_visits,
                 value_backup,
                 pw_chunk,
+                widen_by,
                 draw_retries,
                 resample_every,
                 resample_max_depth: resample_depth.unwrap_or(u32::MAX),

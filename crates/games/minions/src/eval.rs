@@ -52,10 +52,13 @@ impl Seat {
         }
     }
 
-    /// Returns the declaration and the search's candidate-budget accounting. The
-    /// stats are the measurement that decides whether progressive widening is
-    /// worth building: they say how much of the candidate set a search actually
-    /// uses. A greedy seat runs no search and reports nothing.
+    /// Returns the declaration and the search's candidate-budget accounting.
+    /// A greedy seat runs no search and reports nothing.
+    ///
+    /// Test-only since match play moved to `pick_many`, which drives both
+    /// seats' searches in lockstep so they can be batched. The tests still on
+    /// this path all use `Seat::Greedy`, which never searches.
+    #[cfg(test)]
     fn pick(
         &self,
         state: &MinionsState,

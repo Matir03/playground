@@ -160,6 +160,9 @@ pub struct ActorConfig {
     /// Candidates per model call. 1 matches the one-per-visit widening rate;
     /// 0 disables chunking.
     pub pw_chunk: usize,
+    /// What the widening budget counts: candidates held (`children`, the rule
+    /// every run so far has used) or widen requests made (`attempts`).
+    pub widen_by: playground_core::sampled_mcts::WidenBy,
     /// Repeated sampler draws in a row before an interior widen fills with a
     /// random playout instead; 0 = only when the draw budget is spent.
     pub draw_retries: u32,
@@ -241,6 +244,7 @@ impl ActorConfig {
             pw_alpha: self.pw_alpha,
             pw_beta: self.pw_beta,
             pw_chunk: self.pw_chunk,
+            widen_by: self.widen_by,
             kernel_sigma: self.kernel_sigma,
             value_visits: self.value_visits,
             value_backup: self.value_backup,
@@ -267,6 +271,7 @@ impl Default for ActorConfig {
             pw_alpha: 0.5,
             pw_beta: 2.0,
             pw_chunk: 1,
+            widen_by: playground_core::sampled_mcts::WidenBy::Children,
             draw_retries: 3,
             resample_every: 0.0,
             resample_max_depth: u32::MAX,

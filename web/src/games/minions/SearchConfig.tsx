@@ -54,6 +54,10 @@ const GROUPS: { title: string; note?: string; fields: [string, string][] }[] = [
       ["pw_alpha", "Interior nodes hold ceil(pw_beta · n^pw_alpha) candidates after n visits."],
       ["pw_beta", "See pw_alpha. ≤ 0 disables widening."],
       [
+        "widen_by",
+        "What the widening budget is spent on. children: the budget is a target number of candidates, so a widen that returns a duplicate costs nothing and candidates from draws, fills or explore injection count against it. attempts: every widen request spends one whatever it brings, so the rate follows how often the node was asked to grow.",
+      ],
+      [
         "draw_retries",
         "Sampler draws in a row that may repeat at an interior node before the widen adds a random playout instead. 0 = keep drawing until the node's draws are spent. The root always makes all its draws.",
       ],
@@ -77,16 +81,6 @@ const GROUPS: { title: string; note?: string; fields: [string, string][] }[] = [
     ],
   },
   {
-    title: "fast search",
-    note: "used when search = fast: self-play's cheaper search, no forced visits, no random proposals",
-    fields: [
-      ["fast_sims", "Simulations per fast search."],
-      ["candidates_fast", "Candidates per node in a fast search."],
-      ["draws_fast", "Sampler draws per node in a fast search."],
-      ["t_steps_fast", "Diffusion rounds per proposal in a fast search."],
-    ],
-  },
-  {
     title: "self-play only",
     note: "not used by analysis or the seat",
     fields: [["full_search_prob", "Share of self-play turns searched with the full search."]],
@@ -95,18 +89,14 @@ const GROUPS: { title: string; note?: string; fields: [string, string][] }[] = [
 
 const INTEGER = new Set([
   "sims",
-  "fast_sims",
   "forced_visits",
   "forced_extra",
   "temp_moves",
   "pw_chunk",
   "draw_retries",
   "candidates",
-  "candidates_fast",
   "draws",
-  "draws_fast",
   "t_steps",
-  "t_steps_fast",
 ]);
 
 /** Settings that name a mode instead of measuring a quantity. Rendered as a
@@ -115,6 +105,7 @@ const INTEGER = new Set([
  *  is not listed here still round-trips — it just gets a text box. */
 const CHOICES: Record<string, string[]> = {
   value_backup: ["avg", "minimax"],
+  widen_by: ["children", "attempts"],
 };
 
 const errorText = (e: unknown) => (e instanceof ConnectError ? e.message : String(e));

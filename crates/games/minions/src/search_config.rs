@@ -6,11 +6,16 @@
 //! UI can then change any of it (`apply_json`) and restore it. Eval keeps
 //! settings of its own (`eval::match_search`). Every search, whatever its
 //! settings, is built through `ActorConfig::search_params`.
+//!
+//! The *fast* search is deliberately not here. Only self-play runs one --
+//! `full_search_prob` decides how often -- and it configures it from its own
+//! flags, so the shared file describes the full search and nothing else. A
+//! reader that runs a fast search gets `ActorConfig`'s defaults for it.
 
 use crate::sampler::SamplerConfig;
 use crate::selfplay::ActorConfig;
 use anyhow::Context as _;
-use playground_core::sampled_mcts::ValueBackup;
+use playground_core::sampled_mcts::{ValueBackup, WidenBy};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -27,7 +32,6 @@ pub const FILE: &str = "search.json";
 #[serde(deny_unknown_fields)]
 struct Recorded {
     sims: u32,
-    fast_sims: u32,
     full_search_prob: f64,
     c_puct: f32,
     k_forced: f32,
@@ -38,6 +42,8 @@ struct Recorded {
     pw_alpha: f32,
     pw_beta: f32,
     pw_chunk: usize,
+    /// What the widening budget counts, by name -- `children` or `attempts`.
+    widen_by: String,
     draw_retries: u32,
     kernel_sigma: f32,
     resample_every: f32,
@@ -50,11 +56,8 @@ struct Recorded {
     resample_t: usize,
     resample_frac: f32,
     candidates: usize,
-    candidates_fast: usize,
     draws: usize,
-    draws_fast: usize,
     t_steps: usize,
-    t_steps_fast: usize,
     random_fraction: f32,
     temperature: f32,
     use_energy: bool,
@@ -63,7 +66,6 @@ struct Recorded {
 fn record(a: &ActorConfig, s: &SamplerConfig) -> Recorded {
     Recorded {
         sims: a.sims,
-        fast_sims: a.fast_sims,
         full_search_prob: a.full_search_prob,
         c_puct: a.c_puct,
         k_forced: a.k_forced,
@@ -74,6 +76,7 @@ fn record(a: &ActorConfig, s: &SamplerConfig) -> Recorded {
         pw_alpha: a.pw_alpha,
         pw_beta: a.pw_beta,
         pw_chunk: a.pw_chunk,
+        widen_by: a.widen_by.as_str().to_string(),
         draw_retries: a.draw_retries,
         kernel_sigma: a.kernel_sigma,
         resample_every: a.resample_every,
@@ -82,11 +85,8 @@ fn record(a: &ActorConfig, s: &SamplerConfig) -> Recorded {
         resample_t: s.resample_t,
         resample_frac: s.resample_frac,
         candidates: s.k_candidates,
-        candidates_fast: s.k_candidates_fast,
         draws: s.k_draws,
-        draws_fast: s.k_draws_fast,
         t_steps: s.t_steps,
-        t_steps_fast: s.t_steps_fast,
         random_fraction: s.random_fraction,
         temperature: s.temperature,
         use_energy: s.use_energy,
@@ -144,9 +144,12 @@ pub fn apply_json(
         .value_backup
         .parse()
         .map_err(|e: String| anyhow::anyhow!("value_backup: {e}"))?;
+    let widen_by: WidenBy = r
+        .widen_by
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!("widen_by: {e}"))?;
     validate(&r)?;
     actor.sims = r.sims;
-    actor.fast_sims = r.fast_sims;
     actor.full_search_prob = r.full_search_prob;
     actor.c_puct = r.c_puct;
     actor.k_forced = r.k_forced;
@@ -157,6 +160,7 @@ pub fn apply_json(
     actor.pw_alpha = r.pw_alpha;
     actor.pw_beta = r.pw_beta;
     actor.pw_chunk = r.pw_chunk;
+    actor.widen_by = widen_by;
     actor.draw_retries = r.draw_retries;
     actor.kernel_sigma = r.kernel_sigma;
     actor.resample_every = r.resample_every;
@@ -165,11 +169,8 @@ pub fn apply_json(
     sampler.resample_t = r.resample_t;
     sampler.resample_frac = r.resample_frac;
     sampler.k_candidates = r.candidates;
-    sampler.k_candidates_fast = r.candidates_fast;
     sampler.k_draws = r.draws;
-    sampler.k_draws_fast = r.draws_fast;
     sampler.t_steps = r.t_steps;
-    sampler.t_steps_fast = r.t_steps_fast;
     sampler.random_fraction = r.random_fraction;
     sampler.temperature = r.temperature;
     sampler.use_energy = r.use_energy;
@@ -179,11 +180,8 @@ pub fn apply_json(
 fn validate(r: &Recorded) -> anyhow::Result<()> {
     for (name, v) in [
         ("sims", r.sims as usize),
-        ("fast_sims", r.fast_sims as usize),
         ("candidates", r.candidates),
-        ("candidates_fast", r.candidates_fast),
         ("t_steps", r.t_steps),
-        ("t_steps_fast", r.t_steps_fast),
         ("resample_t", r.resample_t),
     ] {
         anyhow::ensure!(v > 0, "{name} must be at least 1");

@@ -300,6 +300,8 @@ pub struct SampledParams {
     /// That coupling matters: with a small chunk the wave must cover
     /// proportionally more nodes, or the batch shrinks and the GPU starves.
     pub pw_chunk: usize,
+    /// What the widening budget counts: candidates held, or widens requested.
+    pub widen_by: WidenBy,
     /// KR-PUCT kernel bandwidth over `SampledGame::move_distance`. Candidates
     /// within roughly this distance share visit counts and values, which is the
     /// point: with ~16 visits per root child, per-candidate value estimates are
@@ -413,6 +415,54 @@ impl std::str::FromStr for ValueBackup {
     }
 }
 
+/// What a node's widening budget `ceil(pw_beta * n^pw_alpha)` is compared
+/// against.
+///
+/// The budget itself is the same either way; these differ in what spends it.
+/// `Children` budgets *results* — a widen that comes back with nothing new
+/// leaves the count where it was, so the node asks again until something
+/// sticks or it exhausts, and candidates that arrive by other routes
+/// (expansion draws, fills, explore injection) count against the budget and
+/// hold growth back. `Attempts` budgets *requests*: every widen spends one
+/// whatever it brings, and only widening grows the count.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WidenBy {
+    /// Candidates the node holds. The rule every run so far has used.
+    #[default]
+    Children,
+    /// Widen requests the node has made.
+    Attempts,
+}
+
+impl WidenBy {
+    /// The spelling `FromStr` round-trips, and the one `search.json` carries.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WidenBy::Children => "children",
+            WidenBy::Attempts => "attempts",
+        }
+    }
+}
+
+impl std::str::FromStr for WidenBy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', '_'], "")
+            .as_str()
+        {
+            "children" | "held" | "candidates" => Ok(WidenBy::Children),
+            "attempts" | "widens" | "requests" => Ok(WidenBy::Attempts),
+            other => Err(format!(
+                "unknown widen-by mode {other:?}: expected children or attempts"
+            )),
+        }
+    }
+}
+
 impl std::str::FromStr for ValueVisits {
     type Err = String;
 
@@ -489,6 +539,7 @@ impl Default for SampledParams {
             pw_alpha: 0.5,
             pw_beta: 2.0,
             pw_chunk: 1,
+            widen_by: WidenBy::Children,
             kernel_sigma: 0.0,
             value_visits: ValueVisits::All,
             value_backup: ValueBackup::Avg,
@@ -655,6 +706,10 @@ struct Node<G: SampledGame> {
     /// without this the node would keep asking for ones it can never get,
     /// spinning the search forever.
     widen_exhausted: bool,
+    /// Widen requests made at this node, counted when the request is issued so
+    /// one that comes back with nothing still counts. Only spent by
+    /// [`WidenBy::Attempts`].
+    widens: u32,
     /// Sampler draws requested at this node so far -- requested, not returned,
     /// so a model that proposes nothing still uses them up. Once they reach the
     /// node's draw target (see [`SampledParams::k_draws`]), a node still short
@@ -954,6 +1009,7 @@ fn new_node<G: SampledGame>(state: G::State) -> Node<G> {
         state,
         entries: Vec::new(),
         widen_exhausted: false,
+        widens: 0,
         draws: 0,
         draw_misses: 0,
         fill_misses: 0,
@@ -1772,13 +1828,29 @@ impl<G: SampledGame> Search<G> {
                             let retries = self.params.draw_retries;
                             let fill = node.draws >= draw_target(&self.params, want)
                                 || (cur != 0 && retries > 0 && node.draw_misses >= retries);
+                            // What the budget is spent on. Counting attempts
+                            // makes the rate depend on how often the node was
+                            // asked to grow rather than on what came back, so a
+                            // widen that returns a duplicate spends budget and
+                            // candidates arriving from draws, fills or explore
+                            // injection do not.
+                            let grown = match self.params.widen_by {
+                                WidenBy::Children => held,
+                                WidenBy::Attempts => node.widens as usize,
+                            };
+                            // A node already holding its whole set has nowhere
+                            // to put another candidate. Implied by `grown <
+                            // want` under `Children`; under `Attempts` it is
+                            // what stops a full node asking forever.
+                            let room = held < self.params.k_candidates.max(1);
                             // Unchunked, every draw came with the expansion, so
                             // a fill is the only widen there is.
-                            if held < want && fill && !self.params.fills {
+                            if grown < want && room && fill && !self.params.fills {
                                 // No fills: the node keeps what its draws brought.
                                 self.tree[cur].widen_exhausted = true;
-                            } else if held < want && (self.params.pw_chunk > 0 || fill) {
+                            } else if grown < want && room && (self.params.pw_chunk > 0 || fill) {
                                 self.pending_widen = Some((cur, fill));
+                                self.tree[cur].widens += 1;
                                 // `path` is kept. Sorting this node's entries in
                                 // `provide_widen` stays safe because `cur`'s own
                                 // edge is not in `path` yet -- only its
@@ -2771,6 +2843,65 @@ mod tests {
                 "D={d}: the one distinct proposal (drawn D times) and two fills"
             );
         }
+    }
+
+    /// The two budgets differ exactly on what a widen that brings nothing back
+    /// costs. `Stuck` proposes the same move however often it is asked, so
+    /// under `Children` the count being budgeted never moves and the node keeps
+    /// asking, while under `Attempts` every ask spends budget whatever it
+    /// returns.
+    #[test]
+    fn widening_by_attempts_charges_for_a_widen_that_adds_nothing() {
+        let run = |mode: WidenBy| {
+            let params = SampledParams {
+                simulations: 60,
+                k_candidates: 3,
+                k_draws: 3,
+                pw_chunk: 1,
+                forced_visits: 0,
+                temp_moves: 0,
+                widen_by: mode,
+                seed: 4,
+                ..Default::default()
+            };
+            let model = Stuck::new(true);
+            let mut search = Search::<Count>::new(CountState { n: 21, side: 1 }, &params, 0);
+            let mut asks = 0usize;
+            loop {
+                match search.step() {
+                    Step::NeedExpansion(st) => {
+                        let (v, c) = model.expand(&st, expansion_k(&params)).unwrap();
+                        search.provide(v, c);
+                    }
+                    Step::NeedWiden { state, fill } => {
+                        asks += 1;
+                        search.provide_widen(widen(&model, &state, fill, chunk_k(&params)));
+                    }
+                    Step::NeedResample { .. } => unreachable!("resampling is off"),
+                    Step::Done => break,
+                }
+            }
+            if mode == WidenBy::Attempts {
+                // The whole point of the mode: no node outruns its budget, even
+                // though nothing it asked for ever arrived.
+                for i in 0..search.tree.len() {
+                    let want = earned(&search.tree[i], &params, i == 0);
+                    assert!(
+                        search.tree[i].widens as usize <= want,
+                        "node {i} made {} widens against a budget of {want}",
+                        search.tree[i].widens
+                    );
+                }
+            }
+            asks
+        };
+        let children = run(WidenBy::Children);
+        let attempts = run(WidenBy::Attempts);
+        assert!(
+            attempts < children,
+            "attempts asked {attempts} times, children {children}: charging for a \
+             duplicate must ask strictly less often against a model that only repeats"
+        );
     }
 
     /// With `fills` off a node never asks for a fill: once its draws are spent
