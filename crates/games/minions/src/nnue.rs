@@ -101,6 +101,85 @@ impl Nnue {
         }
     }
 
+    /// Load trained weights exported from `data/minions_nnue/student_*.pt`.
+    ///
+    /// The file stores every matrix **input-major** (`[in][out]`), which is
+    /// this struct's layout; torch stores `[out][in]`, so the exporter
+    /// transposes. That mismatch would not fail to load -- it would quietly
+    /// evaluate nonsense -- so the magic, the version and all four widths are
+    /// checked, and a file with trailing bytes is refused rather than
+    /// truncated.
+    ///
+    /// Returns the scalar normalisation alongside the net: the 13 scalars ride
+    /// the accumulator raw, so the caller must divide by this exactly as
+    /// training did, or the body sees inputs on the wrong scale.
+    pub fn load(path: &std::path::Path) -> anyhow::Result<(Self, [f32; N_SCALARS])> {
+        const MAGIC: u32 = 0x4E4E_5545;
+        const VERSION: u32 = 2;
+
+        fn take(raw: &[u8], off: &mut usize, n: usize) -> anyhow::Result<Vec<f32>> {
+            let end = *off + n * 4;
+            anyhow::ensure!(end <= raw.len(), "weights truncated: wanted {n} floats");
+            let v = raw[*off..end]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            *off = end;
+            Ok(v)
+        }
+
+        let raw =
+            std::fs::read(path).map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+        anyhow::ensure!(
+            raw.len() >= 24,
+            "{}: too short to hold a header",
+            path.display()
+        );
+        let rd = |o: usize| u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]);
+        anyhow::ensure!(
+            rd(0) == MAGIC,
+            "{}: magic {:#x}, not an nnue weights file",
+            path.display(),
+            rd(0)
+        );
+        anyhow::ensure!(
+            rd(4) == VERSION,
+            "{}: version {} (this binary reads {VERSION})",
+            path.display(),
+            rd(4)
+        );
+        let shape = Shape {
+            hidden: rd(8) as usize,
+            l1: rd(12) as usize,
+            l2: rd(16) as usize,
+            l3: rd(20) as usize,
+        };
+        let mut off = 24;
+        let mut scale = [0f32; N_SCALARS];
+        scale.copy_from_slice(&take(&raw, &mut off, N_SCALARS)?);
+        let cat = shape.hidden + N_SCALARS;
+        let net = Self {
+            shape,
+            ft: take(&raw, &mut off, N_FEATURES * shape.hidden)?,
+            ft_bias: take(&raw, &mut off, shape.hidden)?,
+            fc1: take(&raw, &mut off, cat * shape.l1)?,
+            fc1_bias: take(&raw, &mut off, shape.l1)?,
+            fc2: take(&raw, &mut off, shape.l1 * shape.l2)?,
+            fc2_bias: take(&raw, &mut off, shape.l2)?,
+            fc3: take(&raw, &mut off, shape.l2 * shape.l3)?,
+            fc3_bias: take(&raw, &mut off, shape.l3)?,
+            out: take(&raw, &mut off, shape.l3)?,
+            out_bias: take(&raw, &mut off, 1)?[0],
+        };
+        anyhow::ensure!(
+            off == raw.len(),
+            "{}: {} bytes left over -- shapes disagree with the header",
+            path.display(),
+            raw.len() - off
+        );
+        Ok((net, scale))
+    }
+
     pub fn params(&self) -> usize {
         self.ft.len()
             + self.ft_bias.len()
@@ -495,5 +574,67 @@ mod tests {
         let net = Nnue::random(s, 6);
         // 27*512 + 525*32 + 32*64 + 64*32 + 32
         assert_eq!(net.macs(27), 13824 + 16800 + 2048 + 2048 + 32);
+    }
+
+    /// Trained weights must evaluate to what torch evaluates them to.
+    ///
+    /// This is the test that matters for `load`: torch stores matrices
+    /// `[out][in]` and this file wants `[in][out]`, and loading the wrong one
+    /// produces a net that reads fine, runs fine, and returns nonsense. The
+    /// expected values come from running `student_512_long.pt` in torch on
+    /// exactly these inputs.
+    ///
+    /// Skipped when the weights are absent: `data/` is not in the repo, so a
+    /// clean checkout must not fail here.
+    #[test]
+    fn trained_weights_match_torch() {
+        let path = std::path::Path::new("../../../data/minions_nnue/student_512_long.bin");
+        let path = if path.exists() {
+            path.to_path_buf()
+        } else {
+            let alt = std::path::Path::new("data/minions_nnue/student_512_long.bin");
+            if !alt.exists() {
+                eprintln!("skipping: no exported nnue weights");
+                return;
+            }
+            alt.to_path_buf()
+        };
+        let (net, scale) = Nnue::load(&path).expect("load exported weights");
+        let mut scratch = Scratch::new(Shape::default());
+        // (active features, raw scalars, torch's answer)
+        let cases: [(&[u16], [f32; N_SCALARS], f32); 3] = [
+            (
+                &[0, 5, 100, 587],
+                [
+                    10.0, 12.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 1.0, 0.0, 0.0, 4.0, 7.0,
+                ],
+                0.9875287,
+            ),
+            (
+                &[1, 2, 3],
+                [
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 20.0,
+                ],
+                -0.7732952,
+            ),
+            (
+                &[49, 98, 147, 196, 245, 300],
+                [
+                    30.0, 30.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 30.0,
+                ],
+                0.9662279,
+            ),
+        ];
+        for (active, raw, want) in cases {
+            let mut scal = [0f32; N_SCALARS];
+            for i in 0..N_SCALARS {
+                scal[i] = raw[i] / scale[i];
+            }
+            let got = net.eval_sparse(active, &scal, &mut scratch);
+            assert!(
+                (got - want).abs() < 1e-4,
+                "active {active:?}: got {got}, torch says {want}"
+            );
+        }
     }
 }
