@@ -10,6 +10,7 @@
 use crate::sampler::SamplerConfig;
 use crate::selfplay::ActorConfig;
 use anyhow::Context as _;
+use playground_core::sampled_mcts::ValueBackup;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -41,6 +42,11 @@ struct Recorded {
     kernel_sigma: f32,
     resample_every: f32,
     resample_max_depth: u32,
+    /// How a node's value is aggregated, by name -- `avg` or `minimax`. A
+    /// string rather than a number because it is a mode, not a quantity; it is
+    /// parsed through `ValueBackup`'s `FromStr`, so the aliases that work on
+    /// the command line work here too and an unknown mode is refused by name.
+    value_backup: String,
     resample_t: usize,
     resample_frac: f32,
     candidates: usize,
@@ -72,6 +78,7 @@ fn record(a: &ActorConfig, s: &SamplerConfig) -> Recorded {
         kernel_sigma: a.kernel_sigma,
         resample_every: a.resample_every,
         resample_max_depth: a.resample_max_depth,
+        value_backup: a.value_backup.as_str().to_string(),
         resample_t: s.resample_t,
         resample_frac: s.resample_frac,
         candidates: s.k_candidates,
@@ -131,6 +138,12 @@ pub fn apply_json(
     sampler: &mut SamplerConfig,
 ) -> anyhow::Result<()> {
     let r: Recorded = serde_json::from_str(text)?;
+    // Parsed before anything is written, like `validate`: a refused apply must
+    // leave the running search exactly as it was.
+    let value_backup: ValueBackup = r
+        .value_backup
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!("value_backup: {e}"))?;
     validate(&r)?;
     actor.sims = r.sims;
     actor.fast_sims = r.fast_sims;
@@ -148,6 +161,7 @@ pub fn apply_json(
     actor.kernel_sigma = r.kernel_sigma;
     actor.resample_every = r.resample_every;
     actor.resample_max_depth = r.resample_max_depth;
+    actor.value_backup = value_backup;
     sampler.resample_t = r.resample_t;
     sampler.resample_frac = r.resample_frac;
     sampler.k_candidates = r.candidates;
@@ -256,6 +270,44 @@ mod tests {
             "a search.json without random_fraction loaded"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    /// The aggregation mode is a name, not a number, so it needs its own
+    /// round-trip: it must survive save/load, apply, and be refused by name
+    /// when it is not a mode at all.
+    #[test]
+    fn the_value_backup_mode_round_trips_and_a_bad_one_is_refused() {
+        let actor = ActorConfig {
+            value_backup: ValueBackup::Minimax,
+            ..Default::default()
+        };
+        let sampler = SamplerConfig::default();
+        let path = scratch("value_backup");
+        save(&path, &actor, &sampler).unwrap();
+        let (a2, _) = load(&path).unwrap();
+        assert_eq!(a2.value_backup, ValueBackup::Minimax);
+        std::fs::remove_file(&path).ok();
+
+        let (mut a3, mut s3) = (ActorConfig::default(), SamplerConfig::default());
+        let mut v = serde_json::to_value(record(&a3, &s3)).unwrap();
+        assert_eq!(
+            v["value_backup"], "avg",
+            "the default must serialise by name"
+        );
+
+        // An alias the command line accepts must work here too.
+        v["value_backup"] = "negamax".into();
+        apply_json(&v.to_string(), &mut a3, &mut s3).unwrap();
+        assert_eq!(a3.value_backup, ValueBackup::Minimax);
+
+        v["value_backup"] = "median".into();
+        let err = apply_json(&v.to_string(), &mut a3, &mut s3).unwrap_err();
+        assert!(err.to_string().contains("value_backup"), "{err}");
+        assert_eq!(
+            a3.value_backup,
+            ValueBackup::Minimax,
+            "a refused apply must change nothing"
+        );
     }
 
     /// The UI edits the search in place: applying settings must leave what is

@@ -382,6 +382,18 @@ pub enum ValueBackup {
     Minimax,
 }
 
+impl ValueBackup {
+    /// The spelling `FromStr` round-trips, and the one written to
+    /// `search.json`. Deliberately the canonical name rather than one of the
+    /// aliases, so a saved config always reads back as what it is.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ValueBackup::Avg => "avg",
+            ValueBackup::Minimax => "minimax",
+        }
+    }
+}
+
 impl std::str::FromStr for ValueBackup {
     type Err = String;
 

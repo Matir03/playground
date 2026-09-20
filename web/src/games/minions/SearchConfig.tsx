@@ -18,7 +18,7 @@ import {
   SetSearchConfigRequestSchema,
 } from "../../gen/playground/engine/engine_pb";
 
-type Settings = Record<string, number | boolean>;
+type Settings = Record<string, number | boolean | string>;
 /** Inputs hold text while being edited, so a half-typed number is not
  *  refused mid-keystroke; it is parsed on apply. */
 type Draft = Record<string, string | boolean>;
@@ -41,6 +41,10 @@ const GROUPS: { title: string; note?: string; fields: [string, string][] }[] = [
         "Plies whose turn is picked in proportion to chosen visits rather than the most visited. The seat's move and the analysis 'chosen' row follow it. 0 = always the most visited.",
       ],
       ["kernel_sigma", "KR-PUCT kernel bandwidth. 0 = flat PUCT. Above 0 the influence matrix fills in."],
+      [
+        "value_backup",
+        "How a node's value is aggregated. avg backs up the mean over its subtree; minimax makes a node worth its best child, negated where the side to move flips. Measured at 800 sims on one net: 60-60 over 120 games, i.e. indistinguishable — this is here to experiment with, not a known improvement.",
+      ],
     ],
   },
   {
@@ -105,6 +109,14 @@ const INTEGER = new Set([
   "t_steps_fast",
 ]);
 
+/** Settings that name a mode instead of measuring a quantity. Rendered as a
+ *  select: the engine refuses an unknown mode by name, and a free-text box is
+ *  how you find that out only on apply. A string setting the engine adds that
+ *  is not listed here still round-trips — it just gets a text box. */
+const CHOICES: Record<string, string[]> = {
+  value_backup: ["avg", "minimax"],
+};
+
 const errorText = (e: unknown) => (e instanceof ConnectError ? e.message : String(e));
 
 function toDraft(s: Settings): Draft {
@@ -119,6 +131,15 @@ function parse(d: Draft, like: Settings): Settings | string {
   for (const [k, v] of Object.entries(d)) {
     if (typeof like[k] === "boolean") {
       out[k] = Boolean(v);
+      continue;
+    }
+    // Keyed off what the engine sent, not off CHOICES, so a string setting
+    // added engine-side survives a round trip instead of becoming NaN.
+    if (typeof like[k] === "string") {
+      const s = String(v);
+      const choices = CHOICES[k];
+      if (choices && !choices.includes(s)) return `${k} must be one of ${choices.join(", ")}`;
+      out[k] = s;
       continue;
     }
     const n = Number(v);
@@ -244,6 +265,18 @@ export function SearchConfigPanel({ client }: { client: Client<typeof EngineServ
                             checked={v}
                             onChange={(e) => setDraft({ ...draft, [k]: e.target.checked })}
                           />
+                        ) : CHOICES[k] ? (
+                          <select
+                            value={v ?? ""}
+                            onChange={(e) => setDraft({ ...draft, [k]: e.target.value })}
+                            style={{ font: "inherit" }}
+                          >
+                            {CHOICES[k].map((c) => (
+                              <option key={c} value={c}>
+                                {c}
+                              </option>
+                            ))}
+                          </select>
                         ) : (
                           <input
                             type="text"
