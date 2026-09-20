@@ -119,7 +119,7 @@ impl Default for SamplerConfig {
             k_candidates_fast: 6,
             k_draws: 12,
             k_draws_fast: 6,
-            random_fraction: 0.25,
+            random_fraction: 0.0,
             temperature: 1.0,
             resample_t: 2,
             resample_frac: 0.5,
@@ -1840,7 +1840,9 @@ mod tests {
             .map(|st| realize(st, &TurnSpec::random_playout(st, &mut rng)).spec)
             .collect();
         for seq in 0..4 {
-            let out = m.resample_batch_seq(&states, &from, seq, &[], &|n| n).unwrap();
+            let out = m
+                .resample_batch_seq(&states, &from, seq, &[], &|n| n)
+                .unwrap();
             assert_eq!(out.len(), states.len());
             for (st, cands) in states.iter().zip(&out) {
                 assert_eq!(cands.len(), 1, "one candidate per position");

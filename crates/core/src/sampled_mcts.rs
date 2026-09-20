@@ -427,10 +427,16 @@ impl std::str::FromStr for ValueBackup {
 /// whatever it brings, and only widening grows the count.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WidenBy {
-    /// Candidates the node holds. The rule every run so far has used.
-    #[default]
+    /// Candidates the node holds. The rule up to 2026-09-19.
     Children,
     /// Widen requests the node has made.
+    ///
+    /// The default since 2026-09-19: on gen405, 800 sims, one net on both
+    /// seats, it beat `Children` **285-114 over 400 games** (0.286 for
+    /// children, about 8.5 SE from parity, with margin -7.87 and gamescore
+    /// -40.84 agreeing). Every earlier search experiment in this file sat
+    /// inside +-1.3 SE; this one is not close.
+    #[default]
     Attempts,
 }
 
@@ -544,13 +550,13 @@ impl Default for SampledParams {
             resample_max_depth: u32::MAX,
             k_forced: 2.0,
             min_explore_visits: 2.0,
-            forced_visits: 30,
-            forced_extra: 4,
+            forced_visits: 0,
+            forced_extra: 0,
             temp_moves: 8,
             pw_alpha: 0.5,
             pw_beta: 2.0,
             pw_chunk: 1,
-            widen_by: WidenBy::Children,
+            widen_by: WidenBy::Attempts,
             kernel_sigma: 0.0,
             value_visits: ValueVisits::All,
             value_backup: ValueBackup::Avg,
@@ -2828,6 +2834,10 @@ mod tests {
                 k_candidates: 3,
                 k_draws: d,
                 pw_chunk: 1,
+                // The draw-then-fill schedule is `Children`'s: under
+                // `Attempts` a repeated draw spends budget instead of being
+                // retried, so the node stops before it ever reaches a fill.
+                widen_by: WidenBy::Children,
                 forced_visits: 0,
                 temp_moves: 0,
                 seed: 4,
@@ -3319,6 +3329,8 @@ mod tests {
                 k_draws: 60,
                 draw_retries: retries,
                 pw_chunk: 1,
+                // `draw_retries` only decides anything under `Children`.
+                widen_by: WidenBy::Children,
                 forced_visits: 0,
                 temp_moves: 0,
                 seed: 4,
@@ -3605,6 +3617,10 @@ mod tests {
             k_candidates: 3,
             k_draws: 3,
             pw_chunk: 1,
+            // Fill retries and fill-miss exhaustion are `Children`'s rules.
+            // `Attempts` charges for a widen that brings nothing and stops at
+            // `WIDEN_MISS_LIMIT` instead, which has its own test.
+            widen_by: WidenBy::Children,
             forced_visits: 0,
             temp_moves: 0,
             seed: 4,
@@ -3640,6 +3656,10 @@ mod tests {
             k_candidates: 3,
             k_draws: 3,
             pw_chunk: 1,
+            // Fill retries and fill-miss exhaustion are `Children`'s rules.
+            // `Attempts` charges for a widen that brings nothing and stops at
+            // `WIDEN_MISS_LIMIT` instead, which has its own test.
+            widen_by: WidenBy::Children,
             forced_visits: 0,
             temp_moves: 0,
             seed: 4,
@@ -3699,6 +3719,9 @@ mod tests {
             k_candidates: 3,
             k_draws: 3,
             pw_chunk: 1,
+            // Quotas are earned by candidates a widen actually adds, so the
+            // growth this measures is `Children`'s.
+            widen_by: WidenBy::Children,
             forced_visits: 30,
             temp_moves: 0,
             seed: 4,

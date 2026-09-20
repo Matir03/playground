@@ -142,7 +142,7 @@ KERNEL_SIGMA="${KERNEL_SIGMA:-0}"
 EVAL_CANDIDATES="${EVAL_CANDIDATES:-16}"
 EVAL_SIMS="${EVAL_SIMS:-400}"
 EVAL_T_STEPS="${EVAL_T_STEPS:-$T_STEPS}"
-RANDOM_FRACTION="${RANDOM_FRACTION:-0.3333333}"
+RANDOM_FRACTION="${RANDOM_FRACTION:-0}"
 # Random openings: N random legal turns before the search takes over, none of
 # them recorded. Keeps the training distribution moving when self-play comes
 # from one frozen net — a Hex run stalled at parity without this. Truncated
@@ -162,7 +162,7 @@ MIN_EXPLORE_VISITS="${MIN_EXPLORE_VISITS:-2.0}"
 #
 # 2026-09-15 (user): 10 per random explore candidate (was 30), and only those:
 # ~8 of them is ~80 of 400 simulations.
-FORCED_VISITS="${FORCED_VISITS:-10}"
+FORCED_VISITS="${FORCED_VISITS:-0}"
 # Non-explore candidates drawn at random to also get a quota. 0 since
 # 2026-09-15 (user): only the random explore candidates are forced. The root
 # sweep's one seeded visit per candidate stays (the user kept it).

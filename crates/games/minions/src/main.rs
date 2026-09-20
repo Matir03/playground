@@ -128,7 +128,7 @@ enum Cmd {
         t_steps_fast: usize,
         /// Share of candidates drawn by forced exploration — a random legal turn
         /// played out, independent of the net.
-        #[arg(long, default_value_t = 0.25)]
+        #[arg(long, default_value_t = 0.0)]
         random_fraction: f32,
         /// Random legal turns played before the search takes over, per game.
         /// None become training examples; the point is to keep the training
@@ -154,11 +154,11 @@ enum Cmd {
         /// Flat visits guaranteed to each forced-exploration candidate. These
         /// are excluded from PUCT and from the policy target; they buy a value
         /// estimate only.
-        #[arg(long, default_value_t = 30)]
+        #[arg(long, default_value_t = 0)]
         forced_visits: u32,
         /// Non-explore candidates drawn at random to also get a quota, on top
         /// of every explore candidate.
-        #[arg(long, default_value_t = 4)]
+        #[arg(long, default_value_t = 0)]
         forced_extra: u32,
         /// KataGo forced-playout constant, applied at the root: a low-prior
         /// candidate cannot be starved before it is tried. 0 disables root
@@ -204,8 +204,9 @@ enum Cmd {
         /// hold growth back. `attempts` budgets requests: each widen spends one
         /// whatever it returns, so the rate follows how often the node was asked
         /// to grow rather than what came of it.
-        /// **`children` reproduces the previous search bit-for-bit.**
-        #[arg(long, default_value = "children")]
+        /// `attempts` is the default since it beat `children` 285-114 over 400
+        /// games on gen405; `children` is the pre-2026-09-19 search.
+        #[arg(long, default_value = "attempts")]
         widen_by: playground_core::sampled_mcts::WidenBy,
         /// Candidates generated per model call. 0 (default) produces a node's
         /// whole set in one call.
