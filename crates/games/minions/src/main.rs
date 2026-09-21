@@ -321,6 +321,15 @@ enum Cmd {
         /// `--last-stage-samples` above 1; never reaches the search's values.
         #[arg(long, default_value = "data/minions_nnue/student_512_long.bin")]
         nnue_weights: String,
+        /// Seat A picks resample variables by the head's belief -- each one
+        /// unmasked with probability `1 - p(value already there)` -- instead of
+        /// a uniform random share. Ignores `--resample-frac`.
+        #[arg(long)]
+        resample_bias: bool,
+        /// As `--resample-bias`, for seat B; defaults to A's. Set only this to
+        /// play biased unmasking against the random one on one checkpoint.
+        #[arg(long)]
+        resample_bias_b: Option<bool>,
         /// Diffusion rounds a resample redraws with (both seats).
         #[arg(long, default_value_t = 2)]
         resample_t: usize,
@@ -748,6 +757,8 @@ async fn main() -> anyhow::Result<()> {
             render_games,
             record_file,
             record_search,
+            resample_bias,
+            resample_bias_b,
         } => {
             use minions_engine::eval::{load_seat, match_search, run_match, Seat};
             // Every game advances together, so the live count falls as games
@@ -758,6 +769,17 @@ async fn main() -> anyhow::Result<()> {
                 match_search(sims, candidates, t_steps, games as usize, seed);
             sampler.resample_t = resample_t;
             sampler.resample_frac = resample_frac;
+            sampler.resample_bias = resample_bias;
+            // Biased unmasking only acts inside a resample, so with refinement
+            // off it is a silent no-op: both seats run the identical search and
+            // the match measures nothing but seat noise. Caught the hard way --
+            // a 40-game run reported 22-18 having never called the code path.
+            if (resample_bias || resample_bias_b.unwrap_or(false)) && resample_every == 0.0 {
+                anyhow::bail!(
+                    "--resample-bias needs --resample-every > 0: refinement is off, \
+                     so the flag would change nothing"
+                );
+            }
             sampler.last_stage_samples = last_stage_samples;
             let kind = minions_engine::net::BackendKind::parse(&backend, &ep, fp16, cuda)?;
             // One evaluator per seat: it owns its scratch, and the whole point
@@ -788,6 +810,7 @@ async fn main() -> anyhow::Result<()> {
                 k_draws_fast: cb,
                 resample_t: resample_t_b.unwrap_or(resample_t),
                 resample_frac: resample_frac_b.unwrap_or(resample_frac),
+                resample_bias: resample_bias_b.unwrap_or(resample_bias),
                 last_stage_samples: last_stage_samples_b.unwrap_or(last_stage_samples),
                 ..sampler
             };

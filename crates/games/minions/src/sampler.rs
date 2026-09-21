@@ -96,6 +96,23 @@ pub struct SamplerConfig {
     /// Most of a turn a resample masks again: the share is uniform in
     /// `[0, resample_frac]` of its live variables, and at least one.
     pub resample_frac: f32,
+    /// Choose *which* variables a resample masks from the model's own belief
+    /// rather than uniformly at random.
+    ///
+    /// One extra diffusion pass runs over the fully committed turn first, and
+    /// each live variable is then unmasked independently with probability
+    /// `1 - p(value already there)` -- the mass the head puts on proposing
+    /// something else. Fields it would have changed get rerolled; fields it is
+    /// confident about stay. `resample_frac` plays no part: the number masked
+    /// is whatever the beliefs say.
+    ///
+    /// This is the use the committed-field consistency loss (`--w-unmask`)
+    /// exists for. Without that training a committed field's logits are
+    /// unconstrained, so this probability means nothing.
+    ///
+    /// Costs one diffusion call per resample batch: 3 instead of 2 at
+    /// `resample_t = 2`.
+    pub resample_bias: bool,
     /// Completions drawn from the *final* diffusion step instead of one.
     ///
     /// 1 (default) is the existing sampler. Above 1, the last round is replayed
@@ -132,6 +149,7 @@ impl Default for SamplerConfig {
             temperature: 1.0,
             resample_t: 2,
             resample_frac: 0.5,
+            resample_bias: false,
             last_stage_samples: 1,
             use_energy: true,
             pad_to: 0,
@@ -182,6 +200,68 @@ struct GameCtx {
 /// mask fold into the loop, and caching the scaled logits means the second pass
 /// no longer redoes the division or the predicate.
 #[allow(clippy::too_many_arguments)]
+/// The mass the diffusion head puts on the value already committed at one
+/// field, over that field's legal options.
+///
+/// Legality is the option mask only -- deliberately *not* the claimed-hex rule
+/// `commit_round` applies while building a turn. Every move is committed when
+/// this is called, so every destination is already claimed and that rule would
+/// leave almost nothing legal, making the probability meaningless.
+///
+/// A field holding a value outside its class range scores 0, so it is always
+/// rerolled: a realized turn can carry `NO_MOVE` for a unit that never acted,
+/// and the head cannot express that, so it has no opinion to keep.
+fn p_committed_value(lg: &[f32], cx: &GameCtx, spec: &TurnSpec, cell: u8, field: u8) -> f32 {
+    let ci = cell as usize;
+    let (off, n_cls, opts, cur) = match field {
+        C_MOVE => (
+            OFF_MOVES,
+            N_OFFSETS,
+            cx.move_opts[ci] as u64,
+            spec.moves[ci] as usize,
+        ),
+        C_TARGET => (
+            OFF_TARGETS,
+            N_TARGETS,
+            cx.target_opts[ci] as u64,
+            spec.targets[ci] as usize,
+        ),
+        _ => (
+            OFF_SPAWNS,
+            N_SPAWNS,
+            cx.spawn_opts as u64,
+            spec.spawns[ci] as usize,
+        ),
+    };
+    let row = ci * DECL_LOGITS + off;
+    let mut max_l = f32::NEG_INFINITY;
+    for v in 0..n_cls {
+        if opts & (1 << v) != 0 && lg[row + v] > max_l {
+            max_l = lg[row + v];
+        }
+    }
+    if max_l == f32::NEG_INFINITY {
+        // Nothing legal here, so there is nothing to reroll into.
+        return 1.0;
+    }
+    let (mut sum, mut cur_e) = (0.0f32, 0.0f32);
+    for v in 0..n_cls {
+        if opts & (1 << v) == 0 {
+            continue;
+        }
+        let e = (lg[row + v] - max_l).exp();
+        sum += e;
+        if v == cur {
+            cur_e = e;
+        }
+    }
+    if sum <= 0.0 {
+        1.0
+    } else {
+        cur_e / sum
+    }
+}
+
 fn consider<F: Fn(usize) -> bool>(
     chain: &Partial,
     cell: u8,
@@ -1550,6 +1630,32 @@ impl MinionsModel {
             self.seed ^ batch_seq.wrapping_mul(0xD1B5_4A32_D192_ED03) ^ 0x5E5A,
         );
 
+        // Biased unmasking needs the head's opinion of the turn as it stands,
+        // so the pass is built here and probed once over the fully committed
+        // declaration before anything is masked. The redraw loop below reuses
+        // the same pass, so this costs exactly one extra diffusion call.
+        let probe_stride = DECL_PLANES * NUM_CELLS;
+        let mut pass = self.net.diffusion_pass(&tr.h, g)?;
+        let bias_logits: Option<Vec<f32>> = if self.cfg.resample_bias {
+            let mut decl0 = vec![0f32; g * probe_stride];
+            for gi in 0..g {
+                let cx = &ctx[gi];
+                let spec = if flipped[gi] {
+                    from[src(gi)].rotated()
+                } else {
+                    from[src(gi)]
+                };
+                Partial::fully_committed(&spec, &cx.live)
+                    .write_planes(&mut decl0[gi * probe_stride..(gi + 1) * probe_stride]);
+            }
+            let clk = Instant::now();
+            let l = pass.step(&decl0)?;
+            Phases::add(&self.phases.diffusion_ns, clk);
+            Some(l)
+        } else {
+            None
+        };
+
         let mut chains = Vec::with_capacity(g);
         let mut claimed: Vec<Bb> = Vec::with_capacity(g);
         let mut kept = Vec::with_capacity(g);
@@ -1571,13 +1677,42 @@ impl MinionsModel {
             let n = vars.len();
             let m = if n == 0 {
                 0
+            } else if let Some(bl) = &bias_logits {
+                let row0 = gi * NUM_CELLS * DECL_LOGITS;
+                let lg = &bl[row0..row0 + NUM_CELLS * DECL_LOGITS];
+                // One independent Bernoulli per variable, at the head's own
+                // probability of proposing something other than what is there.
+                let mut pc: Vec<f32> = vars
+                    .iter()
+                    .map(|&(c, f)| 1.0 - p_committed_value(lg, cx, &p.spec, c, f))
+                    .collect();
+                let mut k = 0usize;
+                for i in 0..n {
+                    if rng.gen::<f32>() < pc[i] {
+                        vars.swap(k, i);
+                        pc.swap(k, i);
+                        k += 1;
+                    }
+                }
+                if k == 0 {
+                    // Masking nothing returns the turn unchanged and wastes the
+                    // visit, so the least certain variable goes in regardless.
+                    let best = (0..n).max_by(|&a, &b| pc[a].total_cmp(&pc[b])).unwrap_or(0);
+                    vars.swap(0, best);
+                    k = 1;
+                }
+                k
             } else {
                 let share = rng.gen::<f32>() * self.cfg.resample_frac;
                 ((share * n as f32).round() as usize).clamp(1, n)
             };
-            for i in 0..m {
-                let j = i + rng.gen_range(0..n - i);
-                vars.swap(i, j);
+            // The biased path already moved its picks to the front; only the
+            // uniform path needs a shuffle to choose which `m` they are.
+            if bias_logits.is_none() {
+                for i in 0..m {
+                    let j = i + rng.gen_range(0..n - i);
+                    vars.swap(i, j);
+                }
             }
             let empty = TurnSpec::empty();
             for &(c, f) in &vars[..m] {
@@ -1614,7 +1749,6 @@ impl MinionsModel {
         let stride = DECL_PLANES * NUM_CELLS;
         let width = NUM_CELLS * DECL_LOGITS;
         let mut decl = vec![0f32; g * stride];
-        let mut pass = self.net.diffusion_pass(&tr.h, g)?;
         let mut picks: Vec<(u8, u8, u8)> = Vec::with_capacity(NUM_CELLS);
         for t in 1..=steps {
             for (i, c) in chains.iter().enumerate() {
