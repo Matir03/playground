@@ -420,6 +420,33 @@ pub fn read_arch(checkpoint: &Path) -> (usize, usize, usize) {
     (c, b, e)
 }
 
+/// Candle builds both declaration heads `channels` wide with one diffusion
+/// block. Distilled nets can size them independently (`dif_ch`, `dif_blocks`,
+/// `eng_ch` in `config.json`); ORT reads those shapes from the graphs, but
+/// here an extra diffusion block would be skipped without a word, so refuse.
+fn check_default_heads(checkpoint: &Path, channels: usize) -> anyhow::Result<()> {
+    let Some(txt) = checkpoint
+        .parent()
+        .and_then(|d| std::fs::read_to_string(d.join("config.json")).ok())
+    else {
+        return Ok(());
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
+        return Ok(());
+    };
+    let a = &v["arch"];
+    let dif_ch = a["dif_ch"].as_u64().unwrap_or(channels as u64) as usize;
+    let eng_ch = a["eng_ch"].as_u64().unwrap_or(channels as u64) as usize;
+    let dif_blocks = a["dif_blocks"].as_u64().unwrap_or(1) as usize;
+    anyhow::ensure!(
+        dif_ch == channels && eng_ch == channels && dif_blocks == 1,
+        "candle backend supports only default head shapes \
+         (dif_ch {dif_ch}, eng_ch {eng_ch}, dif_blocks {dif_blocks} vs channels {channels}); \
+         use --backend ort"
+    );
+    Ok(())
+}
+
 /// Which inference backend to run.
 ///
 /// Same split as Hex: candle is the development and parity path, ORT with the
@@ -510,6 +537,7 @@ impl LocalNet {
             Device::Cpu
         };
         let (c, b, e) = read_arch(checkpoint);
+        check_default_heads(checkpoint, c)?;
         let vb =
             unsafe { VarBuilder::from_mmaped_safetensors(&[checkpoint], DType::F32, &device)? };
         Ok(Self {

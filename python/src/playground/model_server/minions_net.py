@@ -135,7 +135,8 @@ PROPOSERS = ("diffusion", "best")
 
 class MinionsNet(nn.Module):
     def __init__(self, channels: int = 96, blocks: int = 8, energy_blocks: int = 2,
-                 proposer: str = "diffusion"):
+                 proposer: str = "diffusion", dif_ch: int | None = None,
+                 dif_blocks: int = 1, eng_ch: int | None = None):
         super().__init__()
         if proposer not in PROPOSERS:
             raise ValueError(f"proposer must be one of {PROPOSERS}, got {proposer!r}")
@@ -143,6 +144,19 @@ class MinionsNet(nn.Module):
         self.blocks_n = blocks
         self.energy_blocks_n = energy_blocks
         self.proposer = proposer
+        # Declaration-head widths and depth, independent of the trunk since
+        # 2026-09-24 so a distilled student can shrink them separately. None =
+        # the trunk width, and the defaults reproduce every earlier checkpoint
+        # exactly. Only the input width `head_ch` is visible to Rust; these are
+        # internal to diffusion.onnx / energy.onnx. Measured the same day:
+        # shrinking them (or the trunk, to 64x6) buys *no* self-play throughput
+        # -- the actor is bound by per-call overhead, not FLOPs -- so they exist
+        # for experiments, not speed.
+        dif_ch = channels if dif_ch is None else dif_ch
+        eng_ch = channels if eng_ch is None else eng_ch
+        self.dif_ch = dif_ch
+        self.dif_blocks_n = dif_blocks
+        self.eng_ch = eng_ch
 
         # ── shared trunk ──────────────────────────────────────────────────────
         self.stem = nn.Conv2d(IN_PLANES, channels, 3, padding=1)
@@ -256,11 +270,15 @@ class MinionsNet(nn.Module):
         # turn directly, and the search takes that single turn plus random
         # playouts as a node's candidates.
         if proposer == "diffusion":
-            self.dif_in = nn.Conv2d(head_ch + DECL_PLANES, channels, 3, padding=1)
-            self.dif_bn = nn.BatchNorm2d(channels)
-            self.dif_block = _ResBlock(channels)
-            self.dif_gpool = GlobalPoolBias(channels)
-            self.dif_out = nn.Conv2d(channels, DECL_LOGITS, 1)
+            self.dif_in = nn.Conv2d(head_ch + DECL_PLANES, dif_ch, 3, padding=1)
+            self.dif_bn = nn.BatchNorm2d(dif_ch)
+            self.dif_block = _ResBlock(dif_ch)
+            # Blocks beyond the first live in their own list so that
+            # `dif_block`'s parameter names -- and so every existing checkpoint
+            # -- are unchanged at the default depth of 1.
+            self.dif_extra = nn.ModuleList(_ResBlock(dif_ch) for _ in range(dif_blocks - 1))
+            self.dif_gpool = GlobalPoolBias(dif_ch)
+            self.dif_out = nn.Conv2d(dif_ch, DECL_LOGITS, 1)
         else:
             # ── best-move head ────────────────────────────────────────────────
             # Unconditioned: no partial declaration comes in, so it commits
@@ -273,11 +291,11 @@ class MinionsNet(nn.Module):
             self.best_out = nn.Conv2d(channels, DECL_LOGITS, 1)
 
         # ── energy head ───────────────────────────────────────────────────────
-        self.eng_in = nn.Conv2d(head_ch + ENERGY_PLANES, channels, 3, padding=1)
-        self.eng_bn = nn.BatchNorm2d(channels)
-        self.eng_blocks = nn.ModuleList(_ResBlock(channels) for _ in range(energy_blocks))
-        self.eng_gpool = GlobalPoolBias(channels)
-        self.eng_fc1 = nn.Linear(2 * channels, 64)
+        self.eng_in = nn.Conv2d(head_ch + ENERGY_PLANES, eng_ch, 3, padding=1)
+        self.eng_bn = nn.BatchNorm2d(eng_ch)
+        self.eng_blocks = nn.ModuleList(_ResBlock(eng_ch) for _ in range(energy_blocks))
+        self.eng_gpool = GlobalPoolBias(eng_ch)
+        self.eng_fc1 = nn.Linear(2 * eng_ch, 64)
         self.eng_fc2 = nn.Linear(64, 1)
 
     # ── forward pieces ────────────────────────────────────────────────────────
@@ -344,7 +362,10 @@ class MinionsNet(nn.Module):
         (B, CELLS, 37), (B, CELLS, 3), (B, CELLS, 6).
         """
         x = F.relu(self.dif_bn(self.dif_in(torch.cat([hh, decl], dim=1))))
-        x = self.dif_gpool(self.dif_block(x))
+        x = self.dif_block(x)
+        for blk in self.dif_extra:
+            x = blk(x)
+        x = self.dif_gpool(x)
         # (B, 46, N, N) -> (B, CELLS, 46) so each cell's logits are contiguous.
         out = self.dif_out(x).permute(0, 2, 3, 1).reshape(-1, CELLS, DECL_LOGITS)
         return torch.split(out, [N_OFFSETS, N_TARGETS, N_SPAWNS], dim=2)
@@ -624,6 +645,9 @@ def arch_of(net: MinionsNet) -> dict:
         "blocks": net.blocks_n,
         "energy_blocks": net.energy_blocks_n,
         "proposer": net.proposer,
+        "dif_ch": net.dif_ch,
+        "dif_blocks": net.dif_blocks_n,
+        "eng_ch": net.eng_ch,
     }
 
 
@@ -633,6 +657,9 @@ def build_model(arch: dict) -> MinionsNet:
         blocks=int(arch.get("blocks", 8)),
         energy_blocks=int(arch.get("energy_blocks", 2)),
         proposer=str(arch.get("proposer", "diffusion")),
+        dif_ch=arch.get("dif_ch"),
+        dif_blocks=int(arch.get("dif_blocks", 1)),
+        eng_ch=arch.get("eng_ch"),
     )
 
 
