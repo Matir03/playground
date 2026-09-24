@@ -15,7 +15,9 @@ PYTHON="${PYTHON:-$repo/python/.venv/bin/python}"
 export PYTHONPATH="$repo/python/src"
 
 CHANNELS="${CHANNELS:-96}"
-BLOCKS="${BLOCKS:-8}"
+# 12 since gen454 (2026-09-24): gen453 grown to 96x12 by python/minions_grow.py.
+# Only seeds generation 0; a running ladder builds from config.json's arch.
+BLOCKS="${BLOCKS:-12}"
 # Recorded examples per generation. Raised 20000 -> 80000 when playout-cap
 # randomization started recording fast positions too: ~4x more examples now come
 # out of the same amount of search, so holding the old target would have cut the
@@ -51,8 +53,14 @@ TARGET_EXAMPLES="${TARGET_EXAMPLES:-100000}"
 # At 1024 and 1536 the reps disagree in sign, so 768 is the plateau. Note the
 # old note in memory had 256 at -5%; that was true of a different inner loop,
 # and re-measuring after changing the loop is the whole point.
+#
+# 2026-09-24, re-measured on the 96x12 net at CONCURRENCY 6144 (held fixed:
+# the actor's RSS already plateaus near 18 GB of 23): workers x batch 6x512
+# beat 4x768 by +7.7%/+12.5% (ABBA, 60 s windows 2-3), while 3x1024 lost 13%,
+# 8x384 16% and 10x307 25%. Net size does not move these numbers -- 64x6
+# through 96x16 self-play at the same rate -- so this is a CPU/overhead optimum.
 CONCURRENCY="${CONCURRENCY:-6144}"
-MAX_BATCH="${MAX_BATCH:-768}"
+MAX_BATCH="${MAX_BATCH:-512}"
 # Pool workers, each owning a disjoint slice of the pool so one worker's CPU
 # phases (commit, realize, playout) overlap another's GPU work. Measured on the
 # 7x7 net, ABBA pairs on a quiet machine: 1 -> 2 is +17.5% (3/3), 2 -> 4 a
@@ -60,7 +68,7 @@ MAX_BATCH="${MAX_BATCH:-768}"
 # behind one session mutex, so extra workers only fill gaps rather than adding
 # GPU throughput. At CONCURRENCY 1024 each of 4 workers holds 256 slots, exactly
 # the 2 * MAX_BATCH `pick_mode` needs to keep padding at zero — verified 0%.
-WORKERS="${WORKERS:-4}"
+WORKERS="${WORKERS:-6}"
 # Trunk feature cache: 12288 MB, set on the actor invocation below and
 # deliberately NOT exported, so the ten concurrent tournament eval engines keep
 # the binary's 8192 MB default.
