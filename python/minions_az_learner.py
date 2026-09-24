@@ -356,6 +356,44 @@ def tb_trajectories(batch: dict, idx: np.ndarray, k: int, sampled: np.ndarray,
     return batch["cand_spec"][flat[keep]], rows[keep]
 
 
+def apply_no_decay(net, opt, live: str, wd: float) -> None:
+    """Exempt the parameters named in ``<live>/no_decay.txt`` from weight decay.
+
+    One regex per line (``re.match`` on the parameter name), ``#`` comments.
+    No file, or no match, leaves Adam's own coupled L2 exactly as it was.
+
+    Why it exists: under Adam, L2 is added to the gradient and then normalised,
+    so a weight whose loss gradient is ~0 moves toward zero by a full ``lr``
+    every step whatever ``wd`` is. A residual block whose last BatchNorm gamma
+    is 0 gets exactly zero gradient in its convolutions, so they are erased in
+    ~30 steps and the block can never switch on. That is how blocks grown by
+    ``minions_grow.py`` died within one generation (2026-09-24), and it is the
+    likely way blocks 3, 4 and 6 of the 96x8 run had been dead since before
+    gen300.
+
+    The exemption is done by moving decay into gradient hooks rather than a
+    second param group, so the saved optimiser state keeps loading: for every
+    other parameter ``grad + wd * p`` is what Adam computed internally.
+    """
+    import re
+    path = os.path.join(live, "no_decay.txt")
+    if wd == 0 or not os.path.exists(path):
+        return
+    pats = [re.compile(l.strip()) for l in open(path)
+            if l.strip() and not l.strip().startswith("#")]
+    exempt = [n for n, _ in net.named_parameters() if any(p.match(n) for p in pats)]
+    if not exempt:
+        return
+    for g in opt.param_groups:
+        g["weight_decay"] = 0.0
+    keep = set(exempt)
+    for n, p in net.named_parameters():
+        if n not in keep:
+            p.register_hook(lambda grad, p=p: grad + wd * p.detach())
+    print(f"weight decay off for {len(exempt)} parameters (no_decay.txt), "
+          f"e.g. {exempt[:3]}")
+
+
 def candidate_rows(batch: dict, idx: np.ndarray, rows: np.ndarray | None = None):
     """The children of ``idx[rows]`` (default: all of ``idx``), flattened.
 
@@ -987,6 +1025,11 @@ def main():
         except (ValueError, KeyError, RuntimeError) as exc:
             print(f"optimiser state does not match this architecture ({exc}); "
                   f"starting fresh moments", file=sys.stderr)
+    # The saved state carries its group's weight_decay, which would override the
+    # flag -- and is 0 whenever an exemption below was in force.
+    for g in opt.param_groups:
+        g["weight_decay"] = args.weight_decay
+    apply_no_decay(net, opt, live, args.weight_decay)
 
     buf = Buffer(os.path.join(live, "buffer"))
     gens_done = 0
