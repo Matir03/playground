@@ -15,9 +15,11 @@ PYTHON="${PYTHON:-$repo/python/.venv/bin/python}"
 export PYTHONPATH="$repo/python/src"
 
 CHANNELS="${CHANNELS:-96}"
-# 12 since gen454 (2026-09-24): gen453 grown to 96x12 by python/minions_grow.py.
 # Only seeds generation 0; a running ladder builds from config.json's arch.
-BLOCKS="${BLOCKS:-12}"
+# 96x12 (gen453 grown by python/minions_grow.py) ran gens 454-455 on 2026-09-24
+# and lost ground (gen455 vs gen451 0.340 against gen453's 0.465), so the ladder
+# went back to 96x8 at gen453's weights.
+BLOCKS="${BLOCKS:-8}"
 # Recorded examples per generation. Raised 20000 -> 80000 when playout-cap
 # randomization started recording fast positions too: ~4x more examples now come
 # out of the same amount of search, so holding the old target would have cut the
