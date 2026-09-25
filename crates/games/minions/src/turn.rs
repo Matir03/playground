@@ -788,7 +788,33 @@ pub fn kernel(state: &MinionsState, a: &TurnSpec, b: &TurnSpec, sigma: f32) -> f
     (-(d * d) / (2.0 * sigma * sigma)).exp()
 }
 
+/// Execute declaration `spec` at `state`: the legal turn it describes, as far as
+/// the position allows.
+///
+/// Resolved in the mover's canonical frame (the side to move as side 0), then
+/// rotated back. Resolution is order-dependent -- units move in cell order, and
+/// a unit that moves first can free or take a cell another one wanted -- and
+/// the 180° rotation reverses that order. Resolved in the real frame, the same
+/// declaration reached a different position for 2.1% of side-1 turns than it
+/// did in the canonical frame the sampler proposes and scores in, so the
+/// search played a turn the nets never saw. Pinning the frame to the mover
+/// makes `realize` commute with the rotation exactly.
 pub fn realize(state: &MinionsState, spec: &TurnSpec) -> Realized {
+    if state.side == 0 {
+        return realize_canonical(state, spec);
+    }
+    let r = realize_canonical(&state.rotated(), &spec.rotated());
+    Realized {
+        actions: r.actions.iter().map(MinionsMove::rotated).collect(),
+        next: r.next.rotated(),
+        spec: r.spec.rotated(),
+        fidelity: r.fidelity,
+    }
+}
+
+/// [`realize`] for a position whose mover is side 0.
+fn realize_canonical(state: &MinionsState, spec: &TurnSpec) -> Realized {
+    debug_assert_eq!(state.side, 0);
     let me = state.side;
     let mut s = state.clone();
     let mut actions = Vec::new();
@@ -1437,50 +1463,50 @@ mod turn_game_tests {
     use playground_core::{SampledGame, SampledModel, SampledParams};
     use rand::SeedableRng;
 
-    /// How often realizing in the canonical frame (as the sampler does) and
-    /// rotating back disagrees with the search's real-frame `apply` of the
-    /// rotated realized spec. Measured 2026-09-25: side 0 never, side 1 in
-    /// 140 of 6512 random-playout candidates (2.1%) -- `realize` resolves units
-    /// in cell order, so the rotation changes who moves first. A diagnostic,
-    /// not an invariant, until `realize` is made frame-independent.
+    /// `realize` commutes with the seat rotation, for both movers, and the
+    /// realized spec reproduces its own position. The sampler realizes in the
+    /// canonical frame and the search applies the rotated realized spec in the
+    /// real one, so both have to hold exactly for the two to see one position.
+    /// Before `realize` pinned the frame, 2.1% of side-1 candidates disagreed.
     #[test]
-    #[ignore = "diagnostic; run with --ignored --nocapture"]
-    fn realize_rotation_mismatch_rate() {
+    fn realize_commutes_with_the_seat_rotation() {
         use playground_core::SampledGame;
         use rand::SeedableRng;
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(21);
-        let mut checked = 0;
-        let mut tally = [(0usize, 0usize, 0usize); 2];
+        let key = MinionsTurns::state_key;
+        let mut checked = [0usize; 2];
+        let mut unfixed = 0usize;
         for _ in 0..60 {
             let mut st = crate::game::Minions::initial_state();
             for _ in 0..40 {
                 if crate::game::Minions::outcome(&st).is_terminal() {
                     break;
                 }
-                let canon = st.canonical();
+                let rot = st.rotated();
                 for _ in 0..8 {
-                    let spec_c = TurnSpec::random_playout(&canon, &mut rng);
-                    let r = realize(&canon, &spec_c);
-                    let (back, spec) = if st.side == 1 {
-                        (r.next.rotated(), r.spec.rotated())
-                    } else {
-                        (r.next, r.spec)
-                    };
-                    let real = realize(&st, &spec).next;
-                    let same = MinionsTurns::state_key(&back) == MinionsTurns::state_key(&real);
-                    let refix = MinionsTurns::state_key(&realize(&canon, &r.spec).next)
-                        == MinionsTurns::state_key(&realize(&canon, &spec_c).next);
-                    tally[st.side as usize].0 += 1;
-                    tally[st.side as usize].1 += (!same) as usize;
-                    tally[st.side as usize].2 += (!refix) as usize;
-                    checked += 1;
+                    let spec = TurnSpec::random_playout(&st, &mut rng);
+                    let r = realize(&st, &spec);
+                    let q = realize(&rot, &spec.rotated());
+                    assert_eq!(key(&q.next), key(&r.next.rotated()), "side {}", st.side);
+                    assert_eq!(q.spec, r.spec.rotated());
+                    let back: Vec<_> = q.actions.iter().map(|a| a.rotated()).collect();
+                    assert_eq!(back, r.actions);
+                    // The actions are the turn: legal in sequence, ending at `next`.
+                    let mut s = st.clone();
+                    for a in &r.actions {
+                        assert!(crate::game::Minions::legal_moves(&s).contains(a), "illegal {a}");
+                        s = crate::game::Minions::apply(&s, a);
+                    }
+                    assert_eq!(key(&s), key(&r.next));
+                    unfixed += (key(&realize(&st, &r.spec).next) != key(&r.next)) as usize;
+                    checked[st.side as usize] += 1;
                 }
                 let spec = TurnSpec::random_playout(&st, &mut rng);
                 st = realize(&st, &spec).next;
             }
         }
-        eprintln!("(n, rotated-back mismatch, realized-spec not a fixed point) by side: {tally:?}");
-        assert!(checked > 2000, "only {checked}");
+        assert!(checked[0] > 1000 && checked[1] > 1000, "{checked:?}");
+        assert_eq!(unfixed, 0, "realized specs that do not reproduce their position");
     }
 
     /// Proposes plausible random declarations — the stand-in for the diffusion

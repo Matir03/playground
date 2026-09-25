@@ -623,6 +623,20 @@ pub enum MinionsMove {
     EndPhase,
 }
 
+impl MinionsMove {
+    /// The same action on the board rotated 180° ([`MinionsState::rotated`]).
+    pub fn rotated(&self) -> Self {
+        let r = |c: u8| crate::map::rot(c as usize) as u8;
+        match *self {
+            MinionsMove::Move { from, to } => MinionsMove::Move { from: r(from), to: r(to) },
+            MinionsMove::Attack { from, to } => MinionsMove::Attack { from: r(from), to: r(to) },
+            MinionsMove::Spawn { unit, at } => MinionsMove::Spawn { unit, at: r(at) },
+            MinionsMove::Buy(u) => MinionsMove::Buy(u),
+            MinionsMove::EndPhase => MinionsMove::EndPhase,
+        }
+    }
+}
+
 impl std::fmt::Display for MinionsMove {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
