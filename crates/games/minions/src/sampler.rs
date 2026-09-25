@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use half::f16;
+use half::slice::HalfFloatSliceExt;
 
 use playground_core::sampled_mcts::Expansion;
 use playground_core::{Game, SampledModel, SampledParams};
@@ -1275,8 +1276,10 @@ impl SampledModel<MinionsTurns> for MinionsModel {
 pub struct CachedRow<'a> {
     pub value: f32,
     pub h: &'a [f16],
-    /// The diffusion head's first-step logits at this position (fp16,
-    /// `NUM_CELLS * DECL_LOGITS`, canonical frame), when held.
+    /// The diffusion head's first-step logits at this position, when held:
+    /// fp16, canonical frame, and only the live cells' rows, in cell order
+    /// (`n_live_cells * DECL_LOGITS`). Nothing else is ever read, and the
+    /// whole 49-cell row was as large as `h` itself.
     pub step1: Option<&'a [f16]>,
 }
 
@@ -1307,7 +1310,8 @@ pub struct WaveOut {
     /// Trunk rows for every request (`exp ++ wid ++ rs`), `fresh` where
     /// computed this wave.
     pub trunk: TrunkRows,
-    /// First-step logits computed this wave, per widen.
+    /// First-step logits computed this wave, per widen, in
+    /// [`CachedRow::step1`]'s live-cells layout.
     pub step1: Vec<Option<Vec<f16>>>,
 }
 
@@ -2207,8 +2211,11 @@ impl MinionsModel {
                     let Some(l1) = hit(ne + gi).and_then(|c| c.step1) else {
                         continue;
                     };
-                    for (o, x) in scratch.iter_mut().zip(l1) {
-                        *o = x.to_f32();
+                    for (k, c) in bitboard::cells(live_cells[gi]).enumerate() {
+                        let c = c as usize;
+                        l1[k * DECL_LOGITS..(k + 1) * DECL_LOGITS].convert_to_f32_slice(
+                            &mut scratch[c * DECL_LOGITS..(c + 1) * DECL_LOGITS],
+                        );
                     }
                     let want = Self::committed_after(1, tw, ctx[gi].n_live);
                     for c in gi * k_diff..(gi + 1) * k_diff {
@@ -2228,11 +2235,7 @@ impl MinionsModel {
             }
             for (j, t) in targets.iter().enumerate() {
                 // Only live cells are ever read, and all of this row's are
-                // written, so the buffer needs no clearing -- except for a
-                // step-1 row, which is kept whole in the cache.
-                if matches!(t, Target::Step1(_)) {
-                    rowbuf.fill(0.0);
-                }
+                // written, so the buffer needs no clearing.
                 for k in starts[j]..starts[j + 1] {
                     let c = cells[k] as usize % NUM_CELLS;
                     rowbuf[c * DECL_LOGITS..(c + 1) * DECL_LOGITS]
@@ -2244,9 +2247,16 @@ impl MinionsModel {
                         // Committed from the fp16 values it is cached as, so
                         // a later hit reproduces this draw exactly. A no-op
                         // with fp16 graphs, whose outputs are fp16 already.
-                        let l16: Vec<f16> = lg.iter().map(|&x| f16::from_f32(x)).collect();
-                        for (o, x) in scratch.iter_mut().zip(&l16) {
-                            *o = x.to_f32();
+                        let l16: Vec<f16> = logits
+                            [starts[j] * DECL_LOGITS..starts[j + 1] * DECL_LOGITS]
+                            .iter()
+                            .map(|&x| f16::from_f32(x))
+                            .collect();
+                        for (k, c) in bitboard::cells(live_cells[gi]).enumerate() {
+                            let c = c as usize;
+                            l16[k * DECL_LOGITS..(k + 1) * DECL_LOGITS].convert_to_f32_slice(
+                                &mut scratch[c * DECL_LOGITS..(c + 1) * DECL_LOGITS],
+                            );
                         }
                         step1[gi] = Some(l16);
                         let want = Self::committed_after(1, tw, ctx[gi].n_live);

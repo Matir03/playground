@@ -361,17 +361,17 @@ pub struct Slot {
     turn: u32,
     rng: rand_chacha::ChaCha8Rng,
     alive: bool,
-    /// Trunk output `(value, h)` for positions this slot's current search has
-    /// already evaluated, keyed by `state_key`. A widen request is always for a
-    /// node expanded earlier; without this it re-ran the trunk on a position
-    /// whose output had just been discarded -- ~60% of trunk rows, and 45% of
-    /// the FLOPs self-play spent. Cleared when the search ends, and on reload.
-    trunk_cache: std::collections::HashMap<u128, (f32, Box<[half::f16]>)>,
-    /// The diffusion head's first-step logits at positions the trunk cache
-    /// holds, for [`MinionsModel::run_wave`]: every widen chain starts from
-    /// the empty declaration, so step 1 is a function of `h` alone. Kept only
-    /// beside a trunk entry, and dropped with it.
-    step1_cache: std::collections::HashMap<u128, Box<[half::f16]>>,
+    /// Trunk output for positions this game has evaluated, keyed by
+    /// `state_key`, with the diffusion head's step-1 logits where a widen
+    /// computed them. Widens and refines always revisit a node expanded
+    /// earlier, and a turn's search starts inside the subtree the previous one
+    /// built, so without this the trunk re-ran on positions whose output had
+    /// just been thrown away. Kept across the game's turns, least recently
+    /// used evicted first ([`cache_evict`]); dropped at game end and on reload.
+    trunk_cache: std::collections::HashMap<u128, CacheEntry>,
+    /// Every position whose trunk this game has run, on a sample of slots
+    /// (every [`SEEN_EVERY`]th): the reference `recomputed` is counted against.
+    seen: Option<std::collections::HashSet<u128>>,
 }
 
 /// Play a **pool** of games, batching expansions across whichever ones happen to
@@ -483,6 +483,13 @@ fn drive_pool_worker(
     let use_cache = cache_budget > 0 && TRUNK_CACHE_USE.load(std::sync::atomic::Ordering::Relaxed);
     // Slots keep their caches across flush windows, so count what they hold.
     let mut cache_bytes: usize = slots.iter().map(cache_size).sum();
+    // The wave clock eviction orders entries by; it resumes past every entry a
+    // previous window left, so they age in order.
+    let mut tick: u32 = slots
+        .iter()
+        .flat_map(|s| s.trunk_cache.values().map(|e| e.tick))
+        .max()
+        .map_or(0, |t| t.wrapping_add(1));
     let seed = *next_seed;
 
     let start_search = |state: &MinionsState,
@@ -610,9 +617,10 @@ fn drive_pool_worker(
                         break;
                     }
                     Step::Done => {
-                        // The tree this cache described is gone.
-                        cache_bytes = cache_bytes.saturating_sub(cache_drop(&mut slots[i]));
+                        // The cache stays: the next turn's search starts in the
+                        // subtree this one built, and asks for those positions.
                         if !advance_turn(&mut slots[i], &start_search, stats) {
+                            cache_bytes = cache_bytes.saturating_sub(cache_drop(&mut slots[i]));
                             // Game over: bank it and refill the slot, so the
                             // batch never narrows while work remains.
                             out.extend(examples_from(
@@ -640,7 +648,7 @@ fn drive_pool_worker(
                                 rng,
                                 alive: true,
                                 trunk_cache: Default::default(),
-                                step1_cache: Default::default(),
+                                seen: sampled_seen(i),
                             };
                         }
                     }
@@ -668,6 +676,7 @@ fn drive_pool_worker(
         let real = ids.len();
         stats.batches += 1;
         stats.expansions += real as u64;
+        tick = tick.wrapping_add(1);
         // One `k` for the whole wave keeps the tensor shape fixed — the
         // constraint that killed an earlier overlap scheme, which set TensorRT
         // rebuilding an engine per shape and cost 97% of throughput.
@@ -755,9 +764,12 @@ fn drive_pool_worker(
                 slots[i].search.provide_resample(c);
             }
             if cache_budget > 0 {
-                cache_store_pairs(slots, &pairs, &got.trunk, cache_budget, &mut cache_bytes, stats);
+                if use_cache {
+                    cache_touch(slots, &pairs, tick);
+                }
+                cache_store_pairs(slots, &pairs, &got.trunk, cache_budget, &mut cache_bytes, tick, stats);
                 let (a, b) = (exp_idx.len(), exp_idx.len() + wid_idx.len());
-                cache_store_step1(slots, &pairs[a..b], &got.step1, cache_budget, &mut cache_bytes, stats);
+                cache_store_step1(slots, &pairs[a..b], &got.step1, cache_budget, &mut cache_bytes, tick, stats);
             }
             continue;
         }
@@ -780,7 +792,11 @@ fn drive_pool_worker(
             for (slot, (v, _)) in exp_idx.iter().zip(r) {
                 values[*slot] = v;
             }
-            cache_store(slots, &ids, &keys, &exp_idx, &fresh, cache_budget, &mut cache_bytes, stats);
+            if use_cache {
+                let pairs: Vec<(usize, u128)> = exp_idx.iter().map(|&j| (ids[j], keys[j])).collect();
+                cache_touch(slots, &pairs, tick);
+            }
+            cache_store(slots, &ids, &keys, &exp_idx, &fresh, cache_budget, &mut cache_bytes, tick, stats);
         }
         let mut cands_for: Vec<Option<Vec<(crate::turn::TurnSpec, f32, bool)>>> =
             (0..real).map(|_| None).collect();
@@ -803,7 +819,11 @@ fn drive_pool_worker(
             for (slot, (_, c)) in wid_idx.iter().zip(r) {
                 cands_for[*slot] = Some(c);
             }
-            cache_store(slots, &ids, &keys, &wid_idx, &fresh, cache_budget, &mut cache_bytes, stats);
+            if use_cache {
+                let pairs: Vec<(usize, u128)> = wid_idx.iter().map(|&j| (ids[j], keys[j])).collect();
+                cache_touch(slots, &pairs, tick);
+            }
+            cache_store(slots, &ids, &keys, &wid_idx, &fresh, cache_budget, &mut cache_bytes, tick, stats);
         }
         for (n, (i, widen)) in ids.into_iter().zip(is_widen).enumerate() {
             if widen {
@@ -834,6 +854,10 @@ fn drive_pool_worker(
             stats.cache_hits += cached.iter().filter(|c| c.is_some()).count() as u64;
             let got = model.resample_batch_seq(&rs_states, &rs_from, *next_seed, &cached, &width_for)?;
             drop(cached);
+            if use_cache {
+                let pairs: Vec<(usize, u128)> = rs_ids.iter().copied().zip(rkeys.iter().copied()).collect();
+                cache_touch(slots, &pairs, tick);
+            }
             *next_seed = next_seed.wrapping_add(1);
             for (i, c) in rs_ids.into_iter().zip(got) {
                 slots[i].search.provide_resample(c);
@@ -887,13 +911,38 @@ const STORE_AB_FILE: &str = "store_ab";
 /// The same switch for the sampler's lean paths (`sampler::LEAN_USE`).
 const LEAN_AB_FILE: &str = "lean_ab";
 
+/// One trunk-cache entry: the trunk's value and `h` at a position, and the
+/// step-1 logits there once a widen has computed them.
+struct CacheEntry {
+    value: f32,
+    /// The worker's wave counter when last stored or hit; eviction takes the
+    /// oldest first.
+    tick: u32,
+    h: Box<[half::f16]>,
+    /// [`crate::sampler::CachedRow::step1`]'s live-cells layout, in a block
+    /// rounded up to [`STEP1_ROUND`] cells; `step1_len` is the part in use.
+    step1: Option<Box<[half::f16]>>,
+    step1_len: u32,
+}
+
+/// One slot in this many records the positions it has evaluated, so the
+/// report can say how many trunk rows were a position seen before.
+const SEEN_EVERY: usize = 64;
+
+fn sampled_seen(i: usize) -> Option<std::collections::HashSet<u128>> {
+    (i % SEEN_EVERY == 0).then(Default::default)
+}
+
 fn entry_bytes(h_len: usize) -> usize {
     h_len * std::mem::size_of::<half::f16>() + 64
 }
 
+fn cache_entry_bytes(e: &CacheEntry) -> usize {
+    entry_bytes(e.h.len()) + e.step1.as_ref().map_or(0, |l| entry_bytes(l.len()))
+}
+
 fn cache_size(slot: &Slot) -> usize {
-    slot.trunk_cache.values().map(|(_, h)| entry_bytes(h.len())).sum::<usize>()
-        + slot.step1_cache.values().map(|l| entry_bytes(l.len())).sum::<usize>()
+    slot.trunk_cache.values().map(cache_entry_bytes).sum()
 }
 
 /// Freed cache blocks, reused rather than handed back to the allocator.
@@ -903,53 +952,134 @@ fn cache_size(slot: &Slot) -> usize {
 /// arenas, which grew to 17.2 GB (276 x 64 MB heaps) around an 8 GB cache.
 /// Recycling caps the footprint at the peak live cache, which the budget bounds.
 static BLOCK_POOL: std::sync::Mutex<Vec<Box<[half::f16]>>> = std::sync::Mutex::new(Vec::new());
-/// The same for step-1 logit blocks, which are a different size.
-static STEP1_POOL: std::sync::Mutex<Vec<Box<[half::f16]>>> = std::sync::Mutex::new(Vec::new());
 
-type BlockPool = std::sync::Mutex<Vec<Box<[half::f16]>>>;
+/// Step-1 blocks, one pool per size class: a position's live-cell count
+/// varies, so blocks are rounded up to a multiple of `STEP1_ROUND` cells.
+const STEP1_ROUND: usize = 4;
+static STEP1_POOLS: std::sync::Mutex<Vec<Vec<Box<[half::f16]>>>> =
+    std::sync::Mutex::new(Vec::new());
 
 fn take_blocks(n: usize) -> Vec<Box<[half::f16]>> {
-    take_from(&BLOCK_POOL, n)
-}
-
-fn return_blocks(blocks: Vec<Box<[half::f16]>>) {
-    return_to(&BLOCK_POOL, blocks)
-}
-
-fn take_from(pool: &BlockPool, n: usize) -> Vec<Box<[half::f16]>> {
     if n == 0 {
         return Vec::new();
     }
-    let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pool = BLOCK_POOL.lock().unwrap_or_else(|e| e.into_inner());
     let keep = pool.len().saturating_sub(n);
     pool.split_off(keep)
 }
 
-fn return_to(pool: &BlockPool, mut blocks: Vec<Box<[half::f16]>>) {
+fn return_blocks(mut blocks: Vec<Box<[half::f16]>>) {
     if !blocks.is_empty() {
-        pool.lock().unwrap_or_else(|e| e.into_inner()).append(&mut blocks);
+        BLOCK_POOL.lock().unwrap_or_else(|e| e.into_inner()).append(&mut blocks);
     }
 }
 
-/// Empty a slot's trunk cache into the block pool, returning the bytes it held.
-fn cache_drop(slot: &mut Slot) -> usize {
-    let b = cache_size(slot);
-    if !slot.trunk_cache.is_empty() {
-        return_blocks(slot.trunk_cache.drain().map(|(_, (_, h))| h).collect());
+/// A step-1 block holding at least `len` logits.
+fn take_step1(len: usize) -> Box<[half::f16]> {
+    let per = STEP1_ROUND * crate::net::DECL_LOGITS;
+    let class = len.div_ceil(per).max(1);
+    let mut pools = STEP1_POOLS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(b) = pools.get_mut(class).and_then(|p| p.pop()) {
+        return b;
     }
-    if !slot.step1_cache.is_empty() {
-        return_to(&STEP1_POOL, slot.step1_cache.drain().map(|(_, l)| l).collect());
+    drop(pools);
+    vec![half::f16::ZERO; class * per].into_boxed_slice()
+}
+
+fn return_step1(blocks: impl IntoIterator<Item = Box<[half::f16]>>) {
+    let per = STEP1_ROUND * crate::net::DECL_LOGITS;
+    let mut pools = STEP1_POOLS.lock().unwrap_or_else(|e| e.into_inner());
+    for b in blocks {
+        let class = b.len() / per;
+        if pools.len() <= class {
+            pools.resize_with(class + 1, Vec::new);
+        }
+        pools[class].push(b);
+    }
+}
+
+/// Return an entry's blocks to their pools; its size in bytes.
+fn recycle(e: CacheEntry, h: &mut Vec<Box<[half::f16]>>, l: &mut Vec<Box<[half::f16]>>) -> usize {
+    let b = cache_entry_bytes(&e);
+    h.push(e.h);
+    l.extend(e.step1);
+    b
+}
+
+/// Empty a slot's trunk cache into the block pools, returning the bytes it held.
+fn cache_drop(slot: &mut Slot) -> usize {
+    let (mut h, mut l, mut b) = (Vec::new(), Vec::new(), 0);
+    for (_, e) in slot.trunk_cache.drain() {
+        b += recycle(e, &mut h, &mut l);
+    }
+    return_blocks(h);
+    return_step1(l);
+    if let Some(seen) = &mut slot.seen {
+        seen.clear();
     }
     b
 }
 
+/// Evict the least recently used eighth of this worker's cache, never an
+/// entry touched this wave (`now`); returns the bytes freed.
+fn cache_evict(slots: &mut [Slot], now: u32, stats: &mut PoolStats) -> usize {
+    let mut ticks: Vec<u32> = slots
+        .iter()
+        .flat_map(|s| s.trunk_cache.values().map(|e| e.tick))
+        .filter(|&t| t != now)
+        .collect();
+    if ticks.is_empty() {
+        return 0;
+    }
+    let k = (ticks.len() / 8).min(ticks.len() - 1);
+    let (_, &mut cut, _) = ticks.select_nth_unstable(k);
+    let (mut h, mut l, mut freed) = (Vec::new(), Vec::new(), 0);
+    for s in slots.iter_mut() {
+        let old: Vec<u128> = s
+            .trunk_cache
+            .iter()
+            .filter(|(_, e)| e.tick <= cut && e.tick != now)
+            .map(|(&k, _)| k)
+            .collect();
+        for key in old {
+            let e = s.trunk_cache.remove(&key).expect("just listed");
+            freed += recycle(e, &mut h, &mut l);
+            stats.cache_evicted += 1;
+        }
+    }
+    return_blocks(h);
+    return_step1(l);
+    freed
+}
+
+/// Make room for `b` more bytes, evicting if needed; whether it fits.
+fn cache_room(slots: &mut [Slot], b: usize, budget: usize, bytes: &mut usize, now: u32, stats: &mut PoolStats) -> bool {
+    while *bytes + b > budget {
+        let freed = cache_evict(slots, now, stats);
+        if freed == 0 {
+            return false;
+        }
+        *bytes = bytes.saturating_sub(freed);
+    }
+    true
+}
+
 /// A slot's cached row for `key`, as `run_wave` takes it.
 fn cache_row(slot: &Slot, key: u128) -> Option<crate::sampler::CachedRow<'_>> {
-    slot.trunk_cache.get(&key).map(|(v, h)| crate::sampler::CachedRow {
-        value: *v,
-        h: &h[..],
-        step1: slot.step1_cache.get(&key).map(|l| &l[..]),
+    slot.trunk_cache.get(&key).map(|e| crate::sampler::CachedRow {
+        value: e.value,
+        h: &e.h[..],
+        step1: e.step1.as_ref().map(|l| &l[..e.step1_len as usize]),
     })
+}
+
+/// Mark the entries this wave read as used now.
+fn cache_touch(slots: &mut [Slot], pairs: &[(usize, u128)], now: u32) {
+    for &(slot, key) in pairs {
+        if let Some(e) = slots[slot].trunk_cache.get_mut(&key) {
+            e.tick = now;
+        }
+    }
 }
 
 /// Cached trunk output for each request in `idx` (indices into `ids`/`keys`).
@@ -964,13 +1094,13 @@ fn cache_lookup<'a>(
         return Vec::new();
     }
     idx.iter()
-        .map(|&j| slots[ids[j]].trunk_cache.get(&keys[j]).map(|(v, h)| (*v, &h[..])))
+        .map(|&j| slots[ids[j]].trunk_cache.get(&keys[j]).map(|e| (e.value, &e.h[..])))
         .collect()
 }
 
-/// Keep the trunk output the sampler just computed, while the budget allows.
-/// Over budget the entry is simply not kept: a miss recomputes, so the budget
-/// bounds memory without ever changing a result.
+/// Keep the trunk output the sampler just computed, evicting the least
+/// recently used entries when the budget is full. A miss only recomputes, so
+/// the budget bounds memory without ever changing a result.
 #[allow(clippy::too_many_arguments)]
 fn cache_store(
     slots: &mut [Slot],
@@ -980,10 +1110,11 @@ fn cache_store(
     rows: &crate::sampler::TrunkRows,
     budget: usize,
     bytes: &mut usize,
+    now: u32,
     stats: &mut PoolStats,
 ) {
     let pairs: Vec<(usize, u128)> = idx.iter().map(|&j| (ids[j], keys[j])).collect();
-    cache_store_pairs(slots, &pairs, rows, budget, bytes, stats)
+    cache_store_pairs(slots, &pairs, rows, budget, bytes, now, stats)
 }
 
 /// `cache_store` for requests named directly by `(slot, key)`, `pairs[n]`
@@ -994,6 +1125,7 @@ fn cache_store_pairs(
     rows: &crate::sampler::TrunkRows,
     budget: usize,
     bytes: &mut usize,
+    now: u32,
     stats: &mut PoolStats,
 ) {
     let want = rows.fresh.iter().take(pairs.len()).filter(|f| f.is_some()).count();
@@ -1002,7 +1134,17 @@ fn cache_store_pairs(
     for (n, &(slot, key)) in pairs.iter().enumerate() {
         let Some(v) = rows.fresh.get(n).copied().flatten() else { continue };
         stats.cache_misses += 1;
-        if *bytes + b > budget {
+        if let Some(seen) = &mut slots[slot].seen {
+            if seen.insert(key) {
+                stats.seen_new += 1;
+            } else {
+                stats.seen_again += 1;
+            }
+        }
+        if slots[slot].trunk_cache.contains_key(&key) {
+            continue; // a duplicate request in this wave; the first is kept
+        }
+        if !cache_room(slots, b, budget, bytes, now, stats) {
             stats.cache_full += 1;
             continue;
         }
@@ -1011,48 +1153,50 @@ fn cache_store_pairs(
             _ => vec![half::f16::ZERO; rows.stride].into_boxed_slice(),
         };
         blk.copy_from_slice(rows.row(n));
-        match slots[slot].trunk_cache.insert(key, (v, blk)) {
-            Some((_, old)) => return_blocks(vec![old]),
-            None => *bytes += b,
-        }
+        let e = CacheEntry { value: v, tick: now, h: blk, step1: None, step1_len: 0 };
+        slots[slot].trunk_cache.insert(key, e);
+        *bytes += b;
     }
     return_blocks(blocks);
     stats.cache_peak_bytes = stats.cache_peak_bytes.max(*bytes as u64);
 }
 
-/// Keep the step-1 logits `run_wave` computed, beside the trunk entry for the
-/// same position (never without one: a trunk miss would recompute both), while
-/// the budget allows.
+/// Keep the step-1 logits `run_wave` computed, on the trunk entry for the
+/// same position (never without one: a trunk miss would recompute both),
+/// evicting as `cache_store_pairs` does.
 fn cache_store_step1(
     slots: &mut [Slot],
     pairs: &[(usize, u128)],
     step1: &[Option<Vec<half::f16>>],
     budget: usize,
     bytes: &mut usize,
+    now: u32,
     stats: &mut PoolStats,
 ) {
-    let want = step1.iter().filter(|l| l.is_some()).count();
-    let mut blocks = take_from(&STEP1_POOL, want);
     for (&(slot, key), l) in pairs.iter().zip(step1) {
         let Some(l) = l else { continue };
-        let s = &mut slots[slot];
-        if !s.trunk_cache.contains_key(&key) || s.step1_cache.contains_key(&key) {
-            continue;
+        match slots[slot].trunk_cache.get(&key) {
+            Some(e) if e.step1.is_none() => {}
+            _ => continue,
         }
-        let b = entry_bytes(l.len());
-        if *bytes + b > budget {
+        let blk = take_step1(l.len());
+        let b = entry_bytes(blk.len());
+        if !cache_room(slots, b, budget, bytes, now, stats) {
             stats.cache_full += 1;
+            return_step1([blk]);
             continue;
         }
-        let mut blk = match blocks.pop() {
-            Some(blk) if blk.len() == l.len() => blk,
-            _ => vec![half::f16::ZERO; l.len()].into_boxed_slice(),
+        // Eviction spares entries touched this wave, and this one was.
+        let Some(e) = slots[slot].trunk_cache.get_mut(&key) else {
+            return_step1([blk]);
+            continue;
         };
-        blk.copy_from_slice(l);
-        s.step1_cache.insert(key, blk);
+        let mut blk = blk;
+        blk[..l.len()].copy_from_slice(l);
+        e.step1 = Some(blk);
+        e.step1_len = l.len() as u32;
         *bytes += b;
     }
-    return_to(&STEP1_POOL, blocks);
     stats.cache_peak_bytes = stats.cache_peak_bytes.max(*bytes as u64);
 }
 
@@ -1108,6 +1252,13 @@ pub struct PoolStats {
     pub step1_hits: u64,
     pub cache_misses: u64,
     pub cache_full: u64,
+    /// Entries evicted to make room.
+    pub cache_evicted: u64,
+    /// Trunk rows on sampled slots (`SEEN_EVERY`): at a position this game
+    /// had never evaluated, and at one it had -- the recomputes a big enough
+    /// cache would have saved.
+    pub seen_new: u64,
+    pub seen_again: u64,
     /// Largest cache held, summed over workers.
     pub cache_peak_bytes: u64,
     pub turns: u64,
@@ -1140,6 +1291,9 @@ impl PoolStats {
         self.step1_hits += o.step1_hits;
         self.cache_misses += o.cache_misses;
         self.cache_full += o.cache_full;
+        self.cache_evicted += o.cache_evicted;
+        self.seen_new += o.seen_new;
+        self.seen_again += o.seen_again;
         self.cache_peak_bytes += o.cache_peak_bytes;
     }
 
@@ -1166,13 +1320,15 @@ impl PoolStats {
         let looked = self.cache_hits + self.cache_misses;
         if looked > 0 {
             s += &format!(
-                "  |  trunk cache {:.1}% hit ({} of {}, {} with step 1), {} not kept, peak {:.0} MB",
+                "  |  trunk cache {:.1}% hit ({} of {}, {} with step 1), {} not kept, {} evicted, peak {:.0} MB, recomputed {:.1}% of sampled trunk rows",
                 100.0 * self.cache_hits as f64 / looked as f64,
                 self.cache_hits,
                 looked,
                 self.step1_hits,
                 self.cache_full,
-                self.cache_peak_bytes as f64 / (1u64 << 20) as f64
+                self.cache_evicted,
+                self.cache_peak_bytes as f64 / (1u64 << 20) as f64,
+                100.0 * self.seen_again as f64 / (self.seen_new + self.seen_again).max(1) as f64
             );
         }
         if self.root_children > 0 {
@@ -1302,7 +1458,7 @@ pub fn new_pool(model: &MinionsModel, cfg: &ActorConfig, n: usize, seed: u64) ->
                 rng,
                 alive: true,
                 trunk_cache: Default::default(),
-                step1_cache: Default::default(),
+                seen: sampled_seen(i),
             }
         })
         .collect()
