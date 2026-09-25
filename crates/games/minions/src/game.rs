@@ -277,6 +277,61 @@ impl MinionsState {
     ///
     /// Cheap: the rotation is index reversal, so this is a reverse plus a colour
     /// flip. Self-inverse, which `canonical_round_trips` checks.
+    /// [`Game::encode_state`]'s bytes, into a buffer padded to whole words
+    /// (the padding stays zero).
+    pub fn encode_into(&self, out: &mut [u8; STATE_WORDS * 8]) {
+        let mut at = 0;
+        let mut put = |b: &[u8]| {
+            out[at..at + b.len()].copy_from_slice(b);
+            at += b.len();
+        };
+        put(&self.cells);
+        put(&self.pstate);
+        for m in self.money {
+            put(&m.to_le_bytes());
+        }
+        for side in self.reinforcements {
+            put(&side);
+        }
+        // Adjudication history travels with the state: priming it from the
+        // position instead would fabricate a past the game did not have, and a
+        // state near the cap would decode to the wrong result.
+        for v in self.nw_hist {
+            put(&v.to_le_bytes());
+        }
+        put(&[self.side, self.phase]);
+        put(&self.turn.to_le_bytes());
+        put(&self.ply.to_le_bytes());
+        put(&[self.winner]);
+        debug_assert_eq!(at, STATE_BYTES);
+    }
+
+    /// A 128-bit hash of the encoded state: two independent multiply-mix lanes
+    /// over its words, each finished with murmur3's `fmix64`. Distinct turns
+    /// routinely converge on one position, and the search merges them by this
+    /// key, so it must be collision-free in practice; 128 bits keeps
+    /// accidental merges far below the noise floor. No allocation, and 17
+    /// word steps where a byte-wise FNV took 133 dependent 128-bit multiplies.
+    pub fn key(&self) -> u128 {
+        let mut buf = [0u8; STATE_WORDS * 8];
+        self.encode_into(&mut buf);
+        let fmix = |mut k: u64| {
+            k ^= k >> 33;
+            k = k.wrapping_mul(0xff51afd7ed558ccd);
+            k ^= k >> 33;
+            k = k.wrapping_mul(0xc4ceb9fe1a85ec53);
+            k ^ (k >> 33)
+        };
+        let (mut a, mut b) = (0x9e3779b97f4a7c15u64, 0x6a09e667f3bcc909u64);
+        for w in buf.chunks_exact(8) {
+            let w = u64::from_le_bytes(w.try_into().unwrap());
+            a = (a ^ w).wrapping_mul(0x87c37b91114253d5).rotate_left(31);
+            b = (b ^ w.rotate_left(29)).wrapping_mul(0x4cf5ad432745937f).rotate_left(27);
+        }
+        let (a, b) = (fmix(a ^ b.rotate_left(17)), fmix(b ^ STATE_BYTES as u64));
+        ((a as u128) << 64) | b as u128
+    }
+
     pub fn canonical(&self) -> Self {
         if self.side == 0 { self.clone() } else { self.rotated() }
     }
@@ -823,28 +878,9 @@ impl Game for Minions {
     }
 
     fn encode_state(state: &Self::State) -> Vec<u8> {
-        let mut out = Vec::with_capacity(STATE_BYTES);
-        out.extend_from_slice(&state.cells);
-        out.extend_from_slice(&state.pstate);
-        for m in state.money {
-            out.extend_from_slice(&m.to_le_bytes());
-        }
-        for side in state.reinforcements {
-            out.extend_from_slice(&side);
-        }
-        // Adjudication history travels with the state: priming it from the
-        // position instead would fabricate a past the game did not have, and a
-        // state near the cap would decode to the wrong result.
-        for v in state.nw_hist {
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        out.push(state.side);
-        out.push(state.phase);
-        out.extend_from_slice(&state.turn.to_le_bytes());
-        out.extend_from_slice(&state.ply.to_le_bytes());
-        out.push(state.winner);
-        debug_assert_eq!(out.len(), STATE_BYTES);
-        out
+        let mut buf = [0u8; STATE_WORDS * 8];
+        state.encode_into(&mut buf);
+        buf[..STATE_BYTES].to_vec()
     }
 
     fn decode_state(bytes: &[u8]) -> anyhow::Result<Self::State> {
@@ -927,7 +963,10 @@ pub const STATE_BYTES: usize = NUM_CELLS   // cells
     + 4                                    // money
     + 2 * BUYABLE.len()                    // reinforcements
     + 2 * ADJ_WINDOW                       // nw_hist
-    + 1 + 1 + 2 + 4 + 1; // side, phase, turn, ply, winner
+    + 1 + 1 + 2 + 4 + 1;
+
+/// [`STATE_BYTES`] in whole 8-byte words, for [`MinionsState::key`].
+pub const STATE_WORDS: usize = STATE_BYTES.div_ceil(8); // side, phase, turn, ply, winner
 
 impl Solver for Minions {
     fn choose_move(state: &Self::State) -> SearchOutcome<Self::Move> {
@@ -1480,6 +1519,37 @@ mod move_targets_bench {
         }
         out.sort_unstable();
         out
+    }
+
+    /// `key` follows the encoding: equal states agree, a change to any one
+    /// byte of the encoding changes it, and random positions never collide.
+    #[test]
+    fn key_separates_every_byte_and_does_not_collide() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(9);
+        let mut keys: std::collections::HashMap<u128, Vec<u8>> = Default::default();
+        let mut st = Minions::initial_state();
+        for step in 0..3000 {
+            if Minions::outcome(&st).is_terminal() {
+                st = Minions::initial_state();
+            }
+            let enc = Minions::encode_state(&st);
+            assert_eq!(st.key(), st.clone().key());
+            if let Some(prev) = keys.insert(st.key(), enc.clone()) {
+                assert_eq!(prev, enc, "two encodings share a key");
+            }
+            if step % 50 == 0 {
+                for i in 0..enc.len() {
+                    let mut e = enc.clone();
+                    e[i] ^= 1 << (step / 50 % 8);
+                    if let Ok(t) = Minions::decode_state(&e) {
+                        assert_ne!(t.key(), st.key(), "byte {i} did not change the key");
+                    }
+                }
+            }
+            let mvs = Minions::legal_moves(&st);
+            st = Minions::apply(&st, &mvs[rng.gen_range(0..mvs.len())]);
+        }
     }
 
     /// The pre-bitboard `spawn_cells`, walking the neighbour table.

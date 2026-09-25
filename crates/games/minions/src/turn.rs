@@ -1421,15 +1421,7 @@ impl playground_core::SampledGame for MinionsTurns {
     }
 
     fn state_key(state: &MinionsState) -> u128 {
-        // FNV-1a over the encoded state. Distinct turns routinely converge on
-        // one position, and the search merges them by this key; 128 bits keeps
-        // accidental merges far below the noise floor.
-        let mut h: u128 = 0x6c62272e07bb0142_62b821756295c58d;
-        for b in Minions::encode_state(state) {
-            h ^= b as u128;
-            h = h.wrapping_mul(0x0000000001000000_000000000000013B);
-        }
-        h
+        state.key()
     }
 
     /// The KR-PUCT kernel's metric over whole-turn declarations — see
@@ -1444,6 +1436,52 @@ mod turn_game_tests {
     use super::*;
     use playground_core::{SampledGame, SampledModel, SampledParams};
     use rand::SeedableRng;
+
+    /// How often realizing in the canonical frame (as the sampler does) and
+    /// rotating back disagrees with the search's real-frame `apply` of the
+    /// rotated realized spec. Measured 2026-09-25: side 0 never, side 1 in
+    /// 140 of 6512 random-playout candidates (2.1%) -- `realize` resolves units
+    /// in cell order, so the rotation changes who moves first. A diagnostic,
+    /// not an invariant, until `realize` is made frame-independent.
+    #[test]
+    #[ignore = "diagnostic; run with --ignored --nocapture"]
+    fn realize_rotation_mismatch_rate() {
+        use playground_core::SampledGame;
+        use rand::SeedableRng;
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(21);
+        let mut checked = 0;
+        let mut tally = [(0usize, 0usize, 0usize); 2];
+        for _ in 0..60 {
+            let mut st = crate::game::Minions::initial_state();
+            for _ in 0..40 {
+                if crate::game::Minions::outcome(&st).is_terminal() {
+                    break;
+                }
+                let canon = st.canonical();
+                for _ in 0..8 {
+                    let spec_c = TurnSpec::random_playout(&canon, &mut rng);
+                    let r = realize(&canon, &spec_c);
+                    let (back, spec) = if st.side == 1 {
+                        (r.next.rotated(), r.spec.rotated())
+                    } else {
+                        (r.next, r.spec)
+                    };
+                    let real = realize(&st, &spec).next;
+                    let same = MinionsTurns::state_key(&back) == MinionsTurns::state_key(&real);
+                    let refix = MinionsTurns::state_key(&realize(&canon, &r.spec).next)
+                        == MinionsTurns::state_key(&realize(&canon, &spec_c).next);
+                    tally[st.side as usize].0 += 1;
+                    tally[st.side as usize].1 += (!same) as usize;
+                    tally[st.side as usize].2 += (!refix) as usize;
+                    checked += 1;
+                }
+                let spec = TurnSpec::random_playout(&st, &mut rng);
+                st = realize(&st, &spec).next;
+            }
+        }
+        eprintln!("(n, rotated-back mismatch, realized-spec not a fixed point) by side: {tally:?}");
+        assert!(checked > 2000, "only {checked}");
+    }
 
     /// Proposes plausible random declarations — the stand-in for the diffusion
     /// sampler, and enough to exercise the search end to end.
@@ -1463,6 +1501,48 @@ mod turn_game_tests {
                 .collect();
             Ok((0.0, cands))
         }
+    }
+
+    /// CPU cost of a whole search, with the random sampler standing in for
+    /// the nets: selection, backup, dedupe and realize, and no GPU. Large
+    /// candidate sets like production roots (~160-300 children).
+    #[test]
+    #[ignore = "timing measurement; run with --ignored --nocapture"]
+    fn search_cpu_cost() {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(3);
+        let mut positions = Vec::new();
+        let mut s = Minions::initial_state();
+        for _ in 0..16 {
+            if Minions::outcome(&s).is_terminal() {
+                break;
+            }
+            positions.push(s.clone());
+            s = realize(&s, &TurnSpec::random_playout(&s, &mut rng)).next;
+        }
+        let params = SampledParams {
+            simulations: 800,
+            k_candidates: 96,
+            seed: 7,
+            ..Default::default()
+        };
+        let run = || {
+            let model = RandomSampler(std::sync::Mutex::new(
+                rand_chacha::ChaCha8Rng::seed_from_u64(5),
+            ));
+            let t0 = std::time::Instant::now();
+            for (i, p) in positions.iter().enumerate() {
+                let r = playground_core::sampled_mcts::search::<MinionsTurns, _>(
+                    &model, p.clone(), &params, i as u32,
+                )
+                .unwrap();
+                std::hint::black_box(r.chosen);
+            }
+            t0.elapsed().as_secs_f64() * 1e3 / positions.len() as f64
+        };
+        run();
+        let mut t: Vec<f64> = (0..5).map(|_| run()).collect();
+        t.sort_by(f64::total_cmp);
+        println!("search_cpu_cost: median {:.2} ms/search over {} positions", t[2], positions.len());
     }
 
     #[test]

@@ -1009,11 +1009,11 @@ impl MinionsModel {
     ) -> Vec<(TurnSpec, bool)> {
         // Distinct declarations routinely converge on one board; unmerged they
         // would fragment the visit counts they are supposed to concentrate.
-        let mut seen: std::collections::HashMap<Vec<u8>, usize> = Default::default();
+        let mut seen: std::collections::HashMap<u128, usize> = Default::default();
         let mut specs: Vec<(TurnSpec, bool)> = Vec::with_capacity(declared.len());
         for (spec, explore) in declared {
             let r = realize(state, &spec);
-            let key = Minions::encode_state(&r.next);
+            let key = r.next.key();
             match seen.get(&key) {
                 Some(&i) => specs[i].1 |= explore,
                 None => {
