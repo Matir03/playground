@@ -318,6 +318,11 @@ impl Pinned {
     }
 }
 
+/// Whether calls may use every session in a graph's pool, or only the first.
+/// Self-play flips it per window for an in-process A/B (`pool_ab` in the live
+/// dir); the pool itself is sized at load by `MINIONS_ORT_POOL`.
+pub static POOL_USE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 /// Whether head and trunk calls take the [`Pinned`] path. Self-play flips it per
 /// window for an in-process A/B (`pinned_ab` in the live dir).
 pub static PINNED_USE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -588,6 +593,11 @@ impl OrtNet {
     /// Take the first free session in the pool, else block on a rotating slot.
     /// `try_lock` first means an idle session is always preferred over waiting.
     fn acquire<'a>(&self, pool: &'a [Mutex<Session>]) -> std::sync::MutexGuard<'a, Session> {
+        let pool = if POOL_USE.load(std::sync::atomic::Ordering::Relaxed) {
+            pool
+        } else {
+            &pool[..1]
+        };
         let start = self.rr.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         for i in 0..pool.len() {
             if let Ok(g) = pool[(start + i) % pool.len()].try_lock() {

@@ -801,6 +801,10 @@ const GRAPH_F16_AB_FILE: &str = "graph_f16_ab";
 /// the other in-process A/Bs.
 const PINNED_AB_FILE: &str = "pinned_ab";
 
+/// The same switch between every session of the ORT pool and the first one
+/// only (`ort_net::POOL_USE`). Needs `MINIONS_ORT_POOL` > 1 to compare anything.
+const POOL_AB_FILE: &str = "pool_ab";
+
 fn entry_bytes(h_len: usize) -> usize {
     h_len * std::mem::size_of::<half::f16>() + 64
 }
@@ -1562,6 +1566,9 @@ pub fn run_loop(
         let pin_ab = live.join(PINNED_AB_FILE).exists();
         let pin_on = !pin_ab || matches!(window % 4, 1 | 2);
         crate::ort_net::PINNED_USE.store(pin_on, std::sync::atomic::Ordering::Relaxed);
+        let pool_ab = live.join(POOL_AB_FILE).exists();
+        let pool_on = !pool_ab || matches!(window % 4, 1 | 2);
+        crate::ort_net::POOL_USE.store(pool_on, std::sync::atomic::Ordering::Relaxed);
         let deadline = Instant::now() + Duration::from_secs(chunk_secs);
         let mut stats = PoolStats::default();
         let t0 = Instant::now();
@@ -1581,7 +1588,7 @@ pub fn run_loop(
         // Raw counts, so a benchmark can measure fixed work rather than a rate:
         // throughput swings ~4x over a generation as the pool moves in step.
         println!(
-            "  window: {} expansions in {:.3}s  cache {}{}  f16 {}{}  pinned {}{}",
+            "  window: {} expansions in {:.3}s  cache {}{}  f16 {}{}  pinned {}{}  pool {}{}",
             stats.expansions,
             t0.elapsed().as_secs_f64(),
             if cache_on { "on" } else { "off" },
@@ -1589,7 +1596,9 @@ pub fn run_loop(
             if f16_on { "on" } else { "off" },
             if f16_ab { " (ab)" } else { "" },
             if pin_on { "on" } else { "off" },
-            if pin_ab { " (ab)" } else { "" }
+            if pin_ab { " (ab)" } else { "" },
+            if pool_on { "on" } else { "off" },
+            if pool_ab { " (ab)" } else { "" }
         );
         if !examples.is_empty() {
             let path = write_chunk(&buffer, chunk_index, &examples)?;
