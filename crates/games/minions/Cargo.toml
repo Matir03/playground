@@ -31,6 +31,8 @@ rand_chacha.workspace = true
 rand_distr.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The CUDA runtime ORT already loaded, for uploads into the device h store.
+libloading = "0.8"
 
 # In-process NN inference, as for hex/amazons: the gRPC model server is ~40x
 # slower than an embedded net, so nothing on a training path goes through it.

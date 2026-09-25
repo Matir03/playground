@@ -20,6 +20,7 @@ use ort::execution_providers::{TensorRT, CUDA};
 use ort::session::Session;
 use ort::value::TensorRef;
 
+use crate::combine::{Axis, Combiner, HStore, RunFn};
 use crate::game::PLANES as IN_PLANES;
 use crate::map::{N, NUM_CELLS};
 use crate::net::{Backend, DiffusionPass, NaivePass, TrunkOut, DECL_LOGITS};
@@ -179,6 +180,19 @@ pub mod call_stats {
         s.hist[b].fetch_add(1, Relaxed);
     }
 
+    /// Combined calls (`Combiner`) per graph: count, rows, GPU-call time.
+    static BATCHES: [[AtomicU64; 3]; 3] = [
+        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+    ];
+
+    pub fn record_batch(g: usize, rows: usize, ns: u64) {
+        BATCHES[g][0].fetch_add(1, Relaxed);
+        BATCHES[g][1].fetch_add(rows as u64, Relaxed);
+        BATCHES[g][2].fetch_add(ns, Relaxed);
+    }
+
     static UPLOADS: AtomicU64 = AtomicU64::new(0);
     static UPLOAD_NS: AtomicU64 = AtomicU64::new(0);
 
@@ -218,6 +232,20 @@ pub mod call_stats {
                 per(post),
                 hist
             ));
+        }
+        for (g, name) in NAMES.iter().enumerate() {
+            let n = BATCHES[g][0].swap(0, Relaxed);
+            let rows = BATCHES[g][1].swap(0, Relaxed);
+            let ns = BATCHES[g][2].swap(0, Relaxed);
+            if n > 0 {
+                parts.push(format!(
+                    "{name} combined {:.0}/s x {:.0} rows, {:.0} us each ({:.0}% busy)",
+                    n as f64 / secs,
+                    rows as f64 / n as f64,
+                    ns as f64 / 1e3 / n as f64,
+                    ns as f64 / 1e7 / secs
+                ));
+            }
         }
         let ups = UPLOADS.swap(0, Relaxed);
         let up_ns = UPLOAD_NS.swap(0, Relaxed);
@@ -271,6 +299,89 @@ pub struct OrtNet {
     pinned: Mutex<std::collections::HashMap<(usize, usize), Vec<Pinned>>>,
     /// `CUDA_PINNED` allocators for inputs and outputs, made on first use.
     pin_alloc: Mutex<Option<(ort::memory::Allocator, ort::memory::Allocator)>>,
+    /// Cross-worker batching per graph (`call_stats` index), made on first use.
+    /// Cross-worker batching per graph, by `COMB_*` slot, made on first use.
+    combiners: [std::sync::OnceLock<Combiner>; 5],
+    combine_init: Mutex<()>,
+    /// The store-indexed head graphs (`diffusion_g.onnx`, `energy_g.onnx`),
+    /// when the export wrote them; see [`HStore`].
+    diffusion_g: Option<Vec<Mutex<Session>>>,
+    energy_g: Option<Vec<Mutex<Session>>>,
+    store: std::sync::OnceLock<HStore>,
+}
+
+fn store_on() -> bool {
+    STORE_USE.load(std::sync::atomic::Ordering::Relaxed) || FORCE_COMBINE.with(|f| f.get())
+}
+
+/// Combiner slots: one per graph a combined call can run.
+const COMB_TRUNK: usize = call_stats::TRUNK;
+const COMB_DIFFUSION_G: usize = 3;
+const COMB_ENERGY_G: usize = 4;
+
+/// Whether waves may use the device `h` store and the store-indexed graphs.
+/// Self-play flips it per window for an in-process A/B (`store_ab` in the live
+/// dir). Opt-in with `MINIONS_ORT_STORE=1`: once head calls were combined,
+/// the bytes it saves stopped mattering (production A/B 2026-09-25, -0.5%).
+pub static STORE_USE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether head calls are batched across workers ([`Combiner`]). Self-play
+/// flips it per window for an in-process A/B (`combine_ab` in the live dir);
+/// `MINIONS_ORT_COMBINE=0` turns it off.
+pub static COMBINE_USE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+thread_local! {
+    /// Set by `OrtNet::warm` to create the combiners whatever `COMBINE_USE`
+    /// says this window.
+    static FORCE_COMBINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn combine_on() -> bool {
+    env_flag("MINIONS_ORT_COMBINE", true)
+        && (COMBINE_USE.load(std::sync::atomic::Ordering::Relaxed)
+            || FORCE_COMBINE.with(|f| f.get()))
+}
+
+/// Rows one combined call may hold (`MINIONS_ORT_COMBINE_ROWS`, default 2048).
+fn combine_cap() -> usize {
+    std::env::var("MINIONS_ORT_COMBINE_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n: &usize| n >= 16)
+        .unwrap_or(2048)
+}
+
+/// A head call's `h`: one contiguous block, or rows gathered from a per-position
+/// block (`Backend::diffusion_rows`) -- copied straight into the pinned input,
+/// so the gathered copy is never built on its own.
+#[derive(Clone, Copy)]
+pub(crate) enum HSrc<'a> {
+    Contig(&'a [f16]),
+    /// `(h, rows, stride)`: row `i` of the call is row `rows[i]` of `h`.
+    Rows(&'a [f16], &'a [u32], usize),
+}
+
+impl HSrc<'_> {
+    fn fill(&self, out: &mut [f16]) {
+        match *self {
+            HSrc::Contig(h) => out.copy_from_slice(h),
+            HSrc::Rows(h, rows, stride) => {
+                for (o, &r) in out.chunks_exact_mut(stride).zip(rows) {
+                    let r = r as usize;
+                    o.copy_from_slice(&h[r * stride..(r + 1) * stride]);
+                }
+            }
+        }
+    }
+
+    fn contiguous(&self) -> std::borrow::Cow<'_, [f16]> {
+        match *self {
+            HSrc::Contig(h) => std::borrow::Cow::Borrowed(h),
+            HSrc::Rows(h, rows, stride) => {
+                std::borrow::Cow::Owned(crate::net::gather_rows(h, rows, stride))
+            }
+        }
+    }
 }
 
 /// One head call's inputs and output in page-locked host memory, reused.
@@ -360,6 +471,12 @@ impl Drop for OrtNet {
         std::mem::forget(self.dev_alloc.lock().unwrap().take());
         std::mem::forget(std::mem::take(&mut *self.pinned.lock().unwrap()));
         std::mem::forget(self.pin_alloc.lock().unwrap().take());
+        for c in std::mem::take(&mut self.combiners) {
+            std::mem::forget(c);
+        }
+        std::mem::forget(self.diffusion_g.take());
+        std::mem::forget(self.energy_g.take());
+        std::mem::forget(std::mem::take(&mut self.store));
     }
 }
 
@@ -545,6 +662,17 @@ impl OrtNet {
             .as_deref()
             .map_or(absent, |p| io(p, "h", "logits"));
         let best_io = best.as_deref().map_or(absent, |p| io(p, "h", "logits"));
+        let (dg_path, eg_path) = (dir.join("diffusion_g.onnx"), dir.join("energy_g.onnx"));
+        let (diffusion_g, energy_g) = if env_flag("MINIONS_ORT_STORE", false)
+            && diffusion_io.in16
+            && diffusion_io.out16
+            && dg_path.exists()
+            && eg_path.exists()
+        {
+            (Some(pool(dg_path)?), Some(pool(eg_path)?))
+        } else {
+            (None, None)
+        };
         let alt = dir.join("fp32");
         let fp32_alt = if alt.join("trunk.onnx").exists() {
             eprintln!("loaded the fp32 graph set in {} (A/B arm)", alt.display());
@@ -570,6 +698,11 @@ impl OrtNet {
             dev_alloc: Mutex::new(None),
             pinned: Mutex::new(Default::default()),
             pin_alloc: Mutex::new(None),
+            combiners: Default::default(),
+            combine_init: Mutex::new(()),
+            diffusion_g,
+            energy_g,
+            store: Default::default(),
         })
     }
 
@@ -616,7 +749,7 @@ impl OrtNet {
         &self,
         which: &Option<Vec<Mutex<Session>>>,
         io: Edges,
-        h: &[f16],
+        h: HSrc<'_>,
         decl: &[f32],
         b: usize,
         output: &str,
@@ -629,6 +762,55 @@ impl OrtNet {
         let dshape = vec![b as i64, decl_planes as i64, N as i64, N as i64];
         let ns = |a: Instant, b: Instant| (b - a).as_nanos() as u64;
         let pool = which.as_ref().expect("session outlives run");
+        if io.in16 && io.out16 && pinned_on() && combine_on() && b <= combine_cap() {
+            let run = |ins: Vec<ort::value::DynValue>,
+                       mut outs: Vec<ort::value::DynValue>,
+                       rows: usize,
+                       _: usize|
+             -> anyhow::Result<()> {
+                use ort::session::{OutputSelector, RunOptions};
+                let tr = Instant::now();
+                let opts = RunOptions::new().map_err(e2a)?.with_outputs(
+                    OutputSelector::no_default()
+                        .with(output)
+                        .preallocate(output, outs.remove(0)),
+                );
+                let mut sess = self.acquire(pool);
+                drop(
+                    sess.run_with_options(ort::inputs!["h" => &ins[0], "decl" => &ins[1]], &opts)
+                        .map_err(e2a)?,
+                );
+                drop(sess);
+                call_stats::record_batch(graph, rows, tr.elapsed().as_nanos() as u64);
+                Ok(())
+            };
+            let comb = self.combiner(
+                graph,
+                pool,
+                &[("h", Axis::Rows), ("decl", Axis::Rows)],
+                &[(output, Axis::Rows)],
+                0,
+                &run,
+            )?;
+            let t0 = Instant::now();
+            let mut out = Vec::new();
+            comb.submit(
+                b,
+                0,
+                &mut |_, _, sl| {
+                    h.fill(sl[0].f16());
+                    sl[1].f16().convert_from_f32_slice(decl);
+                    Ok(())
+                },
+                &mut |o| {
+                    out = o[0].f16().to_f32_vec();
+                    Ok(())
+                },
+                &run,
+            )?;
+            call_stats::record(graph, b, 0, 0, ns(t0, Instant::now()), 0);
+            return Ok(out);
+        }
         if io.in16 && io.out16 && pinned_on() {
             let tp = Instant::now();
             let mut pin = self.take_pinned(
@@ -638,11 +820,7 @@ impl OrtNet {
                 &[("h", hshape), ("decl", dshape)],
                 &[(output, true)],
             )?;
-            pin.ins[0]
-                .try_extract_tensor_mut::<f16>()
-                .map_err(e2a)?
-                .1
-                .copy_from_slice(h);
+            h.fill(pin.ins[0].try_extract_tensor_mut::<f16>().map_err(e2a)?.1);
             pin.ins[1]
                 .try_extract_tensor_mut::<f16>()
                 .map_err(e2a)?
@@ -677,6 +855,8 @@ impl OrtNet {
             );
             return Ok(out);
         }
+        let hv = h.contiguous();
+        let h: &[f16] = &hv;
         let t0 = Instant::now();
         let mut sess = self.acquire(pool);
         let t1 = Instant::now();
@@ -723,6 +903,60 @@ impl OrtNet {
             );
             Ok(out)
         }
+    }
+
+    /// The combiner in slot `slot` (see `COMB_*`), made and warmed on first
+    /// use: under the init lock, so exactly one worker pays for the engine's
+    /// range rebuild.
+    fn combiner(
+        &self,
+        slot: usize,
+        pool: &[Mutex<Session>],
+        ins: &[(&str, Axis)],
+        outs: &[(&str, Axis)],
+        cap_cells: usize,
+        run: &RunFn<'_>,
+    ) -> anyhow::Result<&Combiner> {
+        if let Some(c) = self.combiners[slot].get() {
+            return Ok(c);
+        }
+        let _g = self.combine_init.lock().unwrap();
+        if let Some(c) = self.combiners[slot].get() {
+            return Ok(c);
+        }
+        let made = {
+            let sess = self.acquire(pool);
+            Combiner::new(&sess, ins, outs, combine_cap(), cap_cells)?
+        };
+        made.warm(run)?;
+        let _ = self.combiners[slot].set(made);
+        Ok(self.combiners[slot].get().expect("just set"))
+    }
+
+    /// The device `h` store, made on first use.
+    fn store(&self) -> anyhow::Result<&HStore> {
+        if let Some(s) = self.store.get() {
+            return Ok(s);
+        }
+        let _g = self.combine_init.lock().unwrap();
+        if let Some(s) = self.store.get() {
+            return Ok(s);
+        }
+        let rows: usize = std::env::var("MINIONS_ORT_STORE_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8192);
+        let pool = self
+            .diffusion_g
+            .as_ref()
+            .expect("store needs the store graphs");
+        let made = HStore::new(
+            &pool[0].lock().unwrap(),
+            crate::net::head_width(self.channels),
+            rows,
+        )?;
+        let _ = self.store.set(made);
+        Ok(self.store.get().expect("just set"))
     }
 
     /// A [`Pinned`] set for `graph` at `b` rows, from the pool or made now.
@@ -835,6 +1069,31 @@ impl Backend for OrtNet {
         self.end_profiling_all()
     }
 
+    /// One tiny call through each head's combiner, which creates it and runs
+    /// its range-widening batch now rather than in the first measured window.
+    fn warm(&self) -> anyhow::Result<()> {
+        if !(env_flag("MINIONS_ORT_COMBINE", true) && env_flag("MINIONS_ORT_PINNED", true)) {
+            return Ok(());
+        }
+        FORCE_COMBINE.with(|f| f.set(true));
+        let res = (|| -> anyhow::Result<()> {
+            let b = 16usize;
+            let h = vec![f16::ZERO; b * self.channels() * NUM_CELLS];
+            self.trunk(&vec![0.0; b * IN_PLANES * NUM_CELLS], b)?;
+            if self.diffusion.is_some() {
+                self.diffusion(&h, &vec![0.0; b * DECL_PLANES * NUM_CELLS], b)?;
+            }
+            self.energy(&h, &vec![0.0; b * ENERGY_PLANES * NUM_CELLS], b)?;
+            if let Some(lease) = self.h_lease(&h)? {
+                self.diffusion_store(&lease.rows, &vec![0.0; b * DECL_PLANES * NUM_CELLS], &[0])?;
+                self.energy_store(&lease.rows, &vec![0.0; b * ENERGY_PLANES * NUM_CELLS])?;
+            }
+            Ok(())
+        })();
+        FORCE_COMBINE.with(|f| f.set(false));
+        res
+    }
+
     fn channels(&self) -> usize {
         // Head-conditioning width — `trunk.onnx` emits `head_features(h)`.
         crate::net::head_width(self.channels)
@@ -846,7 +1105,64 @@ impl Backend for OrtNet {
         let pool = net.trunk.as_ref().expect("session outlives forward");
         let ns = |a: std::time::Instant, b: std::time::Instant| (b - a).as_nanos() as u64;
         // Features are small integers, exact in fp16.
-        let (h, value) = if net.trunk_io.in16 && net.trunk_io.out16 && pinned_on() {
+        let (h, value) = if net.trunk_io.in16
+            && net.trunk_io.out16
+            && pinned_on()
+            && combine_on()
+            && b <= combine_cap()
+        {
+            use std::time::Instant;
+            let run = |ins: Vec<ort::value::DynValue>,
+                       mut outs: Vec<ort::value::DynValue>,
+                       rows: usize,
+                       _: usize|
+             -> anyhow::Result<()> {
+                use ort::session::{OutputSelector, RunOptions};
+                let tr = Instant::now();
+                let value = outs.remove(1);
+                let h = outs.remove(0);
+                let opts = RunOptions::new().map_err(e2a)?.with_outputs(
+                    OutputSelector::no_default()
+                        .with("h")
+                        .with("value")
+                        .preallocate("h", h)
+                        .preallocate("value", value),
+                );
+                let mut sess = net.acquire(pool);
+                drop(
+                    sess.run_with_options(ort::inputs!["planes" => &ins[0]], &opts)
+                        .map_err(e2a)?,
+                );
+                drop(sess);
+                call_stats::record_batch(call_stats::TRUNK, rows, tr.elapsed().as_nanos() as u64);
+                Ok(())
+            };
+            let comb = net.combiner(
+                COMB_TRUNK,
+                pool,
+                &[("planes", Axis::Rows)],
+                &[("h", Axis::Rows), ("value", Axis::Rows)],
+                0,
+                &run,
+            )?;
+            let t0 = Instant::now();
+            let mut got = (Vec::new(), Vec::new());
+            comb.submit(
+                b,
+                0,
+                &mut |_, _, sl| {
+                    sl[0].f16().convert_from_f32_slice(planes);
+                    Ok(())
+                },
+                &mut |o| {
+                    got = (o[0].f16().to_vec(), o[1].f32().to_vec());
+                    Ok(())
+                },
+                &run,
+            )?;
+            call_stats::record(call_stats::TRUNK, b, 0, 0, ns(t0, Instant::now()), 0);
+            got
+        } else if net.trunk_io.in16 && net.trunk_io.out16 && pinned_on() {
             use std::time::Instant;
             let tp = Instant::now();
             let mut pin = net.take_pinned(
@@ -952,7 +1268,7 @@ impl Backend for OrtNet {
         let out = net.run_head(
             &net.diffusion,
             net.diffusion_io,
-            h,
+            HSrc::Contig(h),
             decl,
             b,
             "logits",
@@ -963,12 +1279,215 @@ impl Backend for OrtNet {
         Ok(out)
     }
 
+    fn h_lease<'a>(&'a self, h: &[f16]) -> anyhow::Result<Option<crate::net::StoreLease<'a>>> {
+        // The store belongs to the primary graph set; an A/B window on the
+        // fp32 arm takes the per-call path.
+        if !store_on() || self.diffusion_g.is_none() || !std::ptr::eq(self.active(), self) {
+            return Ok(None);
+        }
+        let store = self.store()?;
+        let n = h.len() / (crate::net::head_width(self.channels) * NUM_CELLS);
+        Ok(store.lease(h)?.map(|l| crate::net::StoreLease {
+            rows: (0..n).map(|i| l.row(i)).collect(),
+            hold: Box::new(l),
+        }))
+    }
+
+    fn diffusion_store(
+        &self,
+        rows: &[u32],
+        decl: &[f32],
+        cells: &[u32],
+    ) -> anyhow::Result<Vec<f32>> {
+        use std::time::Instant;
+        let pool = self
+            .diffusion_g
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no diffusion_g.onnx"))?;
+        let store = self.store()?;
+        let run = |ins: Vec<ort::value::DynValue>,
+                   mut outs: Vec<ort::value::DynValue>,
+                   n: usize,
+                   _: usize|
+         -> anyhow::Result<()> {
+            use ort::session::{OutputSelector, RunOptions};
+            let tr = Instant::now();
+            let opts = RunOptions::new().map_err(e2a)?.with_outputs(
+                OutputSelector::no_default()
+                    .with("logits_g")
+                    .preallocate("logits_g", outs.remove(0)),
+            );
+            let mut sess = self.acquire(pool);
+            drop(
+                sess.run_with_options(
+                    ort::inputs![
+                        "h_store" => store.tensor(),
+                        "h_idx" => &ins[0],
+                        "decl" => &ins[1],
+                        "cell_flat" => &ins[2]
+                    ],
+                    &opts,
+                )
+                .map_err(e2a)?,
+            );
+            drop(sess);
+            call_stats::record_batch(call_stats::DIFFUSION, n, tr.elapsed().as_nanos() as u64);
+            Ok(())
+        };
+        let comb = self.combiner(
+            COMB_DIFFUSION_G,
+            pool,
+            &[
+                ("h_idx", Axis::Rows),
+                ("decl", Axis::Rows),
+                ("cell_flat", Axis::Cells),
+            ],
+            &[("logits_g", Axis::Cells)],
+            combine_cap() * NUM_CELLS,
+            &run,
+        )?;
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        comb.submit(
+            rows.len(),
+            cells.len(),
+            &mut |roff, _, sl| {
+                for (o, &r) in sl[0].i64().iter_mut().zip(rows) {
+                    *o = r as i64;
+                }
+                sl[1].f16().convert_from_f32_slice(decl);
+                // Cell indices name batch rows, and this job's start at `roff`.
+                let base = (roff * NUM_CELLS) as i64;
+                for (o, &c) in sl[2].i64().iter_mut().zip(cells) {
+                    *o = base + c as i64;
+                }
+                Ok(())
+            },
+            &mut |o| {
+                out = o[0].f16().to_f32_vec();
+                Ok(())
+            },
+            &run,
+        )?;
+        call_stats::record(
+            call_stats::DIFFUSION,
+            rows.len(),
+            0,
+            0,
+            t0.elapsed().as_nanos() as u64,
+            0,
+        );
+        Ok(out)
+    }
+
+    fn energy_store(&self, rows: &[u32], decl: &[f32]) -> anyhow::Result<Vec<f32>> {
+        use std::time::Instant;
+        let pool = self
+            .energy_g
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no energy_g.onnx"))?;
+        let store = self.store()?;
+        let run = |ins: Vec<ort::value::DynValue>,
+                   mut outs: Vec<ort::value::DynValue>,
+                   n: usize,
+                   _: usize|
+         -> anyhow::Result<()> {
+            use ort::session::{OutputSelector, RunOptions};
+            let tr = Instant::now();
+            let opts = RunOptions::new().map_err(e2a)?.with_outputs(
+                OutputSelector::no_default()
+                    .with("energy")
+                    .preallocate("energy", outs.remove(0)),
+            );
+            let mut sess = self.acquire(pool);
+            drop(
+                sess.run_with_options(
+                    ort::inputs!["h_store" => store.tensor(), "h_idx" => &ins[0], "decl" => &ins[1]],
+                    &opts,
+                )
+                .map_err(e2a)?,
+            );
+            drop(sess);
+            call_stats::record_batch(call_stats::ENERGY, n, tr.elapsed().as_nanos() as u64);
+            Ok(())
+        };
+        let comb = self.combiner(
+            COMB_ENERGY_G,
+            pool,
+            &[("h_idx", Axis::Rows), ("decl", Axis::Rows)],
+            &[("energy", Axis::Rows)],
+            0,
+            &run,
+        )?;
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        comb.submit(
+            rows.len(),
+            0,
+            &mut |_, _, sl| {
+                for (o, &r) in sl[0].i64().iter_mut().zip(rows) {
+                    *o = r as i64;
+                }
+                sl[1].f16().convert_from_f32_slice(decl);
+                Ok(())
+            },
+            &mut |o| {
+                out = o[0].f16().to_f32_vec();
+                Ok(())
+            },
+            &run,
+        )?;
+        call_stats::record(
+            call_stats::ENERGY,
+            rows.len(),
+            0,
+            0,
+            t0.elapsed().as_nanos() as u64,
+            0,
+        );
+        Ok(out)
+    }
+
+    fn diffusion_rows(&self, h: &[f16], rows: &[u32], decl: &[f32]) -> anyhow::Result<Vec<f32>> {
+        let net = self.active();
+        anyhow::ensure!(
+            net.diffusion.is_some(),
+            "this net has no diffusion head (it proposes with best.onnx)"
+        );
+        let stride = crate::net::head_width(net.channels) * NUM_CELLS;
+        net.run_head(
+            &net.diffusion,
+            net.diffusion_io,
+            HSrc::Rows(h, rows, stride),
+            decl,
+            rows.len(),
+            "logits",
+            DECL_PLANES,
+            call_stats::DIFFUSION,
+        )
+    }
+
+    fn energy_rows(&self, h: &[f16], rows: &[u32], decl: &[f32]) -> anyhow::Result<Vec<f32>> {
+        let net = self.active();
+        let stride = crate::net::head_width(net.channels) * NUM_CELLS;
+        net.run_head(
+            &net.energy,
+            net.energy_io,
+            HSrc::Rows(h, rows, stride),
+            decl,
+            rows.len(),
+            "energy",
+            ENERGY_PLANES,
+            call_stats::ENERGY,
+        )
+    }
+
     fn energy(&self, h: &[f16], decl: &[f32], b: usize) -> anyhow::Result<Vec<f32>> {
         let net = self.active();
         net.run_head(
             &net.energy,
             net.energy_io,
-            h,
+            HSrc::Contig(h),
             decl,
             b,
             "energy",
@@ -1445,8 +1964,191 @@ mod tests {
                 }
             }
         }
+        // Gathered rows, pinned and pageable, against gathering by hand.
+        let b = 48usize;
+        let h: Vec<f16> = (0..b * c * NUM_CELLS)
+            .map(|i| f16::from_f32((((i * 29) % 97) as f32 - 48.0) / 24.0))
+            .collect();
+        let rows: Vec<u32> = (0..b as u32).rev().map(|r| (r * 7) % b as u32).collect();
+        let d: Vec<f32> = (0..b * DECL_PLANES * NUM_CELLS)
+            .map(|i| (i % 3 == 0) as u8 as f32)
+            .collect();
+        let e: Vec<f32> = (0..b * ENERGY_PLANES * NUM_CELLS)
+            .map(|i| (i % 5 == 0) as u8 as f32)
+            .collect();
+        let hg = crate::net::gather_rows(&h, &rows, c * NUM_CELLS);
+        for pinned in ["1", "0"] {
+            std::env::set_var("MINIONS_ORT_PINNED", pinned);
+            assert_eq!(
+                ort.diffusion_rows(&h, &rows, &d).unwrap(),
+                ort.diffusion(&hg, &d, b).unwrap()
+            );
+            assert_eq!(
+                ort.energy_rows(&h, &rows, &e).unwrap(),
+                ort.energy(&hg, &e, b).unwrap()
+            );
+        }
         std::env::remove_var("MINIONS_ORT_PINNED");
         eprintln!("pinned parity: worst relative error {worst:e}");
+    }
+
+    /// The combiner under real concurrency: six threads, row counts that vary
+    /// call to call, every input distinct, each result checked against the
+    /// same call made alone. A job reading another's slice, a batch run before
+    /// its rows were filled, or an arena reused while still being read would
+    /// all show up here as wrong rows. Needs `MINIONS_ORT_DIR` and a GPU.
+    #[test]
+    fn combined_calls_match_single_calls() {
+        let Ok(dir) = std::env::var("MINIONS_ORT_DIR") else {
+            eprintln!("MINIONS_ORT_DIR unset — skipping combiner parity");
+            return;
+        };
+        let dir = std::path::Path::new(&dir);
+        let cache = dir.join("trt_cache").to_string_lossy().into_owned();
+        let ort = match OrtNet::with_pool(dir, "trt", true, &cache, 1) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("ORT unavailable ({e}) — skipping");
+                return;
+            }
+        };
+        let c = ort.channels();
+        let hs = c * NUM_CELLS;
+        // (thread, call) -> (h, rows, decl, energy decl)
+        let job = |t: usize, i: usize| {
+            let b = 16 * (1 + (t * 7 + i * 3) % 10);
+            let npos = b / 2 + 1;
+            let h: Vec<f16> = (0..npos * hs)
+                .map(|x| f16::from_f32((((x * 31 + t * 17 + i * 5) % 89) as f32 - 44.0) / 22.0))
+                .collect();
+            let rows: Vec<u32> = (0..b).map(|r| ((r * 5 + t + i) % npos) as u32).collect();
+            let d: Vec<f32> = (0..b * DECL_PLANES * NUM_CELLS)
+                .map(|x| ((x * 7 + t * 3 + i) % 6 == 0) as u8 as f32)
+                .collect();
+            let e: Vec<f32> = (0..b * ENERGY_PLANES * NUM_CELLS)
+                .map(|x| ((x * 11 + t + i * 2) % 5 == 0) as u8 as f32)
+                .collect();
+            (h, rows, d, e)
+        };
+        let (threads, calls) = (6usize, 25usize);
+        COMBINE_USE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let want: Vec<Vec<(Vec<f32>, Vec<f32>)>> = (0..threads)
+            .map(|t| {
+                (0..calls)
+                    .map(|i| {
+                        let (h, rows, d, e) = job(t, i);
+                        (
+                            ort.diffusion_rows(&h, &rows, &d).unwrap(),
+                            ort.energy_rows(&h, &rows, &e).unwrap(),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        COMBINE_USE.store(true, std::sync::atomic::Ordering::Relaxed);
+        std::thread::scope(|sc| {
+            for t in 0..threads {
+                let (ort, want, job) = (&ort, &want, &job);
+                sc.spawn(move || {
+                    for i in 0..calls {
+                        let (h, rows, d, e) = job(t, i);
+                        let got = ort.diffusion_rows(&h, &rows, &d).unwrap();
+                        assert!(
+                            got == want[t][i].0,
+                            "thread {t} call {i}: diffusion differs"
+                        );
+                        let got = ort.energy_rows(&h, &rows, &e).unwrap();
+                        assert!(got == want[t][i].1, "thread {t} call {i}: energy differs");
+                    }
+                });
+            }
+        });
+        eprintln!("{}", call_stats::take_report(1.0).unwrap_or_default());
+    }
+
+    /// The store-indexed graphs against the plain ones, on the GPU and under
+    /// six threads: each thread leases its own rows, and every gathered logit
+    /// row and energy must match the plain call on the same inputs. A wrong
+    /// lease row, a cell offset that ignored the job's place in the batch, or
+    /// a lease released while in use would all show up as mismatches. The two
+    /// are separate TensorRT engines, so fp16-level differences are allowed.
+    /// Needs `MINIONS_ORT_DIR` with `*_g.onnx` beside the graphs.
+    #[test]
+    fn store_calls_match_plain_calls() {
+        let Ok(dir) = std::env::var("MINIONS_ORT_DIR") else {
+            eprintln!("MINIONS_ORT_DIR unset — skipping store parity");
+            return;
+        };
+        let dir = std::path::Path::new(&dir);
+        let cache = dir.join("trt_cache").to_string_lossy().into_owned();
+        let ort = match OrtNet::with_pool(dir, "trt", true, &cache, 1) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("ORT unavailable ({e}) — skipping");
+                return;
+            }
+        };
+        if ort.diffusion_g.is_none() {
+            eprintln!("store graphs not loaded (MINIONS_ORT_STORE=1 and *_g.onnx) — skipping");
+            return;
+        }
+        let c = ort.channels();
+        let hs = c * NUM_CELLS;
+        let worst = std::sync::Mutex::new(0f32);
+        std::thread::scope(|sc| {
+            for t in 0..6usize {
+                let (ort, worst) = (&ort, &worst);
+                sc.spawn(move || {
+                    for i in 0..15usize {
+                        let npos = 5 + (t * 3 + i * 7) % 40;
+                        let h: Vec<f16> = (0..npos * hs)
+                            .map(|x| {
+                                f16::from_f32(
+                                    (((x * 13 + t * 7 + i * 3) % 83) as f32 - 41.0) / 20.0,
+                                )
+                            })
+                            .collect();
+                        let lease = ort.h_lease(&h).unwrap().expect("store has room");
+                        let b = 1 + (t + i * 5) % 70;
+                        let local: Vec<u32> = (0..b).map(|r| ((r * 7 + t) % npos) as u32).collect();
+                        let srows: Vec<u32> =
+                            local.iter().map(|&r| lease.rows[r as usize]).collect();
+                        let d: Vec<f32> = (0..b * DECL_PLANES * NUM_CELLS)
+                            .map(|x| ((x * 5 + t + i) % 7 == 0) as u8 as f32)
+                            .collect();
+                        let cells: Vec<u32> = (0..b)
+                            .flat_map(|r| {
+                                (0..NUM_CELLS)
+                                    .filter(move |cc| (cc * 3 + r + i) % 5 == 0)
+                                    .map(move |cc| (r * NUM_CELLS + cc) as u32)
+                            })
+                            .collect();
+                        let got = ort.diffusion_store(&srows, &d, &cells).unwrap();
+                        let full = ort.diffusion_rows(&h, &local, &d).unwrap();
+                        let want = crate::net::gather_rows(&full, &cells, DECL_LOGITS);
+                        let e: Vec<f32> = (0..b * ENERGY_PLANES * NUM_CELLS)
+                            .map(|x| ((x * 3 + t * 2 + i) % 6 == 0) as u8 as f32)
+                            .collect();
+                        let ge = ort.energy_store(&srows, &e).unwrap();
+                        let we = ort.energy_rows(&h, &local, &e).unwrap();
+                        let mut w = worst.lock().unwrap();
+                        for (x, y) in got.iter().zip(&want).chain(ge.iter().zip(&we)) {
+                            let err = (x - y).abs() / (1.0 + y.abs());
+                            *w = w.max(err);
+                            assert!(err <= 2e-2, "thread {t} call {i}: store {x} vs plain {y}");
+                        }
+                        assert_eq!(got.len(), want.len());
+                        assert_eq!(ge.len(), we.len());
+                        drop(lease);
+                    }
+                });
+            }
+        });
+        eprintln!(
+            "store parity: worst relative error {:e}",
+            *worst.lock().unwrap()
+        );
+        eprintln!("{}", call_stats::take_report(1.0).unwrap_or_default());
     }
 
     #[test]

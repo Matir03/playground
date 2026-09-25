@@ -206,6 +206,27 @@ pub trait Backend: Send + Sync {
     /// `(h, decl)` → `f(s, a)` per row.
     fn energy(&self, h: &[f16], decl: &[f32], b: usize) -> anyhow::Result<Vec<f32>>;
 
+    /// [`Self::diffusion`] with row `i`'s features taken from row `rows[i]` of
+    /// `h` (one row per position, `channels() * NUM_CELLS` wide), so a caller
+    /// batching several positions' chains never builds the tiled copy itself.
+    /// The default gathers and calls `diffusion`; `OrtNet` copies the rows
+    /// straight into its pinned input.
+    fn diffusion_rows(&self, h: &[f16], rows: &[u32], decl: &[f32]) -> anyhow::Result<Vec<f32>> {
+        self.diffusion(
+            &gather_rows(h, rows, self.channels() * crate::map::NUM_CELLS),
+            decl,
+            rows.len(),
+        )
+    }
+    /// [`Self::energy`], gathered as [`Self::diffusion_rows`].
+    fn energy_rows(&self, h: &[f16], rows: &[u32], decl: &[f32]) -> anyhow::Result<Vec<f32>> {
+        self.energy(
+            &gather_rows(h, rows, self.channels() * crate::map::NUM_CELLS),
+            decl,
+            rows.len(),
+        )
+    }
+
     /// Whether this net proposes turns with a best-move head (`best.onnx`)
     /// instead of the diffusion sampler.
     fn has_best(&self) -> bool {
@@ -229,10 +250,55 @@ pub trait Backend: Send + Sync {
         h: &'a [f16],
         b: usize,
     ) -> anyhow::Result<Box<dyn DiffusionPass + 'a>>;
+    /// Upload `h` (whole rows) to a device-resident store for the rest of a
+    /// wave's head calls, when the backend has one; the lease holds the rows
+    /// until dropped. `None`: use the per-call methods.
+    fn h_lease<'a>(&'a self, _h: &[f16]) -> anyhow::Result<Option<StoreLease<'a>>> {
+        Ok(None)
+    }
+    /// [`Self::diffusion`] with row `i`'s features at store row `rows[i]`,
+    /// returning only the logit rows `cells` names (`row * NUM_CELLS + cell`,
+    /// `row` indexing `rows`): `(cells.len(), DECL_LOGITS)`.
+    fn diffusion_store(
+        &self,
+        _rows: &[u32],
+        _decl: &[f32],
+        _cells: &[u32],
+    ) -> anyhow::Result<Vec<f32>> {
+        anyhow::bail!("this backend has no h store")
+    }
+    /// [`Self::energy`] with row `i`'s features at store row `rows[i]`.
+    fn energy_store(&self, _rows: &[u32], _decl: &[f32]) -> anyhow::Result<Vec<f32>> {
+        anyhow::bail!("this backend has no h store")
+    }
+
+    /// Build anything a backend makes lazily on first use and that would
+    /// otherwise stall a measured window (the ORT combiners' engine rebuild).
+    fn warm(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// Flush any profiler traces (ORT's `MINIONS_ORT_PROFILE`); their paths.
     fn end_profiling(&self) -> Vec<String> {
         Vec::new()
     }
+}
+
+/// Rows of trunk features uploaded for a wave (`Backend::h_lease`).
+pub struct StoreLease<'a> {
+    /// The store row holding each uploaded row, in upload order.
+    pub rows: Vec<u32>,
+    /// Whatever keeps those rows reserved; released on drop.
+    pub hold: Box<dyn Send + 'a>,
+}
+
+/// Rows `rows` of `h` (each `stride` wide), in that order.
+pub fn gather_rows<T: Copy>(h: &[T], rows: &[u32], stride: usize) -> Vec<T> {
+    let mut out = Vec::with_capacity(rows.len() * stride);
+    for &r in rows {
+        let r = r as usize;
+        out.extend_from_slice(&h[r * stride..(r + 1) * stride]);
+    }
+    out
 }
 
 /// Repeat one position's trunk features across `n` rows, so a batch of `n`

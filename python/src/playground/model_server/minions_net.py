@@ -661,8 +661,14 @@ def export_onnx_atomic(net: MinionsNet, out_dir: str, f16_io: bool = True) -> No
     # paired a new trunk with the old heads.
     from playground.model_server.onnx_f16io import NATIVE, f16io
 
+    from playground.model_server.onnx_store import write_store_graphs
+
     with torch.no_grad():
         for name, mod, args, ins, outs in specs:
+            if name == "trunk.onnx":
+                # The store-indexed head variants (`onnx_store`), derived from
+                # the heads just written and in place before the trunk.
+                write_store_graphs(out_dir)
             path = os.path.join(out_dir, name)
             tmp = path + ".tmp"
             torch.onnx.export(

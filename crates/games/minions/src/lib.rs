@@ -13,6 +13,7 @@
 
 pub mod assign;
 pub mod bitboard;
+pub(crate) mod combine;
 pub mod eval;
 pub mod game;
 pub mod genpos;

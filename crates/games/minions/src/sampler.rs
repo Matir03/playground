@@ -1224,6 +1224,47 @@ impl SampledModel<MinionsTurns> for MinionsModel {
 /// One buffer rather than a `Vec` per row: per-row allocations interleaved
 /// with the long-lived cache are what grew glibc's thread arenas to 17 GB
 /// around an 8 GB cache.
+/// One cached trunk row, as [`MinionsModel::run_wave`] takes it.
+#[derive(Clone, Copy)]
+pub struct CachedRow<'a> {
+    pub value: f32,
+    pub h: &'a [f16],
+    /// The diffusion head's first-step logits at this position (fp16,
+    /// `NUM_CELLS * DECL_LOGITS`, canonical frame), when held.
+    pub step1: Option<&'a [f16]>,
+}
+
+/// A self-play wave's three kinds of request, served together by
+/// [`MinionsModel::run_wave`].
+pub struct Wave<'a> {
+    /// Value-only expansions.
+    pub exp: &'a [MinionsState],
+    /// Widens, `k` candidates each, fills (`wid_fill`) by playout only.
+    pub wid: &'a [MinionsState],
+    pub wid_fill: &'a [bool],
+    pub k: usize,
+    /// Full search: `t_steps` and exploration draws, else `t_steps_fast`.
+    pub full: bool,
+    /// Refinements of `rs_from[i]` at `rs[i]`.
+    pub rs: &'a [MinionsState],
+    pub rs_from: &'a [TurnSpec],
+    /// Per request, `exp ++ wid ++ rs`; empty when nothing is cached.
+    pub cached: &'a [Option<CachedRow<'a>>],
+}
+
+/// What [`MinionsModel::run_wave`] returns.
+pub struct WaveOut {
+    /// Per value-only expansion.
+    pub values: Vec<f32>,
+    pub wid: Vec<Expansion<MinionsTurns>>,
+    pub rs: Vec<Vec<(TurnSpec, f32, bool)>>,
+    /// Trunk rows for every request (`exp ++ wid ++ rs`), `fresh` where
+    /// computed this wave.
+    pub trunk: TrunkRows,
+    /// First-step logits computed this wave, per widen.
+    pub step1: Vec<Option<Vec<f16>>>,
+}
+
 pub struct TrunkRows {
     pub stride: usize,
     pub h: Vec<f16>,
@@ -1518,7 +1559,7 @@ impl MinionsModel {
         } else {
             0
         };
-        let priors = self.score_lists(states, &h, &specs, g * (k + extra_cap))?;
+        let priors = self.score_lists(states, &h, &specs, g * (k + extra_cap), None)?;
 
         let mut out: Vec<Expansion<MinionsTurns>> = specs
             .into_iter()
@@ -1563,6 +1604,9 @@ impl MinionsModel {
         h: &[f16],
         specs: &[Vec<(TurnSpec, bool)>],
         padded: usize,
+        // Each list's row in the device `h` store, when the wave leased one:
+        // then `h` is not sent at all, and nothing is padded.
+        store: Option<&[u32]>,
     ) -> anyhow::Result<Vec<Vec<f32>>> {
         if !self.cfg.use_energy {
             return Ok(specs.iter().map(|l| vec![1.0; l.len()]).collect());
@@ -1579,29 +1623,38 @@ impl MinionsModel {
         );
         let dstride = crate::turn::ENERGY_PLANES * NUM_CELLS;
         let mut decl = vec![0f32; total * dstride];
-        let mut h_b = Vec::with_capacity(total * hstride);
+        // Each candidate's `h` row, by position: the backend gathers them into
+        // its input rather than this building a tiled copy first.
+        let mut rows: Vec<u32> = Vec::with_capacity(padded);
         let mut at = 0usize;
         for (gi, list) in specs.iter().enumerate() {
             let live = LiveMask::of(&states[gi]);
-            let src = &h[gi * hstride..(gi + 1) * hstride];
             for (spec, _) in list {
                 Partial::fully_committed(spec, &live)
                     .write_energy_planes(&mut decl[at * dstride..(at + 1) * dstride]);
-                h_b.extend_from_slice(src);
+                rows.push(gi as u32);
                 at += 1;
             }
         }
+        debug_assert!(h.len() >= specs.len() * hstride);
         // Pad to a fixed `padded` rows. Candidate counts vary after merging,
         // and TensorRT builds (and caches) a separate engine per input shape —
         // a ragged batch would rebuild constantly. The padding is a few
         // percent of wasted work against seconds per rebuild.
         let energies = if total == 0 {
             Vec::new()
+        } else if let Some(srows) = store {
+            let rows: Vec<u32> = rows.iter().map(|&gi| srows[gi as usize]).collect();
+            let clk = Instant::now();
+            let e = self.net.energy_store(&rows, &decl)?;
+            Phases::add(&self.phases.energy_ns, clk);
+            e
         } else {
             decl.resize(padded * dstride, 0.0);
-            h_b.resize(padded * hstride, f16::ZERO);
+            let last = *rows.last().expect("total > 0");
+            rows.resize(padded, last);
             let clk = Instant::now();
-            let mut e = self.net.energy(&h_b, &decl, padded)?;
+            let mut e = self.net.energy_rows(h, &rows, &decl)?;
             Phases::add(&self.phases.energy_ns, clk);
             e.truncate(total);
             e
@@ -1613,6 +1666,89 @@ impl MinionsModel {
             off += list.len();
         }
         Ok(out)
+    }
+
+    /// One refinement chain: `spec` (canonical frame) with a share of its live
+    /// variables masked again, as `resample_batch_seq` draws it. Returns the
+    /// chain, the hexes its kept moves claim, and how many variables were kept
+    /// and masked. `bias` is the head's logits over the fully committed turn,
+    /// for biased unmasking (`SamplerConfig::resample_bias`).
+    fn refine_chain(
+        &self,
+        cx: &GameCtx,
+        spec: &TurnSpec,
+        bias: Option<&[f32]>,
+        rng: &mut ChaCha8Rng,
+    ) -> (Partial, Bb, usize, usize) {
+        let mut p = Partial::fully_committed(spec, &cx.live);
+        let mut vars: Vec<(u8, u8)> = bitboard::cells(cx.live.moves)
+            .map(|c| (c, C_MOVE))
+            .chain(bitboard::cells(cx.live.targets).map(|c| (c, C_TARGET)))
+            .chain(bitboard::cells(cx.live.spawns).map(|c| (c, C_SPAWN)))
+            .collect();
+        let n = vars.len();
+        let m = if n == 0 {
+            0
+        } else if let Some(lg) = bias {
+            // One independent Bernoulli per variable, at the head's own
+            // probability of proposing something other than what is there.
+            let mut pc: Vec<f32> = vars
+                .iter()
+                .map(|&(c, f)| 1.0 - p_committed_value(lg, cx, &p.spec, c, f))
+                .collect();
+            let mut k = 0usize;
+            for i in 0..n {
+                if rng.gen::<f32>() < pc[i] {
+                    vars.swap(k, i);
+                    pc.swap(k, i);
+                    k += 1;
+                }
+            }
+            if k == 0 {
+                // Masking nothing returns the turn unchanged and wastes the
+                // visit, so the least certain variable goes in regardless.
+                let best = (0..n).max_by(|&a, &b| pc[a].total_cmp(&pc[b])).unwrap_or(0);
+                vars.swap(0, best);
+                k = 1;
+            }
+            k
+        } else {
+            let share = rng.gen::<f32>() * self.cfg.resample_frac;
+            ((share * n as f32).round() as usize).clamp(1, n)
+        };
+        // The biased path already moved its picks to the front; only the
+        // uniform path needs a shuffle to choose which `m` they are.
+        if bias.is_none() {
+            for i in 0..m {
+                let j = i + rng.gen_range(0..n - i);
+                vars.swap(i, j);
+            }
+        }
+        let empty = TurnSpec::empty();
+        for &(c, f) in &vars[..m] {
+            let ci = c as usize;
+            match f {
+                C_MOVE => p.spec.moves[ci] = empty.moves[ci],
+                C_TARGET => p.spec.targets[ci] = empty.targets[ci],
+                _ => p.spec.spawns[ci] = empty.spawns[ci],
+            }
+            p.committed[ci] &= !f;
+        }
+        // The hexes the kept moves already claim, as `commit_round` would
+        // have recorded them. A realized turn can hold `NO_MOVE` for a
+        // unit that did not act; it claims nothing, as `write_planes`
+        // gives it no offset.
+        let mut cl: Bb = 0;
+        for c in bitboard::cells(cx.live.moves) {
+            let v = p.spec.moves[c as usize];
+            if p.is_committed(c, C_MOVE) && v != 0 && (v as usize) < N_OFFSETS {
+                let d = MOVE_DEST[c as usize][v as usize];
+                if d != NO_CELL {
+                    cl |= bit(d);
+                }
+            }
+        }
+        (p, cl, n - m, m)
     }
 
     /// A partial resample of each `from[i]` at `states[i]`: the search's
@@ -1683,85 +1819,19 @@ impl MinionsModel {
         let mut masked = Vec::with_capacity(g);
         let mut rngs: Vec<ChaCha8Rng> = Vec::with_capacity(g);
         for gi in 0..g {
-            let cx = &ctx[gi];
             let spec = if flipped[gi] {
                 from[src(gi)].rotated()
             } else {
                 from[src(gi)]
             };
-            let mut p = Partial::fully_committed(&spec, &cx.live);
-            let mut vars: Vec<(u8, u8)> = bitboard::cells(cx.live.moves)
-                .map(|c| (c, C_MOVE))
-                .chain(bitboard::cells(cx.live.targets).map(|c| (c, C_TARGET)))
-                .chain(bitboard::cells(cx.live.spawns).map(|c| (c, C_SPAWN)))
-                .collect();
-            let n = vars.len();
-            let m = if n == 0 {
-                0
-            } else if let Some(bl) = &bias_logits {
+            let bias = bias_logits.as_ref().map(|bl| {
                 let row0 = gi * NUM_CELLS * DECL_LOGITS;
-                let lg = &bl[row0..row0 + NUM_CELLS * DECL_LOGITS];
-                // One independent Bernoulli per variable, at the head's own
-                // probability of proposing something other than what is there.
-                let mut pc: Vec<f32> = vars
-                    .iter()
-                    .map(|&(c, f)| 1.0 - p_committed_value(lg, cx, &p.spec, c, f))
-                    .collect();
-                let mut k = 0usize;
-                for i in 0..n {
-                    if rng.gen::<f32>() < pc[i] {
-                        vars.swap(k, i);
-                        pc.swap(k, i);
-                        k += 1;
-                    }
-                }
-                if k == 0 {
-                    // Masking nothing returns the turn unchanged and wastes the
-                    // visit, so the least certain variable goes in regardless.
-                    let best = (0..n).max_by(|&a, &b| pc[a].total_cmp(&pc[b])).unwrap_or(0);
-                    vars.swap(0, best);
-                    k = 1;
-                }
-                k
-            } else {
-                let share = rng.gen::<f32>() * self.cfg.resample_frac;
-                ((share * n as f32).round() as usize).clamp(1, n)
-            };
-            // The biased path already moved its picks to the front; only the
-            // uniform path needs a shuffle to choose which `m` they are.
-            if bias_logits.is_none() {
-                for i in 0..m {
-                    let j = i + rng.gen_range(0..n - i);
-                    vars.swap(i, j);
-                }
-            }
-            let empty = TurnSpec::empty();
-            for &(c, f) in &vars[..m] {
-                let ci = c as usize;
-                match f {
-                    C_MOVE => p.spec.moves[ci] = empty.moves[ci],
-                    C_TARGET => p.spec.targets[ci] = empty.targets[ci],
-                    _ => p.spec.spawns[ci] = empty.spawns[ci],
-                }
-                p.committed[ci] &= !f;
-            }
-            // The hexes the kept moves already claim, as `commit_round` would
-            // have recorded them. A realized turn can hold `NO_MOVE` for a
-            // unit that did not act; it claims nothing, as `write_planes`
-            // gives it no offset.
-            let mut cl: Bb = 0;
-            for c in bitboard::cells(cx.live.moves) {
-                let v = p.spec.moves[c as usize];
-                if p.is_committed(c, C_MOVE) && v != 0 && (v as usize) < N_OFFSETS {
-                    let d = MOVE_DEST[c as usize][v as usize];
-                    if d != NO_CELL {
-                        cl |= bit(d);
-                    }
-                }
-            }
+                &bl[row0..row0 + NUM_CELLS * DECL_LOGITS]
+            });
+            let (p, cl, n_kept, m) = self.refine_chain(&ctx[gi], &spec, bias, &mut rng);
             chains.push(p);
             claimed.push(cl);
-            kept.push(n - m);
+            kept.push(n_kept);
             masked.push(m);
             rngs.push(ChaCha8Rng::seed_from_u64(rng.gen::<u64>() ^ gi as u64));
         }
@@ -1801,7 +1871,7 @@ impl MinionsModel {
         let specs: Vec<Vec<(TurnSpec, bool)>> = (0..g)
             .map(|gi| self.finish_candidates(&canon[gi], vec![(chains[gi].spec, false)]))
             .collect();
-        let energies = self.score_lists(&canon, &tr.h, &specs, g)?;
+        let energies = self.score_lists(&canon, &tr.h, &specs, g, None)?;
         let mut out: Vec<Vec<(TurnSpec, f32, bool)>> = specs
             .into_iter()
             .zip(energies)
@@ -1815,6 +1885,455 @@ impl MinionsModel {
             .collect();
         out.truncate(real);
         Ok(out)
+    }
+
+    /// Whether [`Self::run_wave`] can serve this sampler. It covers the
+    /// production configuration only; the rest keep the per-kind path.
+    pub fn joint_ok(&self) -> bool {
+        !self.best_mode()
+            && !self.cfg.resample_bias
+            && !(self.cfg.last_stage_samples > 1 && self.nnue.is_some())
+    }
+
+    /// One self-play wave -- value-only expansions, widens and refines --
+    /// with every network call shared between them.
+    ///
+    /// The per-kind path (`expand_batch_cached` twice, `resample_batch_seq`)
+    /// ran up to three trunk calls, `T + resample_t` diffusion calls and two
+    /// energy calls per wave. Here there is one trunk call for every miss, one
+    /// energy call, and one diffusion call per step of a joint schedule:
+    /// widens run steps `1..=T`, refines the last `resample_t` of them. A call
+    /// costs ~150 us before its first row, so 6 calls became 4.
+    ///
+    /// **Step-1 logits are cached.** A widen chain starts from the empty
+    /// declaration, so its first step depends on `h` alone -- a node widened
+    /// again (a root is widened ~200 times) recomputed the same logits every
+    /// time, and a node with `k` chains computed them `k` times. Step 1 runs
+    /// one row per *position* without cached logits (`CachedRow::step1`), and
+    /// returns what it computed in `WaveOut::step1` for the caller to keep.
+    /// Fill requests skip the diffusion head entirely, since their proposals
+    /// are thrown away.
+    ///
+    /// The draws differ from the per-kind path's (different RNG streams, same
+    /// distributions), so the two are compared by an A/B, not for equality.
+    pub fn run_wave(
+        &self,
+        w: &Wave<'_>,
+        batch_seq: u64,
+        trunk_rows: &dyn Fn(usize) -> usize,
+    ) -> anyhow::Result<WaveOut> {
+        let (ne, nw, nr) = (w.exp.len(), w.wid.len(), w.rs.len());
+        anyhow::ensure!(w.rs_from.len() == nr, "run_wave: one turn per refine");
+        anyhow::ensure!(
+            self.joint_ok(),
+            "run_wave: configuration needs the per-kind path"
+        );
+        let n = ne + nw + nr;
+        let real: Vec<&MinionsState> = w.exp.iter().chain(w.wid).chain(w.rs).collect();
+        let flipped: Vec<bool> = real.iter().map(|s| s.side == 1).collect();
+        let canon: Vec<MinionsState> = real.iter().map(|s| s.canonical()).collect();
+        let hstride = self.net.channels() * NUM_CELLS;
+        let hit = |i: usize| w.cached.get(i).copied().flatten();
+        let mut rng =
+            ChaCha8Rng::seed_from_u64(self.seed ^ batch_seq.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let round16 = |x: usize| (x + 15) / 16 * 16;
+
+        // ── trunk: one call for every request without a cached row ───────────
+        let mut values = vec![0f32; n];
+        let mut h = vec![f16::ZERO; n * hstride];
+        let mut fresh: Vec<Option<f32>> = vec![None; n];
+        let mut miss: Vec<usize> = Vec::new();
+        for i in 0..n {
+            match hit(i) {
+                Some(c) => {
+                    values[i] = c.value;
+                    h[i * hstride..(i + 1) * hstride].copy_from_slice(c.h);
+                }
+                None => miss.push(i),
+            }
+        }
+        if !miss.is_empty() {
+            let pstride = crate::game::PLANES * NUM_CELLS;
+            let width = trunk_rows(miss.len()).max(miss.len());
+            let t = Instant::now();
+            let mut planes = vec![0f32; width * pstride];
+            for (j, &i) in miss.iter().enumerate() {
+                for (o, b) in planes[j * pstride..(j + 1) * pstride]
+                    .iter_mut()
+                    .zip(Minions::to_features(&canon[i]))
+                {
+                    *o = b as f32;
+                }
+            }
+            let nm = miss.len();
+            for j in nm..width {
+                planes.copy_within((nm - 1) * pstride..nm * pstride, j * pstride);
+            }
+            Phases::add(&self.phases.features_ns, t);
+            let t = Instant::now();
+            let tr = self.net.trunk(&planes, width)?;
+            Phases::add(&self.phases.trunk_ns, t);
+            for (j, &i) in miss.iter().enumerate() {
+                values[i] = tr.value[j];
+                h[i * hstride..(i + 1) * hstride]
+                    .copy_from_slice(&tr.h[j * hstride..(j + 1) * hstride]);
+                fresh[i] = Some(values[i]);
+            }
+        }
+
+        // ── chains ──────────────────────────────────────────────────────────
+        // Widen game `gi` is request `ne + gi`; refine `ri` is `ne + nw + ri`.
+        let k = w.k.max(1);
+        let is_fill = |gi: usize| w.wid_fill.get(gi).copied().unwrap_or(false);
+        let k_rand = if w.full && nw > 0 {
+            let want = (k as f32) * self.cfg.random_fraction;
+            let floor = want.floor();
+            floor as usize + usize::from(rng.gen::<f32>() < (want - floor))
+        } else {
+            0
+        };
+        let k_diff = k.saturating_sub(k_rand);
+        let tw = if w.full {
+            self.cfg.t_steps
+        } else {
+            self.cfg.t_steps_fast
+        }
+        .max(1);
+        let trs = self.cfg.resample_t.max(1);
+        let ctx: Vec<GameCtx> = canon[ne..].iter().map(Self::context).collect();
+
+        struct Chain {
+            p: Partial,
+            claimed: Bb,
+            rng: ChaCha8Rng,
+        }
+        // Widen chains, game-major: game `gi`'s are `wc[gi * k_diff..][..k_diff]`
+        // (empty for a fill, or a position with nothing to declare).
+        let active_game = |gi: usize| !is_fill(gi) && k_diff > 0 && ctx[gi].n_live > 0;
+        let mut wc: Vec<Chain> = Vec::with_capacity(nw * k_diff);
+        for gi in 0..nw {
+            for c in 0..k_diff {
+                wc.push(Chain {
+                    p: Partial::new(),
+                    claimed: 0,
+                    rng: ChaCha8Rng::seed_from_u64(rng.gen::<u64>() ^ (gi * k_diff + c) as u64),
+                });
+            }
+        }
+        // Refine chains, one per request, with `(kept, masked)`.
+        let mut rc: Vec<(Chain, usize, usize)> = Vec::with_capacity(nr);
+        for ri in 0..nr {
+            let spec = if flipped[ne + nw + ri] {
+                w.rs_from[ri].rotated()
+            } else {
+                w.rs_from[ri]
+            };
+            let (p, claimed, kept, masked) =
+                self.refine_chain(&ctx[nw + ri], &spec, None, &mut rng);
+            let crng = ChaCha8Rng::seed_from_u64(rng.gen::<u64>() ^ ri as u64);
+            rc.push((
+                Chain {
+                    p,
+                    claimed,
+                    rng: crng,
+                },
+                kept,
+                masked,
+            ));
+        }
+        let any_wid = (0..nw).any(|gi| active_game(gi));
+        let any_rs = rc.iter().any(|(_, _, m)| *m > 0);
+        let steps = match (any_wid, any_rs) {
+            (true, true) => tw.max(trs),
+            (true, false) => tw,
+            (false, true) => trs,
+            (false, false) => 0,
+        };
+        let rs_from_step = steps.saturating_sub(trs) + 1;
+
+        // Every widen and refine position's `h`, uploaded once for the wave when
+        // the backend keeps a device store: the steps below then send indices,
+        // and get back only the live cells' logits.
+        let lease = if steps > 0 || nw + nr > 0 {
+            self.net.h_lease(&h[ne * hstride..])?
+        } else {
+            None
+        };
+        // Cells a position's chains read logits at: its live move, target and
+        // spawn cells, in the canonical frame.
+        let live_cells: Vec<Bb> = ctx
+            .iter()
+            .map(|c| c.live.moves | c.live.targets | c.live.spawns)
+            .collect();
+
+        // ── joint diffusion schedule ─────────────────────────────────────────
+        enum Target {
+            Step1(usize),
+            Wid(usize),
+            Rs(usize),
+        }
+        let dstride = DECL_PLANES * NUM_CELLS;
+        let lwidth = NUM_CELLS * DECL_LOGITS;
+        let temp = self.cfg.temperature;
+        let mut picks: Vec<(u8, u8, u8)> = Vec::with_capacity(NUM_CELLS);
+        let mut step1: Vec<Option<Vec<f16>>> = vec![None; nw];
+        let mut scratch = vec![0f32; lwidth];
+        let mut rowbuf = vec![0f32; lwidth];
+        for s in 1..=steps {
+            let mut rows: Vec<u32> = Vec::new();
+            let mut targets: Vec<Target> = Vec::new();
+            let wid_on = any_wid && s <= tw;
+            let rs_on = any_rs && s >= rs_from_step;
+            if wid_on {
+                for gi in (0..nw).filter(|&gi| active_game(gi)) {
+                    if s == 1 {
+                        if hit(ne + gi).and_then(|c| c.step1).is_none() {
+                            rows.push((ne + gi) as u32);
+                            targets.push(Target::Step1(gi));
+                        }
+                    } else {
+                        for c in gi * k_diff..(gi + 1) * k_diff {
+                            rows.push((ne + gi) as u32);
+                            targets.push(Target::Wid(c));
+                        }
+                    }
+                }
+            }
+            if rs_on {
+                for (ri, (_, _, m)) in rc.iter().enumerate() {
+                    if *m > 0 {
+                        rows.push((ne + nw + ri) as u32);
+                        targets.push(Target::Rs(ri));
+                    }
+                }
+            }
+            // With the store: the gathered logits, and where each target's
+            // cells start in them.
+            let mut cstart: Option<(Vec<u32>, Vec<usize>)> = None;
+            let logits = if rows.is_empty() {
+                Vec::new()
+            } else if let Some(l) = &lease {
+                let clk = Instant::now();
+                let mut decl = vec![0f32; rows.len() * dstride];
+                let mut cells: Vec<u32> = Vec::new();
+                let mut starts: Vec<usize> = Vec::with_capacity(targets.len() + 1);
+                for (j, t) in targets.iter().enumerate() {
+                    let out = &mut decl[j * dstride..(j + 1) * dstride];
+                    match *t {
+                        Target::Step1(_) => {}
+                        Target::Wid(c) => wc[c].p.write_planes(out),
+                        Target::Rs(ri) => rc[ri].0.p.write_planes(out),
+                    }
+                    starts.push(cells.len());
+                    let pos = rows[j] as usize - ne;
+                    cells.extend(
+                        bitboard::cells(live_cells[pos]).map(|c| (j * NUM_CELLS) as u32 + c as u32),
+                    );
+                }
+                starts.push(cells.len());
+                let srows: Vec<u32> = rows.iter().map(|&r| l.rows[r as usize - ne]).collect();
+                Phases::add(&self.phases.decl_write_ns, clk);
+                let clk = Instant::now();
+                let g = self.net.diffusion_store(&srows, &decl, &cells)?;
+                Phases::add(&self.phases.diffusion_ns, clk);
+                cstart = Some((cells, starts));
+                g
+            } else {
+                let clk = Instant::now();
+                let width = round16(rows.len());
+                let mut decl = vec![0f32; width * dstride];
+                for (j, t) in targets.iter().enumerate() {
+                    let out = &mut decl[j * dstride..(j + 1) * dstride];
+                    match *t {
+                        Target::Step1(_) => {} // the empty declaration
+                        Target::Wid(c) => wc[c].p.write_planes(out),
+                        Target::Rs(ri) => rc[ri].0.p.write_planes(out),
+                    }
+                }
+                let last = *rows.last().unwrap();
+                rows.resize(width, last);
+                Phases::add(&self.phases.decl_write_ns, clk);
+                let clk = Instant::now();
+                let l = self.net.diffusion_rows(&h, &rows, &decl)?;
+                Phases::add(&self.phases.diffusion_ns, clk);
+                l
+            };
+            let clk = Instant::now();
+            // Step 1 from cached logits: no row was spent on these games.
+            if wid_on && s == 1 {
+                for gi in (0..nw).filter(|&gi| active_game(gi)) {
+                    let Some(l1) = hit(ne + gi).and_then(|c| c.step1) else {
+                        continue;
+                    };
+                    for (o, x) in scratch.iter_mut().zip(l1) {
+                        *o = x.to_f32();
+                    }
+                    let want = Self::committed_after(1, tw, ctx[gi].n_live);
+                    for c in gi * k_diff..(gi + 1) * k_diff {
+                        let ch = &mut wc[c];
+                        commit_round(
+                            &mut ch.p,
+                            &mut ch.claimed,
+                            &ctx[gi],
+                            &scratch,
+                            want,
+                            temp,
+                            &mut ch.rng,
+                            &mut picks,
+                        );
+                    }
+                }
+            }
+            for (j, t) in targets.iter().enumerate() {
+                let lg: &[f32] = match &cstart {
+                    Some((cells, starts)) => {
+                        // Only live cells are ever read, and all of this row's
+                        // are written, so the buffer needs no clearing -- except
+                        // for a step-1 row, which is kept whole in the cache.
+                        if matches!(t, Target::Step1(_)) {
+                            rowbuf.fill(0.0);
+                        }
+                        for k in starts[j]..starts[j + 1] {
+                            let c = cells[k] as usize % NUM_CELLS;
+                            rowbuf[c * DECL_LOGITS..(c + 1) * DECL_LOGITS]
+                                .copy_from_slice(&logits[k * DECL_LOGITS..(k + 1) * DECL_LOGITS]);
+                        }
+                        &rowbuf
+                    }
+                    None => &logits[j * lwidth..(j + 1) * lwidth],
+                };
+                match *t {
+                    Target::Step1(gi) => {
+                        // Committed from the fp16 values it is cached as, so
+                        // a later hit reproduces this draw exactly. A no-op
+                        // with fp16 graphs, whose outputs are fp16 already.
+                        let l16: Vec<f16> = lg.iter().map(|&x| f16::from_f32(x)).collect();
+                        for (o, x) in scratch.iter_mut().zip(&l16) {
+                            *o = x.to_f32();
+                        }
+                        step1[gi] = Some(l16);
+                        let want = Self::committed_after(1, tw, ctx[gi].n_live);
+                        for c in gi * k_diff..(gi + 1) * k_diff {
+                            let ch = &mut wc[c];
+                            commit_round(
+                                &mut ch.p,
+                                &mut ch.claimed,
+                                &ctx[gi],
+                                &scratch,
+                                want,
+                                temp,
+                                &mut ch.rng,
+                                &mut picks,
+                            );
+                        }
+                    }
+                    Target::Wid(c) => {
+                        let gi = c / k_diff;
+                        let want = Self::committed_after(s, tw, ctx[gi].n_live);
+                        let ch = &mut wc[c];
+                        commit_round(
+                            &mut ch.p,
+                            &mut ch.claimed,
+                            &ctx[gi],
+                            lg,
+                            want,
+                            temp,
+                            &mut ch.rng,
+                            &mut picks,
+                        );
+                    }
+                    Target::Rs(ri) => {
+                        let (ch, kept, masked) = &mut rc[ri];
+                        let want =
+                            *kept + Self::committed_after(s + 1 - rs_from_step, trs, *masked);
+                        commit_round(
+                            &mut ch.p,
+                            &mut ch.claimed,
+                            &ctx[nw + ri],
+                            lg,
+                            want,
+                            temp,
+                            &mut ch.rng,
+                            &mut picks,
+                        );
+                    }
+                }
+            }
+            Phases::add(&self.phases.commit_ns, clk);
+        }
+
+        // ── candidates: playouts, realize and merge ──────────────────────────
+        let t_play = Instant::now();
+        let mut declared: Vec<Vec<(TurnSpec, bool)>> = Vec::with_capacity(nw + nr);
+        for gi in 0..nw {
+            let st = &canon[ne + gi];
+            if is_fill(gi) {
+                declared.push(
+                    (0..k)
+                        .map(|_| (TurnSpec::random_playout(st, &mut rng), true))
+                        .collect(),
+                );
+                continue;
+            }
+            let mut d: Vec<(TurnSpec, bool)> = wc[gi * k_diff..(gi + 1) * k_diff]
+                .iter()
+                .map(|c| (c.p.spec, false))
+                .collect();
+            for _ in 0..k_rand {
+                d.push((TurnSpec::random_playout(st, &mut rng), true));
+            }
+            declared.push(d);
+        }
+        Phases::add(&self.phases.playout_ns, t_play);
+        for (ch, _, _) in &rc {
+            declared.push(vec![(ch.p.spec, false)]);
+        }
+        let t = Instant::now();
+        let specs: Vec<Vec<(TurnSpec, bool)>> = declared
+            .into_iter()
+            .enumerate()
+            .map(|(j, d)| self.finish_candidates(&canon[ne + j], d))
+            .collect();
+        Phases::add(&self.phases.realize_ns, t);
+
+        // ── one energy call for every candidate of the wave ──────────────────
+        let total: usize = specs.iter().map(|l| l.len()).sum();
+        let priors = self.score_lists(
+            &canon[ne..],
+            &h[ne * hstride..],
+            &specs,
+            round16(total),
+            lease.as_ref().map(|l| &l.rows[..]),
+        )?;
+        let mut lists: Vec<Vec<(TurnSpec, f32, bool)>> = specs
+            .into_iter()
+            .zip(priors)
+            .enumerate()
+            .map(|(j, (sp, pr))| {
+                let flip = flipped[ne + j];
+                sp.into_iter()
+                    .zip(pr)
+                    .map(|((spec, x), e)| (if flip { spec.rotated() } else { spec }, e, x))
+                    .collect()
+            })
+            .collect();
+        let rs = lists.split_off(nw);
+        let wid = lists
+            .into_iter()
+            .enumerate()
+            .map(|(gi, c)| (values[ne + gi], c))
+            .collect();
+        Ok(WaveOut {
+            values: values[..ne].to_vec(),
+            wid,
+            rs,
+            trunk: TrunkRows {
+                stride: hstride,
+                h,
+                fresh,
+            },
+            step1,
+        })
     }
 }
 
@@ -2038,6 +2557,221 @@ mod tests {
 
     fn model(cfg: SamplerConfig) -> Option<MinionsModel> {
         Some(MinionsModel::new(Box::new(fixture_net()?), cfg))
+    }
+
+    /// A backend that emulates the device store on the CPU: a lease copies the
+    /// rows, and the store calls gather them, run the plain call, and gather
+    /// the named cells. `run_wave` through it must match `run_wave` without it
+    /// exactly -- the row and cell bookkeeping is the only difference.
+    struct StoreEmu {
+        inner: crate::net::LocalNet,
+        store: std::sync::Mutex<Vec<f16>>,
+    }
+
+    impl crate::net::Backend for StoreEmu {
+        fn channels(&self) -> usize {
+            self.inner.channels()
+        }
+        fn trunk(&self, planes: &[f32], b: usize) -> anyhow::Result<crate::net::TrunkOut> {
+            self.inner.trunk(planes, b)
+        }
+        fn diffusion(&self, h: &[f16], decl: &[f32], b: usize) -> anyhow::Result<Vec<f32>> {
+            self.inner.diffusion(h, decl, b)
+        }
+        fn energy(&self, h: &[f16], decl: &[f32], b: usize) -> anyhow::Result<Vec<f32>> {
+            self.inner.energy(h, decl, b)
+        }
+        fn diffusion_pass<'a>(
+            &'a self,
+            h: &'a [f16],
+            b: usize,
+        ) -> anyhow::Result<Box<dyn crate::net::DiffusionPass + 'a>> {
+            Ok(Box::new(crate::net::NaivePass { net: self, h, b }))
+        }
+        fn h_lease<'a>(&'a self, h: &[f16]) -> anyhow::Result<Option<crate::net::StoreLease<'a>>> {
+            let stride = self.channels() * NUM_CELLS;
+            let mut st = self.store.lock().unwrap();
+            // Leased rows start at an offset, as a real store's would.
+            let base = st.len() / stride + 3;
+            st.resize((base) * stride, f16::ZERO);
+            st.extend_from_slice(h);
+            let n = h.len() / stride;
+            Ok(Some(crate::net::StoreLease {
+                rows: (0..n).map(|i| (base + i) as u32).collect(),
+                hold: Box::new(()),
+            }))
+        }
+        fn diffusion_store(
+            &self,
+            rows: &[u32],
+            decl: &[f32],
+            cells: &[u32],
+        ) -> anyhow::Result<Vec<f32>> {
+            let stride = self.channels() * NUM_CELLS;
+            let h = crate::net::gather_rows(&self.store.lock().unwrap(), rows, stride);
+            let full = self.inner.diffusion(&h, decl, rows.len())?;
+            Ok(crate::net::gather_rows(&full, cells, DECL_LOGITS))
+        }
+        fn energy_store(&self, rows: &[u32], decl: &[f32]) -> anyhow::Result<Vec<f32>> {
+            let stride = self.channels() * NUM_CELLS;
+            let h = crate::net::gather_rows(&self.store.lock().unwrap(), rows, stride);
+            self.inner.energy(&h, decl, rows.len())
+        }
+    }
+
+    #[test]
+    fn run_wave_store_path_matches_the_plain_path() {
+        let cfg = SamplerConfig {
+            k_candidates: 2,
+            t_steps: 4,
+            resample_t: 2,
+            resample_frac: 1.0,
+            random_fraction: 0.25,
+            seed: 13,
+            ..Default::default()
+        };
+        let (Some(plain), Some(inner)) = (model(cfg.clone()), fixture_net()) else {
+            eprintln!("MINIONS_PARITY_DIR unset — skipping");
+            return;
+        };
+        let emu = MinionsModel::new(
+            Box::new(StoreEmu {
+                inner,
+                store: Default::default(),
+            }),
+            cfg,
+        );
+        let mut rng = ChaCha8Rng::seed_from_u64(5);
+        let mut states = vec![Minions::initial_state()];
+        for _ in 0..8 {
+            let s = states.last().unwrap().clone();
+            if Minions::outcome(&s).is_terminal() {
+                break;
+            }
+            states.push(realize(&s, &TurnSpec::random_playout(&s, &mut rng)).next);
+        }
+        let n = states.len();
+        let (exp, wid, rs) = (&states[..2], &states[2..n - 2], &states[n - 3..]);
+        let rs_from: Vec<TurnSpec> = rs
+            .iter()
+            .map(|s| TurnSpec::random_playout(s, &mut rng))
+            .collect();
+        let fill: Vec<bool> = (0..wid.len()).map(|i| i == 1).collect();
+        for full in [true, false] {
+            let run = |m: &MinionsModel| {
+                m.run_wave(
+                    &Wave {
+                        exp,
+                        wid,
+                        wid_fill: &fill,
+                        k: 2,
+                        full,
+                        rs,
+                        rs_from: &rs_from,
+                        cached: &[],
+                    },
+                    9,
+                    &|x| x,
+                )
+                .unwrap()
+            };
+            let (a, b) = (run(&plain), run(&emu));
+            assert_eq!(a.values, b.values);
+            assert_eq!(a.wid, b.wid, "widens differ (full {full})");
+            assert_eq!(a.rs, b.rs, "refines differ (full {full})");
+            for (x, y) in a.step1.iter().zip(&b.step1) {
+                assert_eq!(x.is_some(), y.is_some());
+            }
+        }
+    }
+
+    /// Cached step-1 logits must reproduce the wave exactly: same seed, same
+    /// candidates, energies and values whether step 1 was computed or read
+    /// back from `WaveOut::step1` -- and whether the trunk ran or its rows came
+    /// from the cache. A cache that changed the draws would bias self-play
+    /// toward whatever the cached nodes happened to sample.
+    #[test]
+    fn run_wave_step1_cache_reproduces_the_wave() {
+        let Some(m) = model(SamplerConfig {
+            k_candidates: 2,
+            t_steps: 4,
+            resample_t: 2,
+            resample_frac: 1.0,
+            random_fraction: 0.25,
+            seed: 11,
+            ..Default::default()
+        }) else {
+            eprintln!("MINIONS_PARITY_DIR unset — skipping");
+            return;
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(3);
+        let mut states = vec![Minions::initial_state()];
+        for _ in 0..6 {
+            let s = states.last().unwrap().clone();
+            if Minions::outcome(&s).is_terminal() {
+                break;
+            }
+            states.push(realize(&s, &TurnSpec::random_playout(&s, &mut rng)).next);
+        }
+        let n = states.len();
+        let exp = &states[..1];
+        let wid = &states[1..n - 1];
+        let rs = &states[n - 2..];
+        let rs_from: Vec<TurnSpec> = rs
+            .iter()
+            .map(|s| TurnSpec::random_playout(s, &mut rng))
+            .collect();
+        let fill = vec![false; wid.len()];
+        let run = |cached: &[Option<CachedRow>]| {
+            m.run_wave(
+                &Wave {
+                    exp,
+                    wid,
+                    wid_fill: &fill,
+                    k: 2,
+                    full: true,
+                    rs,
+                    rs_from: &rs_from,
+                    cached,
+                },
+                7,
+                &|x| x,
+            )
+            .unwrap()
+        };
+        let a = run(&[]);
+        assert!(
+            a.step1.iter().all(|l| l.is_some()),
+            "every widen computes step 1"
+        );
+        let rows = |with_step1: bool| -> Vec<Option<CachedRow>> {
+            (0..exp.len() + wid.len() + rs.len())
+                .map(|i| {
+                    let step1 = if with_step1 && i >= exp.len() && i < exp.len() + wid.len() {
+                        a.step1[i - exp.len()].as_deref()
+                    } else {
+                        None
+                    };
+                    Some(CachedRow {
+                        value: a.trunk.fresh[i].unwrap(),
+                        h: a.trunk.row(i),
+                        step1,
+                    })
+                })
+                .collect()
+        };
+        for with_step1 in [false, true] {
+            let b = run(&rows(with_step1));
+            assert_eq!(a.values, b.values);
+            assert_eq!(a.wid, b.wid, "widens differ (step 1 cached: {with_step1})");
+            assert_eq!(a.rs, b.rs, "refines differ (step 1 cached: {with_step1})");
+            if with_step1 {
+                assert!(
+                    b.step1.iter().all(|l| l.is_none()),
+                    "a hit computes nothing"
+                );
+            }
+        }
     }
 
     #[test]

@@ -1518,6 +1518,7 @@ dependencies = [
  "candle-nn",
  "clap",
  "half",
+ "libloading 0.8.9",
  "ort",
  "playground-core",
  "playground-engine-server",
