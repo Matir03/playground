@@ -468,6 +468,47 @@ def energy_loss(scores, visits):
 # throw away the only thing that makes T-step sampling affordable.
 
 
+class _ConstResidual(nn.Module):
+    """A residual block whose first conv is dead, as exported: ``relu(x + r)``.
+
+    With ``c1``'s weights at zero, ``c1(x)`` is its bias whatever ``x`` is, so
+    the whole residual branch is one fixed ``(1, C, N, N)`` tensor ``r`` --
+    spatially varying only through ``c2``'s zero padding. Exact.
+    """
+
+    def __init__(self, r: torch.Tensor):
+        super().__init__()
+        self.register_buffer("r", r)
+
+    def forward(self, x):
+        return F.relu(x + self.r)
+
+
+def without_dead_blocks(net: "MinionsNet", tol: float = 1e-20):
+    """A copy of ``net`` for export, every dead residual block folded away.
+
+    Measured 2026-09-24: blocks 3, 4 and 6 of the 96x8 trunk had been dead
+    since before gen300 (Adam's coupled L2 erases a block whose last BN gamma
+    reaches 0 -- see ``apply_no_decay`` in the learner), yet each still cost
+    two full 3x3 convs on every trunk call: 6 of the trunk's 16. Returns
+    ``(copy, n_folded)``; the training net is not touched.
+    """
+    import copy
+    out = copy.deepcopy(net).eval()
+    dev = next(out.parameters()).device
+    n = 0
+    for mod in list(out.modules()):
+        for name, child in list(mod.named_children()):
+            if isinstance(child, _ResBlock) and float(child.c1.weight.detach().abs().max()) < tol:
+                c = child.c1.in_channels
+                with torch.no_grad():
+                    z = torch.zeros(1, c, N, N, device=dev)
+                    r = child.b2(child.c2(F.relu(child.b1(child.c1(z)))))
+                mod._modules[name] = _ConstResidual(r)
+                n += 1
+    return out, n
+
+
 class _TrunkGraph(nn.Module):
     """planes -> (head features, value). Run once per position.
 
@@ -560,6 +601,8 @@ def export_onnx_atomic(net: MinionsNet, out_dir: str, f16_io: bool = True) -> No
     """
     was_training = net.training
     net.eval()
+    live_net = net
+    net, _ = without_dead_blocks(net)
     dev = next(net.parameters()).device
     # The declaration graphs consume the neck output, not the raw trunk.
     c = net.head_ch
@@ -632,7 +675,7 @@ def export_onnx_atomic(net: MinionsNet, out_dir: str, f16_io: bool = True) -> No
                 f16io(tmp, tmp, *NATIVE[name])
             os.replace(tmp, path)
     if was_training:
-        net.train()
+        live_net.train()
 
 
 # ── checkpoint I/O ────────────────────────────────────────────────────────────
