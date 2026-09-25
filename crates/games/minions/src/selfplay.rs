@@ -683,6 +683,7 @@ fn drive_pool_worker(
         let wid_idx: Vec<usize> = (0..real).filter(|&i| is_widen[i]).collect();
         stats.req_expand += exp_idx.len() as u64;
         stats.req_widen += wid_idx.len() as u64;
+        stats.req_fill += wid_idx.iter().filter(|&&i| fills[i]).count() as u64;
         // Rows the two calls actually pad: each rounds up to `width_for`.
         for n in [exp_idx.len(), wid_idx.len()] {
             if n > 0 {
@@ -794,6 +795,11 @@ const TRUNK_CACHE_AB_FILE: &str = "trunk_cache_ab";
 /// the same net in `best/fp32/` (`ort_net::GRAPH_F16_USE`). Needs that
 /// directory; without it the switch has nothing to switch to.
 const GRAPH_F16_AB_FILE: &str = "graph_f16_ab";
+
+/// While this file exists in the live dir, windows alternate the pinned-buffer
+/// ORT path on and off (`ort_net::PINNED_USE`), in the same A B B A order as
+/// the other in-process A/Bs.
+const PINNED_AB_FILE: &str = "pinned_ab";
 
 fn entry_bytes(h_len: usize) -> usize {
     h_len * std::mem::size_of::<half::f16>() + 64
@@ -919,6 +925,9 @@ pub struct PoolStats {
     pub req_widen: u64,
     /// Refinement requests (`Step::NeedResample`).
     pub req_resample: u64,
+    /// Widens that were fills: their diffusion draws are made (to keep the
+    /// batch shape) and then discarded for random playouts.
+    pub req_fill: u64,
     /// Root children of full searches, and how many of them were stable -- the
     /// ones the policy target is built over.
     pub root_children: u64,
@@ -957,6 +966,7 @@ impl PoolStats {
         self.req_expand += o.req_expand;
         self.req_widen += o.req_widen;
         self.req_resample += o.req_resample;
+        self.req_fill += o.req_fill;
         self.root_children += o.root_children;
         self.root_stable += o.root_stable;
         self.full_roots += o.full_roots;
@@ -980,9 +990,10 @@ impl PoolStats {
             100.0 * (1.0 - self.head_real as f64 / self.head_run as f64)
         };
         let mut s = format!(
-            "requests: {:.0}% value-only, {:.0}% candidate, {:.0}% refine  |  head rows {} of {} run ({:.0}% padding)",
+            "requests: {:.0}% value-only, {:.0}% candidate ({:.0}% of them fills), {:.0}% refine  |  head rows {} of {} run ({:.0}% padding)",
             100.0 * self.req_expand as f64 / reqs as f64,
             100.0 * self.req_widen as f64 / reqs as f64,
+            100.0 * self.req_fill as f64 / self.req_widen.max(1) as f64,
             100.0 * self.req_resample as f64 / reqs as f64,
             self.head_real,
             self.head_run,
@@ -1548,6 +1559,9 @@ pub fn run_loop(
         let f16_ab = live.join(GRAPH_F16_AB_FILE).exists();
         let f16_on = !f16_ab || matches!(window % 4, 1 | 2);
         crate::ort_net::GRAPH_F16_USE.store(f16_on, std::sync::atomic::Ordering::Relaxed);
+        let pin_ab = live.join(PINNED_AB_FILE).exists();
+        let pin_on = !pin_ab || matches!(window % 4, 1 | 2);
+        crate::ort_net::PINNED_USE.store(pin_on, std::sync::atomic::Ordering::Relaxed);
         let deadline = Instant::now() + Duration::from_secs(chunk_secs);
         let mut stats = PoolStats::default();
         let t0 = Instant::now();
@@ -1558,18 +1572,24 @@ pub fn run_loop(
             "  {}",
             model.phases.report_wall(t0.elapsed().as_secs_f64(), cfg.workers)
         );
+        model.phases.reset();
         println!("  {}", stats.explore_report());
         println!("  {}", stats.split_report());
+        if let Some(r) = crate::ort_net::call_stats::take_report(t0.elapsed().as_secs_f64()) {
+            println!("  {r}");
+        }
         // Raw counts, so a benchmark can measure fixed work rather than a rate:
         // throughput swings ~4x over a generation as the pool moves in step.
         println!(
-            "  window: {} expansions in {:.3}s  cache {}{}  f16 {}{}",
+            "  window: {} expansions in {:.3}s  cache {}{}  f16 {}{}  pinned {}{}",
             stats.expansions,
             t0.elapsed().as_secs_f64(),
             if cache_on { "on" } else { "off" },
             if ab { " (ab)" } else { "" },
             if f16_on { "on" } else { "off" },
-            if f16_ab { " (ab)" } else { "" }
+            if f16_ab { " (ab)" } else { "" },
+            if pin_on { "on" } else { "off" },
+            if pin_ab { " (ab)" } else { "" }
         );
         if !examples.is_empty() {
             let path = write_chunk(&buffer, chunk_index, &examples)?;

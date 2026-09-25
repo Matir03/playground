@@ -661,6 +661,11 @@ struct Entry<G: SampledGame> {
     /// edge is reached. Maintained in both modes, so `Avg` reads exactly the
     /// numbers it always did.
     mm: Option<f32>,
+    /// `G::state_key` of the position this move reaches, computed once when
+    /// the entry is made. Every merge compares against it, and recomputing it
+    /// per comparison meant a full `G::apply` of every sibling -- in Minions a
+    /// realize each, ~200 per refine and O(K^2) over a root's widens.
+    key: u128,
 }
 
 impl<G: SampledGame> Entry<G> {
@@ -1579,7 +1584,7 @@ impl<G: SampledGame> Search<G> {
             let i = node
                 .entries
                 .iter()
-                .position(|e| G::state_key(&G::apply(&node.state, &e.mv)) == key)
+                .position(|e| e.key == key)
                 .ok_or_else(|| anyhow::anyhow!("depth {depth}: not a candidate of that node"))?;
             out.push(i);
             if depth + 1 < line.len() {
@@ -1644,11 +1649,7 @@ impl<G: SampledGame> Search<G> {
         anyhow::ensure!(!self.tree[node].terminal, "the game is over there");
         let state = self.tree[node].state.clone();
         let key = G::state_key(&G::apply(&state, &mv));
-        let find = |entries: &[Entry<G>]| {
-            entries
-                .iter()
-                .position(|e| G::state_key(&G::apply(&state, &e.mv)) == key)
-        };
+        let find = |entries: &[Entry<G>]| entries.iter().position(|e| e.key == key);
         if let Some(i) = find(&self.tree[node].entries) {
             return Ok((i, false));
         }
@@ -1675,6 +1676,7 @@ impl<G: SampledGame> Search<G> {
             id,
             stable,
             mm: None,
+            key,
         });
         renormalise(&mut self.tree[node].entries);
         // Every prior moved, so the visited mass FPU reads must be re-summed.
@@ -2000,6 +2002,7 @@ impl<G: SampledGame> Search<G> {
                         id: 0,
                         stable: true,
                         mm: None,
+                        key,
                     });
                 }
             }
@@ -2132,7 +2135,7 @@ impl<G: SampledGame> Search<G> {
             .expect("provide_widen without a pending widen");
         let mut seen: std::collections::HashMap<u128, usize> = Default::default();
         for (i, e) in self.tree[cur].entries.iter().enumerate() {
-            seen.insert(G::state_key(&G::apply(&self.tree[cur].state, &e.mv)), i);
+            seen.insert(e.key, i);
         }
         let k_max = self.params.k_candidates.max(1);
         let before = self.tree[cur].entries.len();
@@ -2173,6 +2176,7 @@ impl<G: SampledGame> Search<G> {
                         true_n: 0,
                         true_w: 0.0,
                         mm: None,
+                        key,
                         draws: draw,
                         manual: false,
                         eval: None,
@@ -2229,11 +2233,10 @@ impl<G: SampledGame> Search<G> {
             // the visit to whichever addition had the best energy prior,
             // quietly overriding that choice.
             let first = added[0];
-            let state = &self.tree[cur].state;
             self.visit_new = self.tree[cur]
                 .entries
                 .iter()
-                .position(|e| G::state_key(&G::apply(state, &e.mv)) == first)
+                .position(|e| e.key == first)
                 .map(|i| (cur, i));
         }
         // Top up only: an explore candidate that arrived by widening still needs
@@ -2275,11 +2278,11 @@ impl<G: SampledGame> Search<G> {
         let origin = self.tree[cur].entries[from].id;
         let state = self.tree[cur].state.clone();
         let key_of = |mv: &G::Move| G::state_key(&G::apply(&state, mv));
-        let mut target = key_of(&self.tree[cur].entries[from].mv);
+        let mut target = self.tree[cur].entries[from].key;
         if let Some((mv, energy, explore)) = candidates.into_iter().next() {
             target = key_of(&mv);
             let entries = &mut self.tree[cur].entries;
-            if !entries.iter().any(|e| key_of(&e.mv) == target) {
+            if !entries.iter().any(|e| e.key == target) {
                 let id = entries.len() as u32;
                 entries.push(Entry {
                     mv,
@@ -2302,13 +2305,14 @@ impl<G: SampledGame> Search<G> {
                     id,
                     stable: false,
                     mm: None,
+                    key: target,
                 });
                 renormalise(entries);
                 self.build_kernel(cur);
             }
         }
         let entries = &mut self.tree[cur].entries;
-        let visit = entries.iter().position(|e| key_of(&e.mv) == target);
+        let visit = entries.iter().position(|e| e.key == target);
         // The visit handed over here is the search's choice of `origin`, which
         // the refinement only redrew: the training target credits it back
         // there (`Entry::target_n`). PUCT sees it where it lands, as ever.
@@ -3261,6 +3265,7 @@ mod tests {
             energy: 0.0,
             p: 1.0 / 3.0,
             mm: None,
+            key: 0,
             n: 0,
             w: 0.0,
             child: -1,
@@ -3955,6 +3960,7 @@ mod tests {
             id: 0,
             stable: false,
             mm: None,
+            key: 0,
         };
         assert_eq!(e.value_wn(ValueVisits::MinTwo), (0.0, 0), "unvisited");
 
@@ -4087,6 +4093,7 @@ mod tests {
                 energy: 0.0,
                 p: 1.0 / 12.0,
                 mm: None,
+                key: 0,
                 n: 0,
                 w: 0.0,
                 child: -1,
@@ -4158,6 +4165,7 @@ mod tests {
                     energy: 0.0,
                     p: 1.0 / 64.0,
                     mm: None,
+                    key: 0,
                     n: 0,
                     w: 0.0,
                     child: -1,
@@ -5101,6 +5109,7 @@ mod forced_quota_tests {
     fn entry(explore: bool) -> Entry<G0> {
         Entry {
             mm: None,
+            key: 0,
             mv: 1,
             energy: 0.0,
             p: 0.25,

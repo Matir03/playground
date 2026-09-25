@@ -229,6 +229,10 @@ pub trait Backend: Send + Sync {
         h: &'a [f16],
         b: usize,
     ) -> anyhow::Result<Box<dyn DiffusionPass + 'a>>;
+    /// Flush any profiler traces (ORT's `MINIONS_ORT_PROFILE`); their paths.
+    fn end_profiling(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Repeat one position's trunk features across `n` rows, so a batch of `n`

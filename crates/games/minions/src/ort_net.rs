@@ -74,6 +74,35 @@ macro_rules! take_f32 {
     };
 }
 
+/// One output copied out raw, so the session can be released *before* the
+/// fp16 -> f32 widening: that conversion took ~115 us of a ~1.4 ms diffusion
+/// hold at ~160 rows, while callers queued ~1.4 ms for the session.
+enum Raw {
+    F16(Vec<f16>),
+    F32(Vec<f32>),
+}
+
+impl Raw {
+    fn into_f32(self) -> Vec<f32> {
+        match self {
+            Raw::F16(v) => v.to_f32_vec(),
+            Raw::F32(v) => v,
+        }
+    }
+}
+
+macro_rules! take_raw {
+    ($outputs:expr, $name:expr, $out16:expr) => {
+        if $out16 {
+            let (_, v) = $outputs[$name].try_extract_tensor::<f16>().map_err(e2a)?;
+            Raw::F16(v.to_vec())
+        } else {
+            let (_, v) = $outputs[$name].try_extract_tensor::<f32>().map_err(e2a)?;
+            Raw::F32(v.to_vec())
+        }
+    };
+}
+
 /// One output as fp16, narrowed when the graph emits f32.
 macro_rules! take_f16 {
     ($outputs:expr, $name:expr, $out16:expr) => {
@@ -85,6 +114,122 @@ macro_rules! take_f16 {
             Vec::<f16>::from_f32_slice(v)
         }
     };
+}
+
+/// Per-graph call accounting, so a window can say *where* a head call's time
+/// goes: waiting for the pooled session, host-side conversion, `Session::run`
+/// (upload + kernels + download + sync), and extracting the output.
+///
+/// Added 2026-09-24 because a head 2.3x narrower self-played at the same rate
+/// as the full one -- so the head's time is not in its arithmetic, and the
+/// phase counters (which time the whole call) cannot say what it is in.
+pub mod call_stats {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub const TRUNK: usize = 0;
+    pub const DIFFUSION: usize = 1;
+    pub const ENERGY: usize = 2;
+    const NAMES: [&str; 3] = ["trunk", "diffusion", "energy"];
+    /// Row-count buckets: <=32, <=128, <=512, <=2048, larger.
+    const EDGES: [u64; 4] = [32, 128, 512, 2048];
+
+    #[derive(Default)]
+    pub struct Graph {
+        calls: AtomicU64,
+        rows: AtomicU64,
+        wait_ns: AtomicU64,
+        prep_ns: AtomicU64,
+        run_ns: AtomicU64,
+        post_ns: AtomicU64,
+        hist: [AtomicU64; 5],
+    }
+
+    pub static GRAPHS: [Graph; 3] = [Graph::new(), Graph::new(), Graph::new()];
+
+    impl Graph {
+        const fn new() -> Self {
+            Self {
+                calls: AtomicU64::new(0),
+                rows: AtomicU64::new(0),
+                wait_ns: AtomicU64::new(0),
+                prep_ns: AtomicU64::new(0),
+                run_ns: AtomicU64::new(0),
+                post_ns: AtomicU64::new(0),
+                hist: [
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                ],
+            }
+        }
+    }
+
+    /// One call's split, in nanoseconds.
+    pub fn record(g: usize, rows: usize, wait: u64, prep: u64, run: u64, post: u64) {
+        let s = &GRAPHS[g];
+        s.calls.fetch_add(1, Relaxed);
+        s.rows.fetch_add(rows as u64, Relaxed);
+        s.wait_ns.fetch_add(wait, Relaxed);
+        s.prep_ns.fetch_add(prep, Relaxed);
+        s.run_ns.fetch_add(run, Relaxed);
+        s.post_ns.fetch_add(post, Relaxed);
+        let b = EDGES.iter().position(|&e| rows as u64 <= e).unwrap_or(4);
+        s.hist[b].fetch_add(1, Relaxed);
+    }
+
+    static UPLOADS: AtomicU64 = AtomicU64::new(0);
+    static UPLOAD_NS: AtomicU64 = AtomicU64::new(0);
+
+    /// A `DevicePass` uploading its `h` once.
+    pub fn record_upload(_rows: usize, ns: u64) {
+        UPLOADS.fetch_add(1, Relaxed);
+        UPLOAD_NS.fetch_add(ns, Relaxed);
+    }
+
+    /// The window's numbers since the last call, then reset. `None` when no
+    /// ORT call was made (candle backend).
+    pub fn take_report(secs: f64) -> Option<String> {
+        let mut parts = Vec::new();
+        for (g, name) in NAMES.iter().enumerate() {
+            let s = &GRAPHS[g];
+            let calls = s.calls.swap(0, Relaxed);
+            let rows = s.rows.swap(0, Relaxed);
+            let ms = |a: &AtomicU64| a.swap(0, Relaxed) as f64 / 1e6;
+            let (wait, prep, run, post) = (
+                ms(&s.wait_ns),
+                ms(&s.prep_ns),
+                ms(&s.run_ns),
+                ms(&s.post_ns),
+            );
+            let hist: Vec<u64> = s.hist.iter().map(|h| h.swap(0, Relaxed)).collect();
+            if calls == 0 {
+                continue;
+            }
+            let per = |x: f64| 1000.0 * x / calls as f64;
+            parts.push(format!(
+                "{name} {:.0}/s x {:.0} rows: wait {:.0} prep {:.0} run {:.0} post {:.0} us/call (hist <=32/128/512/2k/more {:?})",
+                calls as f64 / secs,
+                rows as f64 / calls as f64,
+                per(wait),
+                per(prep),
+                per(run),
+                per(post),
+                hist
+            ));
+        }
+        let ups = UPLOADS.swap(0, Relaxed);
+        let up_ns = UPLOAD_NS.swap(0, Relaxed);
+        if ups > 0 {
+            parts.push(format!(
+                "h uploads {:.0}/s x {:.0} us",
+                ups as f64 / secs,
+                up_ns as f64 / 1e3 / ups as f64
+            ));
+        }
+        (!parts.is_empty()).then(|| format!("ort calls: {}", parts.join("  |  ")))
+    }
 }
 
 fn e2a<E: std::fmt::Display>(e: E) -> anyhow::Error {
@@ -115,6 +260,70 @@ pub struct OrtNet {
     /// Rotates the starting slot so callers do not all probe slot 0 first.
     rr: std::sync::atomic::AtomicUsize,
     channels: usize,
+    /// Device buffers for `DevicePass`'s `h`, by row count, reused across
+    /// passes: allocating one per pass (ort's `Tensor::to`) cost 4.3 ms, six
+    /// times the pass it was saving on. Row counts come from a small fixed set
+    /// (the sampler pads to TensorRT's shapes), so this stays small.
+    dev_h: Mutex<std::collections::HashMap<usize, Vec<ort::value::Tensor<f16>>>>,
+    /// The diffusion session's CUDA allocator, kept alive with the buffers.
+    dev_alloc: Mutex<Option<ort::memory::Allocator>>,
+    /// Pinned host buffers for head calls, by `(graph, rows)` -- see [`Pinned`].
+    pinned: Mutex<std::collections::HashMap<(usize, usize), Vec<Pinned>>>,
+    /// `CUDA_PINNED` allocators for inputs and outputs, made on first use.
+    pin_alloc: Mutex<Option<(ort::memory::Allocator, ort::memory::Allocator)>>,
+}
+
+/// One head call's inputs and output in page-locked host memory, reused.
+///
+/// From pageable memory every call's copies are staged through a driver
+/// bounce buffer and synchronous: the ORT trace put ~200 us of a 536 us
+/// diffusion `model_run` outside the TensorRT kernel, which is what ~1.66 MB
+/// at pageable bandwidth costs. Pinned buffers let those copies go straight
+/// to DMA, and filling them *before* taking the session means the lock --
+/// the diffusion session is the actor's one saturated resource -- is held
+/// only for the run itself. Measured 2026-09-24; `MINIONS_ORT_PINNED=0`
+/// turns it off.
+struct Pinned {
+    /// The graph's fp16 inputs, in the order the caller named them.
+    ins: Vec<ort::value::Tensor<f16>>,
+    /// Holds the preallocated outputs: ORT writes each run's results into them.
+    run: ort::session::RunOptions<ort::session::HasSelectedOutputs>,
+    /// Each output's host data (owned by `run`, which outlives every read) and
+    /// element count, in the order the caller named them.
+    outs: Vec<(*const u8, usize)>,
+}
+
+// SAFETY: `outs` points into tensors `run` owns; a `Pinned` is only ever used by
+// the one thread that popped it from the pool.
+unsafe impl Send for Pinned {}
+
+impl Pinned {
+    /// Output `i` as f32, read after the run and outside the session lock.
+    fn out_f32(&self, i: usize, is_f16: bool) -> Vec<f32> {
+        let (p, n) = self.outs[i];
+        // SAFETY: see the type -- the buffer is live, `n` elements of this type.
+        unsafe {
+            if is_f16 {
+                std::slice::from_raw_parts(p as *const f16, n).to_f32_vec()
+            } else {
+                std::slice::from_raw_parts(p as *const f32, n).to_vec()
+            }
+        }
+    }
+
+    fn out_f16(&self, i: usize) -> Vec<f16> {
+        let (p, n) = self.outs[i];
+        // SAFETY: as `out_f32`; the caller asked for this output as fp16.
+        unsafe { std::slice::from_raw_parts(p as *const f16, n).to_vec() }
+    }
+}
+
+/// Whether head and trunk calls take the [`Pinned`] path. Self-play flips it per
+/// window for an in-process A/B (`pinned_ab` in the live dir).
+pub static PINNED_USE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+fn pinned_on() -> bool {
+    PINNED_USE.load(std::sync::atomic::Ordering::Relaxed) && env_flag("MINIONS_ORT_PINNED", true)
 }
 
 /// How many sessions to build per graph. `1` reproduces the old single-session
@@ -141,6 +350,11 @@ impl Drop for OrtNet {
         std::mem::forget(self.diffusion.take());
         std::mem::forget(self.best.take());
         std::mem::forget(self.energy.take());
+        // Device buffers belong to the leaked sessions' allocator.
+        std::mem::forget(std::mem::take(&mut *self.dev_h.lock().unwrap()));
+        std::mem::forget(self.dev_alloc.lock().unwrap().take());
+        std::mem::forget(std::mem::take(&mut *self.pinned.lock().unwrap()));
+        std::mem::forget(self.pin_alloc.lock().unwrap().take());
     }
 }
 
@@ -214,6 +428,13 @@ pub(crate) fn build(path: &Path, ep: &str, fp16: bool, cache_dir: &str) -> anyho
                     .with_cuda_graph(env_flag("MINIONS_TRT_CUDA_GRAPH", false))
                     .with_engine_cache(true)
                     .with_engine_cache_path(cache_dir.to_string())
+                    // Experiment knobs (unset = TensorRT/ORT defaults).
+                    .with_builder_optimization_level(
+                        std::env::var("MINIONS_TRT_OPT_LEVEL")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(3),
+                    )
                     .build(),
                 cuda().build(), // per-node fallback where TRT cannot build
             ]
@@ -235,12 +456,20 @@ pub(crate) fn build(path: &Path, ep: &str, fp16: bool, cache_dir: &str) -> anyho
         }
         other => anyhow::bail!("unknown --ep {other:?} (use cuda|trt)"),
     };
-    Session::builder()
+    let mut b = Session::builder()
         .map_err(e2a)?
         .with_execution_providers(providers)
-        .map_err(e2a)?
-        .commit_from_file(path)
-        .map_err(e2a)
+        .map_err(e2a)?;
+    // Per-node timings (including host<->device copies) as Chrome-trace JSON,
+    // one file per session: `<prefix>_<graph>_<timestamp>.json`.
+    if let Ok(prefix) = std::env::var("MINIONS_ORT_PROFILE") {
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        b = b.with_profiling(format!("{prefix}_{stem}")).map_err(e2a)?;
+    }
+    b.commit_from_file(path).map_err(e2a)
 }
 
 impl OrtNet {
@@ -332,7 +561,28 @@ impl OrtNet {
             fp32_alt,
             rr: std::sync::atomic::AtomicUsize::new(0),
             channels,
+            dev_h: Mutex::new(Default::default()),
+            dev_alloc: Mutex::new(None),
+            pinned: Mutex::new(Default::default()),
+            pin_alloc: Mutex::new(None),
         })
+    }
+
+    /// Flush `MINIONS_ORT_PROFILE` traces: ORT writes them only when profiling
+    /// ends, and these sessions are never dropped (see [`Drop`]).
+    pub fn end_profiling_all(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for pool in [&self.trunk, &self.diffusion, &self.best, &self.energy]
+            .into_iter()
+            .flatten()
+        {
+            for s in pool {
+                if let Ok(p) = s.lock().unwrap().end_profiling() {
+                    out.push(p);
+                }
+            }
+        }
+        out
     }
 
     /// Take the first free session in the pool, else block on a rotating slot.
@@ -361,28 +611,180 @@ impl OrtNet {
         b: usize,
         output: &str,
         decl_planes: usize,
+        graph: usize,
     ) -> anyhow::Result<Vec<f32>> {
+        use std::time::Instant;
         let c = crate::net::head_width(self.channels) as i64;
         let hshape = vec![b as i64, c, N as i64, N as i64];
         let dshape = vec![b as i64, decl_planes as i64, N as i64, N as i64];
-        let mut sess = self.acquire(which.as_ref().expect("session outlives run"));
+        let ns = |a: Instant, b: Instant| (b - a).as_nanos() as u64;
+        let pool = which.as_ref().expect("session outlives run");
+        if io.in16 && io.out16 && pinned_on() {
+            let tp = Instant::now();
+            let mut pin = self.take_pinned(
+                pool,
+                graph,
+                b,
+                &[("h", hshape), ("decl", dshape)],
+                &[(output, true)],
+            )?;
+            pin.ins[0]
+                .try_extract_tensor_mut::<f16>()
+                .map_err(e2a)?
+                .1
+                .copy_from_slice(h);
+            pin.ins[1]
+                .try_extract_tensor_mut::<f16>()
+                .map_err(e2a)?
+                .1
+                .convert_from_f32_slice(decl);
+            let t0 = Instant::now();
+            let mut sess = self.acquire(pool);
+            let t1 = Instant::now();
+            drop(
+                sess.run_with_options(
+                    ort::inputs!["h" => &pin.ins[0], "decl" => &pin.ins[1]],
+                    &pin.run,
+                )
+                .map_err(e2a)?,
+            );
+            drop(sess);
+            let t2 = Instant::now();
+            let out = pin.out_f32(0, true);
+            self.pinned
+                .lock()
+                .unwrap()
+                .entry((graph, b))
+                .or_default()
+                .push(pin);
+            call_stats::record(
+                graph,
+                b,
+                ns(t0, t1),
+                ns(tp, t0),
+                ns(t1, t2),
+                ns(t2, Instant::now()),
+            );
+            return Ok(out);
+        }
+        let t0 = Instant::now();
+        let mut sess = self.acquire(pool);
+        let t1 = Instant::now();
         if io.in16 {
             let d16: Vec<f16> = Vec::from_f32_slice(decl);
             let ht = TensorRef::from_array_view((hshape, h)).map_err(e2a)?;
             let dt = TensorRef::from_array_view((dshape, &d16[..])).map_err(e2a)?;
-            let outputs = sess
-                .run(ort::inputs!["h" => ht, "decl" => dt])
-                .map_err(e2a)?;
-            Ok(take_f32!(outputs, output, io.out16))
+            let t2 = Instant::now();
+            let raw = {
+                let outputs = sess
+                    .run(ort::inputs!["h" => ht, "decl" => dt])
+                    .map_err(e2a)?;
+                take_raw!(outputs, output, io.out16)
+            };
+            drop(sess);
+            let t3 = Instant::now();
+            let out = raw.into_f32();
+            call_stats::record(
+                graph,
+                b,
+                ns(t0, t1),
+                ns(t1, t2),
+                ns(t2, t3),
+                ns(t3, Instant::now()),
+            );
+            Ok(out)
         } else {
             let h32 = h.to_f32_vec();
             let ht = TensorRef::from_array_view((hshape, &h32[..])).map_err(e2a)?;
             let dt = TensorRef::from_array_view((dshape, decl)).map_err(e2a)?;
+            let t2 = Instant::now();
             let outputs = sess
                 .run(ort::inputs!["h" => ht, "decl" => dt])
                 .map_err(e2a)?;
-            Ok(take_f32!(outputs, output, io.out16))
+            let t3 = Instant::now();
+            let out = take_f32!(outputs, output, io.out16);
+            call_stats::record(
+                graph,
+                b,
+                ns(t0, t1),
+                ns(t1, t2),
+                ns(t2, t3),
+                ns(t3, Instant::now()),
+            );
+            Ok(out)
         }
+    }
+
+    /// A [`Pinned`] set for `graph` at `b` rows, from the pool or made now.
+    /// Made at most a few times per row count: each worker holds one only for
+    /// the length of a call. `outputs` pairs each name with whether it is fp16
+    /// (else f32).
+    fn take_pinned(
+        &self,
+        pool: &[Mutex<Session>],
+        graph: usize,
+        b: usize,
+        inputs: &[(&str, Vec<i64>)],
+        outputs: &[(&str, bool)],
+    ) -> anyhow::Result<Pinned> {
+        use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType};
+        use ort::session::{OutputSelector, RunOptions};
+        if let Some(p) = self
+            .pinned
+            .lock()
+            .unwrap()
+            .get_mut(&(graph, b))
+            .and_then(|v| v.pop())
+        {
+            return Ok(p);
+        }
+        let sess = self.acquire(pool);
+        let mut oshapes: Vec<Vec<i64>> = Vec::new();
+        for (name, _) in outputs {
+            oshapes.push(
+                sess.outputs()
+                    .iter()
+                    .find(|o| o.name() == *name)
+                    .and_then(|o| o.dtype().tensor_shape())
+                    .ok_or_else(|| anyhow::anyhow!("no tensor output {name}"))?
+                    .iter()
+                    .map(|&d| if d < 0 { b as i64 } else { d })
+                    .collect(),
+            );
+        }
+        let mut alloc = self.pin_alloc.lock().unwrap();
+        if alloc.is_none() {
+            let mi =
+                |t| MemoryInfo::new(AllocationDevice::CUDA_PINNED, 0, AllocatorType::Device, t);
+            *alloc = Some((
+                Allocator::new(&sess, mi(MemoryType::CPUInput).map_err(e2a)?).map_err(e2a)?,
+                Allocator::new(&sess, mi(MemoryType::CPUOutput).map_err(e2a)?).map_err(e2a)?,
+            ));
+        }
+        drop(sess);
+        let (ain, aout) = alloc.as_ref().unwrap();
+        let mut ins = Vec::new();
+        for (_, shape) in inputs {
+            ins.push(ort::value::Tensor::<f16>::new(ain, shape.clone()).map_err(e2a)?);
+        }
+        let mut sel = OutputSelector::no_default();
+        let mut outs = Vec::new();
+        for (&(name, is_f16), shape) in outputs.iter().zip(oshapes) {
+            sel = sel.with(name);
+            sel = if is_f16 {
+                let o = ort::value::Tensor::<f16>::new(aout, shape).map_err(e2a)?;
+                let (_, v) = o.try_extract_tensor::<f16>().map_err(e2a)?;
+                outs.push((v.as_ptr() as *const u8, v.len()));
+                sel.preallocate(name, o)
+            } else {
+                let o = ort::value::Tensor::<f32>::new(aout, shape).map_err(e2a)?;
+                let (_, v) = o.try_extract_tensor::<f32>().map_err(e2a)?;
+                outs.push((v.as_ptr() as *const u8, v.len()));
+                sel.preallocate(name, o)
+            };
+        }
+        let run = RunOptions::new().map_err(e2a)?.with_outputs(sel);
+        Ok(Pinned { ins, run, outs })
     }
 
     /// The best-move head: `h` in, one row of outputs per position.
@@ -419,6 +821,10 @@ impl OrtNet {
 }
 
 impl Backend for OrtNet {
+    fn end_profiling(&self) -> Vec<String> {
+        self.end_profiling_all()
+    }
+
     fn channels(&self) -> usize {
         // Head-conditioning width — `trunk.onnx` emits `head_features(h)`.
         crate::net::head_width(self.channels)
@@ -427,17 +833,73 @@ impl Backend for OrtNet {
     fn trunk(&self, planes: &[f32], b: usize) -> anyhow::Result<TrunkOut> {
         let net = self.active();
         let shape = vec![b as i64, IN_PLANES as i64, N as i64, N as i64];
-        let mut sess = net.acquire(net.trunk.as_ref().expect("session outlives forward"));
+        let pool = net.trunk.as_ref().expect("session outlives forward");
+        let ns = |a: std::time::Instant, b: std::time::Instant| (b - a).as_nanos() as u64;
         // Features are small integers, exact in fp16.
-        let (h, value) = if net.trunk_io.in16 {
+        let (h, value) = if net.trunk_io.in16 && net.trunk_io.out16 && pinned_on() {
+            use std::time::Instant;
+            let tp = Instant::now();
+            let mut pin = net.take_pinned(
+                pool,
+                call_stats::TRUNK,
+                b,
+                &[("planes", shape)],
+                &[("h", true), ("value", false)],
+            )?;
+            pin.ins[0]
+                .try_extract_tensor_mut::<f16>()
+                .map_err(e2a)?
+                .1
+                .convert_from_f32_slice(planes);
+            let t0 = Instant::now();
+            let mut sess = net.acquire(pool);
+            let t1 = Instant::now();
+            drop(
+                sess.run_with_options(ort::inputs!["planes" => &pin.ins[0]], &pin.run)
+                    .map_err(e2a)?,
+            );
+            drop(sess);
+            let t2 = Instant::now();
+            let r = (pin.out_f16(0), pin.out_f32(1, false));
+            net.pinned
+                .lock()
+                .unwrap()
+                .entry((call_stats::TRUNK, b))
+                .or_default()
+                .push(pin);
+            call_stats::record(
+                call_stats::TRUNK,
+                b,
+                ns(t0, t1),
+                ns(tp, t0),
+                ns(t1, t2),
+                ns(t2, Instant::now()),
+            );
+            r
+        } else if net.trunk_io.in16 {
+            let t0 = std::time::Instant::now();
+            let mut sess = net.acquire(pool);
+            let t1 = std::time::Instant::now();
             let p16: Vec<f16> = Vec::from_f32_slice(planes);
             let input = TensorRef::from_array_view((shape, &p16[..])).map_err(e2a)?;
+            let t2 = std::time::Instant::now();
             let outputs = sess.run(ort::inputs!["planes" => input]).map_err(e2a)?;
-            (
+            let t3 = std::time::Instant::now();
+            let r = (
                 take_f16!(outputs, "h", net.trunk_io.out16),
                 take_f32!(outputs, "value", false),
-            )
+            );
+            call_stats::record(
+                call_stats::TRUNK,
+                b,
+                ns(t0, t1),
+                ns(t1, t2),
+                ns(t2, t3),
+                ns(t3, std::time::Instant::now()),
+            );
+            r
         } else {
+            let mut sess = net.acquire(pool);
             let input = TensorRef::from_array_view((shape, planes)).map_err(e2a)?;
             let outputs = sess.run(ort::inputs!["planes" => input]).map_err(e2a)?;
             (
@@ -485,6 +947,7 @@ impl Backend for OrtNet {
             b,
             "logits",
             DECL_PLANES,
+            call_stats::DIFFUSION,
         )?;
         debug_assert_eq!(out.len(), b * NUM_CELLS * DECL_LOGITS);
         Ok(out)
@@ -500,6 +963,7 @@ impl Backend for OrtNet {
             b,
             "energy",
             ENERGY_PLANES,
+            call_stats::ENERGY,
         )
     }
 
@@ -534,7 +998,114 @@ impl Backend for OrtNet {
                 crate::net::head_width(net.channels),
             )?));
         }
+        if net.diffusion_io.in16 && env_flag("MINIONS_ORT_DEVICE_H", false) {
+            return Ok(Box::new(DevicePass::new(net, h, b)?));
+        }
         Ok(Box::new(NaivePass { net, h, b }))
+    }
+}
+
+/// A diffusion pass with `h` uploaded to the GPU **once**, then fed to every
+/// step as a device-resident input of an ordinary `Session::run`.
+///
+/// `h` never changes within a pass, yet the per-step path re-sent it on all
+/// `T` steps: at the production shape (~160 rows) that is 752 KB and ~120 us of
+/// PCIe per step, out of a ~0.75 ms call of which only ~0.15 ms is the network
+/// -- measured 2026-09-24, when a 16-wide head ran at 0.60 ms against the
+/// 96-wide head's 0.75.
+///
+/// No `IoBinding` on the model session (that is what `BoundPass` broke on):
+/// the upload goes through ort's own copy helper (`Tensor::to`), and the model
+/// session sees a plain input that happens to live on the device. The session
+/// is taken per step, not held for the pass, so other workers interleave.
+struct DevicePass<'a> {
+    net: &'a OrtNet,
+    /// `Some` for the pass's life; taken back into the pool on drop.
+    h: Option<ort::value::Tensor<f16>>,
+    b: usize,
+}
+
+impl<'a> DevicePass<'a> {
+    fn new(net: &'a OrtNet, h: &[f16], b: usize) -> anyhow::Result<Self> {
+        use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType};
+        let c = crate::net::head_width(net.channels);
+        let shape = vec![b as i64, c as i64, N as i64, N as i64];
+        let t0 = std::time::Instant::now();
+        let reused = net.dev_h.lock().unwrap().get_mut(&b).and_then(|v| v.pop());
+        let mut dev = match reused {
+            Some(t) => t,
+            None => {
+                let mut alloc = net.dev_alloc.lock().unwrap();
+                if alloc.is_none() {
+                    let sess = net.acquire(net.diffusion.as_ref().expect("diffusion session"));
+                    let mi = MemoryInfo::new(
+                        AllocationDevice::CUDA,
+                        0,
+                        AllocatorType::Device,
+                        MemoryType::Default,
+                    )
+                    .map_err(e2a)?;
+                    *alloc = Some(Allocator::new(&sess, mi).map_err(e2a)?);
+                }
+                ort::value::Tensor::<f16>::new(alloc.as_ref().unwrap(), shape.clone())
+                    .map_err(e2a)?
+            }
+        };
+        let host = TensorRef::from_array_view((shape, h)).map_err(e2a)?;
+        host.copy_into(&mut dev).map_err(e2a)?;
+        call_stats::record_upload(b, t0.elapsed().as_nanos() as u64);
+        Ok(Self {
+            net,
+            h: Some(dev),
+            b,
+        })
+    }
+}
+
+impl Drop for DevicePass<'_> {
+    fn drop(&mut self) {
+        if let Some(t) = self.h.take() {
+            self.net
+                .dev_h
+                .lock()
+                .unwrap()
+                .entry(self.b)
+                .or_default()
+                .push(t);
+        }
+    }
+}
+
+impl DiffusionPass for DevicePass<'_> {
+    fn step(&mut self, decl: &[f32]) -> anyhow::Result<Vec<f32>> {
+        use std::time::Instant;
+        let net = self.net;
+        let dshape = vec![self.b as i64, DECL_PLANES as i64, N as i64, N as i64];
+        let t0 = Instant::now();
+        let mut sess = net.acquire(net.diffusion.as_ref().expect("session outlives pass"));
+        let t1 = Instant::now();
+        let d16: Vec<f16> = Vec::from_f32_slice(decl);
+        let dt = TensorRef::from_array_view((dshape, &d16[..])).map_err(e2a)?;
+        let t2 = Instant::now();
+        let raw = {
+            let outputs = sess
+                .run(ort::inputs!["h" => self.h.as_ref().expect("live pass"), "decl" => dt])
+                .map_err(e2a)?;
+            take_raw!(outputs, "logits", net.diffusion_io.out16)
+        };
+        drop(sess);
+        let t3 = Instant::now();
+        let out = raw.into_f32();
+        let ns = |a: Instant, b: Instant| (b - a).as_nanos() as u64;
+        call_stats::record(
+            call_stats::DIFFUSION,
+            self.b,
+            ns(t0, t1),
+            ns(t1, t2),
+            ns(t2, t3),
+            ns(t3, Instant::now()),
+        );
+        Ok(out)
     }
 }
 
@@ -738,6 +1309,136 @@ mod tests {
     /// from the wrong rows — producing plausible-looking logits and quietly
     /// corrupting the training data. Nothing else covers it: the Rust suite runs
     /// on candle, which takes `NaivePass`. Needs `MINIONS_ORT_DIR` and a GPU.
+    #[test]
+    fn device_pass_matches_per_step_path() {
+        // The production configuration: TensorRT, fp16 edges, a realistic row
+        // count, many steps, two passes alive at once (as with several
+        // workers), and passes opened and dropped repeatedly. `BoundPass` was
+        // right on its first step and garbage after, so every step is checked.
+        let Ok(dir) = std::env::var("MINIONS_ORT_DIR") else {
+            eprintln!("MINIONS_ORT_DIR unset — skipping device-pass parity");
+            return;
+        };
+        let dir = std::path::Path::new(&dir);
+        let cache = dir.join("trt_cache").to_string_lossy().into_owned();
+        let ort = match OrtNet::with_pool(dir, "trt", true, &cache, 1) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("ORT unavailable ({e}) — skipping");
+                return;
+            }
+        };
+        assert!(ort.diffusion_io.in16, "needs an fp16-edge export");
+        let b = 160usize;
+        let c = ort.channels();
+        let mk_h = |seed: usize| -> Vec<f16> {
+            (0..b * c * NUM_CELLS)
+                .map(|i| f16::from_f32((((i * 37 + seed * 11) % 101) as f32 - 50.0) / 25.0))
+                .collect()
+        };
+        let mk_decl = |t: usize| -> Vec<f32> {
+            (0..b * DECL_PLANES * NUM_CELLS)
+                .map(|i| ((i * 7 + t * 13) % 5 == 0) as u8 as f32)
+                .collect()
+        };
+        let mut worst = 0f32;
+        for round in 0..3 {
+            let (h1, h2) = (mk_h(2 * round), mk_h(2 * round + 1));
+            let mut p1 = DevicePass::new(&ort, &h1, b).expect("pass 1");
+            let mut p2 = DevicePass::new(&ort, &h2, b).expect("pass 2");
+            for t in 0..10 {
+                let d = mk_decl(t + round);
+                for (pass, h) in [(&mut p1, &h1), (&mut p2, &h2)] {
+                    let dev = pass.step(&d).expect("device step");
+                    let direct = ort.diffusion(h, &d, b).expect("direct step");
+                    assert_eq!(dev.len(), direct.len());
+                    for (i, (x, y)) in dev.iter().zip(&direct).enumerate() {
+                        let err = (x - y).abs() / (1.0 + y.abs());
+                        worst = worst.max(err);
+                        assert!(
+                            err <= 1e-3,
+                            "round {round} step {t} elem {i}: device {x} vs direct {y}"
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!("device pass parity: worst relative error {worst:e}");
+    }
+
+    /// The pinned path reuses one output buffer per set across calls, so a
+    /// missed write or a read before the copy lands would hand back the
+    /// *previous* call's logits -- plausible numbers, wrong rows. Every call
+    /// here changes its inputs, at two row counts, and is checked against the
+    /// pageable path -- both heads and the trunk. Env-toggled, so run it alone
+    /// (`--test-threads 1`).
+    #[test]
+    fn pinned_path_matches_pageable_path() {
+        let Ok(dir) = std::env::var("MINIONS_ORT_DIR") else {
+            eprintln!("MINIONS_ORT_DIR unset — skipping pinned parity");
+            return;
+        };
+        let dir = std::path::Path::new(&dir);
+        let cache = dir.join("trt_cache").to_string_lossy().into_owned();
+        let ort = match OrtNet::with_pool(dir, "trt", true, &cache, 1) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("ORT unavailable ({e}) — skipping");
+                return;
+            }
+        };
+        assert!(
+            ort.diffusion_io.in16 && ort.diffusion_io.out16,
+            "needs an fp16-edge export"
+        );
+        let c = ort.channels();
+        let mut worst = 0f32;
+        for b in [160usize, 144] {
+            for t in 0..12 {
+                let h: Vec<f16> = (0..b * c * NUM_CELLS)
+                    .map(|i| f16::from_f32((((i * 37 + t * 11) % 101) as f32 - 50.0) / 25.0))
+                    .collect();
+                let d: Vec<f32> = (0..b * DECL_PLANES * NUM_CELLS)
+                    .map(|i| ((i * 7 + t * 13) % 5 == 0) as u8 as f32)
+                    .collect();
+                let e: Vec<f32> = (0..b * ENERGY_PLANES * NUM_CELLS)
+                    .map(|i| ((i * 3 + t * 5) % 7 == 0) as u8 as f32)
+                    .collect();
+                std::env::set_var("MINIONS_ORT_PINNED", "1");
+                let (pd, pe) = (
+                    ort.diffusion(&h, &d, b).unwrap(),
+                    ort.energy(&h, &e, b).unwrap(),
+                );
+                std::env::set_var("MINIONS_ORT_PINNED", "0");
+                let (qd, qe) = (
+                    ort.diffusion(&h, &d, b).unwrap(),
+                    ort.energy(&h, &e, b).unwrap(),
+                );
+                let planes: Vec<f32> = (0..b * IN_PLANES * NUM_CELLS)
+                    .map(|i| ((i * 5 + t * 3) % 4) as f32)
+                    .collect();
+                std::env::set_var("MINIONS_ORT_PINNED", "1");
+                let pt = ort.trunk(&planes, b).unwrap();
+                std::env::set_var("MINIONS_ORT_PINNED", "0");
+                let qt = ort.trunk(&planes, b).unwrap();
+                let (ph, qh) = (pt.h.to_f32_vec(), qt.h.to_f32_vec());
+                for (p, q) in [(&pd, &qd), (&pe, &qe), (&ph, &qh), (&pt.value, &qt.value)] {
+                    assert_eq!(p.len(), q.len());
+                    for (i, (x, y)) in p.iter().zip(q.iter()).enumerate() {
+                        let err = (x - y).abs() / (1.0 + y.abs());
+                        worst = worst.max(err);
+                        assert!(
+                            err <= 1e-3,
+                            "rows {b} call {t} elem {i}: pinned {x} vs pageable {y}"
+                        );
+                    }
+                }
+            }
+        }
+        std::env::remove_var("MINIONS_ORT_PINNED");
+        eprintln!("pinned parity: worst relative error {worst:e}");
+    }
+
     #[test]
     fn bound_pass_matches_per_step_path() {
         let Ok(dir) = std::env::var("MINIONS_ORT_DIR") else {

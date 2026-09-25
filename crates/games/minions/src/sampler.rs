@@ -494,6 +494,27 @@ impl Phases {
         counter.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
+    /// Zeroes every counter, so the next report covers one window only.
+    ///
+    /// `report_wall` divides by one window's worker time; without this the
+    /// counters stay cumulative and `unaccounted` clamps to 0 from the second
+    /// window on, hiding whatever the workers do outside the phases.
+    pub fn reset(&self) {
+        for c in [
+            &self.features_ns,
+            &self.trunk_ns,
+            &self.decl_write_ns,
+            &self.diffusion_ns,
+            &self.commit_ns,
+            &self.realize_ns,
+            &self.energy_ns,
+            &self.playout_ns,
+            &self.last_stage_ns,
+        ] {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+
     /// Phase shares **plus** the fraction of worker time no counter covers.
     ///
     /// The shares below are normalised by the sum of the counters, not by wall

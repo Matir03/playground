@@ -432,6 +432,10 @@ enum Cmd {
         /// the GPU stops being latency-bound.
         #[arg(long)]
         sweep: bool,
+        /// Time every graph at exactly this many rows instead (0 = trunk at 1,
+        /// heads at `candidates`) -- the production shape is ~100-170 rows.
+        #[arg(long, default_value_t = 0)]
+        rows: usize,
     },
     /// Write a bundle the Python validator checks itself against: a real replay
     /// chunk plus this side's `Partial::write_planes` output for known
@@ -892,8 +896,9 @@ async fn main() -> anyhow::Result<()> {
             t_steps,
             secs,
             sweep,
+            rows,
         } => bench(
-            &live, &backend, &ep, fp16, cuda, candidates, t_steps, secs, sweep,
+            &live, &backend, &ep, fp16, cuda, candidates, t_steps, secs, sweep, rows,
         )?,
         Cmd::DumpValidation { out, cases, seed } => dump_validation(&out, cases, seed)?,
         Cmd::Soak {
@@ -1179,6 +1184,7 @@ fn bench(
     t_steps: usize,
     secs: u64,
     sweep: bool,
+    rows: usize,
 ) -> anyhow::Result<()> {
     use minions_engine::game::Minions;
     use minions_engine::map::NUM_CELLS;
@@ -1278,6 +1284,102 @@ fn bench(
             let rd = rate(&|| net.diffusion(&h_b, &decl_b, b).map(|_| ()))?;
             let re = rate(&|| net.energy(&h_b, &edecl_b, b).map(|_| ()))?;
             println!("  {b:>6}  {rt:>12.0}  {rd:>12.0}  {re:>12.0}");
+        }
+        return Ok(());
+    }
+
+    if rows > 0 {
+        // Every graph at the same production-sized batch, one thread, no
+        // contention: the floor each call costs before any queueing.
+        let planes_r = repeat_trunk(&planes, rows);
+        let h_r = repeat_trunk(&tr.h, rows);
+        let tile = |src: &[f32], stride: usize| -> Vec<f32> {
+            (0..rows)
+                .flat_map(|i| src[(i % k) * stride..(i % k + 1) * stride].iter().copied())
+                .collect()
+        };
+        let (decl_r, edecl_r) = (tile(&decl, stride), tile(&edecl, estride));
+        // `MINIONS_BENCH_THREADS=n`: n threads share the net, as self-play's
+        // workers do, and the aggregate rate is what counts -- whether a
+        // contended call is bound by its rows or by its count.
+        let threads: usize = std::env::var("MINIONS_BENCH_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        if threads > 1 {
+            let (decl_r, edecl_r) = (tile(&decl, stride), tile(&edecl, estride));
+            net.trunk(&planes_r, rows)?;
+            net.diffusion(&h_r, &decl_r, rows)?;
+            net.energy(&h_r, &edecl_r, rows)?;
+            // One wave's worth of calls in production's proportions:
+            // 3 trunk : 6 diffusion : 2 energy.
+            let mix = |i: u64| -> anyhow::Result<()> {
+                match i % 11 {
+                    0..=2 => net.trunk(&planes_r, rows).map(|_| ()),
+                    3..=8 => net.diffusion(&h_r, &decl_r, rows).map(|_| ()),
+                    _ => net.energy(&h_r, &edecl_r, rows).map(|_| ()),
+                }
+            };
+            for (name, only_diff) in [("diffusion", true), ("mix", false)] {
+                let deadline = Instant::now() + Duration::from_secs(secs);
+                let start = Instant::now();
+                let calls: u64 = std::thread::scope(|sc| {
+                    let hs: Vec<_> = (0..threads)
+                        .map(|t| {
+                            let (h_r, decl_r, net) = (&h_r, &decl_r, &*net);
+                            let mix = &mix;
+                            sc.spawn(move || {
+                                let mut n = 0u64;
+                                while Instant::now() < deadline {
+                                    if only_diff {
+                                        net.diffusion(h_r, decl_r, rows).expect("diffusion");
+                                    } else {
+                                        mix(n + t as u64).expect("mix");
+                                    }
+                                    n += 1;
+                                }
+                                n
+                            })
+                        })
+                        .collect();
+                    hs.into_iter().map(|h| h.join().unwrap()).sum()
+                });
+                let s = start.elapsed().as_secs_f64();
+                println!(
+                    "  {threads} threads {name:<10} {:>8.0} calls/s  {:>9.0} rows/s",
+                    calls as f64 / s,
+                    calls as f64 * rows as f64 / s
+                );
+            }
+            if let Some(r) = minions_engine::ort_net::call_stats::take_report(1.0) {
+                println!("{r}");
+            }
+            return Ok(());
+        }
+        println!("timing at {rows} rows, {secs}s each:");
+        timed("trunk", &|| net.trunk(&planes_r, rows).map(|_| ()))?;
+        timed("diffusion", &|| {
+            net.diffusion(&h_r, &decl_r, rows).map(|_| ())
+        })?;
+        timed("energy", &|| net.energy(&h_r, &edecl_r, rows).map(|_| ()))?;
+        // A whole T-step pass as the sampler runs it: one `diffusion_pass`,
+        // then `t_steps` steps against it.
+        let per = timed("dif pass", &|| {
+            let mut p = net.diffusion_pass(&h_r, rows)?;
+            for _ in 0..t_steps {
+                p.step(&decl_r)?;
+            }
+            Ok(())
+        })?;
+        println!(
+            "  = {:.3} ms per diffusion step within a {t_steps}-step pass",
+            per * 1e3 / t_steps as f64
+        );
+        for p in net.end_profiling() {
+            println!("profile: {p}");
+        }
+        if let Some(r) = minions_engine::ort_net::call_stats::take_report(1.0) {
+            println!("{r}");
         }
         return Ok(());
     }
