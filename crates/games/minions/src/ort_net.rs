@@ -485,6 +485,14 @@ impl Drop for OrtNet {
 /// These are experiment knobs rather than user-facing settings — they exist so a
 /// paired A/B can flip one provider option without rebuilding, which matters
 /// because measuring anything here needs two binaries otherwise.
+/// `out`'s logit rows `cells` (`row * NUM_CELLS + cell`), or all of it.
+fn pick_cells(out: Vec<f32>, cells: Option<&[u32]>) -> Vec<f32> {
+    match cells {
+        Some(cells) => crate::net::gather_rows(&out, cells, DECL_LOGITS),
+        None => out,
+    }
+}
+
 fn env_flag(name: &str, def: bool) -> bool {
     match std::env::var(name) {
         Ok(v) => !matches!(v.as_str(), "" | "0" | "false" | "no"),
@@ -755,6 +763,7 @@ impl OrtNet {
         output: &str,
         decl_planes: usize,
         graph: usize,
+        cells: Option<&[u32]>,
     ) -> anyhow::Result<Vec<f32>> {
         use std::time::Instant;
         let c = crate::net::head_width(self.channels) as i64;
@@ -766,7 +775,8 @@ impl OrtNet {
             let run = |ins: Vec<ort::value::DynValue>,
                        mut outs: Vec<ort::value::DynValue>,
                        rows: usize,
-                       _: usize|
+                       _: usize,
+                       slot: usize|
              -> anyhow::Result<()> {
                 use ort::session::{OutputSelector, RunOptions};
                 let tr = Instant::now();
@@ -775,7 +785,7 @@ impl OrtNet {
                         .with(output)
                         .preallocate(output, outs.remove(0)),
                 );
-                let mut sess = self.acquire(pool);
+                let mut sess = pool[slot % pool.len()].lock().unwrap();
                 drop(
                     sess.run_with_options(ort::inputs!["h" => &ins[0], "decl" => &ins[1]], &opts)
                         .map_err(e2a)?,
@@ -803,7 +813,21 @@ impl OrtNet {
                     Ok(())
                 },
                 &mut |o| {
-                    out = o[0].f16().to_f32_vec();
+                    let o = o[0].f16();
+                    out = match cells {
+                        // Only the named logit rows, converted straight out of
+                        // the arena: ~8 of a position's 49 cells are live.
+                        Some(cells) => {
+                            let w = DECL_LOGITS;
+                            let mut v = vec![0f32; cells.len() * w];
+                            for (d, &c) in v.chunks_exact_mut(w).zip(cells) {
+                                let c = c as usize;
+                                o[c * w..(c + 1) * w].convert_to_f32_slice(d);
+                            }
+                            v
+                        }
+                        None => o.to_f32_vec(),
+                    };
                     Ok(())
                 },
                 &run,
@@ -853,7 +877,7 @@ impl OrtNet {
                 ns(t1, t2),
                 ns(t2, Instant::now()),
             );
-            return Ok(out);
+            return Ok(pick_cells(out, cells));
         }
         let hv = h.contiguous();
         let h: &[f16] = &hv;
@@ -882,7 +906,7 @@ impl OrtNet {
                 ns(t2, t3),
                 ns(t3, Instant::now()),
             );
-            Ok(out)
+            Ok(pick_cells(out, cells))
         } else {
             let h32 = h.to_f32_vec();
             let ht = TensorRef::from_array_view((hshape, &h32[..])).map_err(e2a)?;
@@ -901,7 +925,7 @@ impl OrtNet {
                 ns(t2, t3),
                 ns(t3, Instant::now()),
             );
-            Ok(out)
+            Ok(pick_cells(out, cells))
         }
     }
 
@@ -926,7 +950,7 @@ impl OrtNet {
         }
         let made = {
             let sess = self.acquire(pool);
-            Combiner::new(&sess, ins, outs, combine_cap(), cap_cells)?
+            Combiner::new(&sess, ins, outs, combine_cap(), cap_cells, pool.len())?
         };
         made.warm(run)?;
         let _ = self.combiners[slot].set(made);
@@ -1115,7 +1139,8 @@ impl Backend for OrtNet {
             let run = |ins: Vec<ort::value::DynValue>,
                        mut outs: Vec<ort::value::DynValue>,
                        rows: usize,
-                       _: usize|
+                       _: usize,
+                       slot: usize|
              -> anyhow::Result<()> {
                 use ort::session::{OutputSelector, RunOptions};
                 let tr = Instant::now();
@@ -1128,7 +1153,7 @@ impl Backend for OrtNet {
                         .preallocate("h", h)
                         .preallocate("value", value),
                 );
-                let mut sess = net.acquire(pool);
+                let mut sess = pool[slot % pool.len()].lock().unwrap();
                 drop(
                     sess.run_with_options(ort::inputs!["planes" => &ins[0]], &opts)
                         .map_err(e2a)?,
@@ -1274,6 +1299,7 @@ impl Backend for OrtNet {
             "logits",
             DECL_PLANES,
             call_stats::DIFFUSION,
+            None,
         )?;
         debug_assert_eq!(out.len(), b * NUM_CELLS * DECL_LOGITS);
         Ok(out)
@@ -1308,7 +1334,8 @@ impl Backend for OrtNet {
         let run = |ins: Vec<ort::value::DynValue>,
                    mut outs: Vec<ort::value::DynValue>,
                    n: usize,
-                   _: usize|
+                   _: usize,
+                   slot: usize|
          -> anyhow::Result<()> {
             use ort::session::{OutputSelector, RunOptions};
             let tr = Instant::now();
@@ -1317,7 +1344,7 @@ impl Backend for OrtNet {
                     .with("logits_g")
                     .preallocate("logits_g", outs.remove(0)),
             );
-            let mut sess = self.acquire(pool);
+            let mut sess = pool[slot % pool.len()].lock().unwrap();
             drop(
                 sess.run_with_options(
                     ort::inputs![
@@ -1390,7 +1417,8 @@ impl Backend for OrtNet {
         let run = |ins: Vec<ort::value::DynValue>,
                    mut outs: Vec<ort::value::DynValue>,
                    n: usize,
-                   _: usize|
+                   _: usize,
+                   slot: usize|
          -> anyhow::Result<()> {
             use ort::session::{OutputSelector, RunOptions};
             let tr = Instant::now();
@@ -1399,7 +1427,7 @@ impl Backend for OrtNet {
                     .with("energy")
                     .preallocate("energy", outs.remove(0)),
             );
-            let mut sess = self.acquire(pool);
+            let mut sess = pool[slot % pool.len()].lock().unwrap();
             drop(
                 sess.run_with_options(
                     ort::inputs!["h_store" => store.tensor(), "h_idx" => &ins[0], "decl" => &ins[1]],
@@ -1464,6 +1492,54 @@ impl Backend for OrtNet {
             "logits",
             DECL_PLANES,
             call_stats::DIFFUSION,
+            None,
+        )
+    }
+
+    fn diffusion_cells(
+        &self,
+        h: &[f16],
+        rows: &[u32],
+        decl: &[f32],
+        cells: &[u32],
+    ) -> anyhow::Result<Vec<f32>> {
+        let net = self.active();
+        anyhow::ensure!(
+            net.diffusion.is_some(),
+            "this net has no diffusion head (it proposes with best.onnx)"
+        );
+        let stride = crate::net::head_width(net.channels) * NUM_CELLS;
+        let io = net.diffusion_io;
+        if io.in16 && io.out16 && pinned_on() && combine_on() && rows.len() <= combine_cap() {
+            return net.run_head(
+                &net.diffusion,
+                io,
+                HSrc::Rows(h, rows, stride),
+                decl,
+                rows.len(),
+                "logits",
+                DECL_PLANES,
+                call_stats::DIFFUSION,
+                Some(cells),
+            );
+        }
+        // Per-call paths keep a few batch shapes: pad to a multiple of 16 by
+        // repeating the last row.
+        let width = rows.len().div_ceil(16) * 16;
+        let mut rows = rows.to_vec();
+        rows.resize(width, *rows.last().expect("at least one row"));
+        let mut decl = decl.to_vec();
+        decl.resize(width * DECL_PLANES * NUM_CELLS, 0.0);
+        net.run_head(
+            &net.diffusion,
+            io,
+            HSrc::Rows(h, &rows, stride),
+            &decl,
+            width,
+            "logits",
+            DECL_PLANES,
+            call_stats::DIFFUSION,
+            Some(cells),
         )
     }
 
@@ -1479,6 +1555,7 @@ impl Backend for OrtNet {
             "energy",
             ENERGY_PLANES,
             call_stats::ENERGY,
+            None,
         )
     }
 
@@ -1493,6 +1570,7 @@ impl Backend for OrtNet {
             "energy",
             ENERGY_PLANES,
             call_stats::ENERGY,
+            None,
         )
     }
 
@@ -2005,7 +2083,7 @@ mod tests {
         };
         let dir = std::path::Path::new(&dir);
         let cache = dir.join("trt_cache").to_string_lossy().into_owned();
-        let ort = match OrtNet::with_pool(dir, "trt", true, &cache, 1) {
+        let ort = match OrtNet::with_pool(dir, "trt", true, &cache, pool_size()) {
             Ok(o) => o,
             Err(e) => {
                 eprintln!("ORT unavailable ({e}) — skipping");

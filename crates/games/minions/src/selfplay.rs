@@ -884,6 +884,9 @@ const COMBINE_AB_FILE: &str = "combine_ab";
 /// (`ort_net::STORE_USE`). Needs `diffusion_g.onnx` / `energy_g.onnx`.
 const STORE_AB_FILE: &str = "store_ab";
 
+/// The same switch for the sampler's lean paths (`sampler::LEAN_USE`).
+const LEAN_AB_FILE: &str = "lean_ab";
+
 fn entry_bytes(h_len: usize) -> usize {
     h_len * std::mem::size_of::<half::f16>() + 64
 }
@@ -1738,6 +1741,9 @@ pub fn run_loop(
         let store_ab = live.join(STORE_AB_FILE).exists();
         let store_on = !store_ab || matches!(window % 4, 1 | 2);
         crate::ort_net::STORE_USE.store(store_on, std::sync::atomic::Ordering::Relaxed);
+        let lean_ab = live.join(LEAN_AB_FILE).exists();
+        let lean_on = !lean_ab || matches!(window % 4, 1 | 2);
+        crate::sampler::LEAN_USE.store(lean_on, std::sync::atomic::Ordering::Relaxed);
         let deadline = Instant::now() + Duration::from_secs(chunk_secs);
         let mut stats = PoolStats::default();
         let t0 = Instant::now();
@@ -1757,7 +1763,7 @@ pub fn run_loop(
         // Raw counts, so a benchmark can measure fixed work rather than a rate:
         // throughput swings ~4x over a generation as the pool moves in step.
         println!(
-            "  window: {} expansions in {:.3}s  cache {}{}  f16 {}{}  pinned {}{}  pool {}{}  joint {}{}  combine {}{}  store {}{}",
+            "  window: {} expansions in {:.3}s  cache {}{}  f16 {}{}  pinned {}{}  pool {}{}  joint {}{}  combine {}{}  store {}{}  lean {}{}",
             stats.expansions,
             t0.elapsed().as_secs_f64(),
             if cache_on { "on" } else { "off" },
@@ -1773,7 +1779,9 @@ pub fn run_loop(
             if comb_on { "on" } else { "off" },
             if comb_ab { " (ab)" } else { "" },
             if store_on { "on" } else { "off" },
-            if store_ab { " (ab)" } else { "" }
+            if store_ab { " (ab)" } else { "" },
+            if lean_on { "on" } else { "off" },
+            if lean_ab { " (ab)" } else { "" }
         );
         if !examples.is_empty() {
             let path = write_chunk(&buffer, chunk_index, &examples)?;

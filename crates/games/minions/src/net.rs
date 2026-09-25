@@ -218,6 +218,22 @@ pub trait Backend: Send + Sync {
             rows.len(),
         )
     }
+    /// [`Self::diffusion_rows`] returning only the logit rows `cells` names
+    /// (`row * NUM_CELLS + cell`, `row` indexing `rows`):
+    /// `(cells.len(), DECL_LOGITS)`.
+    fn diffusion_cells(
+        &self,
+        h: &[f16],
+        rows: &[u32],
+        decl: &[f32],
+        cells: &[u32],
+    ) -> anyhow::Result<Vec<f32>> {
+        Ok(gather_rows(
+            &self.diffusion_rows(h, rows, decl)?,
+            cells,
+            DECL_LOGITS,
+        ))
+    }
     /// [`Self::energy`], gathered as [`Self::diffusion_rows`].
     fn energy_rows(&self, h: &[f16], rows: &[u32], decl: &[f32]) -> anyhow::Result<Vec<f32>> {
         self.energy(

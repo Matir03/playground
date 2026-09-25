@@ -58,7 +58,7 @@
 //! train on.
 
 use crate::assign;
-use crate::bitboard::{self, bit, Bb, FULL};
+use crate::bitboard::{self, bit, has, Bb, FULL};
 use crate::game::{Minions, MinionsMove, MinionsState, PHASE_SPAWN};
 use crate::map::{cell_name, dist, NO_CELL, NUM_CELLS};
 use crate::units::{Attack, Unit, BUYABLE};
@@ -499,10 +499,7 @@ pub struct LiveMask {
 impl LiveMask {
     pub fn of(state: &MinionsState) -> Self {
         let me = state.side;
-        let mut spawns: Bb = 0;
-        for c in state.spawn_cells(me) {
-            spawns |= bit(c);
-        }
+        let spawns = state.spawn_bb(me);
         Self { moves: side_bb(state, me), targets: side_bb(state, 1 - me), spawns }
     }
 
@@ -884,10 +881,10 @@ pub fn realize(state: &MinionsState, spec: &TurnSpec) -> Realized {
             .count() as u32;
         // One pass suffices: spawn chaining is illegal, so the set of open cells
         // is fixed for the whole phase and cannot grow as units are placed.
-        let open = s.spawn_cells(me);
+        let open = s.spawn_bb(me);
         for at in 0..NUM_CELLS as u8 {
             let code = spec.spawns[at as usize];
-            if code == 0 || !open.contains(&at) {
+            if code == 0 || !has(open, at) {
                 continue;
             }
             let Some(unit) = Unit::from_index(code) else { continue };

@@ -393,24 +393,25 @@ impl MinionsState {
     /// illegal, so a freshly placed zombie cannot open further cells until next
     /// turn. Spawned units carry `EXHAUSTED`, which is exactly that predicate.
     pub fn spawn_cells(&self, side: u8) -> Vec<u8> {
-        let mut seen = [false; NUM_CELLS];
-        let mut out = Vec::new();
+        crate::bitboard::cells(self.spawn_bb(side)).collect()
+    }
+
+    /// [`Self::spawn_cells`] as a bitboard: the empty neighbours of `side`'s
+    /// spawners that have not themselves spawned this turn.
+    pub fn spawn_bb(&self, side: u8) -> crate::bitboard::Bb {
+        use crate::bitboard::{bit, dilate};
+        let (mut from, mut empty) = (0, 0);
         for (i, &c) in self.cells.iter().enumerate() {
-            if c == 0 || cell_side(c) != side || !cell_unit(c).stats().spawn {
-                continue;
-            }
-            if self.pstate[i] & EXHAUSTED != 0 {
-                continue; // spawned this turn — cannot chain
-            }
-            for &n in &NEIGHBORS[i] {
-                if n != NO_CELL && self.cells[n as usize] == 0 && !seen[n as usize] {
-                    seen[n as usize] = true;
-                    out.push(n);
-                }
+            if c == 0 {
+                empty |= bit(i as u8);
+            } else if cell_side(c) == side
+                && cell_unit(c).stats().spawn
+                && self.pstate[i] & EXHAUSTED == 0
+            {
+                from |= bit(i as u8);
             }
         }
-        out.sort_unstable();
-        out
+        dilate(from) & empty
     }
 
     /// Cells a piece at `from` may move to: empty, and reachable within its
@@ -1479,6 +1480,52 @@ mod move_targets_bench {
         }
         out.sort_unstable();
         out
+    }
+
+    /// The pre-bitboard `spawn_cells`, walking the neighbour table.
+    fn legacy_spawn_cells(s: &MinionsState, side: u8) -> Vec<u8> {
+        let mut seen = [false; NUM_CELLS];
+        let mut out = Vec::new();
+        for (i, &c) in s.cells.iter().enumerate() {
+            if c == 0 || cell_side(c) != side || !cell_unit(c).stats().spawn {
+                continue;
+            }
+            if s.pstate[i] & EXHAUSTED != 0 {
+                continue;
+            }
+            for &n in &NEIGHBORS[i] {
+                if n != NO_CELL && s.cells[n as usize] == 0 && !seen[n as usize] {
+                    seen[n as usize] = true;
+                    out.push(n);
+                }
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    #[test]
+    fn spawn_bb_matches_the_neighbour_walk() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(5);
+        let mut checked = 0;
+        for _ in 0..40 {
+            let mut st = Minions::initial_state();
+            // Single moves, so mid-phase states (spawners exhausted by a
+            // spawn this turn) are covered too.
+            for _ in 0..400 {
+                if Minions::outcome(&st).is_terminal() {
+                    break;
+                }
+                for side in 0..2 {
+                    assert_eq!(st.spawn_cells(side), legacy_spawn_cells(&st, side));
+                    checked += 1;
+                }
+                let mvs = Minions::legal_moves(&st);
+                st = Minions::apply(&st, &mvs[rng.gen_range(0..mvs.len())]);
+            }
+        }
+        assert!(checked > 1000, "only {checked} states checked");
     }
 
     #[test]

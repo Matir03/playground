@@ -157,10 +157,19 @@ pub(crate) unsafe fn tensor_over(
 
 /// Runs one combined batch: the input and output tensors, in port order, and
 /// the batch's row and cell counts.
-pub(crate) type RunFn<'a> = dyn Fn(Vec<ort::value::DynValue>, Vec<ort::value::DynValue>, usize, usize) -> anyhow::Result<()>
+/// Runs one batch: inputs, preallocated outputs, rows, cells, and the runner
+/// slot it holds -- `0..runners`, one session each, so concurrent batches
+/// never share a session.
+pub(crate) type RunFn<'a> = dyn Fn(
+        Vec<ort::value::DynValue>,
+        Vec<ort::value::DynValue>,
+        usize,
+        usize,
+        usize,
+    ) -> anyhow::Result<()>
     + 'a;
 
-/// One of a [`Combiner`]'s two pinned staging areas: every port's region.
+/// One of a [`Combiner`]'s pinned staging areas: every port's region.
 struct Arena {
     /// Inputs, then outputs, each `cap` rows (of its axis) long.
     bufs: Vec<*mut u8>,
@@ -173,13 +182,32 @@ struct Arena {
     /// Batches this arena has run; a job reserved at `gen` is done after it.
     gen: u64,
     err: Option<String>,
+    /// Closed: on the GPU, or with readers left.
+    busy: bool,
+}
+
+impl Arena {
+    fn reset(&mut self) {
+        (self.rows, self.cells, self.jobs, self.filled) = (0, 0, 0, 0);
+    }
 }
 
 struct State {
-    arenas: [Arena; 2],
-    /// The arena taking reservations; `None` while both are busy.
+    arenas: Vec<Arena>,
+    /// The arena taking reservations; `None` while every one is busy.
     open: Option<usize>,
-    running: bool,
+    /// Runner slots in use, one bit each.
+    slots: u32,
+}
+
+impl State {
+    /// Open an idle arena for reservations, if there is one.
+    fn open_idle(&mut self) {
+        if let Some(i) = self.arenas.iter().position(|a| !a.busy) {
+            self.arenas[i].reset();
+            self.open = Some(i);
+        }
+    }
 }
 
 /// Cross-worker batching for one graph -- the replacement for a mutex.
@@ -193,12 +221,15 @@ struct State {
 /// other, and runs everything reserved as one call. Each worker then reads its
 /// own slice of the output. The only serial work left is the GPU call.
 ///
-/// Two arenas so reservation never waits on a running batch: while one is on
-/// the GPU (and then being read), the other fills. An arena reopens only once
-/// all its readers are done.
+/// Up to `runners` batches run at once, one session each, so the host work
+/// of one call (binding, enqueue, the wait) overlaps another's kernels. There
+/// is one arena more than runners, so reservation never waits on a running
+/// batch: while the others are on the GPU (or being read), one fills. An arena
+/// reopens only once all its readers are done.
 pub(crate) struct Combiner {
     st: Mutex<State>,
     cv: Condvar,
+    runners: usize,
     cap_rows: usize,
     cap_cells: usize,
     ins: Vec<Port>,
@@ -250,7 +281,9 @@ impl Combiner {
         outs: &[(&str, Axis)],
         cap_rows: usize,
         cap_cells: usize,
+        runners: usize,
     ) -> anyhow::Result<Self> {
+        anyhow::ensure!((1..=32).contains(&runners), "{runners} runners");
         use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType};
         let ins: Vec<Port> = ins
             .iter()
@@ -295,9 +328,12 @@ impl Combiner {
                 readers: 0,
                 gen: 0,
                 err: None,
+                busy: false,
             })
         };
-        let arenas = [arena()?, arena()?];
+        let arenas = (0..=runners)
+            .map(|_| arena())
+            .collect::<anyhow::Result<_>>()?;
         // The allocators must outlive the buffers; like the sessions they came
         // from, they are leaked.
         std::mem::forget(ain);
@@ -306,9 +342,10 @@ impl Combiner {
             st: Mutex::new(State {
                 arenas,
                 open: Some(0),
-                running: false,
+                slots: 0,
             }),
             cv: Condvar::new(),
+            runners,
             cap_rows,
             cap_cells,
             ins,
@@ -362,7 +399,8 @@ impl Combiner {
     /// range once, up front. Zero is a valid index for every index port.
     ///
     /// Run at both ends of the range, one row (and cell) and the caps: an
-    /// engine first built at one shape takes the other as a widening too.
+    /// engine first built at one shape takes the other as a widening too. And
+    /// on every runner slot, since each has its own session and engine.
     pub fn warm(&self, run: &RunFn<'_>) -> anyhow::Result<()> {
         let st = self.st.lock().unwrap();
         let ar = &st.arenas[0];
@@ -378,10 +416,12 @@ impl Combiner {
             // region is `cap` rows long.
             unsafe { std::slice::from_raw_parts_mut(b, cap(p.axis) * p.row_bytes()).fill(0) };
         }
-        for (rows, cells) in [(1, self.cap_cells.min(1)), (self.cap_rows, self.cap_cells)] {
-            // SAFETY: as above.
-            let (ins, outs) = unsafe { self.tensors(&ar.bufs, rows, cells)? };
-            run(ins, outs, rows, cells)?;
+        for slot in 0..self.runners {
+            for (rows, cells) in [(1, self.cap_cells.min(1)), (self.cap_rows, self.cap_cells)] {
+                // SAFETY: as above.
+                let (ins, outs) = unsafe { self.tensors(&ar.bufs, rows, cells)? };
+                run(ins, outs, rows, cells, slot)?;
+            }
         }
         Ok(())
     }
@@ -454,18 +494,21 @@ impl Combiner {
             eprintln!("combiner fill failed: {e:#}");
         }
         self.cv.notify_all();
-        // Wait for a batch to carry this job, running it if nobody is.
+        // Wait for a batch to carry this job, running it if a runner slot is
+        // free. With the pool off (`pool_ab`) only one batch runs at a time.
+        let max = if crate::ort_net::POOL_USE.load(std::sync::atomic::Ordering::Relaxed) {
+            self.runners
+        } else {
+            1
+        };
         while st.arenas[a].gen == gen {
-            if !st.running && st.open == Some(a) {
-                st.running = true;
+            let slot = (!st.slots).trailing_zeros() as usize;
+            if slot < max && st.open == Some(a) {
+                st.slots |= 1 << slot;
                 st.open = None;
-                let other = 1 - a;
-                if st.arenas[other].readers == 0 {
-                    let o = &mut st.arenas[other];
-                    (o.rows, o.cells, o.jobs, o.filled) = (0, 0, 0, 0);
-                    st.open = Some(other);
-                    self.cv.notify_all();
-                }
+                st.arenas[a].busy = true;
+                st.open_idle();
+                self.cv.notify_all();
                 while st.arenas[a].filled < st.arenas[a].jobs {
                     st = self.cv.wait(st).unwrap();
                 }
@@ -474,13 +517,13 @@ impl Combiner {
                 // SAFETY: the batch owns rows `..rows`/`..cells` of arena `a`
                 // until its readers are released, after the tensors are gone.
                 let res = unsafe { self.tensors(&bufs, rows, cells) }
-                    .and_then(|(ins, outs)| run(ins, outs, rows, cells));
+                    .and_then(|(ins, outs)| run(ins, outs, rows, cells, slot));
                 st = self.st.lock().unwrap();
                 let ar = &mut st.arenas[a];
                 ar.err = res.err().map(|e| format!("{e:#}"));
                 ar.readers = ar.jobs;
                 ar.gen += 1;
-                st.running = false;
+                st.slots &= !(1 << slot);
                 self.cv.notify_all();
                 break;
             }
@@ -519,12 +562,13 @@ impl Combiner {
         };
         let mut st = self.st.lock().unwrap();
         st.arenas[a].readers -= 1;
-        // The last reader reopens the arena if nothing is taking reservations
-        // (the other is on the GPU, or still being read).
-        if st.arenas[a].readers == 0 && st.open.is_none() {
-            let ar = &mut st.arenas[a];
-            (ar.rows, ar.cells, ar.jobs, ar.filled) = (0, 0, 0, 0);
-            st.open = Some(a);
+        // The last reader frees the arena, and reopens it if nothing is taking
+        // reservations (every other one is on the GPU, or still being read).
+        if st.arenas[a].readers == 0 {
+            st.arenas[a].busy = false;
+            if st.open.is_none() {
+                st.open_idle();
+            }
         }
         self.cv.notify_all();
         res

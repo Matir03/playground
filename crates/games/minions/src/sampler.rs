@@ -262,6 +262,16 @@ fn p_committed_value(lg: &[f32], cx: &GameCtx, spec: &TurnSpec, cell: u8, field:
     }
 }
 
+/// Whether the sampler takes its lean paths: diffusion logits gathered to the
+/// live cells inside the backend's read, and inverse-CDF draws in `consider`.
+/// Off is the previous behaviour (whole logits converted, Gumbel-max draws);
+/// self-play flips it per window for an in-process A/B (`lean_ab`).
+pub static LEAN_USE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+fn lean_on() -> bool {
+    LEAN_USE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn consider<F: Fn(usize) -> bool>(
     chain: &Partial,
     cell: u8,
@@ -278,30 +288,66 @@ fn consider<F: Fn(usize) -> bool>(
         return;
     }
     let row = cell as usize * DECL_LOGITS + off;
-    let (mut best_v, mut best_g) = (0usize, f32::NEG_INFINITY);
+    if !lean_on() {
+        let (mut best_v, mut best_g) = (0usize, f32::NEG_INFINITY);
+        for v in 0..n_cls {
+            if !allowed(v) {
+                continue;
+            }
+            let l = logits[row + v] / temp;
+            let u: f32 = rng.gen_range(1e-9f32..1.0);
+            let gm = l - (-u.ln()).ln();
+            if gm > best_g {
+                best_g = gm;
+                best_v = v;
+            }
+        }
+        if best_g > f32::NEG_INFINITY {
+            picks.push((cell, field, best_v as u8));
+        }
+        return;
+    }
+    // One categorical draw by inverse CDF: a uniform against the running sum
+    // of the softmax weights. It draws from the same distribution the Gumbel-max
+    // trick did, for one random number and one `exp` per class instead of one
+    // random number and two `ln`s.
+    let mut w = [0f32; N_OFFSETS];
     let mut max_l = f32::NEG_INFINITY;
     for v in 0..n_cls {
-        if !allowed(v) {
-            continue;
-        }
-        let l = logits[row + v] / temp;
-        if l > max_l {
-            max_l = l;
-        }
-        // Gumbel-max: the argmax of (logit + Gumbel noise) is an exact
-        // categorical draw, and taking the top few gives sampling without
-        // replacement.
-        let u: f32 = rng.gen_range(1e-9f32..1.0);
-        let gm = l - (-u.ln()).ln();
-        if gm > best_g {
-            best_g = gm;
-            best_v = v;
+        if allowed(v) {
+            let l = logits[row + v] / temp;
+            w[v] = l;
+            if l > max_l {
+                max_l = l;
+            }
+        } else {
+            w[v] = f32::NEG_INFINITY;
         }
     }
     if max_l == f32::NEG_INFINITY {
         return; // nothing legal here
     }
-    picks.push((cell, field, best_v as u8));
+    let mut sum = 0.0f32;
+    for x in &mut w[..n_cls] {
+        *x = if *x == f32::NEG_INFINITY {
+            0.0
+        } else {
+            (*x - max_l).exp()
+        };
+        sum += *x;
+    }
+    let mut u = rng.gen::<f32>() * sum;
+    let mut pick = 0;
+    for (v, &x) in w[..n_cls].iter().enumerate() {
+        if x > 0.0 {
+            pick = v; // the last weighted class, should rounding run past it
+            if u < x {
+                break;
+            }
+            u -= x;
+        }
+    }
+    picks.push((cell, field, pick as u8));
 }
 
 /// One diffusion round for one chain: sample every still-masked variable, then
@@ -2079,6 +2125,7 @@ impl MinionsModel {
         let mut step1: Vec<Option<Vec<f16>>> = vec![None; nw];
         let mut scratch = vec![0f32; lwidth];
         let mut rowbuf = vec![0f32; lwidth];
+        let (mut decl, mut cells, mut starts) = (Vec::new(), Vec::new(), Vec::new());
         for s in 1..=steps {
             let mut rows: Vec<u32> = Vec::new();
             let mut targets: Vec<Target> = Vec::new();
@@ -2107,20 +2154,20 @@ impl MinionsModel {
                     }
                 }
             }
-            // With the store: the gathered logits, and where each target's
-            // cells start in them.
-            let mut cstart: Option<(Vec<u32>, Vec<usize>)> = None;
+            // The live cells' logits, gathered by the backend, and where each
+            // target's cells start in them.
             let logits = if rows.is_empty() {
                 Vec::new()
-            } else if let Some(l) = &lease {
+            } else {
                 let clk = Instant::now();
-                let mut decl = vec![0f32; rows.len() * dstride];
-                let mut cells: Vec<u32> = Vec::new();
-                let mut starts: Vec<usize> = Vec::with_capacity(targets.len() + 1);
+                decl.clear();
+                decl.resize(rows.len() * dstride, 0.0);
+                cells.clear();
+                starts.clear();
                 for (j, t) in targets.iter().enumerate() {
                     let out = &mut decl[j * dstride..(j + 1) * dstride];
                     match *t {
-                        Target::Step1(_) => {}
+                        Target::Step1(_) => {} // the empty declaration
                         Target::Wid(c) => wc[c].p.write_planes(out),
                         Target::Rs(ri) => rc[ri].0.p.write_planes(out),
                     }
@@ -2131,32 +2178,27 @@ impl MinionsModel {
                     );
                 }
                 starts.push(cells.len());
-                let srows: Vec<u32> = rows.iter().map(|&r| l.rows[r as usize - ne]).collect();
                 Phases::add(&self.phases.decl_write_ns, clk);
                 let clk = Instant::now();
-                let g = self.net.diffusion_store(&srows, &decl, &cells)?;
-                Phases::add(&self.phases.diffusion_ns, clk);
-                cstart = Some((cells, starts));
-                g
-            } else {
-                let clk = Instant::now();
-                let width = round16(rows.len());
-                let mut decl = vec![0f32; width * dstride];
-                for (j, t) in targets.iter().enumerate() {
-                    let out = &mut decl[j * dstride..(j + 1) * dstride];
-                    match *t {
-                        Target::Step1(_) => {} // the empty declaration
-                        Target::Wid(c) => wc[c].p.write_planes(out),
-                        Target::Rs(ri) => rc[ri].0.p.write_planes(out),
+                let g = match &lease {
+                    Some(l) => {
+                        let srows: Vec<u32> =
+                            rows.iter().map(|&r| l.rows[r as usize - ne]).collect();
+                        self.net.diffusion_store(&srows, &decl, &cells)?
                     }
-                }
-                let last = *rows.last().unwrap();
-                rows.resize(width, last);
-                Phases::add(&self.phases.decl_write_ns, clk);
-                let clk = Instant::now();
-                let l = self.net.diffusion_rows(&h, &rows, &decl)?;
+                    None if lean_on() => self.net.diffusion_cells(&h, &rows, &decl, &cells)?,
+                    None => {
+                        let width = round16(rows.len());
+                        let mut prows = rows.clone();
+                        prows.resize(width, *rows.last().unwrap());
+                        let mut pdecl = decl.clone();
+                        pdecl.resize(width * dstride, 0.0);
+                        let full = self.net.diffusion_rows(&h, &prows, &pdecl)?;
+                        crate::net::gather_rows(&full, &cells, DECL_LOGITS)
+                    }
+                };
                 Phases::add(&self.phases.diffusion_ns, clk);
-                l
+                g
             };
             let clk = Instant::now();
             // Step 1 from cached logits: no row was spent on these games.
@@ -2185,23 +2227,18 @@ impl MinionsModel {
                 }
             }
             for (j, t) in targets.iter().enumerate() {
-                let lg: &[f32] = match &cstart {
-                    Some((cells, starts)) => {
-                        // Only live cells are ever read, and all of this row's
-                        // are written, so the buffer needs no clearing -- except
-                        // for a step-1 row, which is kept whole in the cache.
-                        if matches!(t, Target::Step1(_)) {
-                            rowbuf.fill(0.0);
-                        }
-                        for k in starts[j]..starts[j + 1] {
-                            let c = cells[k] as usize % NUM_CELLS;
-                            rowbuf[c * DECL_LOGITS..(c + 1) * DECL_LOGITS]
-                                .copy_from_slice(&logits[k * DECL_LOGITS..(k + 1) * DECL_LOGITS]);
-                        }
-                        &rowbuf
-                    }
-                    None => &logits[j * lwidth..(j + 1) * lwidth],
-                };
+                // Only live cells are ever read, and all of this row's are
+                // written, so the buffer needs no clearing -- except for a
+                // step-1 row, which is kept whole in the cache.
+                if matches!(t, Target::Step1(_)) {
+                    rowbuf.fill(0.0);
+                }
+                for k in starts[j]..starts[j + 1] {
+                    let c = cells[k] as usize % NUM_CELLS;
+                    rowbuf[c * DECL_LOGITS..(c + 1) * DECL_LOGITS]
+                        .copy_from_slice(&logits[k * DECL_LOGITS..(k + 1) * DECL_LOGITS]);
+                }
+                let lg: &[f32] = &rowbuf;
                 match *t {
                     Target::Step1(gi) => {
                         // Committed from the fp16 values it is cached as, so
@@ -2343,6 +2380,51 @@ mod tests {
     use crate::turn::TARGET_KILL;
     use crate::units::Unit;
     use playground_core::SampledGame;
+
+    /// `consider` draws each legal class with its tempered softmax probability,
+    /// never an illegal one.
+    #[test]
+    fn consider_draws_the_tempered_softmax() {
+        use rand::SeedableRng;
+        let mut logits = vec![0f32; NUM_CELLS * DECL_LOGITS];
+        let cell = 9u8;
+        let row = cell as usize * DECL_LOGITS + OFF_MOVES;
+        for v in 0..N_OFFSETS {
+            logits[row + v] = ((v * 7) % 11) as f32 * 0.35 - 1.5;
+        }
+        let allowed = |v: usize| v % 5 != 3 && v < 30;
+        let temp = 0.8f32;
+        let z: f64 = (0..N_OFFSETS)
+            .filter(|&v| allowed(v))
+            .map(|v| (f64::from(logits[row + v]) / f64::from(temp)).exp())
+            .sum();
+        let chain = Partial::new();
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        let mut picks = Vec::new();
+        let n = 400_000;
+        let mut hist = [0usize; N_OFFSETS];
+        for _ in 0..n {
+            picks.clear();
+            consider(
+                &chain, cell, C_MOVE, OFF_MOVES, N_OFFSETS, allowed, &logits, temp, &mut picks,
+                &mut rng,
+            );
+            hist[picks[0].2 as usize] += 1;
+        }
+        for v in 0..N_OFFSETS {
+            let p = if allowed(v) {
+                (f64::from(logits[row + v]) / f64::from(temp)).exp() / z
+            } else {
+                0.0
+            };
+            let f = hist[v] as f64 / n as f64;
+            let se = (p * (1.0 - p) / n as f64).sqrt().max(1e-9);
+            assert!(
+                (f - p).abs() <= 5.0 * se,
+                "class {v}: drawn {f:.5}, softmax {p:.5}"
+            );
+        }
+    }
 
     /// Forced exploration must keep its share at any chunk size.
     ///
