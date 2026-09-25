@@ -2362,7 +2362,31 @@ impl<G: SampledGame> Search<G> {
         self.tree[node].kern_rows = m;
     }
 
-    pub fn finish(self) -> SampledSearchResult<G> {
+    /// State keys of every position in the subtree under root candidate
+    /// `entry`: the child itself and every candidate below it, expanded or
+    /// not. Once that move is played, these are the only positions of this
+    /// tree the game can still reach -- the state carries the turn, so nothing
+    /// outside the subtree can come round again.
+    pub fn subtree_keys(&self, entry: usize) -> Vec<u128> {
+        let mut out = Vec::new();
+        let Some(e) = self.tree[0].entries.get(entry) else {
+            return out;
+        };
+        out.push(e.key);
+        let mut stack = vec![e.child];
+        while let Some(c) = stack.pop() {
+            if c < 0 {
+                continue;
+            }
+            for e in &self.tree[c as usize].entries {
+                out.push(e.key);
+                stack.push(e.child);
+            }
+        }
+        out
+    }
+
+    pub fn finish(&self) -> SampledSearchResult<G> {
         let mut stats = SearchStats::default();
         for node in self.tree.iter() {
             if !node.expanded {
@@ -2761,6 +2785,28 @@ mod tests {
             seed: 1,
             ..Default::default()
         }
+    }
+
+    /// `subtree_keys` walks the whole subtree under a root candidate: over all
+    /// the root's candidates together it reaches every candidate in the tree,
+    /// and each one's set starts with that candidate's own position.
+    #[test]
+    fn subtree_keys_cover_the_tree() {
+        let mut s = Search::new(Count::initial_state(), &params(300), 0);
+        drive(&Mock, &mut s).unwrap();
+        let all: std::collections::HashSet<u128> = s
+            .tree
+            .iter()
+            .flat_map(|n| n.entries.iter().map(|e| e.key))
+            .collect();
+        let mut union = std::collections::HashSet::new();
+        for (i, e) in s.tree[0].entries.iter().enumerate() {
+            let keys = s.subtree_keys(i);
+            assert_eq!(keys[0], e.key);
+            union.extend(keys);
+        }
+        assert!(s.tree.len() > 20, "search too small to mean anything");
+        assert_eq!(union, all);
     }
 
     /// Answer one widen the way `drive` does.

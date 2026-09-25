@@ -619,7 +619,7 @@ fn drive_pool_worker(
                     Step::Done => {
                         // The cache stays: the next turn's search starts in the
                         // subtree this one built, and asks for those positions.
-                        if !advance_turn(&mut slots[i], &start_search, stats) {
+                        if !advance_turn(&mut slots[i], &start_search, stats, &mut cache_bytes) {
                             cache_bytes = cache_bytes.saturating_sub(cache_drop(&mut slots[i]));
                             // Game over: bank it and refill the slot, so the
                             // batch never narrows while work remains.
@@ -1020,6 +1020,21 @@ fn cache_drop(slot: &mut Slot) -> usize {
     b
 }
 
+/// Drop every entry of `slot`'s cache whose position is not in `keep`;
+/// returns the bytes freed.
+fn cache_prune(slot: &mut Slot, keep: &std::collections::HashSet<u128>, stats: &mut PoolStats) -> usize {
+    let dead: Vec<u128> = slot.trunk_cache.keys().filter(|k| !keep.contains(k)).copied().collect();
+    let (mut h, mut l, mut freed) = (Vec::new(), Vec::new(), 0);
+    for key in dead {
+        let e = slot.trunk_cache.remove(&key).expect("just listed");
+        freed += recycle(e, &mut h, &mut l);
+        stats.cache_pruned += 1;
+    }
+    return_blocks(h);
+    return_step1(l);
+    freed
+}
+
 /// Evict the least recently used eighth of this worker's cache, never an
 /// entry touched this wave (`now`); returns the bytes freed.
 fn cache_evict(slots: &mut [Slot], now: u32, stats: &mut PoolStats) -> usize {
@@ -1254,6 +1269,8 @@ pub struct PoolStats {
     pub cache_full: u64,
     /// Entries evicted to make room.
     pub cache_evicted: u64,
+    /// Entries dropped when their move was not the one played.
+    pub cache_pruned: u64,
     /// Trunk rows on sampled slots (`SEEN_EVERY`): at a position this game
     /// had never evaluated, and at one it had -- the recomputes a big enough
     /// cache would have saved.
@@ -1292,6 +1309,7 @@ impl PoolStats {
         self.cache_misses += o.cache_misses;
         self.cache_full += o.cache_full;
         self.cache_evicted += o.cache_evicted;
+        self.cache_pruned += o.cache_pruned;
         self.seen_new += o.seen_new;
         self.seen_again += o.seen_again;
         self.cache_peak_bytes += o.cache_peak_bytes;
@@ -1320,13 +1338,14 @@ impl PoolStats {
         let looked = self.cache_hits + self.cache_misses;
         if looked > 0 {
             s += &format!(
-                "  |  trunk cache {:.1}% hit ({} of {}, {} with step 1), {} not kept, {} evicted, peak {:.0} MB, recomputed {:.1}% of sampled trunk rows",
+                "  |  trunk cache {:.1}% hit ({} of {}, {} with step 1), {} not kept, {} evicted, {} pruned, peak {:.0} MB, recomputed {:.1}% of sampled trunk rows",
                 100.0 * self.cache_hits as f64 / looked as f64,
                 self.cache_hits,
                 looked,
                 self.step1_hits,
                 self.cache_full,
                 self.cache_evicted,
+                self.cache_pruned,
                 self.cache_peak_bytes as f64 / (1u64 << 20) as f64,
                 100.0 * self.seen_again as f64 / (self.seen_new + self.seen_again).max(1) as f64
             );
@@ -1474,12 +1493,20 @@ fn advance_turn(
     slot: &mut Slot,
     start_search: StartSearch,
     stats: &mut PoolStats,
+    cache_bytes: &mut usize,
 ) -> bool {
     let finished = std::mem::replace(
         &mut slot.search,
         Search::new(slot.state.clone(), &SampledParams { simulations: 0, ..Default::default() }, 0),
     );
     let result = finished.finish();
+    // Only the played move's subtree can come round again; the rest of the
+    // cache is dead weight that LRU would otherwise take a while to age out.
+    if !slot.trunk_cache.is_empty() {
+        let keep: std::collections::HashSet<u128> =
+            finished.subtree_keys(result.chosen).into_iter().collect();
+        *cache_bytes = cache_bytes.saturating_sub(cache_prune(slot, &keep, stats));
+    }
     if result.candidates.is_empty() {
         return false;
     }
