@@ -757,11 +757,11 @@ fn drive_pool_worker(
             for (&j, v) in exp_idx.iter().zip(&got.values) {
                 slots[ids[j]].search.provide(*v, Vec::new());
             }
-            for (&j, (_, c)) in wid_idx.iter().zip(got.wid) {
-                slots[ids[j]].search.provide_widen(c);
+            for ((&j, (_, c)), k) in wid_idx.iter().zip(got.wid).zip(got.wid_keys) {
+                slots[ids[j]].search.provide_widen_keyed(c, Some(k));
             }
-            for (&i, c) in rs_ids.iter().zip(got.rs) {
-                slots[i].search.provide_resample(c);
+            for ((&i, c), k) in rs_ids.iter().zip(got.rs).zip(got.rs_keys) {
+                slots[i].search.provide_resample_keyed(c, Some(k));
             }
             if cache_budget > 0 {
                 if use_cache {

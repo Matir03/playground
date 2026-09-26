@@ -2129,6 +2129,17 @@ impl<G: SampledGame> Search<G> {
     /// that brings nothing new is a miss, and the node is exhausted once its
     /// misses reach the candidates it has earned. See [`SampledParams::k_draws`].
     pub fn provide_widen(&mut self, candidates: Vec<(G::Move, f32, bool)>) {
+        self.provide_widen_keyed(candidates, None)
+    }
+
+    /// [`Self::provide_widen`] with each candidate's `G::state_key` of the
+    /// position it reaches supplied (`keys[i]` for `candidates[i]`), by a
+    /// sampler that already realized them -- sparing a `G::apply` apiece.
+    pub fn provide_widen_keyed(
+        &mut self,
+        candidates: Vec<(G::Move, f32, bool)>,
+        keys: Option<Vec<u128>>,
+    ) {
         let (cur, fill) = self
             .pending_widen
             .take()
@@ -2142,11 +2153,17 @@ impl<G: SampledGame> Search<G> {
         // A fill is not a sampler draw, so it adds to no entry's draw count.
         let draw = u32::from(!fill);
         let mut added: Vec<u128> = Vec::new();
-        for (mv, p, explore) in candidates {
+        for (ci, (mv, p, explore)) in candidates.into_iter().enumerate() {
             if self.tree[cur].entries.len() >= k_max {
                 break;
             }
-            let key = G::state_key(&G::apply(&self.tree[cur].state, &mv));
+            let key = match &keys {
+                Some(k) => {
+                    debug_assert_eq!(k[ci], G::state_key(&G::apply(&self.tree[cur].state, &mv)));
+                    k[ci]
+                }
+                None => G::state_key(&G::apply(&self.tree[cur].state, &mv)),
+            };
             match seen.get(&key) {
                 Some(&i) => {
                     self.tree[cur].entries[i].draws += draw;
@@ -2269,6 +2286,16 @@ impl<G: SampledGame> Search<G> {
     /// replaced. Not capped by `k_candidates`: the point is to grow the set
     /// around the turns the search is spending its visits on.
     pub fn provide_resample(&mut self, candidates: Vec<(G::Move, f32, bool)>) {
+        self.provide_resample_keyed(candidates, None)
+    }
+
+    /// [`Self::provide_resample`] with the candidates' keys supplied, as
+    /// [`Self::provide_widen_keyed`].
+    pub fn provide_resample_keyed(
+        &mut self,
+        candidates: Vec<(G::Move, f32, bool)>,
+        keys: Option<Vec<u128>>,
+    ) {
         let (cur, from) = self
             .pending_resample
             .take()
@@ -2276,11 +2303,16 @@ impl<G: SampledGame> Search<G> {
         // By id: adding a candidate re-sorts the entries, so `from` stops
         // naming the pick once one arrives.
         let origin = self.tree[cur].entries[from].id;
-        let state = self.tree[cur].state.clone();
-        let key_of = |mv: &G::Move| G::state_key(&G::apply(&state, mv));
         let mut target = self.tree[cur].entries[from].key;
         if let Some((mv, energy, explore)) = candidates.into_iter().next() {
-            target = key_of(&mv);
+            let state = &self.tree[cur].state;
+            target = match &keys {
+                Some(k) => {
+                    debug_assert_eq!(k[0], G::state_key(&G::apply(state, &mv)));
+                    k[0]
+                }
+                None => G::state_key(&G::apply(state, &mv)),
+            };
             let entries = &mut self.tree[cur].entries;
             if !entries.iter().any(|e| e.key == target) {
                 let id = entries.len() as u32;

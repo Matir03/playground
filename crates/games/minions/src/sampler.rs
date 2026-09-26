@@ -1008,6 +1008,20 @@ impl MinionsModel {
         state: &MinionsState,
         declared: Vec<(TurnSpec, bool)>,
     ) -> Vec<(TurnSpec, bool)> {
+        self.finish_candidates_keyed(state, declared, false).0
+    }
+
+    /// [`Self::finish_candidates`], also returning each kept candidate's
+    /// `state_key` in the real frame -- `state` is canonical, and the real
+    /// position is its rotation when `flipped`. `realize` commutes with the
+    /// rotation, so this is exactly what the search's own `apply` would key.
+    fn finish_candidates_keyed(
+        &self,
+        state: &MinionsState,
+        declared: Vec<(TurnSpec, bool)>,
+        flipped: bool,
+    ) -> (Vec<(TurnSpec, bool)>, Vec<u128>) {
+        let mut keys: Vec<u128> = Vec::with_capacity(declared.len());
         // Distinct declarations routinely converge on one board; unmerged they
         // would fragment the visit counts they are supposed to concentrate.
         let mut seen: std::collections::HashMap<u128, usize> = Default::default();
@@ -1020,10 +1034,11 @@ impl MinionsModel {
                 None => {
                     seen.insert(key, specs.len());
                     specs.push((r.spec, explore));
+                    keys.push(if flipped { r.next.rotated().key() } else { key });
                 }
             }
         }
-        specs
+        (specs, keys)
     }
 
     /// Candidates carry their **raw energies**; the search turns them into
@@ -1313,6 +1328,10 @@ pub struct WaveOut {
     /// First-step logits computed this wave, per widen, in
     /// [`CachedRow::step1`]'s live-cells layout.
     pub step1: Vec<Option<Vec<f16>>>,
+    /// `state_key` of the position each candidate in `wid` / `rs` reaches,
+    /// real frame, parallel to them -- for `Search::provide_*_keyed`.
+    pub wid_keys: Vec<Vec<u128>>,
+    pub rs_keys: Vec<Vec<u128>>,
 }
 
 pub struct TrunkRows {
@@ -2336,11 +2355,11 @@ impl MinionsModel {
             declared.push(vec![(ch.p.spec, false)]);
         }
         let t = Instant::now();
-        let specs: Vec<Vec<(TurnSpec, bool)>> = declared
+        let (specs, mut keys): (Vec<Vec<(TurnSpec, bool)>>, Vec<Vec<u128>>) = declared
             .into_iter()
             .enumerate()
-            .map(|(j, d)| self.finish_candidates(&canon[ne + j], d))
-            .collect();
+            .map(|(j, d)| self.finish_candidates_keyed(&canon[ne + j], d, flipped[ne + j]))
+            .unzip();
         Phases::add(&self.phases.realize_ns, t);
 
         // ── one energy call for every candidate of the wave ──────────────────
@@ -2365,6 +2384,7 @@ impl MinionsModel {
             })
             .collect();
         let rs = lists.split_off(nw);
+        let rs_keys = keys.split_off(nw);
         let wid = lists
             .into_iter()
             .enumerate()
@@ -2380,6 +2400,8 @@ impl MinionsModel {
                 fresh,
             },
             step1,
+            wid_keys: keys,
+            rs_keys,
         })
     }
 }
@@ -2836,6 +2858,21 @@ mod tests {
             a.step1.iter().all(|l| l.is_some()),
             "every widen computes step 1"
         );
+        // The keys handed to the search are exactly what its own `apply`
+        // would compute, for both movers (the states alternate sides).
+        let pairs = wid
+            .iter()
+            .zip(a.wid.iter().map(|(_, c)| c).zip(&a.wid_keys));
+        let pairs = pairs.chain(rs.iter().zip(a.rs.iter().zip(&a.rs_keys)));
+        let mut checked = 0;
+        for (st, (c, k)) in pairs {
+            assert_eq!(c.len(), k.len());
+            for ((spec, _, _), &key) in c.iter().zip(k) {
+                assert_eq!(key, MinionsTurns::state_key(&MinionsTurns::apply(st, spec)));
+                checked += 1;
+            }
+        }
+        assert!(checked > 0);
         let rows = |with_step1: bool| -> Vec<Option<CachedRow>> {
             (0..exp.len() + wid.len() + rs.len())
                 .map(|i| {
