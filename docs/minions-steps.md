@@ -323,7 +323,9 @@ instead of ~480 in the same ~4 minutes (~1.5k records per game), and trains
 | 17 | 1224 | 0.56 | 0.625 | 0.715 |
 | 18 | 1193 | 0.505 | 0.595 | 0.71 |
 | 19 | 1173 | 0.57 | 0.615 | 0.79 |
-| 20 | | 0.51 | 0.635 | **0.80** |
+| 20 | | 0.51 | 0.635 | 0.80 |
+| 21 | | 0.465 | 0.615 | 0.84 |
+| 22 | | 0.54 | 0.635 | 0.83 |
 
 Strength vs gen 0 rises after the switch (gens 2-12 sat at 0.50-0.605), and
 the search now beats greedy with the same net (0.58-0.63 from gen 16): the
@@ -335,6 +337,10 @@ Greedy vs the old net, which fell to 0.31-0.35 by gen 13-16, recovered to
 (The cycle died after gen 20 on a bash syntax error: cycle.sh had been
 rewritten in place while bash was still reading it. Restarted at gen 21;
 from there the old-net match is by search.)
+
+**Search vs the old champion's value net, logged by the cycle from gen 21:
+0.64 (gen 21), 0.63 (gen 22)** -- the step nets now beat the reference that
+bootstrapped them (gen 0: 0.29).
 
 **The old champion's value net as a fixed reference, under the step search**
 (both sides search 2000 expansions, 100 pairs): gen 0 scores 0.29, gen 13
