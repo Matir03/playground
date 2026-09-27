@@ -236,7 +236,7 @@ where
             return Err(Status::failed_precondition("game is already over"));
         }
 
-        let next = G::apply_encoded_turn(&state, &inner.turn)
+        let next = G::commit_encoded_turn(&state, &inner.turn)
             .map_err(|e| Status::invalid_argument(format!("apply_turn: {e}")))?;
         games.insert(handle_id, G::encode_state(&next));
 

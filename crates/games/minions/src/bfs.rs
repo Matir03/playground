@@ -135,14 +135,14 @@ impl Tree {
         matches!(self.nodes[0].kind, TERMINAL | DEAD)
     }
 
-    fn children(&self, n: u32) -> std::ops::Range<u32> {
+    pub fn children(&self, n: u32) -> std::ops::Range<u32> {
         let nd = &self.nodes[n as usize];
         nd.first..nd.first + nd.nch as u32
     }
 
     /// Child `c`'s value from its parent's mover's point of view.
     #[inline]
-    fn q_parent(&self, c: u32) -> f32 {
+    pub fn q_parent(&self, c: u32) -> f32 {
         let n = &self.nodes[c as usize];
         if n.flip {
             1.0 - n.value

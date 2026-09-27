@@ -45,6 +45,11 @@ pub struct StepsSeat {
     pub max_expansions: u64,
 }
 
+/// The step-search seat, if `serve --steps-net` configured one.
+pub(crate) fn steps_seat() -> Option<StepsSeat> {
+    STEPS.lock().unwrap().clone()
+}
+
 pub fn configure_steps(seat: StepsSeat) {
     *STEPS.lock().unwrap() = Some(seat);
     *PLAN.lock().unwrap() = None;
@@ -817,6 +822,13 @@ impl playground_core::Analyzable for Minions {
         budget: SolverBudget,
         opts: playground_core::AnalysisOptions,
     ) -> Option<anyhow::Result<playground_core::Analysis>> {
+        if let Some(seat) = steps_seat() {
+            return Some(if opts.eval_only {
+                crate::steps_analysis::eval_only(&seat, state)
+            } else {
+                crate::steps_analysis::analyze(&seat, state, budget)
+            });
+        }
         if !is_configured() {
             return None;
         }
@@ -824,22 +836,38 @@ impl playground_core::Analyzable for Minions {
     }
 
     fn apply_encoded_turn(state: &MinionsState, turn: &[u8]) -> anyhow::Result<MinionsState> {
+        if let Some(board) = crate::steps_analysis::apply(turn) {
+            return board;
+        }
         Ok(realize(state, &decode_turn(turn)?).next)
     }
 
+    fn commit_encoded_turn(state: &MinionsState, turn: &[u8]) -> anyhow::Result<MinionsState> {
+        if let Some(seat) = steps_seat() {
+            if let Some(next) = crate::steps_analysis::commit(&seat, turn) {
+                return next;
+            }
+        }
+        Self::apply_encoded_turn(state, turn)
+    }
+
+    // The sampled-AZ search's settings; the step seat has none of these.
     fn search_config() -> Option<anyhow::Result<playground_core::SearchConfigJson>> {
-        is_configured().then(current_search)
+        CONFIG.lock().unwrap().is_some().then(current_search)
     }
 
     fn set_search_config(
         json: Option<&str>,
     ) -> Option<anyhow::Result<playground_core::SearchConfigJson>> {
-        is_configured().then(|| set_search(json))
+        CONFIG.lock().unwrap().is_some().then(|| set_search(json))
     }
 
     fn session(
         op: playground_core::SessionOp<MinionsState>,
     ) -> Option<anyhow::Result<playground_core::SessionResult<MinionsState>>> {
+        if let Some(seat) = steps_seat() {
+            return Some(crate::steps_analysis::session(&seat, op));
+        }
         is_configured().then(|| session_inner(op))
     }
 }

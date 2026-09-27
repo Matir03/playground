@@ -224,6 +224,14 @@ pub trait Analyzable: crate::Game {
         anyhow::bail!("this game has no turn encoding")
     }
 
+    /// Play an encoded turn on the real game (`ApplyTurn`). Usually the same
+    /// as [`Self::apply_encoded_turn`]; a game whose analysis edges can stop
+    /// partway through a turn (Minions' step search) completes the turn here,
+    /// so committing never leaves the game mid-turn.
+    fn commit_encoded_turn(state: &Self::State, turn: &[u8]) -> anyhow::Result<Self::State> {
+        Self::apply_encoded_turn(state, turn)
+    }
+
     /// The search `analyze` and the engine's seat run. `None` = this game has
     /// no configurable search.
     fn search_config() -> Option<anyhow::Result<SearchConfigJson>> {

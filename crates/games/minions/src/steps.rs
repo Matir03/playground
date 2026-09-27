@@ -305,6 +305,52 @@ impl StepState {
         }
     }
 
+    /// What option `v` of the current step decides, in the real board's cell
+    /// names, for analysis views.
+    pub fn step_label(&self, v: u8) -> String {
+        let cell = |c: u8| {
+            let r = if self.flipped {
+                crate::map::rot(c as usize) as u8
+            } else {
+                c
+            };
+            crate::map::cell_name(r)
+        };
+        let unit = |c: u8| {
+            self.base
+                .piece_at(c)
+                .map_or("?".to_string(), |(_, u)| u.stats().name.to_string())
+        };
+        match self.stage {
+            Stage::Fates => {
+                let e = self.enemies[self.idx];
+                let what = match v {
+                    TARGET_STAY => "spare",
+                    TARGET_KILL => "kill",
+                    _ => "unsummon",
+                };
+                format!("{what} {} {}", unit(e), cell(e))
+            }
+            Stage::Moves => {
+                let c = self.friends[self.idx];
+                let d = MOVE_DEST[c as usize][v as usize];
+                if d == c {
+                    format!("hold {} {}", unit(c), cell(c))
+                } else {
+                    format!("move {} {}{}", unit(c), cell(c), cell(d))
+                }
+            }
+            Stage::Spawns => {
+                let at = self.spawn_cells[self.idx];
+                match Unit::from_index(v) {
+                    Some(u) if v != 0 => format!("spawn {} {}", u.stats().name, cell(at)),
+                    _ => format!("no spawn {}", cell(at)),
+                }
+            }
+            Stage::Terminal => String::new(),
+        }
+    }
+
     /// Legal options for the current step (empty at a dead end or `Terminal`).
     pub fn children(&self) -> Vec<u8> {
         match &self.opts {

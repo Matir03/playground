@@ -28,6 +28,7 @@ pub mod search_config;
 pub mod selfplay;
 pub mod solver;
 pub mod steps;
+pub mod steps_analysis;
 pub mod stepsp;
 pub mod turn;
 pub mod units;

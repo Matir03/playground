@@ -1575,7 +1575,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                   onForce={session && !compose ? forceVisit : undefined}
                   shown={walk?.line}
                   onCommit={(turn, label) => void commitTurn(turn, label)}
-                  maxDepth={12}
+                  maxDepth={64}
                 />
               ) : (
                 <div style={{ color: "#777" }}>
