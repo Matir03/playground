@@ -502,3 +502,44 @@ through that decision (best line, greedy below it) via the new
 `Analyzable::commit_encoded_turn`; +N runs N iterations; force expands the
 first unexpanded node on the best line below a row; 600 most-descended
 nodes are exported. Overview page: https://claude.ai/artifact/FQZsM2cdGJ3qQ77HqDUzNG
+
+## Athenan-style generations (from gen 33)
+
+Search 2000 (best-first) in every match; 200 games, +-0.035.
+
+| gen | games | vs prev (greedy) | search vs prev | search vs greedy | search vs gen20 | search vs old net |
+|---|---|---|---|---|---|---|
+| 33 | 219 | 0.545 | 0.560 | 0.760 | 0.848 | 0.905 |
+| 34 | 280 | 0.505 | 0.510 | 0.775 | 0.780 | **0.925** |
+
+## Self-play throughput (2026-09-27)
+
+The box has 11 cores; at 32 workers the CPU runs ~98% busy and the GPU
+~31%, so self-play is CPU-bound and the exact witness search was the cost
+(47% of thread time in gen 33). Measured on the step tests (deterministic
+node counts) and in 80 s self-play trials with the cycle paused (SIGSTOP):
+
+- **Hall bound** in the exact search (one attack per unit, damage by fate
+  type) instead of per-target reachability: 16% fewer nodes, budget-outs
+  787 -> 613 over 4 test games; per node slower, so time neutral.
+- **Transpositions are free**: 55% of nodes were memo hits (the same
+  position by another action order); they no longer spend budget (capped
+  at 4x the budget). With that, **budget 20000 -> 5000** leaves as many
+  options undecided as before (743 vs 787) for about a third of the work.
+  Budget 2000 would be ~35% faster again but loses ~1% of feasible
+  options; not taken.
+- Found-path cache sharded (64 locks) and keyed without allocation.
+- **Lazy witnesses** (`--lazy-witness`, from gen 36): an option only the
+  exact search could confirm is offered once the necessary relaxation
+  passes, and the search runs when the child is first expanded (a dead end
+  if it finds nothing). Only ~1 in 4 children is ever expanded. ABBA, 32
+  workers, gen 34 net: **71.6k / 71.0k -> 124.2k / 115.3k expansions/s**,
+  records/s +67%, exact search 42% -> 22% of thread time. Cost: ~45% of the
+  lazily offered children that get expanded are dead (infeasible
+  declarations look attractive, so descents find them), ~1.4% of
+  expansions; until expanded, such a child's static value sits in its
+  parent's power mean. Feasible options are treated exactly as before (the
+  same query, run later). Eval matches stay eager.
+- Profile after these (eager, thread-s over 60 s x 32 threads, nested):
+  option generation 50% (exact 41%, fast realizer 8%), children 1%,
+  feature views 0.5%; the remainder is evaluation wait and tree work.
