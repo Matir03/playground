@@ -1417,7 +1417,7 @@ fn pick_mode(n_full: usize, n_fast: usize, max_batch: usize, prev_full: bool) ->
 ///
 /// Uses [`TurnSpec::random_playout`] so each opening turn is a real sequence of
 /// legal moves rather than a declaration that mostly fails to realize.
-fn random_opening(
+pub(crate) fn random_opening(
     max: u32,
     decay: f32,
     rng: &mut rand_chacha::ChaCha8Rng,

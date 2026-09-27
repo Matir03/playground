@@ -571,6 +571,51 @@ enum Cmd {
         #[arg(long, default_value_t = 200_000)]
         reps: usize,
     },
+    /// Self-play with the best-first step search (docs/minions-steps.md):
+    /// writes every well-visited search node as a value record.
+    StepsSelfplay {
+        /// Record output directory.
+        #[arg(long)]
+        out: String,
+        /// Evaluate with the sampled-AZ champion's value head on the projected
+        /// board (a dir holding trunk.onnx + config.json).
+        #[arg(long)]
+        old_net: Option<String>,
+        /// Evaluate with a step-trained ONNX value net.
+        #[arg(long)]
+        onnx: Option<String>,
+        #[arg(long, default_value = "trt")]
+        ep: String,
+        #[arg(long, default_value_t = 8)]
+        workers: usize,
+        #[arg(long, default_value_t = 32)]
+        heads: usize,
+        #[arg(long, default_value_t = 2.0)]
+        power: f32,
+        /// Leaf expansions per move.
+        #[arg(long, default_value_t = 2000)]
+        expansions: u64,
+        #[arg(long, default_value_t = 0.0)]
+        move_secs: f64,
+        #[arg(long, default_value_t = 20)]
+        min_visits: u32,
+        #[arg(long, default_value_t = 1.0)]
+        temp: f32,
+        #[arg(long, default_value_t = 0.3)]
+        dirichlet_alpha: f32,
+        #[arg(long, default_value_t = 0.25)]
+        dirichlet_eps: f32,
+        #[arg(long, default_value_t = 22)]
+        opening_max: u32,
+        #[arg(long, default_value_t = 1.0884)]
+        opening_decay: f32,
+        #[arg(long, default_value_t = 1_000_000)]
+        target_records: u64,
+        #[arg(long, default_value_t = 20_000)]
+        chunk_records: usize,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
 }
 
 #[tokio::main]
@@ -1060,6 +1105,58 @@ async fn main() -> anyhow::Result<()> {
             )?;
         }
         Cmd::NnueBench { active, reps } => minions_engine::nnue::bench_sweep(active, reps),
+        Cmd::StepsSelfplay {
+            out,
+            old_net,
+            onnx,
+            ep,
+            workers,
+            heads,
+            power,
+            expansions,
+            move_secs,
+            min_visits,
+            temp,
+            dirichlet_alpha,
+            dirichlet_eps,
+            opening_max,
+            opening_decay,
+            target_records,
+            chunk_records,
+            seed,
+        } => {
+            use std::sync::Arc;
+            let eval: Arc<dyn minions_engine::bfs::Evaluator> = match (old_net, onnx) {
+                (Some(dir), None) => {
+                    let dir = std::path::Path::new(&dir);
+                    let cache = dir.join("trt_cache").to_string_lossy().into_owned();
+                    let net = minions_engine::ort_net::OrtNet::new(dir, &ep, true, &cache)?;
+                    Arc::new(minions_engine::bfs::OldNetEval { net: Box::new(net) })
+                }
+                (None, Some(path)) => {
+                    let p = std::path::Path::new(&path);
+                    let cache = p.with_extension("trt_cache").to_string_lossy().into_owned();
+                    Arc::new(minions_engine::bfs::OnnxEval::load(p, &ep, true, &cache, workers.min(4))?)
+                }
+                _ => anyhow::bail!("give exactly one of --old-net / --onnx"),
+            };
+            let cfg = minions_engine::stepsp::Config {
+                workers,
+                params: minions_engine::bfs::Params { heads, power },
+                expansions,
+                move_secs,
+                min_visits,
+                temp,
+                dirichlet_alpha,
+                dirichlet_eps,
+                opening_max,
+                opening_decay,
+                target_records,
+                chunk_records,
+                seed,
+            };
+            minions_engine::stepsp::run(cfg, eval, std::path::Path::new(&out))?;
+        }
     }
     Ok(())
 }

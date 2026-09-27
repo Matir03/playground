@@ -12,6 +12,7 @@
 //! sequence of [`MinionsMove`]s. [`bitboard`] is the `u128` hex board it uses.
 
 pub mod assign;
+pub mod bfs;
 pub mod bitboard;
 pub(crate) mod combine;
 pub mod eval;
@@ -27,6 +28,7 @@ pub mod search_config;
 pub mod selfplay;
 pub mod solver;
 pub mod steps;
+pub mod stepsp;
 pub mod turn;
 pub mod units;
 
