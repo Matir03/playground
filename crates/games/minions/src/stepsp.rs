@@ -414,6 +414,9 @@ fn play_game(
 
 /// Run `cfg.workers` self-play threads until `cfg.target_records` are written.
 pub fn run(cfg: Config, eval: Arc<dyn Evaluator>, out: &Path) -> anyhow::Result<()> {
+    if std::env::var("STEPS_EXACT_DUP").is_ok() {
+        let _ = crate::steps::EXACT_DUP.set(Default::default());
+    }
     std::fs::create_dir_all(out)?;
     let c = Arc::new(Counters::default());
     let stop = Arc::new(AtomicBool::new(false));
@@ -489,6 +492,13 @@ pub fn run(cfg: Config, eval: Arc<dyn Evaluator>, out: &Path) -> anyhow::Result<
                 g(&x[1]),
                 g(&x[2]),
                 g(&x[3]) as f64 * 1e-9
+            );
+            let z = &crate::steps::EXACT_OUTCOME;
+            println!(
+                "  exact by outcome: found {:.0}s {:.0} nodes/call, impossible {:.0}s {:.0} nodes/call, out-of-budget {:.0}s | repeated queries {}",
+                g(&z[0][0]) as f64 * 1e-9, g(&z[0][1]) as f64 / g(&x[0]).max(1) as f64,
+                g(&z[1][0]) as f64 * 1e-9, g(&z[1][1]) as f64 / g(&x[1]).max(1) as f64,
+                g(&z[2][0]) as f64 * 1e-9, g(&z[3][0])
             );
             let y = &crate::steps::EXACT_SITES;
             println!(

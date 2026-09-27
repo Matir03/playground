@@ -640,7 +640,7 @@ impl StepState {
             }
             let fated = self.enemies[..=self.idx].iter().fold(0, |b, &x| b | bit(x));
             let t0 = std::time::Instant::now();
-            let r = exact_realize(&self.base, &spec, 0, fated, EXACT_BUDGET);
+            let r = exact_realize(&self.base, &spec, 0, fated, exact_budget());
             exact_site(0, t0);
             if let Exact::Found(w, _) = r {
                 out.push(v);
@@ -749,7 +749,7 @@ impl StepState {
             let decided_bb = dec.iter().fold(0, |b, &x| b | bit(x));
             let fated = side_bb(&self.base, 1);
             let t0 = std::time::Instant::now();
-            let r = exact_realize(&self.base, &spec, decided_bb, fated, EXACT_BUDGET);
+            let r = exact_realize(&self.base, &spec, decided_bb, fated, exact_budget());
             exact_site(1, t0);
             if let Exact::Found(w, _) = r {
                 out.push(k);
@@ -1203,7 +1203,13 @@ fn exact_complete(base: &MinionsState, spec: &TurnSpec) -> Option<Vec<MinionsMov
     let mut sp = *spec;
     sp.spawns = [0; NUM_CELLS];
     let t0 = std::time::Instant::now();
-    let r = exact_realize(base, &sp, side_bb(base, 0), side_bb(base, 1), EXACT_BUDGET);
+    let r = exact_realize(
+        base,
+        &sp,
+        side_bb(base, 0),
+        side_bb(base, 1),
+        exact_budget(),
+    );
     exact_site(2, t0);
     match r {
         Exact::Found(_, path) => Some(path),
@@ -1300,6 +1306,32 @@ pub fn turn_actions(real: &MinionsState, done: &TurnSpec) -> anyhow::Result<Vec<
     Ok(acts)
 }
 
+/// Exact-search nanoseconds and nodes by outcome (found, impossible,
+/// out of budget); `[3][0]` counts repeated queries when [`EXACT_DUP`] is on.
+pub static EXACT_OUTCOME: [[std::sync::atomic::AtomicU64; 2]; 4] = [
+    [
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+    ],
+    [
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+    ],
+    [
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+    ],
+    [
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+    ],
+];
+
+/// Diagnostics: every exact query's key, to count repeats (set by
+/// `STEPS_EXACT_DUP`).
+pub static EXACT_DUP: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
+    std::sync::OnceLock::new();
+
 /// Exact-search calls and nanoseconds by call site: fates options, moves
 /// options, complete declarations (last unit / commit).
 pub static EXACT_SITES: [[std::sync::atomic::AtomicU64; 2]; 3] = [
@@ -1328,8 +1360,26 @@ fn exact_site(site: usize, t0: std::time::Instant) {
 /// at the cap.
 pub const DEPTH_LAMBDA: f32 = 0.5;
 
+/// Benchmark switch: the per-target reachability bound instead of the
+/// assignment bound (`STEPS_EXACT_OLD_BOUND`).
+fn exact_old_bound() -> bool {
+    static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OLD.get_or_init(|| std::env::var("STEPS_EXACT_OLD_BOUND").is_ok())
+}
+
 /// Search nodes [`exact_realize`] may visit before giving up.
-pub const EXACT_BUDGET: u32 = 20_000;
+pub const EXACT_BUDGET: u32 = 5_000;
+
+/// [`EXACT_BUDGET`], or `STEPS_EXACT_BUDGET` if set (for benchmarks).
+pub fn exact_budget() -> u32 {
+    static B: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("STEPS_EXACT_BUDGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(EXACT_BUDGET)
+    })
+}
 
 /// Outcome of [`exact_realize`].
 pub enum Exact {
@@ -1380,6 +1430,7 @@ pub fn exact_realize(
         path: Vec<MinionsMove>,
         found: Option<TurnSpec>,
         out_of_budget: bool,
+        hits: u64,
     }
     // Per cell: the origin of the friendly unit standing there (NO_CELL if
     // none), and per enemy origin how it left the board (0 = present).
@@ -1449,7 +1500,89 @@ pub fn exact_realize(
         if necro_open {
             return false;
         }
-        bitboard::cells(rem).any(|t| !hittable(c, st, t, spared))
+        if rem == 0 {
+            return false;
+        }
+        if exact_old_bound() {
+            return bitboard::cells(rem).any(|t| !hittable(c, st, t, spared));
+        }
+        // Each friend that can still attack, with the hexes it could end its
+        // turn on (ignoring blockers other than spared enemies).
+        let s = &st.s;
+        let mut atk: Vec<(Unit, Bb)> = Vec::new();
+        for a in 0..NUM_CELLS as u8 {
+            let Some((sd, u)) = s.piece_at(a) else {
+                continue;
+            };
+            if sd != 0 || !s.can_attack_piece(a, u) {
+                continue;
+            }
+            let st_ = u.stats();
+            let o = st.origin_at[a as usize];
+            let ends = if has(c.decided, o) {
+                let d = dest_of(c.spec, o);
+                if d == a || !s.can_move_piece(a) {
+                    bit(a)
+                } else if st_.lumbering {
+                    0
+                } else {
+                    bit(d)
+                }
+            } else if s.can_move_piece(a) && !st_.lumbering {
+                let pass = if st_.flying { FULL } else { FULL & !spared };
+                bitboard::reachable(bit(a), st_.speed, pass)
+            } else {
+                bit(a)
+            };
+            if ends != 0 {
+                atk.push((u, ends));
+            }
+        }
+        // The remaining targets as an assignment problem (one attack per
+        // unit, damage by fate type): a Hall violation proves the rest
+        // cannot all happen.
+        let mut targets = Vec::new();
+        for t in bitboard::cells(rem) {
+            let Some((_, tu)) = s.piece_at(t) else {
+                continue;
+            };
+            let unsummon = c.spec.targets[t as usize] == TARGET_UNSUMMON;
+            let mut reach = Vec::new();
+            for (i, &(u, ends)) in atk.iter().enumerate() {
+                let ring = bitboard::reachable(bit(t), u.stats().range, FULL) & !bit(t);
+                if ends & ring == 0 {
+                    continue;
+                }
+                let dmg = if unsummon {
+                    u32::from(matches!(u.stats().attack, Attack::Unsummon))
+                } else {
+                    kill_damage_against(u, tu) as u32
+                };
+                if dmg > 0 {
+                    reach.push((i, dmg));
+                }
+            }
+            if reach.is_empty() {
+                return true;
+            }
+            let need = if unsummon {
+                1
+            } else {
+                tu.stats().defense.saturating_sub(s.damage_on(t)) as u32
+            };
+            targets.push(assign::Target {
+                cell: t,
+                need,
+                reach,
+            });
+        }
+        let attackers: Vec<assign::Attacker> = (0..atk.len())
+            .map(|i| assign::Attacker {
+                cell: i as u8,
+                attacks: 1,
+            })
+            .collect();
+        assign::hall_violation(&targets, &attackers).is_some()
     }
     // Whether some friend can still end its turn in range of `t` and attack.
     fn hittable(c: &Ctx, st: &St, t: u8, spared: Bb) -> bool {
@@ -1516,18 +1649,21 @@ pub fn exact_realize(
         if st.s.winner != 0 {
             return false;
         }
+        // Transpositions (the same position by another action order) are
+        // over half the nodes; they cost a hash, not budget.
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        st.s.key().hash(&mut h);
+        st.origin_at.hash(&mut h);
+        st.gone.hash(&mut h);
+        if !c.seen.insert(h.finish()) {
+            c.hits += 1;
+            return false;
+        }
         if c.budget == 0 {
             c.out_of_budget = true;
             return false;
         }
         c.budget -= 1;
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        Minions::encode_state(&st.s).hash(&mut h);
-        st.origin_at.hash(&mut h);
-        st.gone.hash(&mut h);
-        if !c.seen.insert(h.finish()) {
-            return false;
-        }
         let rem = remaining(c, st);
         if hopeless(c, st, rem) {
             return false;
@@ -1657,11 +1793,39 @@ pub fn exact_realize(
         path: Vec::new(),
         found: None,
         out_of_budget: false,
+        hits: 0,
     };
     use std::sync::atomic::Ordering::Relaxed;
+    if let Some(set) = EXACT_DUP.get() {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        base.key().hash(&mut h);
+        decided.hash(&mut h);
+        fated.hash(&mut h);
+        for o in bitboard::cells(decided) {
+            spec.moves[o as usize].hash(&mut h);
+        }
+        for e in bitboard::cells(fated) {
+            spec.targets[e as usize].hash(&mut h);
+        }
+        if !set.lock().unwrap().insert(h.finish()) {
+            EXACT_OUTCOME[3][0].fetch_add(1, Relaxed);
+        }
+    }
     let t0 = std::time::Instant::now();
     let ok = dfs(&mut c, &root);
-    EXACT_STATS[3].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+    let ns = t0.elapsed().as_nanos() as u64;
+    EXACT_STATS[3].fetch_add(ns, Relaxed);
+    let o = if ok {
+        0
+    } else if c.out_of_budget {
+        2
+    } else {
+        1
+    };
+    EXACT_OUTCOME[o][0].fetch_add(ns, Relaxed);
+    EXACT_OUTCOME[o][1].fetch_add(u64::from(budget - c.budget), Relaxed);
+    EXACT_OUTCOME[3][1].fetch_add(c.hits, Relaxed);
     if ok {
         let mut path = c.path;
         let mut s = base.clone();
@@ -2265,7 +2429,7 @@ mod tests {
                             _ => spec.moves[s.friends[s.idx] as usize] = v,
                         }
                         let te = std::time::Instant::now();
-                        let r = exact_realize(&s.base, &spec, decided, fated, EXACT_BUDGET);
+                        let r = exact_realize(&s.base, &spec, decided, fated, exact_budget());
                         exact_ns += te.elapsed().as_nanos();
                         let is_offered = opts.contains(&v);
                         match r {
@@ -2378,6 +2542,14 @@ mod tests {
             dropped_stage[1],
             exact_ns as f64 * 1e-9,
             t0.elapsed().as_secs_f64()
+        );
+        let g = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "exact nodes: found {} impossible {} out-of-budget {}; memo hits {}",
+            g(&EXACT_OUTCOME[0][1]),
+            g(&EXACT_OUTCOME[1][1]),
+            g(&EXACT_OUTCOME[2][1]),
+            g(&EXACT_OUTCOME[3][1])
         );
     }
 
