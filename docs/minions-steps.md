@@ -105,7 +105,8 @@ subtree (`reroot`).
 | evaluator | where | notes |
 |---|---|---|
 | `OldNetEval` | GPU (TRT) | the sampled-AZ champion's value head on the projected board; the bootstrap, no step training needed |
-| `OnnxEval` | GPU (TRT) | any step-trained net exported by the learner |
+| `OnnxEval` | GPU (TRT) | any step-trained net exported by the learner; one call per worker expansion, sessions pooled |
+| `BatchedOnnxEval` | GPU (TRT) | same nets behind a shared queue (`--batcher N` runner threads): workers featurize and enqueue, a runner drains up to 1024 rows into one padded call (shapes 256 / 1024) |
 | `CpuMlpEval` | CPU | the learner's `mlp:` nets from `mlp.bin`; sparse first layer; matches ONNX to 2e-7 (`steps-check`) |
 
 ## Bootstrapping
@@ -167,3 +168,35 @@ The generation loop (`data/models/minions/steps/cycle.sh`) starts from res
 32x4: self-play 1.5M records with the latest net, train on a 4-generation
 window warm-started from it, log greedy matches vs the previous generation
 and vs the old champion (not gating).
+
+## Batching across workers (2026-09-27)
+
+With one ONNX call per worker expansion (~150 rows padded to 256) the GPU sat
+at ~46% while eval took 70-85% of worker time: latency-bound, not
+throughput-bound. Session count barely mattered (8 workers: 2 sessions 67k,
+8 sessions 77k expansions/s; 16 x 16 73k). A shared queue drained by one or two
+runner threads into 1024-row calls (`BatchedOnnxEval`) fixed it. ABBA,
+res 32x4, 130 s per arm:
+
+| config | expansions/s |
+|---|---|
+| 8 workers, 8 sessions (per-worker calls) | 79k / 83k |
+| 16 workers, 2 runners | 114k / 114k |
+| 16 workers, 1 runner | 129k / 125k |
+| 24 workers, 2 runners | 138k / 144k |
+
+## Matches
+
+`steps-match` plays seat-swapped pairs from shared random openings, either
+greedy on static values (`--expansions 0`) or by search (`--expansions N`:
+a fresh tree per turn, then the PV to the end of the turn), pairs in
+parallel (`--threads`). Greedy matches are mostly decided by the opening
+(76 of 100 pairs split 1-1 at gen 1), so the cycle also logs search matches
+vs the previous generation and vs gen 0.
+
+## Generation log
+
+| gen | data | holdout MSE | greedy vs prev | greedy vs old champion |
+|---|---|---|---|---|
+| 0 | old champion search, 3.0M records | 0.0096 | -- | 0.43 (50 pairs) |
+| 1 | gen0 search, 1.5M records / 344 games, 68k exp/s | 0.0076 | 0.47 | 0.355 |

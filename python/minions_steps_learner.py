@@ -83,17 +83,30 @@ def load_chunks(dirs, max_records=None, holdout_every=0):
     return recs, held, len(files)
 
 
-def to_dense(recs):
-    """[n, 849] float32 dense inputs, as `bfs::dense_features` builds them."""
-    n = len(recs)
-    x = np.zeros((n, DENSE_DIM), np.float32)
-    act = recs["active"].astype(np.int64)
-    cnt = recs["n_active"].astype(np.int64)
-    mask = np.arange(MAX_ACTIVE)[None, :] < cnt[:, None]
-    rows = np.repeat(np.arange(n), MAX_ACTIVE).reshape(n, MAX_ACTIVE)
-    x[rows[mask], act[mask]] = 1.0
-    x[:, SPARSE_DIM:] = recs["scalars"]
-    return x
+class SparseSet:
+    """Records kept as active-index lists on the device, densified per batch:
+    ~200 B per record instead of 3.4 KB dense (6M records would be 20 GB)."""
+
+    def __init__(self, recs, dev):
+        n = len(recs)
+        act = recs["active"].astype(np.int64)
+        cnt = recs["n_active"].astype(np.int64)
+        # Inactive slots point at a spare column that is dropped after the scatter.
+        act[np.arange(MAX_ACTIVE)[None, :] >= cnt[:, None]] = DENSE_DIM
+        self.act = torch.from_numpy(act.astype(np.int16)).to(dev)
+        self.scal = torch.from_numpy(recs["scalars"].astype(np.float32)).to(dev)
+        self.n = n
+
+    def __len__(self):
+        return self.n
+
+    def dense(self, idx):
+        a = self.act[idx].long()
+        x = torch.zeros(len(a), DENSE_DIM + 1, device=a.device)
+        x.scatter_(1, a, 1.0)
+        x = x[:, :DENSE_DIM]
+        x[:, SPARSE_DIM:] = self.scal[idx]
+        return x
 
 
 class ResBlock(nn.Module):
@@ -199,7 +212,7 @@ def evaluate(net, x, y, dev, bs=8192):
     out = []
     with torch.no_grad():
         for i in range(0, len(x), bs):
-            xb = torch.from_numpy(x[i : i + bs]).to(dev)
+            xb = x.dense(torch.arange(i, min(i + bs, len(x)), device=dev))
             out.append(torch.sigmoid(net(xb)).float().cpu().numpy())
     net.train()
     p = np.concatenate(out)
@@ -228,7 +241,8 @@ def main():
     ap.add_argument("--wd", type=float, default=1e-4)
     ap.add_argument("--holdout", type=float, default=0.05)
     ap.add_argument("--max-records", type=int, default=0)
-    ap.add_argument("--min-visits", type=int, default=0, help="train only on records with at least this many descents")
+    ap.add_argument("--min-visits", type=int, default=0, help="train only on records with at least this many descents (the holdout keeps all)")
+    ap.add_argument("--keep-best", type=int, default=1, help="export the checkpoint with the best holdout MSE seen at the log points, not the last")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -246,10 +260,9 @@ def main():
         hold, train = train[perm[:n_hold]], train[perm[n_hold:]]
     if args.min_visits:
         train = train[train["visits"] >= args.min_visits]
-        hold = hold[hold["visits"] >= args.min_visits]
     recs = train
-    x_tr, y_tr = to_dense(train), train["target"].astype(np.float32)
-    x_ho, y_ho = to_dense(hold), hold["target"].astype(np.float32)
+    x_tr, y_tr = SparseSet(train, dev), train["target"].astype(np.float32)
+    x_ho, y_ho = SparseSet(hold, dev), hold["target"].astype(np.float32)
     print(f"loaded {len(train) + len(hold)} records from {nfiles} chunks in {time.time() - t0:.1f}s; train {len(train)} holdout {len(hold)} (whole files)")
     print(f"target mean {y_tr.mean():.3f} std {y_tr.std():.3f}; stage mix {np.bincount(train['stage'], minlength=4).tolist()}")
 
@@ -267,13 +280,13 @@ def main():
     prior_err = hold["prior"] - y_ho
     print(f"holdout before: {base} | prior-vs-target mse {np.mean(prior_err**2):.4f} mae {np.mean(np.abs(prior_err)):.4f}")
 
-    x_gpu = torch.from_numpy(x_tr).to(dev) if x_tr.nbytes < 3e9 else None
     y_gpu = torch.from_numpy(y_tr).to(dev)
     t0 = time.time()
     log_every = max(1, steps // 20)
+    best = (base["mse"], {k: v.clone() for k, v in net.state_dict().items()}, 0)
     for step in range(steps):
         idx = torch.randint(0, len(train), (args.batch,), device=dev)
-        xb = x_gpu[idx] if x_gpu is not None else torch.from_numpy(x_tr[idx.cpu().numpy()]).to(dev)
+        xb = x_tr.dense(idx)
         yb = y_gpu[idx]
         loss = F.binary_cross_entropy_with_logits(net(xb), yb)
         opt.zero_grad(set_to_none=True)
@@ -283,7 +296,12 @@ def main():
         if (step + 1) % log_every == 0 or step + 1 == steps:
             m = evaluate(net, x_ho, y_ho, dev)
             print(f"step {step + 1}/{steps} loss {loss.item():.4f} holdout mse {m['mse']:.5f} mae {m['mae']:.4f} r {m['r']:.4f} bce+ {m['bce_excess']:.5f} ({time.time() - t0:.0f}s)", flush=True)
+            if m["mse"] < best[0]:
+                best = (m["mse"], {k: v.clone() for k, v in net.state_dict().items()}, step + 1)
 
+    if args.keep_best:
+        net.load_state_dict(best[1])
+        print(f"keeping step {best[2]} (holdout mse {best[0]:.5f})")
     final = evaluate(net, x_ho, y_ho, dev)
     torch.save(net.state_dict(), os.path.join(args.out, "net.pt"))
     net.eval()
