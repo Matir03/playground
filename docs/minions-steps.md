@@ -353,3 +353,24 @@ bootstrapped them (gen 0: 0.29). Gen 0 is saturated as an anchor (>0.9).
 0.375. The greedy-vs-old column falls over the generations (0.43 -> 0.31)
 but that is a greedy artefact; with search the step nets gain on the fixed
 reference. The cycle logs the search version from its next restart.
+
+## Tree-only targets again (from gen 28)
+
+Game results are no longer mixed into the training target: the user's
+call (2026-09-27), since the trees already reach real result nodes. Records
+still store the result (metadata); the cycle runs with `--ema 0.999` only.
+Gen 27's in-progress self-play was discarded so gen 28 is the first
+generation fully without it: search vs gen 27 0.598, search vs greedy with
+the same net **0.745** (highest so far). The cycle's fixed anchors are now
+search vs gen 20 and search vs the old net.
+
+## Analysis window
+
+`serve --steps-net <net> --steps-secs N` also answers the UI's analysis
+sessions with the step search (`steps_analysis.rs`, no protocol change):
+edges are single step decisions in board notation; walking a line shows the
+projected board and the node's search value; ▶ commits the whole turn
+through that decision (best line, greedy below it) via the new
+`Analyzable::commit_encoded_turn`; +N runs N iterations; force expands the
+first unexpanded node on the best line below a row; 600 most-descended
+nodes are exported. Overview page: https://claude.ai/artifact/FQZsM2cdGJ3qQ77HqDUzNG
