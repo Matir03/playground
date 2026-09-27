@@ -436,6 +436,25 @@ generation fully without it: search vs gen 27 0.598, search vs greedy with
 the same net **0.745** (highest so far). The cycle's fixed anchors are now
 search vs gen 20 and search vs the old net.
 
+Gens 28-31 (best-first self-play, 2000 expansions/move, tree-only targets;
+200 games each, +-0.035):
+
+| gen | holdout mse | vs prev (greedy) | search vs prev | search vs greedy | search vs gen20 | search vs old net |
+|---|---|---|---|---|---|---|
+| 28 | 0.00166 | 0.540 | 0.598 | 0.745 | 0.802 | 0.845 |
+| 29 | 0.00139 | 0.495 | 0.510 | 0.675 | 0.805 | 0.855 |
+| 30 | 0.00150 | 0.545 | 0.535 | 0.710 | 0.795 | **0.895** |
+| 31 | 0.00144 | 0.515 | 0.530 | 0.718 | 0.810 | 0.860 |
+
+A plateau: search vs gen 20 flat at ~0.80, vs the old net 0.85-0.90, and
+consecutive generations within noise of each other. The cycle stopped after
+gen 31 for the switch to Descent self-play, complete witnesses and the
+25-plane input.
+
+**Backup exponent.** p = 1 (the visit-weighted mean) vs p = 2, gen 31 on
+both sides, best-first 2000 expansions: 0.490 +- 0.035 (200 games). No
+measurable difference at this budget.
+
 ## Analysis window
 
 `serve --steps-net <net> --steps-secs N` also answers the UI's analysis
