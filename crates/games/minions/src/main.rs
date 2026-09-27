@@ -689,6 +689,10 @@ enum Cmd {
         /// Probability of keeping each eligible node as a record.
         #[arg(long, default_value_t = 1.0)]
         record_frac: f64,
+        /// Keep records in proportion to visits^alpha (normalized so the
+        /// expected count is unchanged; 0 = uniform).
+        #[arg(long, default_value_t = 0.5)]
+        record_alpha: f64,
         #[arg(long, default_value_t = 1_000_000)]
         target_records: u64,
         #[arg(long, default_value_t = 20_000)]
@@ -1264,6 +1268,7 @@ async fn main() -> anyhow::Result<()> {
             search,
             select,
             record_frac,
+            record_alpha,
             target_records,
             chunk_records,
             seed,
@@ -1307,6 +1312,7 @@ async fn main() -> anyhow::Result<()> {
                 descent: search == "descent",
                 ordinal: select == "ordinal",
                 record_frac,
+                record_alpha,
                 target_records,
                 chunk_records,
                 seed,

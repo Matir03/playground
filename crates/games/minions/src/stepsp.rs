@@ -57,6 +57,8 @@ pub struct Config {
     /// probability: the trees produce far more records than the learner can
     /// take, so a uniform sample spreads a generation over more games.
     pub record_frac: f64,
+    /// Sampling weight exponent on visits (see `record_nodes`).
+    pub record_alpha: f64,
     /// Stop once this many records are written.
     pub target_records: u64,
     pub chunk_records: usize,
@@ -203,13 +205,19 @@ impl Counters {
     }
 }
 
-/// Record every node of `tree` outside the subtree of `keep` (all nodes when
-/// `keep` is `None`) with enough descents.
+/// Record the nodes of `tree` outside the subtree of `keep` (all nodes when
+/// `keep` is `None`): every node with at least `min_visits` descents, and
+/// every terminal node once per distinct position (many step orders reach
+/// the same end). Each is kept with probability `frac * w / mean(w)` (capped
+/// at 1), `w = max(visits, 1)^alpha`, so the expected count stays `frac` of
+/// the eligible nodes while well-visited nodes are favoured (`alpha = 0` is
+/// uniform).
 fn record_nodes(
     tree: &Tree,
     keep: Option<u32>,
     min_visits: u32,
     frac: f64,
+    alpha: f64,
     rng: &mut rand_chacha::ChaCha8Rng,
     w: &mut Writer,
 ) -> anyhow::Result<u64> {
@@ -226,28 +234,30 @@ fn record_nodes(
             }
         }
     }
-    let mut n = 0;
-    for id in tree.trained_nodes(min_visits) {
-        if inside[id as usize] || frac < 1.0 && rng.gen::<f64>() >= frac {
-            continue;
-        }
-        let nd = &tree.nodes[id as usize];
-        let st = tree.state_of(id);
-        w.push(&st.view(), st.flipped, nd.value, nd.prior, nd.visits);
-        n += 1;
-    }
-    // Terminal nodes are exact labels: all of them, visited or not, once per
-    // distinct position (many step orders reach the same end).
+    let mut cand: Vec<u32> = tree
+        .trained_nodes(min_visits)
+        .into_iter()
+        .filter(|&id| !inside[id as usize])
+        .collect();
     let mut seen = std::collections::HashSet::new();
     for id in tree.terminal_nodes() {
-        if inside[id as usize] || frac < 1.0 && rng.gen::<f64>() >= frac {
+        if !inside[id as usize] && seen.insert(tree.state_of(id).base.key()) {
+            cand.push(id);
+        }
+    }
+    let weight = |id: u32| f64::from(tree.nodes[id as usize].visits.max(1)).powf(alpha);
+    let mean = if cand.is_empty() {
+        1.0
+    } else {
+        cand.iter().map(|&id| weight(id)).sum::<f64>() / cand.len() as f64
+    };
+    let mut n = 0;
+    for id in cand {
+        if frac < 1.0 && rng.gen::<f64>() >= frac * weight(id) / mean {
             continue;
         }
         let nd = &tree.nodes[id as usize];
         let st = tree.state_of(id);
-        if !seen.insert(st.base.key()) {
-            continue;
-        }
         w.push(&st.view(), st.flipped, nd.value, nd.prior, nd.visits);
         n += 1;
     }
@@ -366,14 +376,30 @@ fn play_game(
             );
         }
         let Some(next) = next else { break };
-        let rec = record_nodes(&tree, Some(next), cfg.min_visits, cfg.record_frac, rng, w)?;
+        let rec = record_nodes(
+            &tree,
+            Some(next),
+            cfg.min_visits,
+            cfg.record_frac,
+            cfg.record_alpha,
+            rng,
+            w,
+        )?;
         c.records.fetch_add(rec, Ordering::Relaxed);
         c.add_stats(&tree.stats);
         tree = tree.reroot(next);
         c.moves.fetch_add(1, Ordering::Relaxed);
         turns += 1;
     }
-    let rec = record_nodes(&tree, None, cfg.min_visits, cfg.record_frac, rng, w)?;
+    let rec = record_nodes(
+        &tree,
+        None,
+        cfg.min_visits,
+        cfg.record_frac,
+        cfg.record_alpha,
+        rng,
+        w,
+    )?;
     let end = tree.root.real_base();
     w.finish_game(end.winner, end.turn)?;
     c.records.fetch_add(rec, Ordering::Relaxed);

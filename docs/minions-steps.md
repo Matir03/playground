@@ -184,6 +184,11 @@ losses: a win on turn t is worth 0.5 + 0.5 (1 - 0.5 t / 30), so 1.0 on turn
   records/s and a uniform sample spreads a generation over more games
   (measured at 5 s/move, gen32 net: 6 moves/s, 62.5k expansions/s, 10.9k
   eligible records per move, games ~10 turns).
+- From gen 34: sampling favours well-visited nodes: each eligible node or
+  distinct terminal is kept with probability `frac * w / mean(w)` (capped at
+  1), `w = max(visits, 1)^alpha`, `--record-alpha 0.5` (default); the mean is
+  over the batch being written, so the expected count is unchanged. Gen 33
+  was uniform.
 - Descent visit counts (one 2.5-minute run, gen31 net, `--min-visits 1`,
   9.6M records): 0.4% zero visits (terminal records), **97.7% exactly one**,
   0.5% two, 0.7% 3-4, 0.4% 5-9, 0.2% 10-19, 0.1% 20+. A descent runs ~300
