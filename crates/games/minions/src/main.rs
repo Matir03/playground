@@ -5,6 +5,10 @@
 
 mod soak;
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::net::SocketAddr;
 
 use clap::{Parser, Subcommand};
