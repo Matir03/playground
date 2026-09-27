@@ -68,6 +68,8 @@ pub fn encode_record(v: &View, target: f32, prior: f32, visits: u32, out: &mut V
     out.extend_from_slice(&target.to_le_bytes());
     out.extend_from_slice(&prior.to_le_bytes());
     out.extend_from_slice(&v.board.turn.to_le_bytes());
+    // Game outcome for this record's mover, patched in at game end
+    // (`Writer::finish_game`): see [`outcome_code`]. 0 = unknown.
     out.extend_from_slice(&0u16.to_le_bytes());
     for i in 0..MAX_ACTIVE {
         let x = act.get(i).copied().unwrap_or(0);
@@ -79,6 +81,25 @@ pub fn encode_record(v: &View, target: f32, prior: f32, visits: u32, out: &mut V
     debug_assert_eq!(out.len() - start, REC_BYTES);
 }
 
+/// Byte offset of the outcome field in a record.
+pub const OUTCOME_AT: usize = 14;
+
+/// The outcome field: bits 0-1 the result for the record's mover (1 loss,
+/// 2 draw, 3 win; 0 unknown), bits 2-15 the turns from the record's turn to
+/// the end of the game.
+pub fn outcome_code(mover: u8, winner: u8, turn: u16, end_turn: u16) -> u16 {
+    let r = match winner {
+        3 => 2,
+        w if w == mover + 1 => 3,
+        1 | 2 => 1,
+        _ => 0,
+    };
+    if r == 0 {
+        return 0;
+    }
+    r | (end_turn.saturating_sub(turn).min(0x3fff) << 2)
+}
+
 struct Writer {
     dir: PathBuf,
     tag: String,
@@ -86,15 +107,34 @@ struct Writer {
     buf: Vec<u8>,
     n: usize,
     per_chunk: usize,
+    /// This game's records so far, held until its outcome is known, with
+    /// each record's real mover (0 = first player).
+    game: Vec<u8>,
+    movers: Vec<u8>,
 }
 
 impl Writer {
-    fn push(&mut self, v: &View, target: f32, prior: f32, visits: u32) -> anyhow::Result<()> {
-        encode_record(v, target, prior, visits, &mut self.buf);
-        self.n += 1;
-        if self.n >= self.per_chunk {
-            self.flush()?;
+    fn push(&mut self, v: &View, flipped: bool, target: f32, prior: f32, visits: u32) {
+        encode_record(v, target, prior, visits, &mut self.game);
+        self.movers.push(u8::from(flipped));
+    }
+
+    /// Stamp the held records with the game's result (`winner` as in
+    /// `MinionsState`, 0 = unfinished) and queue them for writing.
+    fn finish_game(&mut self, winner: u8, end_turn: u16) -> anyhow::Result<()> {
+        let game = std::mem::take(&mut self.game);
+        for (i, rec) in game.chunks_exact(REC_BYTES).enumerate() {
+            let at = self.buf.len();
+            self.buf.extend_from_slice(rec);
+            let turn = u16::from_le_bytes([rec[12], rec[13]]);
+            let code = outcome_code(self.movers[i], winner, turn, end_turn);
+            self.buf[at + OUTCOME_AT..at + OUTCOME_AT + 2].copy_from_slice(&code.to_le_bytes());
+            self.n += 1;
+            if self.n >= self.per_chunk {
+                self.flush()?;
+            }
         }
+        self.movers.clear();
         Ok(())
     }
 
@@ -178,8 +218,8 @@ fn record_nodes(
             continue;
         }
         let nd = &tree.nodes[id as usize];
-        let v = tree.state_of(id).view();
-        w.push(&v, nd.value, nd.prior, nd.visits)?;
+        let st = tree.state_of(id);
+        w.push(&st.view(), st.flipped, nd.value, nd.prior, nd.visits);
         n += 1;
     }
     Ok(n)
@@ -200,7 +240,7 @@ fn play_game(
     let mut turns = 0u64;
     while !tree.root.is_terminal() && !tree.is_solved() {
         if stop.load(Ordering::Relaxed) {
-            return Ok(());
+            return w.finish_game(0, 0);
         }
         let t = Instant::now();
         let before = tree.stats.expansions;
@@ -294,6 +334,8 @@ fn play_game(
         turns += 1;
     }
     let rec = record_nodes(&tree, None, cfg.min_visits, w)?;
+    let end = tree.root.real_base();
+    w.finish_game(end.winner, end.turn)?;
     c.records.fetch_add(rec, Ordering::Relaxed);
     c.add_stats(&tree.stats);
     c.games.fetch_add(1, Ordering::Relaxed);
@@ -329,6 +371,8 @@ pub fn run(cfg: Config, eval: Arc<dyn Evaluator>, out: &Path) -> anyhow::Result<
                 buf: Vec::new(),
                 n: 0,
                 per_chunk: cfg.chunk_records,
+                game: Vec::new(),
+                movers: Vec::new(),
             };
             while !stop.load(Ordering::Relaxed) {
                 play_game(&cfg, eval.as_ref(), &mut rng, &mut w, &c, &stop)?;
@@ -586,6 +630,8 @@ pub fn play_match(
         })
         .collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
+    // STEPS_SHOW=1: print every position (use with --threads 1).
+    let show = std::env::var("STEPS_SHOW").is_ok();
     // Per pair: A's points from each seat order, and whether seat 1 won each.
     let results: Mutex<Vec<(usize, [Outcome; 2], [bool; 2])>> = Mutex::new(Vec::new());
     let err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
@@ -613,6 +659,14 @@ pub fn play_match(
                         let p = if a_moves { a } else { b };
                         real = p.turn(&real, salt ^ turns as u64)?;
                         turns += 1;
+                        if show {
+                            eprintln!(
+                                "--- pair {i} game {} turn {turns}: {} moved\n{}",
+                                if a_first { 1 } else { 2 },
+                                if a_moves { "A" } else { "B" },
+                                real.render()
+                            );
+                        }
                     }
                     let res = crate::game::Minions::outcome(&real);
                     Ok((res, a_first))
@@ -664,4 +718,20 @@ pub fn play_match(
         2 * pairs
     );
     Ok((score / (2 * pairs) as f64, wdl))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::outcome_code;
+
+    #[test]
+    fn outcome_codes() {
+        // First player (mover 0) wins at turn 20; records from turn 12.
+        assert_eq!(outcome_code(0, 1, 12, 20), 3 | (8 << 2));
+        assert_eq!(outcome_code(1, 1, 12, 20), 1 | (8 << 2));
+        assert_eq!(outcome_code(1, 2, 20, 20), 3);
+        assert_eq!(outcome_code(0, 3, 5, 9), 2 | (4 << 2));
+        // Unfinished game: unknown, whatever the turns.
+        assert_eq!(outcome_code(0, 0, 5, 9), 0);
+    }
 }

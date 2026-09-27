@@ -46,7 +46,9 @@ REC_DTYPE = np.dtype(
         ("target", "<f4"),
         ("prior", "<f4"),
         ("turn", "<u2"),
-        ("pad", "<u2"),
+        # Game result for the record's mover: bits 0-1 (1 loss, 2 draw, 3 win,
+        # 0 unknown), bits 2-15 turns to the game's end (stepsp::outcome_code).
+        ("outcome", "<u2"),
         ("active", "<u2", (MAX_ACTIVE,)),
         ("scalars", "<f4", (N_SCALARS,)),
     ]
@@ -253,7 +255,14 @@ def export_onnx(net, out, dev):
     )
 
 
-def evaluate(net, x, y, dev, bs=8192):
+def outcome_value(recs):
+    """(z, known): the mover's game result as 0 / 0.5 / 1, and whether known."""
+    code = recs["outcome"] & 3
+    z = np.where(code == 3, 1.0, np.where(code == 2, 0.5, 0.0)).astype(np.float32)
+    return z, code != 0
+
+
+def evaluate(net, x, y, dev, bs=8192, z=None):
     net.eval()
     out = []
     with torch.no_grad():
@@ -263,7 +272,12 @@ def evaluate(net, x, y, dev, bs=8192):
     net.train()
     p = np.concatenate(out)
     err = p - y
-    return {
+    extra = {}
+    if z is not None and z[1].any():
+        # How well the values predict the games' actual results.
+        zz, known = z
+        extra["outcome_mse"] = float(np.mean((p[known] - zz[known]) ** 2))
+    return extra | {
         "mse": float(np.mean(err**2)),
         "mae": float(np.mean(np.abs(err))),
         "r": float(np.corrcoef(p, y)[0, 1]) if len(y) > 2 else float("nan"),
@@ -289,6 +303,8 @@ def main():
     ap.add_argument("--holdout", type=float, default=0.05)
     ap.add_argument("--max-records", type=int, default=0)
     ap.add_argument("--min-visits", type=int, default=0, help="train only on records with at least this many descents (the holdout keeps all)")
+    ap.add_argument("--outcome-weight", type=float, default=0.0, help="train on (1-w)*search value + w*game result where the result is known")
+    ap.add_argument("--outcome-decay", type=float, default=1.0, help="scale the outcome weight by this per turn to the game's end")
     ap.add_argument("--ema", type=float, default=0.0, help="evaluate and export an exponential moving average of the weights with this decay (0 = off)")
     ap.add_argument("--keep-best", type=int, default=1, help="export the checkpoint with the best holdout MSE seen at the log points, not the last")
     ap.add_argument("--seed", type=int, default=0)
@@ -318,6 +334,13 @@ def main():
     recs = train
     x_tr, y_tr = SparseSet(train, dev), train["target"].astype(np.float32)
     x_ho, y_ho = SparseSet(hold, dev), hold["target"].astype(np.float32)
+    z_ho = outcome_value(hold)
+    z_tr, known_tr = outcome_value(train)
+    print(f"game results known for {known_tr.mean():.3f} of training records")
+    if args.outcome_weight > 0:
+        left = (train["outcome"] >> 2).astype(np.float32)
+        w = args.outcome_weight * args.outcome_decay**left * known_tr
+        y_tr = ((1 - w) * y_tr + w * z_tr).astype(np.float32)
     print(f"loaded {len(train) + len(hold)} records from {nfiles} chunks in {time.time() - t0:.1f}s; train {len(train)} holdout {len(hold)} (whole files)")
     print(f"target mean {y_tr.mean():.3f} std {y_tr.std():.3f}; stage mix {np.bincount(train['stage'], minlength=4).tolist()}")
 
@@ -330,7 +353,7 @@ def main():
     steps = int(math.ceil(args.epochs * len(train) / args.batch))
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=steps, pct_start=0.05)
 
-    base = evaluate(net, x_ho, y_ho, dev)
+    base = evaluate(net, x_ho, y_ho, dev, z=z_ho)
     # The static evaluation stored with each record: how far the search moved it.
     prior_err = hold["prior"] - y_ho
     print(f"holdout before: {base} | prior-vs-target mse {np.mean(prior_err**2):.4f} mae {np.mean(np.abs(prior_err)):.4f}")
@@ -359,8 +382,8 @@ def main():
                     else:
                         pe.copy_(pn)
         if (step + 1) % log_every == 0 or step + 1 == steps:
-            m = evaluate(judged, x_ho, y_ho, dev)
-            print(f"step {step + 1}/{steps} loss {loss.item():.4f} holdout mse {m['mse']:.5f} mae {m['mae']:.4f} r {m['r']:.4f} bce+ {m['bce_excess']:.5f} ({time.time() - t0:.0f}s)", flush=True)
+            m = evaluate(judged, x_ho, y_ho, dev, z=z_ho)
+            print(f"step {step + 1}/{steps} loss {loss.item():.4f} holdout mse {m['mse']:.5f} mae {m['mae']:.4f} r {m['r']:.4f} bce+ {m['bce_excess']:.5f} z-mse {m.get('outcome_mse', float('nan')):.4f} ({time.time() - t0:.0f}s)", flush=True)
             if m["mse"] < best[0]:
                 best = (m["mse"], {k: v.clone() for k, v in judged.state_dict().items()}, step + 1)
 
@@ -369,7 +392,7 @@ def main():
     if args.keep_best:
         net.load_state_dict(best[1])
         print(f"keeping step {best[2]} (holdout mse {best[0]:.5f})")
-    final = evaluate(net, x_ho, y_ho, dev)
+    final = evaluate(net, x_ho, y_ho, dev, z=z_ho)
     torch.save(net.state_dict(), os.path.join(args.out, "net.pt"))
     export_onnx(net, args.out, dev)
     if isinstance(net, Mlp):

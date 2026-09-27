@@ -603,6 +603,14 @@ enum Cmd {
         /// Leaf expansions per turn for each side (0 = greedy on static values).
         #[arg(long, default_value_t = 0)]
         expansions: u64,
+        /// B's expansions per turn, if different from A's.
+        #[arg(long)]
+        expansions_b: Option<u64>,
+        /// Backup power-mean exponent (`inf` = max) for A, and for B if different.
+        #[arg(long, default_value_t = 2.0)]
+        power: f32,
+        #[arg(long)]
+        power_b: Option<f32>,
         #[arg(long, default_value_t = 32)]
         heads: usize,
         /// Game-pair threads.
@@ -1175,12 +1183,13 @@ async fn main() -> anyhow::Result<()> {
             )?;
         }
         Cmd::NnueBench { active, reps } => minions_engine::nnue::bench_sweep(active, reps),
-        Cmd::StepsMatch { a, b, pairs, opening_max, opening_decay, ep, seed, expansions, heads, threads } => {
-            let params = minions_engine::bfs::Params { heads, ..Default::default() };
-            let player = |spec: &str| -> anyhow::Result<minions_engine::stepsp::Player> {
-                Ok(minions_engine::stepsp::Player { eval: load_step_eval(spec, &ep)?, expansions, params: params.clone() })
+        Cmd::StepsMatch { a, b, pairs, opening_max, opening_decay, ep, seed, expansions, expansions_b, power, power_b, heads, threads } => {
+            let player = |spec: &str, expansions: u64, power: f32| -> anyhow::Result<minions_engine::stepsp::Player> {
+                let params = minions_engine::bfs::Params { heads, power, ..Default::default() };
+                Ok(minions_engine::stepsp::Player { eval: load_step_eval(spec, &ep)?, expansions, params })
             };
-            let (pa, pb) = (player(&a)?, player(&b)?);
+            let pa = player(&a, expansions, power)?;
+            let pb = player(&b, expansions_b.unwrap_or(expansions), power_b.unwrap_or(power))?;
             let t = std::time::Instant::now();
             let (score, wdl) = minions_engine::stepsp::play_match(&pa, &pb, pairs, opening_max, opening_decay, seed, threads)?;
             let n = (2 * pairs) as f64;
@@ -1291,6 +1300,9 @@ async fn main() -> anyhow::Result<()> {
 /// on projected boards), `<path>.bin` (a step MLP on the CPU), or an ONNX graph.
 fn load_step_eval(spec: &str, ep: &str) -> anyhow::Result<std::sync::Arc<dyn minions_engine::bfs::Evaluator>> {
     use std::sync::Arc;
+    if spec == "material" {
+        return Ok(Arc::new(minions_engine::bfs::MaterialEval));
+    }
     if let Some(dir) = spec.strip_prefix("old:") {
         let dir = std::path::Path::new(dir);
         let cache = dir.join("trt_cache").to_string_lossy().into_owned();

@@ -367,6 +367,19 @@ impl Tree {
     /// Recompute `n`'s value from its children; `false` if all are dead.
     fn recompute(&mut self, n: u32) -> bool {
         let p = self.params.power;
+        if p.is_infinite() {
+            // p = inf: the max (plain minimax over the movers' choices).
+            let best = self
+                .children(n)
+                .filter(|&c| self.nodes[c as usize].kind != DEAD)
+                .map(|c| self.q_parent(c))
+                .fold(f32::NEG_INFINITY, f32::max);
+            if best == f32::NEG_INFINITY {
+                return false;
+            }
+            self.nodes[n as usize].value = best.clamp(0.0, 1.0);
+            return true;
+        }
         let (mut num, mut den) = (0f64, 0f64);
         for c in self.children(n) {
             let nd = &self.nodes[c as usize];
@@ -835,32 +848,37 @@ impl Evaluator for BatchedOnnxEval {
     }
 }
 
+/// A cheap deterministic evaluator: material balance for the mover (unit
+/// costs, necromancer +20) through a logistic. For tests and sanity checks
+/// (`steps-match --a material`).
+pub struct MaterialEval;
+
+impl Evaluator for MaterialEval {
+    fn eval(&self, views: &[View]) -> anyhow::Result<Vec<f32>> {
+        Ok(views
+            .iter()
+            .map(|v| {
+                let mut d = 0f32;
+                for c in 0..crate::map::NUM_CELLS as u8 {
+                    if let Some((s, u)) = v.board.piece_at(c) {
+                        let w = u.stats().cost.max(1) as f32
+                            + if u.stats().necromancer { 20.0 } else { 0.0 };
+                        d += if s == 0 { w } else { -w };
+                    }
+                }
+                1.0 / (1.0 + (-d / 10.0).exp())
+            })
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::game::MinionsState;
     use rand::SeedableRng;
 
-    /// A cheap deterministic evaluator: material balance for the mover.
-    struct Material;
-    impl Evaluator for Material {
-        fn eval(&self, views: &[View]) -> anyhow::Result<Vec<f32>> {
-            Ok(views
-                .iter()
-                .map(|v| {
-                    let mut d = 0f32;
-                    for c in 0..crate::map::NUM_CELLS as u8 {
-                        if let Some((s, u)) = v.board.piece_at(c) {
-                            let w = u.stats().cost.max(1) as f32
-                                + if u.stats().necromancer { 20.0 } else { 0.0 };
-                            d += if s == 0 { w } else { -w };
-                        }
-                    }
-                    1.0 / (1.0 + (-d / 10.0).exp())
-                })
-                .collect())
-        }
-    }
+    use super::MaterialEval as Material;
 
     #[test]
     fn search_runs_and_backs_up_consistently() {
