@@ -255,6 +255,12 @@ enum Cmd {
         max_examples: usize,
         #[arg(long, default_value_t = 200)]
         max_chunks: usize,
+        /// Move pruned chunks here instead of deleting them.
+        #[arg(long)]
+        archive_dir: Option<String>,
+        /// Cap on the archive's size; the oldest chunks are deleted past it.
+        #[arg(long, default_value_t = 50.0)]
+        archive_max_gb: f64,
         /// Exit once this many examples have been produced (0 = run forever).
         #[arg(long, default_value_t = 0)]
         target_examples: usize,
@@ -664,6 +670,8 @@ async fn main() -> anyhow::Result<()> {
             chunk_secs,
             max_examples,
             max_chunks,
+            archive_dir,
+            archive_max_gb,
             target_examples,
             seed,
         } => {
@@ -720,6 +728,10 @@ async fn main() -> anyhow::Result<()> {
                 chunk_secs,
                 max_examples,
                 max_chunks,
+                archive_dir.map(|d| minions_engine::selfplay::Archive {
+                    dir: d.into(),
+                    max_bytes: (archive_max_gb * 1e9) as u64,
+                }),
                 target_examples,
                 seed,
             )?

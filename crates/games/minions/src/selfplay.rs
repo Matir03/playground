@@ -1765,7 +1765,19 @@ fn policy_record(children: impl Iterator<Item = (TurnSpec, f32)>) -> Vec<(TurnSp
     v
 }
 
-fn prune_buffer(dir: &Path, max_examples: usize, max_chunks: usize) -> anyhow::Result<()> {
+/// Where pruned chunks go instead of being deleted, and how many bytes of them
+/// to keep; the oldest (by mtime) are deleted past the cap.
+pub struct Archive {
+    pub dir: PathBuf,
+    pub max_bytes: u64,
+}
+
+fn prune_buffer(
+    dir: &Path,
+    max_examples: usize,
+    max_chunks: usize,
+    archive: Option<&Archive>,
+) -> anyhow::Result<()> {
     let mut chunks: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "bin"))
@@ -1792,9 +1804,78 @@ fn prune_buffer(dir: &Path, max_examples: usize, max_chunks: usize) -> anyhow::R
         }
         total -= count_of(p);
         n -= 1;
-        let _ = std::fs::remove_file(p);
+        match archive {
+            Some(a) => archive_chunk(p, a),
+            None => {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+    if let Some(a) = archive {
+        trim_archive(a);
     }
     Ok(())
+}
+
+/// Move a pruned chunk into the archive. A name already there (chunk numbering
+/// restarts after some resumes) gets a numeric suffix rather than overwriting
+/// it; if the move fails the chunk is deleted, as without an archive, so the
+/// live buffer can never overshoot its cap.
+fn archive_chunk(p: &Path, a: &Archive) {
+    let Some(name) = p.file_name() else { return };
+    let _ = std::fs::create_dir_all(&a.dir);
+    let mut dst = a.dir.join(name);
+    // Already archived as a hard link to this very file (the bridge watcher
+    // does that): dropping the buffer's link is the whole move.
+    if same_file(p, &dst) {
+        let _ = std::fs::remove_file(p);
+        return;
+    }
+    let mut i = 1;
+    while dst.exists() {
+        let stem = p.file_stem().unwrap_or_default().to_string_lossy();
+        dst = a.dir.join(format!("{stem}.{i}.bin"));
+        i += 1;
+    }
+    if let Err(e) = std::fs::rename(p, &dst) {
+        eprintln!("archive: moving {} failed ({e}); deleting it", p.display());
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
+    }
+}
+
+/// Delete the oldest archived chunks (by mtime, which a rename preserves) until
+/// the archive fits in `max_bytes`.
+fn trim_archive(a: &Archive) {
+    let Ok(rd) = std::fs::read_dir(&a.dir) else { return };
+    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = rd
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "bin"))
+        .filter_map(|e| {
+            let m = e.metadata().ok()?;
+            Some((m.modified().ok()?, m.len(), e.path()))
+        })
+        .collect();
+    let mut total: u64 = files.iter().map(|f| f.1).sum();
+    if total <= a.max_bytes {
+        return;
+    }
+    files.sort();
+    for (_, len, p) in files {
+        if total <= a.max_bytes {
+            break;
+        }
+        if std::fs::remove_file(&p).is_ok() {
+            total -= len;
+        }
+    }
 }
 
 /// Continuous actor: play games, flush chunks, hot-reload weights.
@@ -1808,6 +1889,7 @@ pub fn run_loop(
     chunk_secs: u64,
     max_examples: usize,
     max_chunks: usize,
+    archive: Option<Archive>,
     target_examples: usize,
     seed: u64,
 ) -> anyhow::Result<()> {
@@ -1976,7 +2058,7 @@ pub fn run_loop(
                 examples.len(),
                 produced
             );
-            prune_buffer(&buffer, max_examples, max_chunks)?;
+            prune_buffer(&buffer, max_examples, max_chunks, archive.as_ref())?;
         }
 
         if target_examples > 0 && produced >= target_examples {
@@ -2010,6 +2092,45 @@ pub fn run_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pruned chunks land in the archive (a clashing name gets a suffix, not an
+    /// overwrite), and the archive is trimmed oldest-first to its byte cap.
+    #[test]
+    fn prune_archives_and_trims_oldest_first() {
+        let root = std::env::temp_dir().join(format!("minions_archive_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (buf, arc) = (root.join("buffer"), root.join("archive"));
+        std::fs::create_dir_all(&buf).unwrap();
+        std::fs::create_dir_all(&arc).unwrap();
+        // 16-byte header whose second word is the example count, plus padding.
+        let chunk = |p: &Path, n: u64| {
+            let mut b = vec![0u8; 100];
+            b[8..16].copy_from_slice(&n.to_le_bytes());
+            std::fs::write(p, b).unwrap();
+        };
+        chunk(&arc.join("chunk_000001.bin"), 10); // an older archived clash
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        for i in 1..=4 {
+            chunk(&buf.join(format!("chunk_{i:06}.bin")), 10);
+        }
+        // chunk 2 is already hard-linked into the archive, as the bridge does.
+        std::fs::hard_link(buf.join("chunk_000002.bin"), arc.join("chunk_000002.bin")).unwrap();
+        let a = Archive { dir: arc.clone(), max_bytes: 250 };
+        prune_buffer(&buf, 20, 100, Some(&a)).unwrap();
+        let names = |d: &Path| {
+            let mut v: Vec<String> = std::fs::read_dir(d)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names(&buf), ["chunk_000003.bin", "chunk_000004.bin"]);
+        // Three 100-byte files would exceed 250, so the oldest -- the one that
+        // was already archived -- goes; both newly pruned chunks survive.
+        assert_eq!(names(&arc), ["chunk_000001.1.bin", "chunk_000002.bin"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     /// The shipped opening distribution must have the mean it claims, and must

@@ -189,6 +189,10 @@ K_FORCED="${K_FORCED:-0}"
 # buffer and the learner holds it all in RAM on a 24 GB box. The user accepted
 # the truncation (top 160 by visits) rather than raising the cap.
 MAX_EXAMPLES="${MAX_EXAMPLES:-250000}"
+# Pruned chunks are moved here instead of deleted (user, 2026-09-26), keeping
+# the newest ARCHIVE_MAX_GB of them; outside $LIVE so nothing reads them by accident.
+ARCHIVE_DIR="${ARCHIVE_DIR:-$(dirname "$LIVE")/buffer_archive}"
+ARCHIVE_MAX_GB="${ARCHIVE_MAX_GB:-50}"
 # 488 * 512 = 250k samples per generation -- a quarter of the buffer -- so each
 # example is drawn about 1.25 times over its five-generation life.
 #
@@ -358,6 +362,7 @@ while true; do
     --forced-visits "$FORCED_VISITS" --forced-extra "$FORCED_EXTRA" \
     --k-forced "$K_FORCED" \
     --max-examples "$MAX_EXAMPLES" --target-examples "$TARGET_EXAMPLES" \
+    --archive-dir "$ARCHIVE_DIR" --archive-max-gb "$ARCHIVE_MAX_GB" \
     --seed "${seed:-$gen}" --backend "$BACKEND" --ep "$EP" $FP16_FLAG $CUDA_FLAG
 
   echo "== cycle $gen: train =="
