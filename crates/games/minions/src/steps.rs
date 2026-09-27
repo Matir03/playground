@@ -1157,7 +1157,7 @@ pub fn attack_part(base: &MinionsState, spec: &TurnSpec) -> Option<MinionsState>
 fn exact_key(base: &MinionsState, spec: &TurnSpec) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    Minions::encode_state(base).hash(&mut h);
+    base.key().hash(&mut h);
     for c in 0..NUM_CELLS as u8 {
         if base.piece_at(c).is_some_and(|(sd, _)| sd == 0) {
             let k = spec.moves[c as usize];
@@ -1176,19 +1176,35 @@ fn exact_key(base: &MinionsState, spec: &TurnSpec) -> u64 {
 /// Attack-phase paths of complete declarations the exact search found,
 /// so committing a declaration never re-runs a search that could run out of
 /// budget where the one that offered it did not.
-static EXACT_CACHE: std::sync::Mutex<Option<std::collections::HashMap<u64, Vec<MinionsMove>>>> =
-    std::sync::Mutex::new(None);
+/// Sharded by key so the self-play workers do not serialize on one lock.
+type ExactShard = std::sync::Mutex<Option<std::collections::HashMap<u64, Vec<MinionsMove>>>>;
+const EXACT_SHARDS: usize = 64;
+static EXACT_CACHE: [ExactShard; EXACT_SHARDS] =
+    [const { std::sync::Mutex::new(None) }; EXACT_SHARDS];
+
+fn exact_shard(k: u64) -> &'static ExactShard {
+    &EXACT_CACHE[(k >> 58) as usize % EXACT_SHARDS]
+}
 
 fn exact_cache_get(base: &MinionsState, spec: &TurnSpec) -> Option<Vec<MinionsMove>> {
     let k = exact_key(base, spec);
-    EXACT_CACHE.lock().unwrap().as_ref()?.get(&k).cloned()
+    exact_shard(k).lock().unwrap().as_ref()?.get(&k).cloned()
+}
+
+fn exact_cache_has(base: &MinionsState, spec: &TurnSpec) -> bool {
+    let k = exact_key(base, spec);
+    exact_shard(k)
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|m| m.contains_key(&k))
 }
 
 fn exact_cache_put(base: &MinionsState, spec: &TurnSpec, path: &[MinionsMove]) {
     let k = exact_key(base, spec);
-    let mut g = EXACT_CACHE.lock().unwrap();
+    let mut g = exact_shard(k).lock().unwrap();
     let m = g.get_or_insert_with(Default::default);
-    if m.len() >= 200_000 {
+    if m.len() >= 200_000 / EXACT_SHARDS {
         m.clear();
     }
     m.insert(k, path.to_vec());
@@ -1219,7 +1235,7 @@ fn exact_complete(base: &MinionsState, spec: &TurnSpec) -> Option<Vec<MinionsMov
 
 /// The fast realizers, then the exact-path cache: never searches.
 fn known_realizable(base: &MinionsState, spec: &TurnSpec) -> bool {
-    attack_part_fast(base, spec).is_some() || exact_cache_get(base, spec).is_some()
+    exact_cache_has(base, spec) || attack_part_fast(base, spec).is_some()
 }
 
 /// The two fast realizers: all kills planned at once, then one kill at a
