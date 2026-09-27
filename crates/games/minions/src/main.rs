@@ -571,6 +571,36 @@ enum Cmd {
         #[arg(long, default_value_t = 200_000)]
         reps: usize,
     },
+    /// Greedy match between two step evaluators (each step: evaluate every
+    /// option, take the best). Evaluators: `old:<dir>`, `<path>.onnx`, or an
+    /// MLP's `<path>.bin` (CPU).
+    StepsMatch {
+        #[arg(long)]
+        a: String,
+        #[arg(long)]
+        b: String,
+        #[arg(long, default_value_t = 100)]
+        pairs: usize,
+        /// 0 = standard opening with bidding; otherwise random openings.
+        #[arg(long, default_value_t = 22)]
+        opening_max: u32,
+        #[arg(long, default_value_t = 1.0884)]
+        opening_decay: f32,
+        #[arg(long, default_value = "trt")]
+        ep: String,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+    },
+    /// Check a step-trained MLP's CPU evaluator against its ONNX graph on
+    /// random step-tree positions.
+    StepsCheck {
+        #[arg(long)]
+        mlp: String,
+        #[arg(long)]
+        onnx: String,
+        #[arg(long, default_value_t = 2000)]
+        positions: usize,
+    },
     /// Self-play with the best-first step search (docs/minions-steps.md):
     /// writes every well-visited search node as a value record.
     StepsSelfplay {
@@ -581,7 +611,8 @@ enum Cmd {
         /// board (a dir holding trunk.onnx + config.json).
         #[arg(long)]
         old_net: Option<String>,
-        /// Evaluate with a step-trained ONNX value net.
+        /// Evaluate with a step-trained value net: an ONNX graph on the GPU, or
+        /// an MLP's `mlp.bin` on the CPU.
         #[arg(long)]
         onnx: Option<String>,
         #[arg(long, default_value = "trt")]
@@ -1105,6 +1136,53 @@ async fn main() -> anyhow::Result<()> {
             )?;
         }
         Cmd::NnueBench { active, reps } => minions_engine::nnue::bench_sweep(active, reps),
+        Cmd::StepsMatch { a, b, pairs, opening_max, opening_decay, ep, seed } => {
+            let ea = load_step_eval(&a, &ep)?;
+            let eb = load_step_eval(&b, &ep)?;
+            let t = std::time::Instant::now();
+            let (score, wdl) = minions_engine::stepsp::greedy_match(ea.as_ref(), eb.as_ref(), pairs, opening_max, opening_decay, seed)?;
+            let n = (2 * pairs) as f64;
+            let se = (score * (1.0 - score) / n).sqrt();
+            println!(
+                "A {a}\nB {b}\nA score {score:.3} +- {se:.3} over {} games (A wins {}, B wins {}, draws {}) in {:.0}s",
+                2 * pairs, wdl[0], wdl[1], wdl[2], t.elapsed().as_secs_f64()
+            );
+        }
+        Cmd::StepsCheck { mlp, onnx, positions } => {
+            use minions_engine::bfs::Evaluator;
+            use rand::{Rng, SeedableRng};
+            let cpu = minions_engine::bfs::CpuMlpEval::load(std::path::Path::new(&mlp))?;
+            let p = std::path::Path::new(&onnx);
+            let cache = p.with_extension("trt_cache").to_string_lossy().into_owned();
+            let gpu = minions_engine::bfs::OnnxEval::load(p, "cuda", false, &cache, 1)?;
+            let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(9);
+            let mut views = Vec::new();
+            while views.len() < positions {
+                let mut real = minions_engine::game::MinionsState::with_bid(rng.gen_range(-5..=10));
+                for _ in 0..rng.gen_range(0..20) {
+                    let mut s = minions_engine::steps::StepState::begin(&real, 1);
+                    let f0 = s.flipped;
+                    while !s.is_terminal() && s.flipped == f0 {
+                        views.push(s.view());
+                        let ch = s.children();
+                        if ch.is_empty() {
+                            break;
+                        }
+                        s.apply(ch[rng.gen_range(0..ch.len())]);
+                    }
+                    if s.is_terminal() {
+                        break;
+                    }
+                    real = s.real_base();
+                }
+            }
+            views.truncate(positions);
+            let a = cpu.eval(&views)?;
+            let b = gpu.eval(&views)?;
+            let d = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+            let mean = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).sum::<f32>() / a.len() as f32;
+            println!("{} positions: max |cpu - onnx| {d:.2e}, mean {mean:.2e}; cpu mean value {:.3}", a.len(), a.iter().sum::<f32>() / a.len() as f32);
+        }
         Cmd::StepsSelfplay {
             out,
             old_net,
@@ -1133,6 +1211,10 @@ async fn main() -> anyhow::Result<()> {
                     let net = minions_engine::ort_net::OrtNet::new(dir, &ep, true, &cache)?;
                     Arc::new(minions_engine::bfs::OldNetEval { net: Box::new(net) })
                 }
+                (None, Some(path)) if path.ends_with(".bin") => {
+                    // A step-trained MLP's raw weights: evaluate on the CPU.
+                    Arc::new(minions_engine::bfs::CpuMlpEval::load(std::path::Path::new(&path))?)
+                }
                 (None, Some(path)) => {
                     let p = std::path::Path::new(&path);
                     let cache = p.with_extension("trt_cache").to_string_lossy().into_owned();
@@ -1159,6 +1241,24 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// A step evaluator by spec: `old:<dir>` (the sampled-AZ champion's value head
+/// on projected boards), `<path>.bin` (a step MLP on the CPU), or an ONNX graph.
+fn load_step_eval(spec: &str, ep: &str) -> anyhow::Result<std::sync::Arc<dyn minions_engine::bfs::Evaluator>> {
+    use std::sync::Arc;
+    if let Some(dir) = spec.strip_prefix("old:") {
+        let dir = std::path::Path::new(dir);
+        let cache = dir.join("trt_cache").to_string_lossy().into_owned();
+        let net = minions_engine::ort_net::OrtNet::new(dir, ep, true, &cache)?;
+        return Ok(Arc::new(minions_engine::bfs::OldNetEval { net: Box::new(net) }));
+    }
+    let p = std::path::Path::new(spec);
+    if spec.ends_with(".bin") {
+        return Ok(Arc::new(minions_engine::bfs::CpuMlpEval::load(p)?));
+    }
+    let cache = p.with_extension("trt_cache").to_string_lossy().into_owned();
+    Ok(Arc::new(minions_engine::bfs::OnnxEval::load(p, ep, true, &cache, 2)?))
 }
 
 fn greedy_games(games: u32, verbose: bool) {

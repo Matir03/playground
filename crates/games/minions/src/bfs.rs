@@ -745,3 +745,117 @@ mod tests {
         let _ = a;
     }
 }
+
+/// A step-trained MLP (`python/minions_steps_learner.py --arch mlp:...`) run
+/// on the CPU, NNUE-style: the first layer sums the rows of the active sparse
+/// features instead of multiplying the dense input. Hidden layers clip to
+/// `[0, 1]`; the output is a logit.
+pub struct CpuMlpEval {
+    dims: Vec<usize>,
+    /// Per layer: weights `[in][out]` and bias `[out]`.
+    layers: Vec<(Vec<f32>, Vec<f32>)>,
+}
+
+impl CpuMlpEval {
+    pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
+        let bytes = std::fs::read(path)?;
+        let rd = |off: usize| u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+        let n = rd(0);
+        let dims: Vec<usize> = (0..=n).map(|i| rd(4 + 4 * i)).collect();
+        anyhow::ensure!(
+            dims[0] == DENSE_DIM,
+            "mlp.bin input {} != {}",
+            dims[0],
+            DENSE_DIM
+        );
+        let mut off = 4 + 4 * (n + 1);
+        let mut take = |k: usize| -> Vec<f32> {
+            let v: Vec<f32> = bytes[off..off + 4 * k]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            off += 4 * k;
+            v
+        };
+        let mut layers = Vec::with_capacity(n);
+        for l in 0..n {
+            let w = take(dims[l] * dims[l + 1]);
+            let b = take(dims[l + 1]);
+            layers.push((w, b));
+        }
+        Ok(Self { dims, layers })
+    }
+
+    fn eval_one(&self, v: &View, act: &mut Vec<u16>, buf: &mut [Vec<f32>; 2]) -> f32 {
+        let mut sc = [0f32; crate::steps::N_SCALARS];
+        v.features(act, &mut sc);
+        let h1 = self.dims[1];
+        let (w, b) = &self.layers[0];
+        let x = &mut buf[0];
+        x.clear();
+        x.extend_from_slice(b);
+        for &i in act.iter() {
+            let row = &w[i as usize * h1..(i as usize + 1) * h1];
+            for (a, r) in x.iter_mut().zip(row) {
+                *a += r;
+            }
+        }
+        for (s, &val) in sc.iter().enumerate() {
+            if val != 0.0 {
+                let i = crate::steps::SPARSE_DIM + s;
+                let row = &w[i * h1..(i + 1) * h1];
+                for (a, r) in x.iter_mut().zip(row) {
+                    *a += r * val;
+                }
+            }
+        }
+        for a in x.iter_mut() {
+            *a = a.clamp(0.0, 1.0);
+        }
+        for l in 1..self.layers.len() {
+            let (w, b) = &self.layers[l];
+            let (din, dout) = (self.dims[l], self.dims[l + 1]);
+            let (src, dst) = if l % 2 == 1 {
+                let (a, bb) = buf.split_at_mut(1);
+                (&a[0], &mut bb[0])
+            } else {
+                let (a, bb) = buf.split_at_mut(1);
+                (&bb[0], &mut a[0])
+            };
+            dst.clear();
+            dst.extend_from_slice(b);
+            for i in 0..din {
+                let xi = src[i];
+                if xi == 0.0 {
+                    continue;
+                }
+                let row = &w[i * dout..(i + 1) * dout];
+                for (a, r) in dst.iter_mut().zip(row) {
+                    *a += r * xi;
+                }
+            }
+            if l + 1 < self.layers.len() {
+                for a in dst.iter_mut() {
+                    *a = a.clamp(0.0, 1.0);
+                }
+            }
+        }
+        let last = if (self.layers.len() - 1) % 2 == 1 {
+            &buf[1]
+        } else {
+            &buf[0]
+        };
+        1.0 / (1.0 + (-last[0]).exp())
+    }
+}
+
+impl Evaluator for CpuMlpEval {
+    fn eval(&self, views: &[View]) -> anyhow::Result<Vec<f32>> {
+        let mut act = Vec::with_capacity(crate::steps::MAX_ACTIVE);
+        let mut buf = [Vec::new(), Vec::new()];
+        Ok(views
+            .iter()
+            .map(|v| self.eval_one(v, &mut act, &mut buf))
+            .collect())
+    }
+}

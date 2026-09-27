@@ -385,3 +385,159 @@ pub fn run(cfg: Config, eval: Arc<dyn Evaluator>, out: &Path) -> anyhow::Result<
     );
     Ok(())
 }
+
+/// Play one turn greedily: at every step, evaluate all options with `eval`
+/// and take the best for the mover. Returns the position after the turn.
+pub fn greedy_turn(
+    real: &crate::game::MinionsState,
+    eval: &dyn Evaluator,
+    salt: u64,
+) -> anyhow::Result<crate::game::MinionsState> {
+    let mut s = StepState::begin(real, salt);
+    let f0 = s.flipped;
+    while !s.is_terminal() && s.flipped == f0 {
+        let opts = s.options();
+        if opts.is_empty() {
+            anyhow::bail!("dead end in a greedy turn");
+        }
+        if opts.len() == 1 {
+            s.apply(opts[0]);
+            continue;
+        }
+        let kids: Vec<StepState> = opts
+            .iter()
+            .map(|&v| {
+                let mut c = s.clone();
+                c.apply(v);
+                c
+            })
+            .collect();
+        let live: Vec<usize> = (0..kids.len())
+            .filter(|&i| !kids[i].is_terminal())
+            .collect();
+        let views: Vec<View> = live.iter().map(|&i| kids[i].view()).collect();
+        let vals = if views.is_empty() {
+            Vec::new()
+        } else {
+            eval.eval(&views)?
+        };
+        let mut q = vec![0f32; kids.len()];
+        for (j, &i) in live.iter().enumerate() {
+            q[i] = vals[j];
+        }
+        for (i, k) in kids.iter().enumerate() {
+            if k.is_terminal() {
+                q[i] = k.terminal_value();
+            }
+            if k.flipped != f0 {
+                q[i] = 1.0 - q[i]; // the child is the opponent's to move
+            }
+        }
+        let best = (0..kids.len())
+            .max_by(|&a, &b| q[a].total_cmp(&q[b]))
+            .expect("options");
+        s = kids.into_iter().nth(best).expect("best");
+    }
+    Ok(s.real_base())
+}
+
+/// A side's bid: the handicap (money to the second player, `BID_MIN..=BID_MAX`)
+/// at which its own evaluator rates the opening even for the first player,
+/// found by binary search on the (decreasing) first-player value.
+pub fn bid(eval: &dyn Evaluator, salt: u64) -> anyhow::Result<i16> {
+    use crate::game::{BID_MAX, BID_MIN};
+    let v = |b: i16| -> anyhow::Result<f32> {
+        let s = StepState::begin(&crate::game::MinionsState::with_bid(b), salt);
+        Ok(eval.eval(&[s.view()])?[0])
+    };
+    let (mut lo, mut hi) = (BID_MIN, BID_MAX);
+    if v(lo)? < 0.5 {
+        return Ok(lo);
+    }
+    if v(hi)? >= 0.5 {
+        return Ok(hi);
+    }
+    // Invariant: v(lo) >= 0.5 > v(hi).
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if v(mid)? >= 0.5 {
+            lo = mid
+        } else {
+            hi = mid
+        }
+    }
+    Ok(lo)
+}
+
+/// Greedy match between two evaluators. Game pairs share a start (a random
+/// opening, or the standard opening with a bid when `opening_max` is 0) with
+/// seats swapped. Returns A's score and the per-game results.
+pub fn greedy_match(
+    a: &dyn Evaluator,
+    b: &dyn Evaluator,
+    pairs: usize,
+    opening_max: u32,
+    opening_decay: f32,
+    seed: u64,
+) -> anyhow::Result<(f64, [u32; 3])> {
+    use playground_core::{Game, Outcome};
+    use rand::Rng;
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+    let mut wdl = [0u32; 3]; // A wins, B wins, draws
+    let mut score = 0f64;
+    let mut first_wins = 0u32;
+    let mut split_pairs = 0u32;
+    for _ in 0..pairs {
+        let start = if opening_max == 0 {
+            None
+        } else {
+            Some(crate::selfplay::random_opening(opening_max, opening_decay, &mut rng).0)
+        };
+        let salt: u64 = rng.gen();
+        let mut pair_a = 0u32;
+        for a_first in [true, false] {
+            let mut real = match &start {
+                Some(s) => s.clone(),
+                None => {
+                    let (ba, bb) = (bid(a, salt)?, bid(b, salt)?);
+                    // The two bids' average (rounded toward zero) is the handicap.
+                    crate::game::MinionsState::with_bid((ba + bb) / 2)
+                }
+            };
+            let mut turns = 0;
+            while !crate::game::Minions::outcome(&real).is_terminal() && turns < 200 {
+                let a_moves = (real.side == 0) == a_first;
+                real = greedy_turn(&real, if a_moves { a } else { b }, salt ^ turns as u64)?;
+                turns += 1;
+            }
+            let res = crate::game::Minions::outcome(&real);
+            if res == Outcome::FirstWins {
+                first_wins += 1;
+            }
+            let a_seat_first = a_first;
+            let (aw, bw) = match res {
+                Outcome::FirstWins => (a_seat_first, !a_seat_first),
+                Outcome::SecondWins => (!a_seat_first, a_seat_first),
+                _ => (false, false),
+            };
+            if aw {
+                wdl[0] += 1;
+                pair_a += 1;
+                score += 1.0;
+            } else if bw {
+                wdl[1] += 1;
+            } else {
+                wdl[2] += 1;
+                score += 0.5;
+            }
+        }
+        if pair_a == 1 {
+            split_pairs += 1;
+        }
+    }
+    eprintln!(
+        "first seat won {first_wins} of {} games; {split_pairs} of {pairs} pairs split 1-1 by seat",
+        2 * pairs
+    );
+    Ok((score / (2 * pairs) as f64, wdl))
+}
