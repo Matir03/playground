@@ -688,7 +688,7 @@ fn empty_bb(s: &MinionsState) -> Bb {
 /// *persistent* unit it deals 1, which can be the finishing blow: a ghost
 /// (defense 4) dies to a serpent's 3 plus a necromancer's 1.
 #[inline]
-fn kill_damage_against(attacker: Unit, target: Unit) -> u8 {
+pub(crate) fn kill_damage_against(attacker: Unit, target: Unit) -> u8 {
     match attacker.stats().attack {
         Attack::Damage(d) => d,
         Attack::Unsummon => u8::from(target.stats().persistent),

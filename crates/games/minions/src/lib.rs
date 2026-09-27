@@ -26,6 +26,7 @@ pub mod sampler;
 pub mod search_config;
 pub mod selfplay;
 pub mod solver;
+pub mod steps;
 pub mod turn;
 pub mod units;
 
