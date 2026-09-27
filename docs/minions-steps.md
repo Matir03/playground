@@ -123,3 +123,47 @@ nets train on that data.
 - Records are ~113 per move at 2000 expansions/move.
 
 (See the net study section below for fit vs speed.)
+
+## Net study: fit vs speed vs strength (gen0 data, 2026-09-27)
+
+Generation 0: 3.0M records from 548 games, the old champion as evaluator,
+6000 expansions/move. Each architecture trained 4 epochs
+(`data/models/minions/steps/study.sh`); holdout = whole chunk files (other
+games); speed = end-to-end `steps-selfplay` with that net as the evaluator
+(GPU nets via TensorRT fp16 at a fixed 256-row shape, CPU MLPs with 10
+workers); strength = 50 seat-swapped greedy pairs vs the old champion from
+random openings (SE ~0.05).
+
+| arch | where | params | holdout MSE | greedy vs old | expansions/s | evals/s |
+|---|---|---|---|---|---|---|
+| mlp 256,32,32 | CPU | 227k | 0.0141 | 0.31 | **227k** | **987k** |
+| mlp 512,64,32 | CPU | 470k | 0.0158 | 0.34 | 166k | 728k |
+| mlp 1024,256,64 | CPU | 1.15M | 0.0170 | 0.32 | 89k | 381k |
+| **res 32x4** | GPU | 135k | 0.0096 | **0.43** | 63k | 288k |
+| res 64x6 | GPU | 514k | **0.0094** | 0.41 | 49k | 231k |
+| res 96x8 | GPU | 1.41M | 0.0106 | 0.32 | 21k | 105k |
+| fcres 64x6 | GPU | 3.16M | 0.0153 | 0.36 | 48k | 215k |
+| old champion (bootstrap) | GPU | 2.25M | 0.0101* | 0.50 | 41k | 170k |
+
+\* static values vs targets its own search produced -- not a fair holdout.
+
+Readings:
+
+- **Data-limited.** Every family gets *worse* with capacity (MLP 0.0141 ->
+  0.0170; ResNet 64x6 -> 96x8; the 3.2M-param fcres worst of the convs).
+  548 games is little data, however many records it yields.
+- **Convolution's prior wins at this size**: the 135k-param res 32x4 fits
+  and plays best.
+- **The CPU MLP is the throughput outlier**: 5.5x the old-net pipeline and
+  3.6x res 32x4, CPU-bound (expand 70%). If more data closes its fit gap it
+  is the obvious engine; re-test it once the buffer holds more games.
+- The FC-first-layer ResNet (the "NNUE on GPU" idea) buys nothing here: the
+  dense 849 -> 49*ch layer is most of its parameters and overfits.
+- Fixed ONNX shapes matter: variable batch sizes made TensorRT build an
+  engine per shape (res 32x4 measured 2.3k expansions/s before padding every
+  call to 256 rows, 63k after).
+
+The generation loop (`data/models/minions/steps/cycle.sh`) starts from res
+32x4: self-play 1.5M records with the latest net, train on a 4-generation
+window warm-started from it, log greedy matches vs the previous generation
+and vs the old champion (not gating).

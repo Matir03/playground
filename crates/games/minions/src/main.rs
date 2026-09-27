@@ -1218,7 +1218,7 @@ async fn main() -> anyhow::Result<()> {
                 (None, Some(path)) => {
                     let p = std::path::Path::new(&path);
                     let cache = p.with_extension("trt_cache").to_string_lossy().into_owned();
-                    Arc::new(minions_engine::bfs::OnnxEval::load(p, &ep, true, &cache, workers.min(4))?)
+                    Arc::new(minions_engine::bfs::OnnxEval::load(p, &ep, true, &cache, 2)?)
                 }
                 _ => anyhow::bail!("give exactly one of --old-net / --onnx"),
             };

@@ -625,27 +625,34 @@ impl OnnxEval {
     }
 }
 
+/// Every ONNX call runs at exactly this many rows (padded), so TensorRT builds
+/// one engine instead of one per batch size.
+pub const ONNX_CHUNK: usize = 256;
+
 impl Evaluator for OnnxEval {
     fn eval(&self, views: &[View]) -> anyhow::Result<Vec<f32>> {
         use ort::value::Tensor;
         let n = views.len();
-        let b = n.div_ceil(BATCH_QUANTUM) * BATCH_QUANTUM;
-        let mut x = vec![0f32; b * DENSE_DIM];
+        let mut out = Vec::with_capacity(n);
         let mut act = Vec::new();
-        for (i, v) in views.iter().enumerate() {
-            dense_features(v, &mut x[i * DENSE_DIM..(i + 1) * DENSE_DIM], &mut act);
+        for part in views.chunks(ONNX_CHUNK) {
+            let mut x = vec![0f32; ONNX_CHUNK * DENSE_DIM];
+            for (i, v) in part.iter().enumerate() {
+                dense_features(v, &mut x[i * DENSE_DIM..(i + 1) * DENSE_DIM], &mut act);
+            }
+            let t = Tensor::from_array((vec![ONNX_CHUNK as i64, DENSE_DIM as i64], x))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let k = self.rr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.pool.len();
+            let mut sess = self.pool[k].lock().unwrap();
+            let outs = sess
+                .run(ort::inputs!["x" => t])
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let (_, v) = outs["v"]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            out.extend_from_slice(&v[..part.len()]);
         }
-        let t = Tensor::from_array((vec![b as i64, DENSE_DIM as i64], x))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let k = self.rr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.pool.len();
-        let mut sess = self.pool[k].lock().unwrap();
-        let outs = sess
-            .run(ort::inputs!["x" => t])
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let (_, v) = outs["v"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(v[..n].to_vec())
+        Ok(out)
     }
 }
 
