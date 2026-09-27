@@ -315,7 +315,9 @@ impl Tree {
                 Some(s) => s,
                 None => self.state_of(leaf),
             };
+            let tp = Instant::now();
             let opts = s.collapse_forced();
+            crate::steps::prof::add(0, tp);
             if opts.is_empty() {
                 if std::env::var("STEPS_DEBUG_DEAD").is_ok()
                     && DEAD_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8
@@ -330,13 +332,17 @@ impl Tree {
             let first_view = views.len();
             let mut kids = Vec::with_capacity(opts.len());
             for v in opts {
+                let tp = Instant::now();
                 let c = s.child(v);
+                crate::steps::prof::add(1, tp);
                 let flip = c.flipped != s.flipped;
                 if c.is_terminal() {
                     let tv = (c.terminal_value(), c.terminal_outcome());
                     kids.push((v, flip, Some(tv), c));
                 } else {
+                    let tp = Instant::now();
                     views.push(c.view());
+                    crate::steps::prof::add(2, tp);
                     kids.push((v, flip, None, c));
                 }
             }

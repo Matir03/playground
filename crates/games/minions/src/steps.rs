@@ -433,14 +433,58 @@ impl StepState {
     }
 
     fn compute_options(&self) -> (Vec<u8>, Vec<TurnSpec>) {
+        // A lazily offered option's witness is found here, when the node is
+        // first expanded; none means the node is a dead end.
+        let resolved;
+        let wit: &TurnSpec = if is_pending(&self.witness) {
+            match self.resolve_witness() {
+                Some(w) => {
+                    resolved = w;
+                    &resolved
+                }
+                None => return (Vec::new(), Vec::new()),
+            }
+        } else {
+            &self.witness
+        };
         match self.stage {
             Stage::Terminal => (Vec::new(), Vec::new()),
-            Stage::Fates => self.fate_options(),
-            Stage::Moves => self.move_options(),
+            Stage::Fates => self.fate_options(wit),
+            Stage::Moves => self.move_options(wit),
             Stage::Spawns => {
                 let o = self.spawn_options();
-                let w = vec![self.witness; o.len()];
+                let w = vec![*wit; o.len()];
                 (o, w)
+            }
+        }
+    }
+
+    /// The exact search for this node's decisions so far (the query its
+    /// parent deferred under [`LAZY_WITNESS`]).
+    fn resolve_witness(&self) -> Option<TurnSpec> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n_fated = if self.stage == Stage::Fates {
+            self.idx
+        } else {
+            self.enemies.len()
+        };
+        let fated = self.enemies[..n_fated].iter().fold(0, |b, &x| b | bit(x));
+        let decided = if self.stage == Stage::Moves {
+            self.friends[..self.idx].iter().fold(0, |b, &x| b | bit(x))
+        } else {
+            0
+        };
+        let t0 = std::time::Instant::now();
+        let r = exact_realize(&self.base, &self.spec, decided, fated, exact_budget());
+        exact_site(usize::from(self.stage != Stage::Fates), t0);
+        match r {
+            Exact::Found(w, _) => {
+                LAZY_STATS[1].fetch_add(1, Relaxed);
+                Some(w)
+            }
+            _ => {
+                LAZY_STATS[2].fetch_add(1, Relaxed);
+                None
             }
         }
     }
@@ -599,21 +643,21 @@ impl StepState {
 
     // ── Fates ────────────────────────────────────────────────────────────────
 
-    fn fate_options(&self) -> (Vec<u8>, Vec<TurnSpec>) {
+    fn fate_options(&self, wit: &TurnSpec) -> (Vec<u8>, Vec<TurnSpec>) {
         let e = self.enemies[self.idx];
         let (_, t) = self.base.piece_at(e).expect("enemy");
         // The current witness's own fate for `e` is always completable (the
         // witness itself). It is usually "stay", but an exact-search witness
         // may kill an undecided enemy to open a path.
-        let own = self.witness.targets[e as usize];
-        let (mut out, mut ws) = (vec![own], vec![self.witness]);
+        let own = wit.targets[e as usize];
+        let (mut out, mut ws) = (vec![own], vec![*wit]);
         for v in [TARGET_STAY, TARGET_KILL, TARGET_UNSUMMON] {
             if v == own || v == TARGET_UNSUMMON && t.stats().persistent {
                 continue;
             }
             let mut spec = self.spec;
             spec.targets[e as usize] = v;
-            let mut cand = self.witness;
+            let mut cand = *wit;
             cand.targets[e as usize] = v;
             if known_realizable(&self.base, &cand) {
                 out.push(v);
@@ -638,6 +682,13 @@ impl StepState {
                     continue;
                 }
             }
+            // Deferred to the child's first expansion, except the
+            // necromancer's fate (a kill must realize on the spot).
+            if lazy_witness() && !t.stats().necromancer {
+                out.push(v);
+                ws.push(pending(spec));
+                continue;
+            }
             let fated = self.enemies[..=self.idx].iter().fold(0, |b, &x| b | bit(x));
             let t0 = std::time::Instant::now();
             let r = exact_realize(&self.base, &spec, 0, fated, exact_budget());
@@ -652,7 +703,7 @@ impl StepState {
 
     // ── Moves ────────────────────────────────────────────────────────────────
 
-    fn move_options(&self) -> (Vec<u8>, Vec<TurnSpec>) {
+    fn move_options(&self, wit: &TurnSpec) -> (Vec<u8>, Vec<TurnSpec>) {
         let c = self.friends[self.idx];
         let (_, u) = self.base.piece_at(c).expect("friend");
         let st = u.stats();
@@ -685,7 +736,7 @@ impl StepState {
         let last = self.idx + 1 == self.friends.len();
         let decided: Vec<u8> = self.friends[..self.idx].to_vec();
         let (mut out, mut ws) = (Vec::new(), Vec::new());
-        let wk = match self.witness.moves[c as usize] {
+        let wk = match wit.moves[c as usize] {
             NO_MOVE => 0,
             k => k,
         };
@@ -698,7 +749,7 @@ impl StepState {
             // think (a witness may win the game before a conflict matters).
             if k == wk {
                 out.push(k);
-                ws.push(self.witness);
+                ws.push(*wit);
                 continue;
             }
             if !has(reach, d) {
@@ -721,7 +772,7 @@ impl StepState {
                 continue;
             }
             // The current witness, with this unit's move swapped in.
-            let mut cand = self.witness;
+            let mut cand = *wit;
             cand.moves[c as usize] = k;
             if known_realizable(&self.base, &cand) {
                 out.push(k);
@@ -746,6 +797,11 @@ impl StepState {
                     continue;
                 }
             }
+            if lazy_witness() {
+                out.push(k);
+                ws.push(pending(spec));
+                continue;
+            }
             let decided_bb = dec.iter().fold(0, |b, &x| b | bit(x));
             let fated = side_bb(&self.base, 1);
             let t0 = std::time::Instant::now();
@@ -766,6 +822,13 @@ impl StepState {
     /// the movement constraints as a vertex-disjoint-paths max flow; kills are
     /// not modelled here.
     fn movers_completable(&self, spec: &TurnSpec, claimed: Bb, c: u8, k: u8) -> bool {
+        let t0 = std::time::Instant::now();
+        let r = self.movers_completable_inner(spec, claimed, c, k);
+        prof::add(6, t0);
+        r
+    }
+
+    fn movers_completable_inner(&self, spec: &TurnSpec, claimed: Bb, c: u8, k: u8) -> bool {
         let undecided = &self.friends[self.idx + 1..];
         if undecided.iter().all(|&u| !has(claimed, u)) {
             return true;
@@ -1242,6 +1305,13 @@ fn known_realizable(base: &MinionsState, spec: &TurnSpec) -> bool {
 /// time (six rotations of which target goes first). Incomplete: a miss is not
 /// a proof. Cheap enough for the witness swap checks.
 pub fn attack_part_fast(base: &MinionsState, spec: &TurnSpec) -> Option<MinionsState> {
+    let t0 = std::time::Instant::now();
+    let r = attack_part_fast_inner(base, spec);
+    prof::add(3, t0);
+    r
+}
+
+fn attack_part_fast_inner(base: &MinionsState, spec: &TurnSpec) -> Option<MinionsState> {
     let mut sp = *spec;
     sp.spawns = [0; NUM_CELLS];
     let r = crate::turn::realize_attack(base, &sp);
@@ -1383,8 +1453,89 @@ fn exact_old_bound() -> bool {
     *OLD.get_or_init(|| std::env::var("STEPS_EXACT_OLD_BOUND").is_ok())
 }
 
+/// Lazy witnesses: options only the exact search could confirm are offered
+/// once the (necessary) relaxation passes, and the exact search runs when the
+/// child is first expanded -- a dead end then, if it finds nothing. Most
+/// children are never expanded, so most of those searches never run.
+pub static LAZY_WITNESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Lazy witnesses: offered, resolved found, resolved dead.
+pub static LAZY_STATS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+fn lazy_witness() -> bool {
+    LAZY_WITNESS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Witnesses carry no spawns, so a spawn code no unit has marks a deferred
+/// one; the rest of the spec is the decisions it has to extend.
+const PENDING_MARK: u8 = u8::MAX;
+
+fn pending(spec: TurnSpec) -> TurnSpec {
+    LAZY_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut w = spec;
+    w.spawns = [0; NUM_CELLS];
+    w.spawns[0] = PENDING_MARK;
+    w
+}
+
+fn is_pending(w: &TurnSpec) -> bool {
+    w.spawns[0] == PENDING_MARK
+}
+
+/// Per-thread timers for the self-play profile (flushed per move).
+pub mod prof {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub const N: usize = 7;
+    pub const NAMES: [&str; N] = [
+        "options",
+        "children",
+        "views",
+        "fast-realize",
+        "build-witness",
+        "relaxed",
+        "movers",
+    ];
+    thread_local!(static ACC: Cell<[u64; N]> = const { Cell::new([0; N]) });
+    pub static TOTAL: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+
+    #[inline]
+    pub fn add(i: usize, t0: std::time::Instant) {
+        let ns = t0.elapsed().as_nanos() as u64;
+        ACC.with(|a| {
+            let mut v = a.get();
+            v[i] += ns;
+            a.set(v);
+        });
+    }
+
+    pub fn flush() {
+        let v = ACC.with(|a| a.replace([0; N]));
+        for (t, x) in TOTAL.iter().zip(v) {
+            t.fetch_add(x, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Search nodes [`exact_realize`] may visit before giving up.
 pub const EXACT_BUDGET: u32 = 5_000;
+
+/// Transpositions the exact search may meet per node of budget before it
+/// gives up (they are cheap but not free: a clone, an apply and a hash).
+/// `STEPS_EXACT_HIT_MULT` overrides it for benchmarks.
+pub const EXACT_HIT_MULT: u64 = 4;
+
+fn exact_hit_mult() -> u64 {
+    static M: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        std::env::var("STEPS_EXACT_HIT_MULT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(EXACT_HIT_MULT)
+    })
+}
 
 /// [`EXACT_BUDGET`], or `STEPS_EXACT_BUDGET` if set (for benchmarks).
 pub fn exact_budget() -> u32 {
@@ -1447,6 +1598,7 @@ pub fn exact_realize(
         found: Option<TurnSpec>,
         out_of_budget: bool,
         hits: u64,
+        max_hits: u64,
     }
     // Per cell: the origin of the friendly unit standing there (NO_CELL if
     // none), and per enemy origin how it left the board (0 = present).
@@ -1673,6 +1825,9 @@ pub fn exact_realize(
         st.gone.hash(&mut h);
         if !c.seen.insert(h.finish()) {
             c.hits += 1;
+            if c.hits > c.max_hits {
+                c.out_of_budget = true;
+            }
             return false;
         }
         if c.budget == 0 {
@@ -1782,7 +1937,7 @@ pub fn exact_realize(
                 return true;
             }
             c.path.pop();
-            if c.budget == 0 {
+            if c.budget == 0 || c.out_of_budget {
                 c.out_of_budget = true;
                 return false;
             }
@@ -1810,6 +1965,7 @@ pub fn exact_realize(
         found: None,
         out_of_budget: false,
         hits: 0,
+        max_hits: u64::from(budget) * exact_hit_mult(),
     };
     use std::sync::atomic::Ordering::Relaxed;
     if let Some(set) = EXACT_DUP.get() {
@@ -2138,6 +2294,13 @@ fn kill_targets(
 /// the enemies in `open` are still unfated (they may be killed to open paths
 /// and hexes, so they are treated as removable).
 fn relaxed_feasible(base: &MinionsState, spec: &TurnSpec, decided: &[u8], open: Bb) -> bool {
+    let t0 = std::time::Instant::now();
+    let r = relaxed_feasible_inner(base, spec, decided, open);
+    prof::add(5, t0);
+    r
+}
+
+fn relaxed_feasible_inner(base: &MinionsState, spec: &TurnSpec, decided: &[u8], open: Bb) -> bool {
     let atk = attackers(base, spec, decided, 0, open);
     let Some(targets) = kill_targets(base, spec, &atk) else {
         return false;
@@ -2164,6 +2327,13 @@ fn relaxed_feasible(base: &MinionsState, spec: &TurnSpec, decided: &[u8], open: 
 /// forced off claimed origins relocated, everyone else staying. `None` if no
 /// attempt realizes within the budget.
 fn build_witness(base: &MinionsState, spec: &TurnSpec, decided: &[u8]) -> Option<TurnSpec> {
+    let t0 = std::time::Instant::now();
+    let r = build_witness_inner(base, spec, decided);
+    prof::add(4, t0);
+    r
+}
+
+fn build_witness_inner(base: &MinionsState, spec: &TurnSpec, decided: &[u8]) -> Option<TurnSpec> {
     let friends: Vec<u8> = (0..NUM_CELLS as u8)
         .filter(|&c| base.piece_at(c).is_some_and(|(sd, _)| sd == 0))
         .collect();
@@ -2490,8 +2660,8 @@ mod tests {
                                     false_offer += 1;
                                     if false_offer <= 6 {
                                         let (o, ws) = match s.stage {
-                                            Stage::Fates => s.fate_options(),
-                                            _ => s.move_options(),
+                                            Stage::Fates => s.fate_options(&s.witness),
+                                            _ => s.move_options(&s.witness),
                                         };
                                         let w = ws[o.iter().position(|&x| x == v).unwrap()];
                                         let mut sp = w;

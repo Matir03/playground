@@ -312,6 +312,7 @@ fn play_game(
             }
         }
         tree.clear_descents();
+        crate::steps::prof::flush();
         c.search_ns
             .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if t.elapsed().as_secs_f64() > 10.0 {
@@ -500,6 +501,21 @@ pub fn run(cfg: Config, eval: Arc<dyn Evaluator>, out: &Path) -> anyhow::Result<
                 g(&z[1][0]) as f64 * 1e-9, g(&z[1][1]) as f64 / g(&x[1]).max(1) as f64,
                 g(&z[2][0]) as f64 * 1e-9, g(&z[3][0])
             );
+            let pr: Vec<String> = crate::steps::prof::NAMES
+                .iter()
+                .zip(crate::steps::prof::TOTAL.iter())
+                .map(|(n, t)| format!("{n} {:.0}s", g(t) as f64 * 1e-9))
+                .collect();
+            println!("  profile (thread-s, nested): {}", pr.join(", "));
+            let lz = &crate::steps::LAZY_STATS;
+            if g(&lz[0]) > 0 {
+                println!(
+                    "  lazy witnesses: offered {} resolved {} dead {}",
+                    g(&lz[0]),
+                    g(&lz[1]),
+                    g(&lz[2])
+                );
+            }
             let y = &crate::steps::EXACT_SITES;
             println!(
                 "  exact by site: fates {} calls {:.0}s, moves {} calls {:.0}s, complete {} calls {:.0}s",

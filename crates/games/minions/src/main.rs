@@ -693,6 +693,10 @@ enum Cmd {
         /// expected count is unchanged; 0 = uniform).
         #[arg(long, default_value_t = 0.5)]
         record_alpha: f64,
+        /// Defer exact witness searches to each child's first expansion
+        /// (`steps::LAZY_WITNESS`).
+        #[arg(long)]
+        lazy_witness: bool,
         #[arg(long, default_value_t = 1_000_000)]
         target_records: u64,
         #[arg(long, default_value_t = 20_000)]
@@ -1269,6 +1273,7 @@ async fn main() -> anyhow::Result<()> {
             select,
             record_frac,
             record_alpha,
+            lazy_witness,
             target_records,
             chunk_records,
             seed,
@@ -1276,6 +1281,7 @@ async fn main() -> anyhow::Result<()> {
             use std::sync::Arc;
             anyhow::ensure!(search == "descent" || search == "bfs", "--search descent|bfs");
             anyhow::ensure!(select == "ordinal" || select == "visits", "--select ordinal|visits");
+            minions_engine::steps::LAZY_WITNESS.store(lazy_witness, std::sync::atomic::Ordering::Relaxed);
             let eval: Arc<dyn minions_engine::bfs::Evaluator> = match (old_net, onnx) {
                 (Some(dir), None) => {
                     let dir = std::path::Path::new(&dir);
