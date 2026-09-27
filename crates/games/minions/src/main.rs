@@ -612,10 +612,13 @@ enum Cmd {
     /// Check a step-trained MLP's CPU evaluator against its ONNX graph on
     /// random step-tree positions.
     StepsCheck {
+        /// Evaluator specs as for steps-match (`.bin` CPU MLP, `.onnx`, `old:<dir>`).
         #[arg(long)]
-        mlp: String,
+        a: String,
         #[arg(long)]
-        onnx: String,
+        b: String,
+        #[arg(long, default_value = "cuda")]
+        ep: String,
         #[arg(long, default_value_t = 2000)]
         positions: usize,
     },
@@ -1187,13 +1190,9 @@ async fn main() -> anyhow::Result<()> {
                 2 * pairs, wdl[0], wdl[1], wdl[2], t.elapsed().as_secs_f64()
             );
         }
-        Cmd::StepsCheck { mlp, onnx, positions } => {
-            use minions_engine::bfs::Evaluator;
+        Cmd::StepsCheck { a, b, ep, positions } => {
             use rand::{Rng, SeedableRng};
-            let cpu = minions_engine::bfs::CpuMlpEval::load(std::path::Path::new(&mlp))?;
-            let p = std::path::Path::new(&onnx);
-            let cache = p.with_extension("trt_cache").to_string_lossy().into_owned();
-            let gpu = minions_engine::bfs::OnnxEval::load(p, "cuda", false, &cache, 1)?;
+            let (ea, eb) = (load_step_eval(&a, &ep)?, load_step_eval(&b, &ep)?);
             let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(9);
             let mut views = Vec::new();
             while views.len() < positions {
@@ -1216,11 +1215,11 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             views.truncate(positions);
-            let a = cpu.eval(&views)?;
-            let b = gpu.eval(&views)?;
+            let a = ea.eval(&views)?;
+            let b = eb.eval(&views)?;
             let d = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
             let mean = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).sum::<f32>() / a.len() as f32;
-            println!("{} positions: max |cpu - onnx| {d:.2e}, mean {mean:.2e}; cpu mean value {:.3}", a.len(), a.iter().sum::<f32>() / a.len() as f32);
+            println!("{} positions: max |a - b| {d:.2e}, mean {mean:.2e}; a mean value {:.3}", a.len(), a.iter().sum::<f32>() / a.len() as f32);
         }
         Cmd::StepsSelfplay {
             out,
@@ -1303,7 +1302,7 @@ fn load_step_eval(spec: &str, ep: &str) -> anyhow::Result<std::sync::Arc<dyn min
         return Ok(Arc::new(minions_engine::bfs::CpuMlpEval::load(p)?));
     }
     let cache = p.with_extension("trt_cache").to_string_lossy().into_owned();
-    Ok(Arc::new(minions_engine::bfs::OnnxEval::load(p, ep, true, &cache, 2)?))
+    Ok(Arc::new(minions_engine::bfs::BatchedOnnxEval::load(p, ep, true, &cache, 2)?))
 }
 
 fn greedy_games(games: u32, verbose: bool) {

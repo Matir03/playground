@@ -17,6 +17,7 @@ Example:
 """
 
 import argparse
+import copy
 import glob
 import json
 import math
@@ -207,6 +208,51 @@ class Export(nn.Module):
         return torch.sigmoid(self.net(x))
 
 
+class SparseExport(nn.Module):
+    """Same net, sparse inputs: `idx` [B, MAX_ACTIVE] int32 active features
+    (unused slots = SPARSE_DIM, a spare column dropped after the scatter) and
+    `scal` [B, N_SCALARS] f32. ~9x fewer bytes per row to the GPU than `x`."""
+
+    def __init__(self, net):
+        super().__init__()
+        self.net = net
+
+    def forward(self, idx, scal):
+        b = idx.shape[0]
+        ones = torch.ones(b, MAX_ACTIVE, device=scal.device, dtype=scal.dtype)
+        x = torch.zeros(b, SPARSE_DIM + 1, device=scal.device, dtype=scal.dtype)
+        x = x.scatter(1, idx.long(), ones)[:, :SPARSE_DIM]
+        return torch.sigmoid(self.net(torch.cat([x, scal], 1)))
+
+
+def export_onnx(net, out, dev):
+    """`value.onnx` (dense input `x`) and `value_sparse.onnx` (`idx`, `scal`)."""
+    net.eval()
+    torch.onnx.export(
+        Export(net).to(dev).eval(),
+        torch.zeros(64, DENSE_DIM, device=dev),
+        os.path.join(out, "value.onnx"),
+        input_names=["x"],
+        output_names=["v"],
+        dynamic_axes={"x": {0: "b"}, "v": {0: "b"}},
+        opset_version=17,
+        dynamo=False,
+    )
+    torch.onnx.export(
+        SparseExport(net).to(dev).eval(),
+        (
+            torch.full((64, MAX_ACTIVE), SPARSE_DIM, dtype=torch.int32, device=dev),
+            torch.zeros(64, DENSE_DIM - SPARSE_DIM, device=dev),
+        ),
+        os.path.join(out, "value_sparse.onnx"),
+        input_names=["idx", "scal"],
+        output_names=["v"],
+        dynamic_axes={"idx": {0: "b"}, "scal": {0: "b"}, "v": {0: "b"}},
+        opset_version=17,
+        dynamo=False,
+    )
+
+
 def evaluate(net, x, y, dev, bs=8192):
     net.eval()
     out = []
@@ -231,7 +277,8 @@ def evaluate(net, x, y, dev, bs=8192):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", nargs="+", required=True)
+    ap.add_argument("--data", nargs="+")
+    ap.add_argument("--export-only", action="store_true", help="just export --init's weights (ONNX graphs) into --out")
     ap.add_argument("--arch", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--init", help="checkpoint (.pt) to start from")
@@ -242,6 +289,7 @@ def main():
     ap.add_argument("--holdout", type=float, default=0.05)
     ap.add_argument("--max-records", type=int, default=0)
     ap.add_argument("--min-visits", type=int, default=0, help="train only on records with at least this many descents (the holdout keeps all)")
+    ap.add_argument("--ema", type=float, default=0.0, help="evaluate and export an exponential moving average of the weights with this decay (0 = off)")
     ap.add_argument("--keep-best", type=int, default=1, help="export the checkpoint with the best holdout MSE seen at the log points, not the last")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -251,6 +299,13 @@ def main():
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(args.out, exist_ok=True)
 
+    if args.export_only:
+        net = build(args.arch).to(dev)
+        net.load_state_dict(torch.load(args.init, map_location=dev))
+        os.makedirs(args.out, exist_ok=True)
+        export_onnx(net, args.out, dev)
+        print(f"exported {args.init} to {args.out}")
+        return
     t0 = time.time()
     every = max(2, int(round(1 / args.holdout))) if args.holdout > 0 else 0
     train, hold, nfiles = load_chunks(args.data, args.max_records or None, every)
@@ -284,6 +339,9 @@ def main():
     t0 = time.time()
     log_every = max(1, steps // 20)
     best = (base["mse"], {k: v.clone() for k, v in net.state_dict().items()}, 0)
+    # EMA of parameters and BN buffers; `judged` is what gets evaluated/kept.
+    ema = copy.deepcopy(net) if args.ema > 0 else None
+    judged = ema if ema is not None else net
     for step in range(steps):
         idx = torch.randint(0, len(train), (args.batch,), device=dev)
         xb = x_tr.dense(idx)
@@ -293,31 +351,27 @@ def main():
         loss.backward()
         opt.step()
         sched.step()
+        if ema is not None:
+            with torch.no_grad():
+                for pe, pn in zip(ema.state_dict().values(), net.state_dict().values()):
+                    if pe.dtype.is_floating_point:
+                        pe.mul_(args.ema).add_(pn, alpha=1 - args.ema)
+                    else:
+                        pe.copy_(pn)
         if (step + 1) % log_every == 0 or step + 1 == steps:
-            m = evaluate(net, x_ho, y_ho, dev)
+            m = evaluate(judged, x_ho, y_ho, dev)
             print(f"step {step + 1}/{steps} loss {loss.item():.4f} holdout mse {m['mse']:.5f} mae {m['mae']:.4f} r {m['r']:.4f} bce+ {m['bce_excess']:.5f} ({time.time() - t0:.0f}s)", flush=True)
             if m["mse"] < best[0]:
-                best = (m["mse"], {k: v.clone() for k, v in net.state_dict().items()}, step + 1)
+                best = (m["mse"], {k: v.clone() for k, v in judged.state_dict().items()}, step + 1)
 
+    if ema is not None:
+        net.load_state_dict(ema.state_dict())
     if args.keep_best:
         net.load_state_dict(best[1])
         print(f"keeping step {best[2]} (holdout mse {best[0]:.5f})")
     final = evaluate(net, x_ho, y_ho, dev)
     torch.save(net.state_dict(), os.path.join(args.out, "net.pt"))
-    net.eval()
-    exp = Export(net).to(dev).eval()
-    dummy = torch.zeros(64, DENSE_DIM, device=dev)
-    onnx_path = os.path.join(args.out, "value.onnx")
-    torch.onnx.export(
-        exp,
-        dummy,
-        onnx_path,
-        input_names=["x"],
-        output_names=["v"],
-        dynamic_axes={"x": {0: "b"}, "v": {0: "b"}},
-        opset_version=17,
-        dynamo=False,
-    )
+    export_onnx(net, args.out, dev)
     if isinstance(net, Mlp):
         # Raw weights for the Rust CPU evaluator (bfs::CpuMlpEval): u32 layer
         # count, u32 dims (in, h1, ..., 1), then per layer W as [in][out] f32

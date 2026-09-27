@@ -659,7 +659,12 @@ impl Evaluator for OnnxEval {
 pub const BATCH_SHAPES: [usize; 2] = [256, 1024];
 
 struct BatchReq {
+    /// Dense rows `[n, DENSE_DIM]`, or for a sparse graph the scalars
+    /// `[n, N_SCALARS]` beside `idx`.
     x: Vec<f32>,
+    /// Sparse graphs only: active features `[n, MAX_ACTIVE]`, padded with
+    /// `SPARSE_DIM`.
+    idx: Vec<i32>,
     n: usize,
     tx: std::sync::mpsc::SyncSender<anyhow::Result<Vec<f32>>>,
 }
@@ -673,9 +678,12 @@ struct BatchQueue {
 /// [`OnnxEval`] behind a shared queue: worker threads featurize their own
 /// rows and enqueue them; `runners` GPU threads each drain as many queued
 /// requests as fit the largest shape and run them as one padded call. Fewer,
-/// larger calls than one call per worker expansion.
+/// larger calls than one call per worker expansion. A graph with inputs
+/// `idx` + `scal` (the learner's `value_sparse.onnx`) is fed active-feature
+/// indices instead of dense rows: ~9x fewer bytes to the GPU.
 pub struct BatchedOnnxEval {
     queue: std::sync::Arc<BatchQueue>,
+    sparse: bool,
     /// Calls and rows run, for the padding ratio.
     pub calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub rows: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -692,17 +700,25 @@ impl BatchedOnnxEval {
         let queue = std::sync::Arc::new(BatchQueue::default());
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let rows = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut sparse = false;
         for _ in 0..runners.max(1) {
             let sess = crate::ort_net::build(path, ep, fp16, cache)?;
+            sparse = sess.inputs().iter().any(|i| i.name() == "idx");
             let (queue, calls, rows) = (queue.clone(), calls.clone(), rows.clone());
-            std::thread::spawn(move || batch_runner(sess, &queue, &calls, &rows));
+            std::thread::spawn(move || batch_runner(sess, sparse, &queue, &calls, &rows));
         }
-        Ok(Self { queue, calls, rows })
+        Ok(Self {
+            queue,
+            sparse,
+            calls,
+            rows,
+        })
     }
 }
 
 fn batch_runner(
     mut sess: ort::session::Session,
+    sparse: bool,
     queue: &BatchQueue,
     calls: &std::sync::atomic::AtomicU64,
     rows: &std::sync::atomic::AtomicU64,
@@ -726,20 +742,38 @@ fn batch_runner(
             }
         }
         let shape = *BATCH_SHAPES.iter().find(|&&s| s >= total).unwrap();
-        let mut x = vec![0f32; shape * DENSE_DIM];
-        let mut at = 0;
+        let width = if sparse {
+            crate::steps::N_SCALARS
+        } else {
+            DENSE_DIM
+        };
+        let mut x = vec![0f32; shape * width];
+        let mut idx = if sparse {
+            vec![crate::steps::SPARSE_DIM as i32; shape * crate::steps::MAX_ACTIVE]
+        } else {
+            Vec::new()
+        };
+        let (mut at, mut ai) = (0, 0);
         for r in &batch {
             x[at..at + r.x.len()].copy_from_slice(&r.x);
             at += r.x.len();
+            idx[ai..ai + r.idx.len()].copy_from_slice(&r.idx);
+            ai += r.idx.len();
         }
         calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         rows.fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
         let res = (|| -> anyhow::Result<Vec<f32>> {
-            let t = Tensor::from_array((vec![shape as i64, DENSE_DIM as i64], x))
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let outs = sess
-                .run(ort::inputs!["x" => t])
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let e = |e: ort::Error| anyhow::anyhow!("{e}");
+            let t = Tensor::from_array((vec![shape as i64, width as i64], x)).map_err(e)?;
+            let outs = if sparse {
+                let ti =
+                    Tensor::from_array((vec![shape as i64, crate::steps::MAX_ACTIVE as i64], idx))
+                        .map_err(e)?;
+                sess.run(ort::inputs!["idx" => ti, "scal" => t])
+            } else {
+                sess.run(ort::inputs!["x" => t])
+            }
+            .map_err(e)?;
             let (_, v) = outs["v"]
                 .try_extract_tensor::<f32>()
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -763,13 +797,30 @@ impl Evaluator for BatchedOnnxEval {
         let mut act = Vec::new();
         let mut waits = Vec::new();
         for part in views.chunks(max) {
-            let mut x = vec![0f32; part.len() * DENSE_DIM];
-            for (i, v) in part.iter().enumerate() {
-                dense_features(v, &mut x[i * DENSE_DIM..(i + 1) * DENSE_DIM], &mut act);
-            }
+            let (x, idx) = if self.sparse {
+                use crate::steps::{MAX_ACTIVE, N_SCALARS, SPARSE_DIM};
+                let mut x = vec![0f32; part.len() * N_SCALARS];
+                let mut idx = vec![SPARSE_DIM as i32; part.len() * MAX_ACTIVE];
+                let mut sc = [0f32; N_SCALARS];
+                for (i, v) in part.iter().enumerate() {
+                    v.features(&mut act, &mut sc);
+                    x[i * N_SCALARS..(i + 1) * N_SCALARS].copy_from_slice(&sc);
+                    for (j, &a) in act.iter().take(MAX_ACTIVE).enumerate() {
+                        idx[i * MAX_ACTIVE + j] = i32::from(a);
+                    }
+                }
+                (x, idx)
+            } else {
+                let mut x = vec![0f32; part.len() * DENSE_DIM];
+                for (i, v) in part.iter().enumerate() {
+                    dense_features(v, &mut x[i * DENSE_DIM..(i + 1) * DENSE_DIM], &mut act);
+                }
+                (x, Vec::new())
+            };
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             self.queue.q.lock().unwrap().push_back(BatchReq {
                 x,
+                idx,
                 n: part.len(),
                 tx,
             });

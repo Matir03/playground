@@ -184,6 +184,25 @@ res 32x4, 130 s per arm:
 | 16 workers, 2 runners | 114k / 114k |
 | 16 workers, 1 runner | 129k / 125k |
 | 24 workers, 2 runners | 138k / 144k |
+| 32 workers, 2 runners | 150k / 155k |
+| 48 workers, 2 runners | 157k / 150k |
+| 32 workers, 1 runner | 133k / 134k |
+
+GPU still at ~44% and 42 W with CPU ~22% idle at 32 x 2: per-call cost, not
+compute. **Sparse input** (`value_sparse.onnx`: `idx` [B, 96] int32 active
+features + `scal` [B, 16], scattered to the dense row inside the graph; ~9x
+fewer bytes per row) on top, ABBA, 32 workers:
+
+| input, runners | expansions/s |
+|---|---|
+| dense, 2 | 154k / 152k |
+| **sparse, 2** | **185k / 191k** |
+| sparse, 3 | 169k / 167k |
+| dense, 3 | 130k / 133k |
+
+The learner exports both graphs; `BatchedOnnxEval` picks the mode from the
+graph's inputs; the cycle uses the sparse graph when present. Dense vs sparse
+under TensorRT fp16: max |diff| 4.9e-4 over 3000 positions (`steps-check`).
 
 ## Matches
 
@@ -206,7 +225,26 @@ request like the sampled-AZ seat's plans.
 
 ## Generation log
 
-| gen | data | holdout MSE | greedy vs prev | greedy vs old champion |
-|---|---|---|---|---|
-| 0 | old champion search, 3.0M records | 0.0096 | -- | 0.43 (50 pairs) |
-| 1 | gen0 search, 1.5M records / 344 games, 68k exp/s | 0.0076 | 0.47 | 0.355 |
+Scores are A's over 200 games (100 seat-swapped pairs, SE ~0.035). Search
+matches: 2000 expansions per turn for both sides. From gen 2: 2M records per
+generation, 6-generation window, 1 epoch at lr 1e-3 warm-started, best-holdout
+checkpoint, 32 workers x 2 batcher runners.
+
+| gen | self-play | holdout MSE (init -> kept) | greedy vs prev | search vs prev | search vs gen0 | greedy vs old champion |
+|---|---|---|---|---|---|---|
+| 0 | old champion, 3.0M records / 548 games | 0.0096 | -- | -- | -- | 0.43 (50 pairs) |
+| 1 | 1.5M / 344 games, 68k exp/s | 0.0076 | 0.47 | -- | -- | 0.355 |
+| 2 | 2.0M / 489 games, 140-149k exp/s | 0.0069 -> 0.0063 | 0.505 | 0.55 | **0.595** | 0.395 |
+| 3 | 2.0M / 446 games | 0.0060 -> 0.0060 (step 0 kept: gen3 = gen2) | 0.515 | 0.54 | 0.56 | 0.38 |
+| 4 | 2.0M / 431 games | 0.0058 -> 0.0057 | 0.46 | 0.46 | 0.54 | 0.40 |
+
+**Training fixes after gen 4.** Learner experiments (gen 3 init, gen 0-4
+data, same holdout): plain 1 epoch best-checkpoint 0.00561; with a weight EMA
+(`--ema 0.999`, evaluated and exported) 0.00537; EMA at lr 3e-4 0.00544; EMA
+over 2 epochs 0.00540. The cycle uses EMA 0.999 from gen 5.
+
+Gen 3 is gen 2's weights (no checkpoint beat the init on the holdout), so
+its 0.54 vs gen 2 is a same-net match: a calibration of the noise. Strength
+vs gen 0 has been flat since gen 2; warm-started training barely moves the
+holdout (the peak of the one-cycle schedule knocks the net off and one
+epoch does not recover).
