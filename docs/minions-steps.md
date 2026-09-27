@@ -248,3 +248,44 @@ its 0.54 vs gen 2 is a same-net match: a calibration of the noise. Strength
 vs gen 0 has been flat since gen 2; warm-started training barely moves the
 holdout (the peak of the one-cycle schedule knocks the net off and one
 epoch does not recover).
+
+## Diagnosis: the loop reached a fixed point (gen 5-8)
+
+Search matches vs gen 0 stayed at 0.50-0.55 from gen 2 to gen 8 while the
+holdout kept improving (MSE 0.0051 at gen 5; 0.0013-0.0015 from gen 6, when
+the old champion's gen 0 data left the window and the holdout became
+self-generated data only, r = 0.996).
+
+The direct test is search vs greedy step picking **with the same net**
+(gen 5, 100 pairs each, SE ~0.035):
+
+| A | B | A score |
+|---|---|---|
+| search 2000, p = 2 | greedy | 0.47 |
+| search 6000, p = 2 | search 2000, p = 2 | 0.46 |
+| search 2000, p = 8 / 32 / max | greedy | 0.51 / 0.59 / 0.53 (60 pairs) |
+| search 2000, p = 32 | search 2000, p = 2 | 0.515 |
+| search 6000, p = 32 | greedy | 0.505 |
+| search 2000, p = 32 | search 2000, max | 0.53 |
+| **material evaluator**: search 2000, p = 2 | greedy | **0.73** (50 pairs) |
+| material evaluator: search 2000, max | greedy | 0.46 (50 pairs) |
+
+So the search works (it beats greedy by a wide margin on a crude evaluator)
+but adds nothing on top of the trained net: the net has learned to predict
+its own search's backed-up values, so greedy picking is already the
+distilled search, and each generation's targets equal the previous
+generation's predictions except where a tree reaches terminal positions.
+New information enters only through those, roughly a turn of look-ahead per
+generation. (Selective expansion also makes max backup over-optimistic:
+it loses to p = 2 with the material evaluator.)
+
+**Grounding experiment (from gen 9).** Records now carry the game's result
+for the record's mover and the turns to the end (`stepsp::outcome_code`, in
+the former pad; 0 = unknown). The cycle trains on
+`(1 - w) * search value + w * result` with `w = 0.5 * 0.9^turns_to_end`
+(`--outcome-weight 0.5 --outcome-decay 0.9`) where the result is known
+(gen 8 on). This departs from the design's "games are exploration only":
+self-play still picks moves with temperature 1 + Dirichlet at every step, so
+results measure that exploratory policy. The cycle also logs search vs
+greedy with the same net each generation (the improvement the search still
+offers).
