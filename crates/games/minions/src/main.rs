@@ -682,6 +682,13 @@ enum Cmd {
         /// `bfs` (best-first, the eval search).
         #[arg(long, default_value = "descent")]
         search: String,
+        /// Turn walk: `ordinal` (ordinal distribution + completed action
+        /// selection) or `visits` (descents with --temp and Dirichlet noise).
+        #[arg(long, default_value = "ordinal")]
+        select: String,
+        /// Probability of keeping each eligible node as a record.
+        #[arg(long, default_value_t = 1.0)]
+        record_frac: f64,
         #[arg(long, default_value_t = 1_000_000)]
         target_records: u64,
         #[arg(long, default_value_t = 20_000)]
@@ -1255,12 +1262,15 @@ async fn main() -> anyhow::Result<()> {
             opening_max,
             opening_decay,
             search,
+            select,
+            record_frac,
             target_records,
             chunk_records,
             seed,
         } => {
             use std::sync::Arc;
             anyhow::ensure!(search == "descent" || search == "bfs", "--search descent|bfs");
+            anyhow::ensure!(select == "ordinal" || select == "visits", "--select ordinal|visits");
             let eval: Arc<dyn minions_engine::bfs::Evaluator> = match (old_net, onnx) {
                 (Some(dir), None) => {
                     let dir = std::path::Path::new(&dir);
@@ -1295,6 +1305,8 @@ async fn main() -> anyhow::Result<()> {
                 opening_max,
                 opening_decay,
                 descent: search == "descent",
+                ordinal: select == "ordinal",
+                record_frac,
                 target_records,
                 chunk_records,
                 seed,

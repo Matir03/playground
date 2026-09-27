@@ -328,12 +328,23 @@ impl StepState {
         self.stage == Stage::Terminal
     }
 
-    /// The terminal outcome for the side to move at `base` (1 win, 0 loss, 0.5 draw).
+    /// The terminal value for the side to move at `base`, with the depth
+    /// reinforcement heuristic (Cohen-Solal, arXiv 2008.01188, section 6.2.2):
+    /// quick wins beat slow ones and slow losses beat quick ones. A win on
+    /// turn `t` is worth `0.5 + 0.5 * (1 - DEPTH_LAMBDA * t / MAX_TURNS)`, a
+    /// loss the mirror image, a draw 0.5.
     pub fn terminal_value(&self) -> f32 {
+        let t = f32::from(self.base.turn.min(crate::game::MAX_TURNS));
+        let margin = 0.5 * (1.0 - DEPTH_LAMBDA * t / f32::from(crate::game::MAX_TURNS));
+        0.5 + margin * f32::from(self.terminal_outcome())
+    }
+
+    /// The result for the side to move at `base`: 1 win, -1 loss, 0 draw.
+    pub fn terminal_outcome(&self) -> i8 {
         match self.base.winner {
-            1 => 1.0, // canonical side 0 = the mover of `base`
-            2 => 0.0,
-            _ => 0.5,
+            1 => 1, // canonical side 0 = the mover of `base`
+            2 => -1,
+            _ => 0,
         }
     }
 
@@ -1311,6 +1322,11 @@ fn exact_site(site: usize, t0: std::time::Instant) {
     EXACT_SITES[site][0].fetch_add(1, Relaxed);
     EXACT_SITES[site][1].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
 }
+
+/// How much a win's value shrinks by the turn cap (see
+/// [`StepState::terminal_value`]): wins are worth 1.0 on turn 0 down to 0.75
+/// at the cap.
+pub const DEPTH_LAMBDA: f32 = 0.5;
 
 /// Search nodes [`exact_realize`] may visit before giving up.
 pub const EXACT_BUDGET: u32 = 20_000;

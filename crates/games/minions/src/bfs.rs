@@ -48,6 +48,13 @@ pub struct Node {
     pub value: f32,
     /// Static evaluation at creation.
     pub prior: f32,
+    /// Completion (Cohen-Solal, arXiv 2008.01188, section 5): the proven
+    /// result for this node's mover, 1 win / -1 loss / 0 unknown or draw,
+    /// the minimax of the terminal results below it.
+    pub comp: i8,
+    /// Resolved: the result is proven (a proven win or loss, or every child
+    /// resolved). Descents never enter a resolved node again.
+    pub resolved: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -110,10 +117,10 @@ pub struct Tree {
 impl Tree {
     /// A tree whose root is `root`, evaluated with `eval`.
     pub fn new(root: StepState, params: Params, eval: &dyn Evaluator) -> anyhow::Result<Self> {
-        let (kind, value) = if root.is_terminal() {
-            (TERMINAL, root.terminal_value())
+        let (kind, value, comp) = if root.is_terminal() {
+            (TERMINAL, root.terminal_value(), root.terminal_outcome())
         } else {
-            (LEAF, eval.eval(&[root.view()])?[0])
+            (LEAF, eval.eval(&[root.view()])?[0], 0)
         };
         let node = Node {
             parent: u32::MAX,
@@ -125,6 +132,8 @@ impl Tree {
             visits: 0,
             value,
             prior: value,
+            comp,
+            resolved: kind == TERMINAL,
         };
         Ok(Self {
             nodes: vec![node],
@@ -138,7 +147,7 @@ impl Tree {
     }
 
     pub fn is_solved(&self) -> bool {
-        matches!(self.nodes[0].kind, TERMINAL | DEAD)
+        matches!(self.nodes[0].kind, TERMINAL | DEAD) || self.nodes[0].resolved
     }
 
     pub fn children(&self, n: u32) -> std::ops::Range<u32> {
@@ -157,16 +166,28 @@ impl Tree {
         }
     }
 
+    /// Child `c`'s completion from its parent's mover's point of view.
+    #[inline]
+    pub fn c_parent(&self, c: u32) -> i8 {
+        let n = &self.nodes[c as usize];
+        if n.flip {
+            -n.comp
+        } else {
+            n.comp
+        }
+    }
+
+    /// The best live child: by completion, then value.
     pub fn best_child(&self, n: u32) -> Option<u32> {
         let mut best = None;
-        let mut bq = f32::NEG_INFINITY;
+        let mut bk = (i8::MIN, f32::NEG_INFINITY);
         for c in self.children(n) {
             if self.nodes[c as usize].kind == DEAD {
                 continue;
             }
-            let q = self.q_parent(c);
-            if q > bq {
-                bq = q;
+            let k = (self.c_parent(c), self.q_parent(c));
+            if k.0 > bk.0 || k.0 == bk.0 && k.1 > bk.1 {
+                bk = k;
                 best = Some(c);
             }
         }
@@ -242,7 +263,7 @@ impl Tree {
                 };
                 let bq = self.q_parent(b);
                 for c in self.children(p) {
-                    if self.nodes[c as usize].kind == DEAD {
+                    if self.nodes[c as usize].kind == DEAD || self.nodes[c as usize].resolved {
                         continue;
                     }
                     cand.push((bq - self.q_parent(c), c));
@@ -284,7 +305,7 @@ impl Tree {
         let t = Instant::now();
         struct Pending {
             leaf: u32,
-            kids: Vec<(u8, bool, Option<f32>, StepState)>, // (step, flip, terminal value, state)
+            kids: Vec<(u8, bool, Option<(f32, i8)>, StepState)>, // (step, flip, terminal value + result, state)
             first_view: usize,
         }
         let mut views: Vec<View> = Vec::new();
@@ -312,7 +333,7 @@ impl Tree {
                 let c = s.child(v);
                 let flip = c.flipped != s.flipped;
                 if c.is_terminal() {
-                    let tv = c.terminal_value();
+                    let tv = (c.terminal_value(), c.terminal_outcome());
                     kids.push((v, flip, Some(tv), c));
                 } else {
                     views.push(c.view());
@@ -341,12 +362,12 @@ impl Tree {
             let mut vi = p.first_view;
             let nk = p.kids.len();
             for (step, flip, term, st) in p.kids {
-                let (kind, value) = match term {
-                    Some(v) => (TERMINAL, v),
+                let (kind, value, comp) = match term {
+                    Some((v, r)) => (TERMINAL, v, r),
                     None => {
                         let v = vals[vi];
                         vi += 1;
-                        (LEAF, v)
+                        (LEAF, v, 0)
                     }
                 };
                 self.nodes.push(Node {
@@ -359,6 +380,8 @@ impl Tree {
                     visits: 0,
                     value,
                     prior: value,
+                    comp,
+                    resolved: kind == TERMINAL,
                 });
                 self.states.push(Some(st));
             }
@@ -372,36 +395,57 @@ impl Tree {
     }
 
     /// Recompute `n`'s value from its children; `false` if all are dead.
+    ///
+    /// With completion: a proven win for the mover makes `n` a proven win
+    /// worth its best proven-winning child (the quickest win under the depth
+    /// heuristic); if every child is a proven loss, `n` is a proven loss worth
+    /// the slowest one. Otherwise proven losses are ignored and the value is
+    /// the visit-weighted power mean (`p`; the max for `p = inf`) of the rest.
+    /// `n` is resolved when proven, or when every live child is resolved.
     fn recompute(&mut self, n: u32) -> bool {
         let p = self.params.power;
-        if p.is_infinite() {
-            // p = inf: the max (plain minimax over the movers' choices).
-            let best = self
-                .children(n)
-                .filter(|&c| self.nodes[c as usize].kind != DEAD)
-                .map(|c| self.q_parent(c))
-                .fold(f32::NEG_INFINITY, f32::max);
-            if best == f32::NEG_INFINITY {
-                return false;
-            }
-            self.nodes[n as usize].value = best.clamp(0.0, 1.0);
-            return true;
-        }
-        let (mut num, mut den) = (0f64, 0f64);
+        let mut best_c = i8::MIN;
+        let mut all_resolved = true;
+        let mut any = false;
         for c in self.children(n) {
             let nd = &self.nodes[c as usize];
             if nd.kind == DEAD {
                 continue;
             }
-            let w = 1.0 + nd.visits as f64;
-            let q = self.q_parent(c).clamp(0.0, 1.0) as f64;
-            num += w * q.powf(p as f64);
-            den += w;
+            any = true;
+            best_c = best_c.max(self.c_parent(c));
+            all_resolved &= nd.resolved;
         }
-        if den == 0.0 {
+        if !any {
             return false;
         }
-        self.nodes[n as usize].value = (num / den).powf(1.0 / p as f64) as f32;
+        let pick = if best_c == 0 { 0 } else { best_c };
+        let value = if pick != 0 || p.is_infinite() {
+            // Proven: the best child in that class. p = inf: the max over the
+            // unproven ones (plain minimax over the movers' choices).
+            self.children(n)
+                .filter(|&c| self.nodes[c as usize].kind != DEAD && self.c_parent(c) == pick)
+                .map(|c| self.q_parent(c))
+                .fold(f32::NEG_INFINITY, f32::max)
+                .clamp(0.0, 1.0)
+        } else {
+            let (mut num, mut den) = (0f64, 0f64);
+            for c in self.children(n) {
+                let nd = &self.nodes[c as usize];
+                if nd.kind == DEAD || self.c_parent(c) != 0 {
+                    continue;
+                }
+                let w = 1.0 + nd.visits as f64;
+                let q = self.q_parent(c).clamp(0.0, 1.0) as f64;
+                num += w * q.powf(p as f64);
+                den += w;
+            }
+            (num / den).powf(1.0 / p as f64) as f32
+        };
+        let nd = &mut self.nodes[n as usize];
+        nd.value = value;
+        nd.comp = pick;
+        nd.resolved = pick != 0 || all_resolved;
         true
     }
 
@@ -515,26 +559,33 @@ impl Tree {
             let n = *self.cursors[i].last().expect("a descent path");
             match self.nodes[n as usize].kind {
                 LEAF => return Some(n),
-                EXPANDED => {}
+                EXPANDED if !self.nodes[n as usize].resolved => {}
                 _ => {
-                    if self.nodes[n as usize].kind == TERMINAL {
+                    // A terminal, or a proven result (resolution stop).
+                    if self.nodes[n as usize].kind != DEAD {
                         self.stats.terminal_leaves += 1;
                     }
                     return None;
                 }
             }
+            // Among unresolved children: by completion, then value (with
+            // virtual loss), then fewest visits.
             let mut best = None;
-            let mut bq = f32::NEG_INFINITY;
+            let mut bk = (i8::MIN, f32::NEG_INFINITY, i64::MIN);
             for c in self.children(n) {
                 let nd = &self.nodes[c as usize];
-                if nd.kind == DEAD {
+                if nd.kind == DEAD || nd.resolved {
                     continue;
                 }
                 let m = self.inflight.get(c as usize).copied().unwrap_or(0) as f32;
                 let w = (1 + nd.visits) as f32 - m;
-                let q = self.q_parent(c) * w / (w + m);
-                if q > bq {
-                    bq = q;
+                let k = (
+                    self.c_parent(c),
+                    self.q_parent(c) * w / (w + m),
+                    -(nd.visits as i64),
+                );
+                if k > bk {
+                    bk = k;
                     best = Some(c);
                 }
             }
@@ -616,6 +667,45 @@ impl Tree {
             r -= x;
         }
         kids.last().copied()
+    }
+
+    /// Self-play step choice at `n` (Cohen-Solal, arXiv 2008.01188, sections
+    /// 5 and 7): a proven win is always played (the quickest); proven losses
+    /// only when nothing else is left; otherwise the ordinal distribution over
+    /// the rest ranked by value -- the `i`-th best (of `m`) is taken, given no
+    /// better one was, with probability `e + (1 - e) / (m - i)`, where the
+    /// exploitation `e` is drawn uniformly from [0, 1] at each choice.
+    pub fn pick_ordinal(&self, n: u32, rng: &mut rand_chacha::ChaCha8Rng) -> Option<u32> {
+        use rand::Rng;
+        let live: Vec<u32> = self
+            .children(n)
+            .filter(|&c| self.nodes[c as usize].kind != DEAD)
+            .collect();
+        if live.is_empty() {
+            return None;
+        }
+        let top = live.iter().map(|&c| self.c_parent(c)).max().unwrap();
+        if top == 1 {
+            return self.best_child(n);
+        }
+        let mut pool: Vec<u32> = live
+            .iter()
+            .copied()
+            .filter(|&c| self.c_parent(c) == 0)
+            .collect();
+        if pool.is_empty() {
+            pool = live;
+        }
+        pool.sort_by(|&a, &b| self.q_parent(b).total_cmp(&self.q_parent(a)));
+        let e: f64 = rng.gen();
+        let m = pool.len();
+        for (i, &c) in pool.iter().enumerate() {
+            let p = e + (1.0 - e) / (m - i) as f64;
+            if rng.gen::<f64>() < p {
+                return Some(c);
+            }
+        }
+        pool.last().copied()
     }
 
     /// Expand `n` alone if it is still a leaf (for playing through a turn the
@@ -1064,6 +1154,20 @@ mod tests {
             }
             let below: u32 = t.children(n).map(|c| t.nodes[c as usize].visits).sum();
             assert!(below <= t.nodes[n as usize].visits, "node {n}");
+            // Completion: minimax of the children's proven results.
+            let live: Vec<u32> = t.children(n).filter(|&c| t.kind(c) != DEAD).collect();
+            let top = live.iter().map(|&c| t.c_parent(c)).max().unwrap();
+            let want = if top == 1 {
+                1
+            } else if top == -1 {
+                -1
+            } else {
+                0
+            };
+            let nd = &t.nodes[n as usize];
+            assert_eq!(nd.comp, want, "node {n} completion");
+            let all = live.iter().all(|&c| t.nodes[c as usize].resolved);
+            assert_eq!(nd.resolved, want != 0 || all, "node {n} resolution");
         }
         let paths: Vec<Vec<u32>> = t.cursors.clone();
         for (n, &m) in t.inflight.iter().enumerate() {

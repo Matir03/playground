@@ -49,6 +49,14 @@ pub struct Config {
     /// Search with Descent ([`Tree::descent_wave`], `params.heads` descents in
     /// flight) instead of best-first.
     pub descent: bool,
+    /// Walk each turn with [`Tree::pick_ordinal`] (ordinal distribution +
+    /// completed action selection) instead of descents with temperature and
+    /// Dirichlet noise.
+    pub ordinal: bool,
+    /// Keep each eligible node (and terminal) as a record with this
+    /// probability: the trees produce far more records than the learner can
+    /// take, so a uniform sample spreads a generation over more games.
+    pub record_frac: f64,
     /// Stop once this many records are written.
     pub target_records: u64,
     pub chunk_records: usize,
@@ -201,8 +209,11 @@ fn record_nodes(
     tree: &Tree,
     keep: Option<u32>,
     min_visits: u32,
+    frac: f64,
+    rng: &mut rand_chacha::ChaCha8Rng,
     w: &mut Writer,
 ) -> anyhow::Result<u64> {
+    use rand::Rng;
     let mut inside = vec![false; tree.nodes.len()];
     if let Some(k) = keep {
         // Children are always created after their parent, so one forward pass
@@ -217,7 +228,7 @@ fn record_nodes(
     }
     let mut n = 0;
     for id in tree.trained_nodes(min_visits) {
-        if inside[id as usize] {
+        if inside[id as usize] || frac < 1.0 && rng.gen::<f64>() >= frac {
             continue;
         }
         let nd = &tree.nodes[id as usize];
@@ -229,7 +240,7 @@ fn record_nodes(
     // distinct position (many step orders reach the same end).
     let mut seen = std::collections::HashSet::new();
     for id in tree.terminal_nodes() {
-        if inside[id as usize] {
+        if inside[id as usize] || frac < 1.0 && rng.gen::<f64>() >= frac {
             continue;
         }
         let nd = &tree.nodes[id as usize];
@@ -329,9 +340,12 @@ fn play_game(
                 n = tree.nodes[n as usize].parent;
                 continue;
             }
-            let Some(ch) =
+            let pick = if cfg.ordinal {
+                tree.pick_ordinal(n, rng)
+            } else {
                 tree.pick_child(n, cfg.temp, (cfg.dirichlet_alpha, cfg.dirichlet_eps), rng)
-            else {
+            };
+            let Some(ch) = pick else {
                 break None;
             };
             if tree.nodes[ch as usize].flip || tree.kind(ch) == 2 {
@@ -352,14 +366,14 @@ fn play_game(
             );
         }
         let Some(next) = next else { break };
-        let rec = record_nodes(&tree, Some(next), cfg.min_visits, w)?;
+        let rec = record_nodes(&tree, Some(next), cfg.min_visits, cfg.record_frac, rng, w)?;
         c.records.fetch_add(rec, Ordering::Relaxed);
         c.add_stats(&tree.stats);
         tree = tree.reroot(next);
         c.moves.fetch_add(1, Ordering::Relaxed);
         turns += 1;
     }
-    let rec = record_nodes(&tree, None, cfg.min_visits, w)?;
+    let rec = record_nodes(&tree, None, cfg.min_visits, cfg.record_frac, rng, w)?;
     let end = tree.root.real_base();
     w.finish_game(end.winner, end.turn)?;
     c.records.fetch_add(rec, Ordering::Relaxed);

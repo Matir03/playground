@@ -149,6 +149,20 @@ Concurrent descents are split by virtual loss: a child's value is averaged
 with one pending loss per descent in flight through it, weighted like its
 visits.
 
+**Completion (from gen 33, both searches).** Each node carries the proven
+result for its mover (win / loss / unknown), the minimax of the terminal
+results below, and a resolved flag (proven, or every child resolved). A
+proven win takes its best proven-winning child's value; a node whose
+children are all proven losses takes the slowest loss; otherwise proven
+losses are left out of the power mean. Children compare by (proof, value).
+Descents never enter a resolved node (they end there), and a search stops
+when its root is resolved.
+
+**Depth heuristic (from gen 33).** Terminal values reward quick wins and slow
+losses: a win on turn t is worth 0.5 + 0.5 (1 - 0.5 t / 30), so 1.0 on turn
+0 down to 0.75 at the turn cap; losses mirror it (`DEPTH_LAMBDA` in
+`steps.rs`). Ordering-preserving, as in Athenan's reinforcement heuristics.
+
 ## Self-play (`stepsp.rs`, `steps-selfplay`)
 
 - Starts from the opening with a random bid; no random turns
@@ -157,8 +171,19 @@ visits.
 - Per move: `--search descent` (default) for `--move-secs`; `--search bfs`
   searches until `--expansions` leaf expansions (or the candidate pool
   starves -- the PV runs into decided lines).
-- Play one whole turn step by step: descents with temperature + Dirichlet
-  noise; by value where nothing below was descended; dead picks backed out.
+- Play one whole turn step by step. From gen 33 (`--select ordinal`,
+  default): a proven win is always played, proven losses only if nothing
+  else is left, otherwise the ordinal distribution over children ranked by
+  value (the i-th best of m, given no better one was taken, with probability
+  e + (1 - e)/(m - i), e drawn uniformly from [0, 1] per choice); no
+  Dirichlet noise. `--select visits` is the old walk (descents with
+  temperature + Dirichlet). Dead picks are backed out.
+- From gen 33: 5 s per move, `--min-visits 1` (every node a descent entered,
+  as in Athenan's tree learning) and `--record-frac 0.05`: each eligible node
+  or terminal is kept with probability 5%, since the trees produce ~65k
+  records/s and a uniform sample spreads a generation over more games
+  (measured at 5 s/move, gen32 net: 6 moves/s, 62.5k expansions/s, 10.9k
+  eligible records per move, games ~10 turns).
 - Descent visit counts (one 2.5-minute run, gen31 net, `--min-visits 1`,
   9.6M records): 0.4% zero visits (terminal records), **97.7% exactly one**,
   0.5% two, 0.7% 3-4, 0.4% 5-9, 0.2% 10-19, 0.1% 20+. A descent runs ~300
