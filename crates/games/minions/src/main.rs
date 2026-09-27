@@ -590,6 +590,14 @@ enum Cmd {
         ep: String,
         #[arg(long, default_value_t = 1)]
         seed: u64,
+        /// Leaf expansions per turn for each side (0 = greedy on static values).
+        #[arg(long, default_value_t = 0)]
+        expansions: u64,
+        #[arg(long, default_value_t = 32)]
+        heads: usize,
+        /// Game-pair threads.
+        #[arg(long, default_value_t = 1)]
+        threads: usize,
     },
     /// Check a step-trained MLP's CPU evaluator against its ONNX graph on
     /// random step-tree positions.
@@ -619,6 +627,13 @@ enum Cmd {
         ep: String,
         #[arg(long, default_value_t = 8)]
         workers: usize,
+        /// ONNX sessions for a GPU step net (0 = one per worker).
+        #[arg(long, default_value_t = 0)]
+        sessions: usize,
+        /// Shared-queue GPU runner threads for a GPU step net (0 = each worker
+        /// calls its own session).
+        #[arg(long, default_value_t = 0)]
+        batcher: usize,
         #[arg(long, default_value_t = 32)]
         heads: usize,
         #[arg(long, default_value_t = 2.0)]
@@ -1136,11 +1151,14 @@ async fn main() -> anyhow::Result<()> {
             )?;
         }
         Cmd::NnueBench { active, reps } => minions_engine::nnue::bench_sweep(active, reps),
-        Cmd::StepsMatch { a, b, pairs, opening_max, opening_decay, ep, seed } => {
-            let ea = load_step_eval(&a, &ep)?;
-            let eb = load_step_eval(&b, &ep)?;
+        Cmd::StepsMatch { a, b, pairs, opening_max, opening_decay, ep, seed, expansions, heads, threads } => {
+            let params = minions_engine::bfs::Params { heads, ..Default::default() };
+            let player = |spec: &str| -> anyhow::Result<minions_engine::stepsp::Player> {
+                Ok(minions_engine::stepsp::Player { eval: load_step_eval(spec, &ep)?, expansions, params: params.clone() })
+            };
+            let (pa, pb) = (player(&a)?, player(&b)?);
             let t = std::time::Instant::now();
-            let (score, wdl) = minions_engine::stepsp::greedy_match(ea.as_ref(), eb.as_ref(), pairs, opening_max, opening_decay, seed)?;
+            let (score, wdl) = minions_engine::stepsp::play_match(&pa, &pb, pairs, opening_max, opening_decay, seed, threads)?;
             let n = (2 * pairs) as f64;
             let se = (score * (1.0 - score) / n).sqrt();
             println!(
@@ -1189,6 +1207,8 @@ async fn main() -> anyhow::Result<()> {
             onnx,
             ep,
             workers,
+            sessions,
+            batcher,
             heads,
             power,
             expansions,
@@ -1218,7 +1238,11 @@ async fn main() -> anyhow::Result<()> {
                 (None, Some(path)) => {
                     let p = std::path::Path::new(&path);
                     let cache = p.with_extension("trt_cache").to_string_lossy().into_owned();
-                    Arc::new(minions_engine::bfs::OnnxEval::load(p, &ep, true, &cache, 2)?)
+                    if batcher > 0 {
+                        Arc::new(minions_engine::bfs::BatchedOnnxEval::load(p, &ep, true, &cache, batcher)?)
+                    } else {
+                        Arc::new(minions_engine::bfs::OnnxEval::load(p, &ep, true, &cache, if sessions == 0 { workers } else { sessions })?)
+                    }
                 }
                 _ => anyhow::bail!("give exactly one of --old-net / --onnx"),
             };

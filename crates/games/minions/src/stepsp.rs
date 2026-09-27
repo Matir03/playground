@@ -404,14 +404,7 @@ pub fn greedy_turn(
             s.apply(opts[0]);
             continue;
         }
-        let kids: Vec<StepState> = opts
-            .iter()
-            .map(|&v| {
-                let mut c = s.clone();
-                c.apply(v);
-                c
-            })
-            .collect();
+        let kids: Vec<StepState> = opts.iter().map(|&v| s.child(v)).collect();
         let live: Vec<usize> = (0..kids.len())
             .filter(|&i| !kids[i].is_terminal())
             .collect();
@@ -469,66 +462,173 @@ pub fn bid(eval: &dyn Evaluator, salt: u64) -> anyhow::Result<i16> {
     Ok(lo)
 }
 
-/// Greedy match between two evaluators. Game pairs share a start (a random
-/// opening, or the standard opening with a bid when `opening_max` is 0) with
-/// seats swapped. Returns A's score and the per-game results.
-pub fn greedy_match(
-    a: &dyn Evaluator,
-    b: &dyn Evaluator,
+/// One turn by search: a fresh tree searched for `expansions` leaf
+/// expansions (or until the candidate pool starves), then the principal
+/// variation played to the end of the turn.
+pub fn search_turn(
+    real: &crate::game::MinionsState,
+    eval: &dyn Evaluator,
+    params: &Params,
+    expansions: u64,
+    salt: u64,
+) -> anyhow::Result<crate::game::MinionsState> {
+    let mut tree = Tree::new(StepState::begin(real, salt), params.clone(), eval)?;
+    let mut starved = 0;
+    while !tree.is_solved() && tree.stats.expansions < expansions {
+        let got = tree.iterate(eval)?;
+        if got == 0 {
+            break;
+        }
+        if got * 4 < params.heads {
+            starved += 1;
+            if starved >= 8 {
+                break;
+            }
+        } else {
+            starved = 0;
+        }
+    }
+    let mut n = 0u32;
+    loop {
+        tree.ensure_expanded(n, eval)?;
+        if tree.kind(n) == 3 {
+            anyhow::ensure!(n != 0, "dead root in a search turn");
+            n = tree.nodes[n as usize].parent;
+            continue;
+        }
+        let Some(ch) = tree.best_child(n) else {
+            anyhow::bail!("no live child in a search turn");
+        };
+        if tree.nodes[ch as usize].flip || tree.kind(ch) == 2 {
+            return Ok(tree.state_of(ch).real_base());
+        }
+        n = ch;
+    }
+}
+
+/// How one side plays its turns in a match.
+#[derive(Clone)]
+pub struct Player {
+    pub eval: Arc<dyn Evaluator>,
+    /// 0 = greedy (static values only); otherwise [`search_turn`] with this
+    /// many expansions per turn.
+    pub expansions: u64,
+    pub params: Params,
+}
+
+impl Player {
+    fn turn(
+        &self,
+        real: &crate::game::MinionsState,
+        salt: u64,
+    ) -> anyhow::Result<crate::game::MinionsState> {
+        if self.expansions == 0 {
+            greedy_turn(real, self.eval.as_ref(), salt)
+        } else {
+            search_turn(
+                real,
+                self.eval.as_ref(),
+                &self.params,
+                self.expansions,
+                salt,
+            )
+        }
+    }
+}
+
+/// Match between two players. Game pairs share a start (a random opening, or
+/// the standard opening with a bid when `opening_max` is 0) with seats
+/// swapped; pairs run on `threads` threads. Returns A's score and the
+/// per-game results (A wins, B wins, draws).
+pub fn play_match(
+    a: &Player,
+    b: &Player,
     pairs: usize,
     opening_max: u32,
     opening_decay: f32,
     seed: u64,
+    threads: usize,
 ) -> anyhow::Result<(f64, [u32; 3])> {
     use playground_core::{Game, Outcome};
     use rand::Rng;
+    use std::sync::Mutex;
     let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
-    let mut wdl = [0u32; 3]; // A wins, B wins, draws
-    let mut score = 0f64;
-    let mut first_wins = 0u32;
-    let mut split_pairs = 0u32;
-    for _ in 0..pairs {
-        let start = if opening_max == 0 {
-            None
-        } else {
-            Some(crate::selfplay::random_opening(opening_max, opening_decay, &mut rng).0)
-        };
-        let salt: u64 = rng.gen();
-        let mut pair_a = 0u32;
-        for a_first in [true, false] {
-            let mut real = match &start {
-                Some(s) => s.clone(),
-                None => {
-                    let (ba, bb) = (bid(a, salt)?, bid(b, salt)?);
-                    // The two bids' average (rounded toward zero) is the handicap.
-                    crate::game::MinionsState::with_bid((ba + bb) / 2)
+    // Starts drawn up front so results do not depend on the thread count.
+    let starts: Vec<(Option<crate::game::MinionsState>, u64)> = (0..pairs)
+        .map(|_| {
+            let start = (opening_max != 0)
+                .then(|| crate::selfplay::random_opening(opening_max, opening_decay, &mut rng).0);
+            (start, rng.gen())
+        })
+        .collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    // Per pair: A's points from each seat order, and whether seat 1 won each.
+    let results: Mutex<Vec<(usize, [Outcome; 2], [bool; 2])>> = Mutex::new(Vec::new());
+    let err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    std::thread::scope(|sc| {
+        for _ in 0..threads.max(1) {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= pairs || err.lock().unwrap().is_some() {
+                    return;
                 }
-            };
-            let mut turns = 0;
-            while !crate::game::Minions::outcome(&real).is_terminal() && turns < 200 {
-                let a_moves = (real.side == 0) == a_first;
-                real = greedy_turn(&real, if a_moves { a } else { b }, salt ^ turns as u64)?;
-                turns += 1;
-            }
-            let res = crate::game::Minions::outcome(&real);
-            if res == Outcome::FirstWins {
-                first_wins += 1;
-            }
-            let a_seat_first = a_first;
-            let (aw, bw) = match res {
-                Outcome::FirstWins => (a_seat_first, !a_seat_first),
-                Outcome::SecondWins => (!a_seat_first, a_seat_first),
-                _ => (false, false),
-            };
-            if aw {
-                wdl[0] += 1;
-                pair_a += 1;
-                score += 1.0;
-            } else if bw {
-                wdl[1] += 1;
-            } else {
-                wdl[2] += 1;
-                score += 0.5;
+                let (start, salt) = &starts[i];
+                let game = |a_first: bool| -> anyhow::Result<(Outcome, bool)> {
+                    let mut real = match start {
+                        Some(s) => s.clone(),
+                        None => {
+                            let (ba, bb) =
+                                (bid(a.eval.as_ref(), *salt)?, bid(b.eval.as_ref(), *salt)?);
+                            // The two bids' average (rounded toward zero) is the handicap.
+                            crate::game::MinionsState::with_bid((ba + bb) / 2)
+                        }
+                    };
+                    let mut turns = 0;
+                    while !crate::game::Minions::outcome(&real).is_terminal() && turns < 200 {
+                        let a_moves = (real.side == 0) == a_first;
+                        let p = if a_moves { a } else { b };
+                        real = p.turn(&real, salt ^ turns as u64)?;
+                        turns += 1;
+                    }
+                    let res = crate::game::Minions::outcome(&real);
+                    Ok((res, a_first))
+                };
+                match game(true).and_then(|g1| Ok((g1, game(false)?))) {
+                    Ok(((r1, _), (r2, _))) => results.lock().unwrap().push((
+                        i,
+                        [r1, r2],
+                        [r1 == Outcome::FirstWins, r2 == Outcome::FirstWins],
+                    )),
+                    Err(e) => *err.lock().unwrap() = Some(e),
+                }
+            });
+        }
+    });
+    if let Some(e) = err.into_inner().unwrap() {
+        return Err(e);
+    }
+    let mut wdl = [0u32; 3];
+    let mut score = 0f64;
+    let (mut first_wins, mut split_pairs) = (0u32, 0u32);
+    for (_, res, first) in results.into_inner().unwrap() {
+        let mut pair_a = 0;
+        for (k, r) in res.iter().enumerate() {
+            let a_first = k == 0;
+            first_wins += u32::from(first[k]);
+            match r {
+                Outcome::FirstWins | Outcome::SecondWins => {
+                    if (*r == Outcome::FirstWins) == a_first {
+                        wdl[0] += 1;
+                        pair_a += 1;
+                        score += 1.0;
+                    } else {
+                        wdl[1] += 1;
+                    }
+                }
+                _ => {
+                    wdl[2] += 1;
+                    score += 0.5;
+                }
             }
         }
         if pair_a == 1 {

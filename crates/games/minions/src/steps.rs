@@ -288,8 +288,7 @@ impl StepState {
             if o.len() != 1 {
                 return o;
             }
-            let mut t = self.clone();
-            t.apply(o[0]);
+            let t = self.child(o[0]);
             if t.flipped != self.flipped || t.is_terminal() {
                 return o; // the forced step ends the turn: keep it as a child
             }
@@ -334,6 +333,41 @@ impl StepState {
         if let Some(i) = o.iter().position(|&x| x == v) {
             self.witness = w[i];
         }
+        self.apply_step(v);
+    }
+
+    /// The state after option `v`, settled. Unlike `clone` + `apply`, this does
+    /// not copy this state's option cache (up to 37 witnesses per clone).
+    pub fn child(&self, v: u8) -> StepState {
+        let witness = match &self.opts {
+            Some((o, w)) => o.iter().position(|&x| x == v).map(|i| w[i]),
+            None => {
+                let (o, w) = self.compute_options();
+                o.iter().position(|&x| x == v).map(|i| w[i])
+            }
+        };
+        let mut c = StepState {
+            base: self.base.clone(),
+            flipped: self.flipped,
+            spec: self.spec,
+            enemies: self.enemies.clone(),
+            friends: self.friends.clone(),
+            spawn_cells: self.spawn_cells.clone(),
+            stage: self.stage,
+            idx: self.idx,
+            claimed: self.claimed,
+            post: self.post.clone(),
+            salt: self.salt,
+            opts: None,
+            witness: witness.unwrap_or(self.witness),
+        };
+        c.apply_step(v);
+        c.settle();
+        c
+    }
+
+    /// Record decision `v` for the current variable (no witness bookkeeping).
+    fn apply_step(&mut self, v: u8) {
         match self.stage {
             Stage::Fates => {
                 let e = self.enemies[self.idx];
@@ -901,14 +935,8 @@ impl Flow {
 pub fn attack_part(base: &MinionsState, spec: &TurnSpec) -> Option<MinionsState> {
     let mut sp = *spec;
     sp.spawns = [0; NUM_CELLS];
-    let r = realize(base, &sp);
-    let mut s = base.clone();
-    for a in &r.actions {
-        s = Minions::apply(&s, a);
-        if *a == MinionsMove::EndPhase || s.winner != 0 {
-            break;
-        }
-    }
+    let r = crate::turn::realize_attack(base, &sp);
+    let s = r.next;
     if s.winner != 0 {
         return Some(s); // a won game needs nothing else declared to happen
     }

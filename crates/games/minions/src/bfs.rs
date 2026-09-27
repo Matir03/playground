@@ -151,7 +151,7 @@ impl Tree {
         }
     }
 
-    fn best_child(&self, n: u32) -> Option<u32> {
+    pub fn best_child(&self, n: u32) -> Option<u32> {
         let mut best = None;
         let mut bq = f32::NEG_INFINITY;
         for c in self.children(n) {
@@ -303,8 +303,7 @@ impl Tree {
             let first_view = views.len();
             let mut kids = Vec::with_capacity(opts.len());
             for v in opts {
-                let mut c = s.clone();
-                c.apply(v);
+                let c = s.child(v);
                 let flip = c.flipped != s.flipped;
                 if c.is_terminal() {
                     let tv = c.terminal_value();
@@ -651,6 +650,135 @@ impl Evaluator for OnnxEval {
                 .try_extract_tensor::<f32>()
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             out.extend_from_slice(&v[..part.len()]);
+        }
+        Ok(out)
+    }
+}
+
+/// Shapes a batched call may take; each gets its own TensorRT engine.
+pub const BATCH_SHAPES: [usize; 2] = [256, 1024];
+
+struct BatchReq {
+    x: Vec<f32>,
+    n: usize,
+    tx: std::sync::mpsc::SyncSender<anyhow::Result<Vec<f32>>>,
+}
+
+#[derive(Default)]
+struct BatchQueue {
+    q: std::sync::Mutex<std::collections::VecDeque<BatchReq>>,
+    cv: std::sync::Condvar,
+}
+
+/// [`OnnxEval`] behind a shared queue: worker threads featurize their own
+/// rows and enqueue them; `runners` GPU threads each drain as many queued
+/// requests as fit the largest shape and run them as one padded call. Fewer,
+/// larger calls than one call per worker expansion.
+pub struct BatchedOnnxEval {
+    queue: std::sync::Arc<BatchQueue>,
+    /// Calls and rows run, for the padding ratio.
+    pub calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub rows: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl BatchedOnnxEval {
+    pub fn load(
+        path: &std::path::Path,
+        ep: &str,
+        fp16: bool,
+        cache: &str,
+        runners: usize,
+    ) -> anyhow::Result<Self> {
+        let queue = std::sync::Arc::new(BatchQueue::default());
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let rows = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        for _ in 0..runners.max(1) {
+            let sess = crate::ort_net::build(path, ep, fp16, cache)?;
+            let (queue, calls, rows) = (queue.clone(), calls.clone(), rows.clone());
+            std::thread::spawn(move || batch_runner(sess, &queue, &calls, &rows));
+        }
+        Ok(Self { queue, calls, rows })
+    }
+}
+
+fn batch_runner(
+    mut sess: ort::session::Session,
+    queue: &BatchQueue,
+    calls: &std::sync::atomic::AtomicU64,
+    rows: &std::sync::atomic::AtomicU64,
+) {
+    use ort::value::Tensor;
+    let max = *BATCH_SHAPES.last().unwrap();
+    loop {
+        let mut batch = Vec::new();
+        let mut total = 0;
+        {
+            let mut q = queue.q.lock().unwrap();
+            while q.is_empty() {
+                q = queue.cv.wait(q).unwrap();
+            }
+            while let Some(r) = q.front() {
+                if total + r.n > max {
+                    break;
+                }
+                total += r.n;
+                batch.push(q.pop_front().unwrap());
+            }
+        }
+        let shape = *BATCH_SHAPES.iter().find(|&&s| s >= total).unwrap();
+        let mut x = vec![0f32; shape * DENSE_DIM];
+        let mut at = 0;
+        for r in &batch {
+            x[at..at + r.x.len()].copy_from_slice(&r.x);
+            at += r.x.len();
+        }
+        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        rows.fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
+        let res = (|| -> anyhow::Result<Vec<f32>> {
+            let t = Tensor::from_array((vec![shape as i64, DENSE_DIM as i64], x))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let outs = sess
+                .run(ort::inputs!["x" => t])
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let (_, v) = outs["v"]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(v[..total].to_vec())
+        })();
+        let mut at = 0;
+        for r in batch {
+            let part = match &res {
+                Ok(v) => Ok(v[at..at + r.n].to_vec()),
+                Err(e) => Err(anyhow::anyhow!("{e}")),
+            };
+            at += r.n;
+            let _ = r.tx.send(part);
+        }
+    }
+}
+
+impl Evaluator for BatchedOnnxEval {
+    fn eval(&self, views: &[View]) -> anyhow::Result<Vec<f32>> {
+        let max = *BATCH_SHAPES.last().unwrap();
+        let mut act = Vec::new();
+        let mut waits = Vec::new();
+        for part in views.chunks(max) {
+            let mut x = vec![0f32; part.len() * DENSE_DIM];
+            for (i, v) in part.iter().enumerate() {
+                dense_features(v, &mut x[i * DENSE_DIM..(i + 1) * DENSE_DIM], &mut act);
+            }
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            self.queue.q.lock().unwrap().push_back(BatchReq {
+                x,
+                n: part.len(),
+                tx,
+            });
+            self.queue.cv.notify_one();
+            waits.push(rx);
+        }
+        let mut out = Vec::with_capacity(views.len());
+        for rx in waits {
+            out.extend(rx.recv().map_err(|e| anyhow::anyhow!("{e}"))??);
         }
         Ok(out)
     }

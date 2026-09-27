@@ -814,6 +814,19 @@ pub fn realize(state: &MinionsState, spec: &TurnSpec) -> Realized {
 
 /// [`realize`] for a position whose mover is side 0.
 fn realize_canonical(state: &MinionsState, spec: &TurnSpec) -> Realized {
+    realize_canonical_to(state, spec, false)
+}
+
+/// The attack part of [`realize`] only, for a side-0 (canonical) state: `next`
+/// is the position right after the attack phase closes -- the spawn phase, or
+/// the next turn on turn 0, or a finished game. Spawns are not declared.
+pub fn realize_attack(state: &MinionsState, spec: &TurnSpec) -> Realized {
+    debug_assert_eq!(state.side, 0);
+    realize_canonical_to(state, spec, true)
+}
+
+#[inline]
+fn realize_canonical_to(state: &MinionsState, spec: &TurnSpec, stop_at_spawn: bool) -> Realized {
     debug_assert_eq!(state.side, 0);
     let me = state.side;
     let mut s = state.clone();
@@ -899,7 +912,7 @@ fn realize_canonical(state: &MinionsState, spec: &TurnSpec) -> Realized {
     }
 
     // ── S: spawns.
-    if s.winner == 0 && s.phase == PHASE_SPAWN {
+    if s.winner == 0 && s.phase == PHASE_SPAWN && !stop_at_spawn {
         fid.declared_spawns = spec
             .spawns
             .iter()
