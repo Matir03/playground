@@ -2,14 +2,14 @@
 
 Reads the `MSTP` record chunks written by `minions-engine steps-selfplay`
 (layout in crates/games/minions/src/stepsp.rs), trains a value net on the
-backed-up search values, and exports it to ONNX with input `x` [B, 849] --
-the 833 sparse 0/1 features (`plane * 49 + cell`) followed by 16 scalars,
+backed-up search values, and exports it to ONNX with input `x` [B, 1241] --
+the 1225 sparse 0/1 features (`plane * 49 + cell`) followed by 16 scalars,
 exactly `bfs::dense_features` -- and output `v` [B], a win probability.
 
 Architectures (`--arch`):
   mlp:<h1>,<h2>,...   dense MLP; the first layer is the NNUE accumulator
-  res:<ch>x<blocks>   conv ResNet over the 17 feature planes + 16 broadcast scalars
-  fcres:<ch>x<blocks> a fully connected first layer 849 -> 49*ch, then the ResNet
+  res:<ch>x<blocks>   conv ResNet over the 25 feature planes + 16 broadcast scalars
+  fcres:<ch>x<blocks> a fully connected first layer 1241 -> 49*ch, then the ResNet
 
 Example:
   python minions_steps_learner.py --data data/models/minions/steps/data/gen0 \
@@ -31,10 +31,14 @@ import torch.nn.functional as F
 
 N = 7
 CELLS = 49
-SPARSE_PLANES = 17
-SPARSE_DIM = SPARSE_PLANES * CELLS  # 833
+# 12 unit planes, graveyards, 4 decision markers, then (from 2026-09-27) the
+# fated enemies: killed, unsummoned, and a one-hot of the unit removed (6).
+# Mirrors steps.rs (SPARSE_PLANES, P_*). Records written before the fated
+# planes existed read unchanged: their indices are all below plane 17.
+SPARSE_PLANES = 25
+SPARSE_DIM = SPARSE_PLANES * CELLS  # 1225
 N_SCALARS = 16
-DENSE_DIM = SPARSE_DIM + N_SCALARS  # 849
+DENSE_DIM = SPARSE_DIM + N_SCALARS  # 1241
 MAX_ACTIVE = 96
 REC_BYTES = 272
 
@@ -157,7 +161,7 @@ class ResNet(nn.Module):
 
 
 class FcResNet(nn.Module):
-    """A fully connected first layer 849 -> 49*ch (the NNUE-style accumulator,
+    """A fully connected first layer 1241 -> 49*ch (the NNUE-style accumulator,
     reshaped onto the board), then a conv ResNet."""
 
     def __init__(self, ch, blocks):
@@ -262,6 +266,32 @@ def outcome_value(recs):
     return z, code != 0
 
 
+def load_compatible(net, path, dev):
+    """Load weights saved under an older input layout (fewer sparse planes):
+    input weights for the planes both layouts have and for the scalars are
+    copied to their new positions; weights for new planes start at zero, so
+    the loaded net computes exactly what the old one did."""
+    old = torch.load(path, map_location=dev)
+    cur = net.state_dict()
+    for k, w in old.items():
+        if k not in cur or cur[k].shape == w.shape:
+            continue
+        new = torch.zeros_like(cur[k])
+        if w.dim() == 4:  # conv stem: [out, planes + scalars, kh, kw]
+            p_old = w.shape[1] - N_SCALARS
+            new[:, :p_old] = w[:, :p_old]
+            new[:, SPARSE_PLANES:] = w[:, p_old:]
+        elif w.dim() == 2:  # dense first layer: [out, planes * 49 + scalars]
+            s_old = w.shape[1] - N_SCALARS
+            new[:, :s_old] = w[:, :s_old]
+            new[:, SPARSE_DIM:] = w[:, s_old:]
+        else:
+            raise ValueError(f"cannot adapt {k}: {tuple(w.shape)} -> {tuple(cur[k].shape)}")
+        print(f"adapted {k}: {tuple(w.shape)} -> {tuple(new.shape)} (new inputs zero)")
+        old[k] = new
+    net.load_state_dict(old)
+
+
 def evaluate(net, x, y, dev, bs=8192, z=None):
     net.eval()
     out = []
@@ -317,7 +347,7 @@ def main():
 
     if args.export_only:
         net = build(args.arch).to(dev)
-        net.load_state_dict(torch.load(args.init, map_location=dev))
+        load_compatible(net, args.init, dev)
         os.makedirs(args.out, exist_ok=True)
         export_onnx(net, args.out, dev)
         print(f"exported {args.init} to {args.out}")
@@ -350,7 +380,7 @@ def main():
 
     net = build(args.arch).to(dev)
     if args.init:
-        net.load_state_dict(torch.load(args.init, map_location=dev))
+        load_compatible(net, args.init, dev)
     n_params = sum(p.numel() for p in net.parameters())
     print(f"arch {args.arch}: {n_params} params")
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.wd)

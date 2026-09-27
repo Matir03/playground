@@ -77,7 +77,7 @@ pub struct StepState {
 }
 
 /// Features of a node, for the value nets. Sparse indices are `plane * 49 + cell`.
-pub const SPARSE_PLANES: usize = 17;
+pub const SPARSE_PLANES: usize = 25;
 pub const SPARSE_DIM: usize = SPARSE_PLANES * NUM_CELLS;
 pub const N_SCALARS: usize = 16;
 pub const MAX_ACTIVE: usize = 96;
@@ -89,6 +89,13 @@ pub const P_DEC_FRIEND: usize = 13;
 pub const P_DEC_ENEMY: usize = 14;
 pub const P_DEC_SPAWN: usize = 15;
 pub const P_NEXT: usize = 16;
+/// Hexes whose enemy is fated this turn: killed, unsummoned, and a one-hot of
+/// the unit that stood there (6 planes, by `Unit` index). The projected board
+/// has removed it, but which unit it was still constrains the rest of the
+/// turn (who attacked it, which hexes it blocked) and cannot be read back.
+pub const P_KILLED: usize = 17;
+pub const P_UNSUMMONED: usize = 18;
+pub const P_GONE_UNIT: usize = 19;
 
 /// What the value net sees: the turn so far *projected* onto the board (fated
 /// enemies removed, decided units at their destinations, spawns placed) plus
@@ -101,6 +108,11 @@ pub struct View {
     pub dec_spawn: Bb,
     pub next: Bb,
     pub stage: Stage,
+    /// Fated enemies (see [`P_KILLED`]): hexes killed, hexes unsummoned, and
+    /// per unit type the hexes such a unit was removed from.
+    pub killed: Bb,
+    pub unsummoned: Bb,
+    pub gone_units: [Bb; 6],
 }
 
 impl View {
@@ -122,9 +134,16 @@ impl View {
             (P_DEC_ENEMY, self.dec_enemy),
             (P_DEC_SPAWN, self.dec_spawn),
             (P_NEXT, self.next),
+            (P_KILLED, self.killed),
+            (P_UNSUMMONED, self.unsummoned),
         ] {
             for c in bitboard::cells(bb) {
                 active.push((p * NUM_CELLS + c as usize) as u16);
+            }
+        }
+        for (u, &bb) in self.gone_units.iter().enumerate() {
+            for c in bitboard::cells(bb) {
+                active.push(((P_GONE_UNIT + u) * NUM_CELLS + c as usize) as u16);
             }
         }
         debug_assert!(active.len() <= MAX_ACTIVE);
@@ -140,6 +159,26 @@ impl View {
         scalars[14] = (self.stage == Stage::Moves) as u8 as f32;
         scalars[15] = (self.stage == Stage::Spawns) as u8 as f32;
     }
+}
+
+/// Whether the friendly unit on `c` could attack some enemy in `enemies` this
+/// turn, optimistically: from any hex within its speed ignoring blockers
+/// (from `c` only if lumbering or unable to move).
+fn could_attack(base: &MinionsState, c: u8, enemies: Bb) -> bool {
+    let Some((_, u)) = base.piece_at(c) else {
+        return false;
+    };
+    if !base.can_attack_piece(c, u) {
+        return false;
+    }
+    let st = u.stats();
+    let from = if st.lumbering || !base.can_move_piece(c) {
+        bit(c)
+    } else {
+        bitboard::reachable(bit(c), st.speed, FULL)
+    };
+    bitboard::cells(enemies)
+        .any(|e| from & bitboard::reachable(bit(e), st.range, FULL) & !bit(e) != 0)
 }
 
 fn side_bb(s: &MinionsState, side: u8) -> Bb {
@@ -180,8 +219,25 @@ impl StepState {
         let mut rng = s.rng(1);
         s.enemies = bitboard::cells(side_bb(&s.base, 1)).collect();
         s.enemies.shuffle(&mut rng);
-        s.friends = bitboard::cells(side_bb(&s.base, 0)).collect();
-        s.friends.shuffle(&mut rng);
+        // The necromancer's fate first: "kill it" ends the game, and "spare
+        // it" keeps every later witness from winning its way past the rest.
+        if let Some(i) = s.enemies.iter().position(|&e| {
+            s.base
+                .piece_at(e)
+                .is_some_and(|(_, u)| u.stats().necromancer)
+        }) {
+            let n = s.enemies.remove(i);
+            s.enemies.insert(0, n);
+        }
+        // Units that could in theory attack some enemy this turn decide first
+        // (their moves constrain the rest most); shuffled within each group.
+        let enemies = side_bb(&s.base, 1);
+        let (mut threats, mut others): (Vec<u8>, Vec<u8>) =
+            bitboard::cells(side_bb(&s.base, 0)).partition(|&c| could_attack(&s.base, c, enemies));
+        threats.shuffle(&mut rng);
+        others.shuffle(&mut rng);
+        threats.extend(others);
+        s.friends = threats;
         s.settle();
         s
     }
@@ -279,6 +335,12 @@ impl StepState {
             2 => 0.0,
             _ => 0.5,
         }
+    }
+
+    /// Forget the cached options and their witnesses (a node whose children
+    /// exist no longer needs them).
+    pub fn drop_options(&mut self) {
+        self.opts = None;
     }
 
     /// Options for the current step, computed once and cached.
@@ -429,6 +491,24 @@ impl StepState {
                 let e = self.enemies[self.idx];
                 self.spec.targets[e as usize] = v;
                 self.idx += 1;
+                // Killing the necromancer wins on the spot, whatever else is
+                // declared: the option's witness realizes it, and the node is
+                // terminal.
+                if v != TARGET_STAY
+                    && self
+                        .base
+                        .piece_at(e)
+                        .is_some_and(|(_, u)| u.stats().necromancer)
+                {
+                    if let Some(post) = attack_part(&self.base, &self.witness) {
+                        if post.winner != 0 {
+                            let real = if self.flipped { post.rotated() } else { post };
+                            let done = self.witness;
+                            *self = StepState::begin(&real, self.salt);
+                            self.done = done;
+                        }
+                    }
+                }
             }
             Stage::Moves => {
                 let c = self.friends[self.idx];
@@ -511,28 +591,47 @@ impl StepState {
     fn fate_options(&self) -> (Vec<u8>, Vec<TurnSpec>) {
         let e = self.enemies[self.idx];
         let (_, t) = self.base.piece_at(e).expect("enemy");
-        // Staying is always completable: the current witness leaves every
-        // undecided enemy alone.
-        let mut stay = self.witness;
-        stay.targets[e as usize] = TARGET_STAY;
-        let (mut out, mut ws) = (vec![TARGET_STAY], vec![stay]);
-        for v in [TARGET_KILL, TARGET_UNSUMMON] {
-            if v == TARGET_UNSUMMON && t.stats().persistent {
+        // The current witness's own fate for `e` is always completable (the
+        // witness itself). It is usually "stay", but an exact-search witness
+        // may kill an undecided enemy to open a path.
+        let own = self.witness.targets[e as usize];
+        let (mut out, mut ws) = (vec![own], vec![self.witness]);
+        for v in [TARGET_STAY, TARGET_KILL, TARGET_UNSUMMON] {
+            if v == own || v == TARGET_UNSUMMON && t.stats().persistent {
                 continue;
             }
             let mut spec = self.spec;
             spec.targets[e as usize] = v;
             let mut cand = self.witness;
             cand.targets[e as usize] = v;
-            if attack_part(&self.base, &cand).is_some() {
+            if known_realizable(&self.base, &cand) {
                 out.push(v);
                 ws.push(cand);
                 continue;
             }
-            if !relaxed_feasible(&self.base, &spec, &[]) {
-                continue;
+            // With the unfated enemies treated as removable the relaxation is
+            // a necessary condition; treating them as staying (as the
+            // constructor does) is not -- killing one can open a path -- so
+            // that only gates the cheap constructor, and the exact search
+            // decides.
+            let open = self.enemies[self.idx + 1..]
+                .iter()
+                .fold(0, |b, &x| b | bit(x));
+            if !relaxed_feasible(&self.base, &spec, &[], open) {
+                continue; // necessary even with the unfated enemies removable
             }
-            if let Some(w) = build_witness(&self.base, &spec, &[]) {
+            if relaxed_feasible(&self.base, &spec, &[], 0) {
+                if let Some(w) = build_witness(&self.base, &spec, &[]) {
+                    out.push(v);
+                    ws.push(w);
+                    continue;
+                }
+            }
+            let fated = self.enemies[..=self.idx].iter().fold(0, |b, &x| b | bit(x));
+            let t0 = std::time::Instant::now();
+            let r = exact_realize(&self.base, &spec, 0, fated, EXACT_BUDGET);
+            exact_site(0, t0);
+            if let Exact::Found(w, _) = r {
                 out.push(v);
                 ws.push(w);
             }
@@ -613,20 +712,35 @@ impl StepState {
             // The current witness, with this unit's move swapped in.
             let mut cand = self.witness;
             cand.moves[c as usize] = k;
-            if attack_part(&self.base, &cand).is_some() {
+            if known_realizable(&self.base, &cand) {
                 out.push(k);
                 ws.push(cand);
                 continue;
             }
-            if !self.movers_completable(&spec, self.claimed | bit(d), c, k) {
-                continue;
-            }
             let mut dec = decided.clone();
             dec.push(c);
-            if !relaxed_feasible(&self.base, &spec, &dec) {
+            // A necessary condition here: every enemy is fated by now, so
+            // the relaxation's "undecided enemies stay" is vacuous.
+            // (`witness_drop_rate` checks it.)
+            if !relaxed_feasible(&self.base, &spec, &dec, 0) {
                 continue;
             }
-            if let Some(w) = build_witness(&self.base, &spec, &dec) {
+            // Not necessary (it routes evacuating units on vertex-disjoint
+            // paths, but friends pass through friends), so it only gates the
+            // cheap constructor; the exact search decides.
+            if self.movers_completable(&spec, self.claimed | bit(d), c, k) {
+                if let Some(w) = build_witness(&self.base, &spec, &dec) {
+                    out.push(k);
+                    ws.push(w);
+                    continue;
+                }
+            }
+            let decided_bb = dec.iter().fold(0, |b, &x| b | bit(x));
+            let fated = side_bb(&self.base, 1);
+            let t0 = std::time::Instant::now();
+            let r = exact_realize(&self.base, &spec, decided_bb, fated, EXACT_BUDGET);
+            exact_site(1, t0);
+            if let Exact::Found(w, _) = r {
                 out.push(k);
                 ws.push(w);
             }
@@ -805,7 +919,7 @@ impl StepState {
             }
             let mut dec: Vec<u8> = self.friends[..self.idx].to_vec();
             dec.push(c);
-            if !relaxed_feasible(&self.base, &spec, &dec) {
+            if !relaxed_feasible(&self.base, &spec, &dec, 0) {
                 r[2] += 1;
                 continue;
             }
@@ -859,7 +973,31 @@ impl StepState {
             dec_spawn: 0,
             next: 0,
             stage: self.stage,
+            killed: 0,
+            unsummoned: 0,
+            gone_units: [0; 6],
         };
+        // Fated enemies, from the start-of-turn position (the spawn stage's
+        // board has already removed them).
+        let n_fated = match self.stage {
+            Stage::Terminal => 0,
+            Stage::Fates => self.idx,
+            Stage::Moves | Stage::Spawns => self.enemies.len(),
+        };
+        for &e in &self.enemies[..n_fated] {
+            let t = self.spec.targets[e as usize];
+            if t == TARGET_STAY {
+                continue;
+            }
+            if let Some((_, unit)) = self.base.piece_at(e) {
+                v.gone_units[unit as usize] |= bit(e);
+            }
+            if t == TARGET_UNSUMMON {
+                v.unsummoned |= bit(e);
+            } else {
+                v.killed |= bit(e);
+            }
+        }
         match self.stage {
             Stage::Terminal => {}
             Stage::Fates | Stage::Moves => {
@@ -988,7 +1126,89 @@ impl Flow {
 /// the position after the attack phase closes — the spawn-phase position, or
 /// the next turn on turn 0, or a finished game — or `None` if any declared
 /// move or kill did not happen.
+/// [`attack_part_fast`], then the exact search when the fast realizers miss:
+/// complete up to [`EXACT_BUDGET`]. Every realization the step tree commits
+/// to goes through here.
 pub fn attack_part(base: &MinionsState, spec: &TurnSpec) -> Option<MinionsState> {
+    if let Some(s) = attack_part_fast(base, spec) {
+        return Some(s);
+    }
+    let path = exact_complete(base, spec)?;
+    let mut s = base.clone();
+    for mv in &path {
+        s = Minions::apply(&s, mv);
+    }
+    Some(s)
+}
+
+/// Key of a complete declaration at `base`: the position, every friend's
+/// destination and every enemy's fate (spawns ignored).
+fn exact_key(base: &MinionsState, spec: &TurnSpec) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    Minions::encode_state(base).hash(&mut h);
+    for c in 0..NUM_CELLS as u8 {
+        if base.piece_at(c).is_some_and(|(sd, _)| sd == 0) {
+            let k = spec.moves[c as usize];
+            let d = if k == NO_MOVE || k == 0 {
+                c
+            } else {
+                MOVE_DEST[c as usize][k as usize]
+            };
+            d.hash(&mut h);
+        }
+    }
+    spec.targets.hash(&mut h);
+    h.finish()
+}
+
+/// Attack-phase paths of complete declarations the exact search found,
+/// so committing a declaration never re-runs a search that could run out of
+/// budget where the one that offered it did not.
+static EXACT_CACHE: std::sync::Mutex<Option<std::collections::HashMap<u64, Vec<MinionsMove>>>> =
+    std::sync::Mutex::new(None);
+
+fn exact_cache_get(base: &MinionsState, spec: &TurnSpec) -> Option<Vec<MinionsMove>> {
+    let k = exact_key(base, spec);
+    EXACT_CACHE.lock().unwrap().as_ref()?.get(&k).cloned()
+}
+
+fn exact_cache_put(base: &MinionsState, spec: &TurnSpec, path: &[MinionsMove]) {
+    let k = exact_key(base, spec);
+    let mut g = EXACT_CACHE.lock().unwrap();
+    let m = g.get_or_insert_with(Default::default);
+    if m.len() >= 200_000 {
+        m.clear();
+    }
+    m.insert(k, path.to_vec());
+}
+
+/// The attack-phase actions realizing a complete declaration by the exact
+/// search (cached).
+fn exact_complete(base: &MinionsState, spec: &TurnSpec) -> Option<Vec<MinionsMove>> {
+    if let Some(p) = exact_cache_get(base, spec) {
+        return Some(p);
+    }
+    let mut sp = *spec;
+    sp.spawns = [0; NUM_CELLS];
+    let t0 = std::time::Instant::now();
+    let r = exact_realize(base, &sp, side_bb(base, 0), side_bb(base, 1), EXACT_BUDGET);
+    exact_site(2, t0);
+    match r {
+        Exact::Found(_, path) => Some(path),
+        _ => None,
+    }
+}
+
+/// The fast realizers, then the exact-path cache: never searches.
+fn known_realizable(base: &MinionsState, spec: &TurnSpec) -> bool {
+    attack_part_fast(base, spec).is_some() || exact_cache_get(base, spec).is_some()
+}
+
+/// The two fast realizers: all kills planned at once, then one kill at a
+/// time (six rotations of which target goes first). Incomplete: a miss is not
+/// a proof. Cheap enough for the witness swap checks.
+pub fn attack_part_fast(base: &MinionsState, spec: &TurnSpec) -> Option<MinionsState> {
     let mut sp = *spec;
     sp.spawns = [0; NUM_CELLS];
     let r = crate::turn::realize_attack(base, &sp);
@@ -997,7 +1217,10 @@ pub fn attack_part(base: &MinionsState, spec: &TurnSpec) -> Option<MinionsState>
         return Some(s); // a won game needs nothing else declared to happen
     }
     let f = r.fidelity;
-    if f.done_moves == f.declared_moves && f.done_kills == f.declared_kills {
+    if f.done_moves == f.declared_moves
+        && f.done_kills == f.declared_kills
+        && r.spec.targets == sp.targets
+    {
         return Some(s);
     }
     // The realizer plans every kill at once; some turns need one kill to open
@@ -1031,6 +1254,14 @@ pub fn turn_actions(real: &MinionsState, done: &TurnSpec) -> anyhow::Result<Vec<
                 let mut log = Vec::new();
                 realize_sequential(&base, &sp, first, Some(&mut log)).map(|s| (log, s))
             })
+            .or_else(|| {
+                let path = exact_complete(&base, &sp)?;
+                let mut s = base.clone();
+                for mv in &path {
+                    s = Minions::apply(&s, mv);
+                }
+                Some((path, s))
+            })
             .ok_or_else(|| anyhow::anyhow!("the declared attack part does not realize"))?
     };
     if s.winner == 0 && s.phase == PHASE_SPAWN {
@@ -1056,6 +1287,385 @@ pub fn turn_actions(real: &MinionsState, done: &TurnSpec) -> anyhow::Result<Vec<
         acts.iter_mut().for_each(|m| *m = m.rotated());
     }
     Ok(acts)
+}
+
+/// Exact-search calls and nanoseconds by call site: fates options, moves
+/// options, complete declarations (last unit / commit).
+pub static EXACT_SITES: [[std::sync::atomic::AtomicU64; 2]; 3] = [
+    [
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+    ],
+    [
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+    ],
+    [
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+    ],
+];
+
+fn exact_site(site: usize, t0: std::time::Instant) {
+    use std::sync::atomic::Ordering::Relaxed;
+    EXACT_SITES[site][0].fetch_add(1, Relaxed);
+    EXACT_SITES[site][1].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+}
+
+/// Search nodes [`exact_realize`] may visit before giving up.
+pub const EXACT_BUDGET: u32 = 20_000;
+
+/// Outcome of [`exact_realize`].
+pub enum Exact {
+    /// A completed declaration and the attack-phase actions that realize it
+    /// (ending with the `EndPhase` into the spawn phase unless the game was
+    /// won on the way).
+    Found(TurnSpec, Vec<MinionsMove>),
+    /// No sequence of legal actions realizes the decisions.
+    Impossible,
+    /// The budget ran out first.
+    Unknown,
+}
+
+/// Counters for how often the exact search runs and what it concludes.
+pub static EXACT_STATS: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0), // found
+    std::sync::atomic::AtomicU64::new(0), // impossible
+    std::sync::atomic::AtomicU64::new(0), // unknown (budget)
+    std::sync::atomic::AtomicU64::new(0), // nanoseconds spent
+];
+
+/// Exhaustive search over the attack phase's legal atomic actions for a
+/// sequence that realizes the decisions in `spec`: every friend in `decided`
+/// ends on its declared hex, every enemy in `fated` meets its declared fate
+/// (spared ones untouched), and no enemy is left damaged but alive (a
+/// declaration has no "damage only"). Undecided friends may do anything that
+/// can matter -- move to where they can attack a remaining target, or vacate a
+/// hex that a decided unit or an attacker may need -- and undecided enemies
+/// may be killed or unsummoned (a kill that opens a path). Game rules come
+/// from `Minions::legal_moves`, so this is complete up to the budget: unlike
+/// the fast realizers and the witness constructor it never misses an
+/// ordering, an attacker choice or a blocker that has to move.
+pub fn exact_realize(
+    base: &MinionsState,
+    spec: &TurnSpec,
+    decided: Bb,
+    fated: Bb,
+    budget: u32,
+) -> Exact {
+    use std::collections::HashSet;
+    use std::hash::{Hash, Hasher};
+    struct Ctx<'a> {
+        spec: &'a TurnSpec,
+        decided: Bb,
+        fated: Bb,
+        budget: u32,
+        seen: HashSet<u64>,
+        path: Vec<MinionsMove>,
+        found: Option<TurnSpec>,
+        out_of_budget: bool,
+    }
+    // Per cell: the origin of the friendly unit standing there (NO_CELL if
+    // none), and per enemy origin how it left the board (0 = present).
+    #[derive(Clone)]
+    struct St {
+        s: MinionsState,
+        origin_at: [u8; NUM_CELLS],
+        gone: [u8; NUM_CELLS],
+    }
+    fn dest_of(spec: &TurnSpec, o: u8) -> u8 {
+        let k = spec.moves[o as usize];
+        if k == NO_MOVE || k == 0 {
+            o
+        } else {
+            MOVE_DEST[o as usize][k as usize]
+        }
+    }
+    // Enemies that still have to go: fated kill/unsummon, still present.
+    fn remaining(c: &Ctx, st: &St) -> Bb {
+        let mut b = 0;
+        for e in bitboard::cells(c.fated) {
+            if c.spec.targets[e as usize] != TARGET_STAY && st.gone[e as usize] == 0 {
+                b |= bit(e);
+            }
+        }
+        b
+    }
+    fn goal(c: &Ctx, st: &St) -> bool {
+        if st.s.winner != 0 {
+            return st.s.winner == 1;
+        }
+        for o in bitboard::cells(c.decided) {
+            if st.origin_at[dest_of(c.spec, o) as usize] != o {
+                return false;
+            }
+        }
+        for e in 0..NUM_CELLS as u8 {
+            let fate = c.spec.targets[e as usize];
+            if has(c.fated, e) && st.gone[e as usize] != fate {
+                return false;
+            }
+            // Damaged but alive: a declaration cannot say that.
+            if st.gone[e as usize] == 0
+                && st.s.piece_at(e).is_some_and(|(sd, _)| sd == 1)
+                && st.s.damage_on(e) > 0
+            {
+                return false;
+            }
+        }
+        true
+    }
+    // Cheap dead-end test: a remaining target nobody can still reach -- unless
+    // the enemy necromancer can still be hit, since winning makes every other
+    // declared fate moot (the game ends mid-turn).
+    fn hopeless(c: &Ctx, st: &St, rem: Bb) -> bool {
+        let spared: Bb = bitboard::cells(c.fated)
+            .filter(|&e| c.spec.targets[e as usize] == TARGET_STAY)
+            .fold(0, |b, e| b | bit(e));
+        let necro_open = (0..NUM_CELLS as u8).any(|e| {
+            !has(spared, e)
+                && st
+                    .s
+                    .piece_at(e)
+                    .is_some_and(|(sd, u)| sd == 1 && u.stats().necromancer)
+                && hittable(c, st, e, spared)
+        });
+        if necro_open {
+            return false;
+        }
+        bitboard::cells(rem).any(|t| !hittable(c, st, t, spared))
+    }
+    // Whether some friend can still end its turn in range of `t` and attack.
+    fn hittable(c: &Ctx, st: &St, t: u8, spared: Bb) -> bool {
+        let s = &st.s;
+        {
+            let mut ok = false;
+            for a in 0..NUM_CELLS as u8 {
+                let Some((sd, u)) = s.piece_at(a) else {
+                    continue;
+                };
+                if sd != 0 || !s.can_attack_piece(a, u) {
+                    continue;
+                }
+                let st_ = u.stats();
+                let ring = bitboard::reachable(bit(t), st_.range, FULL) & !bit(t);
+                let o = st.origin_at[a as usize];
+                let ends = if has(c.decided, o) {
+                    let d = dest_of(c.spec, o);
+                    if d == a || !s.can_move_piece(a) {
+                        bit(a)
+                    } else if st_.lumbering {
+                        0
+                    } else {
+                        bit(d)
+                    }
+                } else if s.can_move_piece(a) && !st_.lumbering {
+                    let pass = if st_.flying { FULL } else { FULL & !spared };
+                    bitboard::reachable(bit(a), st_.speed, pass)
+                } else {
+                    bit(a)
+                };
+                if ends & ring != 0 {
+                    ok = true;
+                    break;
+                }
+            }
+            ok
+        }
+    }
+    fn dfs(c: &mut Ctx, st: &St) -> bool {
+        if goal(c, st) {
+            // The completed declaration: where every friend ended, what
+            // happened to every enemy.
+            let mut w = *c.spec;
+            w.spawns = [0; NUM_CELLS];
+            for cell in 0..NUM_CELLS as u8 {
+                let o = st.origin_at[cell as usize];
+                if o != NO_CELL {
+                    w.moves[o as usize] = if o == cell {
+                        0
+                    } else {
+                        crate::turn::offset_index(o, cell).unwrap_or(0)
+                    };
+                }
+            }
+            for e in 0..NUM_CELLS as u8 {
+                if !has(c.fated, e) {
+                    w.targets[e as usize] = st.gone[e as usize];
+                }
+            }
+            c.found = Some(w);
+            return true;
+        }
+        if st.s.winner != 0 {
+            return false;
+        }
+        if c.budget == 0 {
+            c.out_of_budget = true;
+            return false;
+        }
+        c.budget -= 1;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        Minions::encode_state(&st.s).hash(&mut h);
+        st.origin_at.hash(&mut h);
+        st.gone.hash(&mut h);
+        if !c.seen.insert(h.finish()) {
+            return false;
+        }
+        let rem = remaining(c, st);
+        if hopeless(c, st, rem) {
+            return false;
+        }
+        // Hexes someone may still need: decided units' destinations not yet
+        // reached, and every hex from which a remaining (or unfated) target
+        // can be hit.
+        let mut want: Bb = 0;
+        for o in bitboard::cells(c.decided) {
+            let d = dest_of(c.spec, o);
+            if st.origin_at[d as usize] != o {
+                want |= bit(d);
+            }
+        }
+        let open_targets: Bb = (0..NUM_CELLS as u8)
+            .filter(|&e| {
+                st.gone[e as usize] == 0
+                    && st.s.piece_at(e).is_some_and(|(sd, _)| sd == 1)
+                    && !(has(c.fated, e) && c.spec.targets[e as usize] == TARGET_STAY)
+            })
+            .fold(0, |b, e| b | bit(e));
+        let rmax = (0..6u8)
+            .filter_map(Unit::from_index)
+            .map(|u| u.stats().range)
+            .max()
+            .unwrap_or(1);
+        let mut rings: Bb = 0;
+        for t in bitboard::cells(open_targets) {
+            rings |= bitboard::reachable(bit(t), rmax, FULL) & !bit(t);
+        }
+        let mut attacks = Vec::new();
+        let mut moves = Vec::new();
+        for mv in Minions::legal_moves(&st.s) {
+            match mv {
+                MinionsMove::Attack { from, to } => {
+                    if !has(open_targets, to) {
+                        continue;
+                    }
+                    let (_, au) = st.s.piece_at(from).expect("attacker");
+                    let (_, tu) = st.s.piece_at(to).expect("target");
+                    let unsummons =
+                        matches!(au.stats().attack, Attack::Unsummon) && !tu.stats().persistent;
+                    if has(c.fated, to) {
+                        let fate = c.spec.targets[to as usize];
+                        if (fate == TARGET_UNSUMMON) != unsummons {
+                            continue;
+                        }
+                    }
+                    attacks.push(mv);
+                }
+                MinionsMove::Move { from, to } => {
+                    let o = st.origin_at[from as usize];
+                    if has(c.decided, o) {
+                        if dest_of(c.spec, o) == to && to != o {
+                            moves.push((0u8, mv));
+                        }
+                        continue;
+                    }
+                    let (_, u) = st.s.piece_at(from).expect("mover");
+                    let range = u.stats().range;
+                    let can_hit = bitboard::cells(open_targets)
+                        .any(|t| crate::map::dist(to, t) <= range as u32 && to != t);
+                    if can_hit {
+                        moves.push((1, mv));
+                    } else if has(want | rings, from) {
+                        // Vacate, preferably to a hex nobody wants.
+                        moves.push((if has(want | rings, to) { 3 } else { 2 }, mv));
+                    }
+                }
+                _ => {}
+            }
+        }
+        moves.sort_by_key(|&(p, _)| p);
+        let actions = attacks.into_iter().chain(moves.into_iter().map(|(_, m)| m));
+        for mv in actions.collect::<Vec<_>>() {
+            let mut nx = st.clone();
+            nx.s = Minions::apply(&st.s, &mv);
+            match mv {
+                MinionsMove::Move { from, to } => {
+                    nx.origin_at[to as usize] = st.origin_at[from as usize];
+                    nx.origin_at[from as usize] = NO_CELL;
+                }
+                MinionsMove::Attack { from, to } => {
+                    if nx.s.piece_at(to).is_none() {
+                        let (_, au) = st.s.piece_at(from).expect("attacker");
+                        let (_, tu) = st.s.piece_at(to).expect("target");
+                        let unsummoned =
+                            matches!(au.stats().attack, Attack::Unsummon) && !tu.stats().persistent;
+                        nx.gone[to as usize] = if unsummoned {
+                            TARGET_UNSUMMON
+                        } else {
+                            TARGET_KILL
+                        };
+                    }
+                }
+                _ => {}
+            }
+            c.path.push(mv);
+            if dfs(c, &nx) {
+                return true;
+            }
+            c.path.pop();
+            if c.budget == 0 {
+                c.out_of_budget = true;
+                return false;
+            }
+        }
+        false
+    }
+    let mut origin_at = [NO_CELL; NUM_CELLS];
+    for cell in 0..NUM_CELLS as u8 {
+        if base.piece_at(cell).is_some_and(|(sd, _)| sd == 0) {
+            origin_at[cell as usize] = cell;
+        }
+    }
+    let root = St {
+        s: base.clone(),
+        origin_at,
+        gone: [0; NUM_CELLS],
+    };
+    let mut c = Ctx {
+        spec,
+        decided,
+        fated,
+        budget,
+        seen: HashSet::new(),
+        path: Vec::new(),
+        found: None,
+        out_of_budget: false,
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    let t0 = std::time::Instant::now();
+    let ok = dfs(&mut c, &root);
+    EXACT_STATS[3].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+    if ok {
+        let mut path = c.path;
+        let mut s = base.clone();
+        for mv in &path {
+            s = Minions::apply(&s, mv);
+        }
+        if s.winner == 0 {
+            path.push(MinionsMove::EndPhase);
+        }
+        EXACT_STATS[0].fetch_add(1, Relaxed);
+        let w = c.found.expect("found");
+        exact_cache_put(base, &w, &path);
+        Exact::Found(w, path)
+    } else if c.out_of_budget {
+        EXACT_STATS[2].fetch_add(1, Relaxed);
+        Exact::Unknown
+    } else {
+        EXACT_STATS[1].fetch_add(1, Relaxed);
+        Exact::Impossible
+    }
 }
 
 /// Moves whenever possible, then a single declared kill (targets tried from
@@ -1202,16 +1812,19 @@ fn realize_sequential(
 /// Friendly units that can still attack, with the hexes each could end on:
 /// a decided unit its destination (none if lumbering and moved); an undecided
 /// one its origin (unless claimed) plus reachable hexes not in `block`.
+/// Enemies in `open` (not yet fated) may be removed, so they block nothing.
 fn attackers(
     base: &MinionsState,
     spec: &TurnSpec,
     decided: &[u8],
     block: Bb,
+    open: Bb,
 ) -> Vec<(u8, Unit, Bb)> {
     let mut staying_enemies: Bb = 0;
     for e in 0..NUM_CELLS as u8 {
         if base.piece_at(e).is_some_and(|(sd, _)| sd != 0)
             && spec.targets[e as usize] == TARGET_STAY
+            && !has(open, e)
         {
             staying_enemies |= bit(e);
         }
@@ -1325,8 +1938,11 @@ fn kill_targets(
 
 /// A cheap necessary condition for the declared kills: reach on real end
 /// hexes, the deficiency bound, and a positional search (budget-limited).
-fn relaxed_feasible(base: &MinionsState, spec: &TurnSpec, decided: &[u8]) -> bool {
-    let atk = attackers(base, spec, decided, 0);
+/// A necessary condition for `spec`'s declared kills and decided moves when
+/// the enemies in `open` are still unfated (they may be killed to open paths
+/// and hexes, so they are treated as removable).
+fn relaxed_feasible(base: &MinionsState, spec: &TurnSpec, decided: &[u8], open: Bb) -> bool {
+    let atk = attackers(base, spec, decided, 0, open);
     let Some(targets) = kill_targets(base, spec, &atk) else {
         return false;
     };
@@ -1380,7 +1996,7 @@ fn build_witness(base: &MinionsState, spec: &TurnSpec, decided: &[u8]) -> Option
     }
     // Undecided attackers may not step onto another undecided unit's origin
     // (it stays by default) -- conservative, but keeps witnesses simple.
-    let atk = attackers(base, spec, decided, und_origins);
+    let atk = attackers(base, spec, decided, und_origins, 0);
     let targets = kill_targets(base, spec, &atk)?;
     let mut found = None;
     let mut attempts = 0u32;
@@ -1435,7 +2051,7 @@ fn build_witness(base: &MinionsState, spec: &TurnSpec, decided: &[u8]) -> Option
             taken |= bit(h);
             moved |= bit(u);
         }
-        if attack_part(base, &w).is_some() {
+        if attack_part_fast(base, &w).is_some() {
             found = Some(w);
             true
         } else {
@@ -1574,6 +2190,181 @@ mod tests {
     /// Walk random step paths through whole games. Every completed path must
     /// be a legal turn that hands over the move, and dead ends (a step with no
     /// option) must be rare; the search prunes them. Restarts the turn on one.
+    /// How many options the witness system drops that the exact search can
+    /// realize (run with --ignored --nocapture; a measurement, not a check).
+    #[test]
+    #[ignore]
+    fn witness_drop_rate() {
+        use rand::Rng;
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(5);
+        let (mut steps, mut offered, mut rejected, mut dropped, mut unknown, mut false_offer) =
+            (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut dropped_stage = [0usize; 2];
+        let t0 = std::time::Instant::now();
+        let mut exact_ns = 0u128;
+        let games: u64 = std::env::var("DROP_GAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        for g in 0..games {
+            let (real, _) = crate::selfplay::random_opening(16, 1.0884, &mut rng);
+            let mut s = StepState::begin(&real, g);
+            let mut turns = 0;
+            while !s.is_terminal() && turns < 30 {
+                let opts = s.children();
+                assert!(!opts.is_empty());
+                if matches!(s.stage, Stage::Fates | Stage::Moves) {
+                    steps += 1;
+                    let (cands, fated, decided): (Vec<u8>, Bb, Bb) = match s.stage {
+                        Stage::Fates => {
+                            let e = s.enemies[s.idx];
+                            let fated = s.enemies[..=s.idx].iter().fold(0, |b, &x| b | bit(x));
+                            let _ = e;
+                            (vec![TARGET_STAY, TARGET_KILL, TARGET_UNSUMMON], fated, 0)
+                        }
+                        _ => {
+                            let c = s.friends[s.idx];
+                            let fated = s.enemies.iter().fold(0, |b, &x| b | bit(x));
+                            let decided = s.friends[..=s.idx].iter().fold(0, |b, &x| b | bit(x));
+                            let ks = (0..N_OFFSETS as u8)
+                                .filter(|&k| MOVE_DEST[c as usize][k as usize] != NO_CELL)
+                                .collect();
+                            (ks, fated, decided)
+                        }
+                    };
+                    for v in cands {
+                        let mut spec = s.spec;
+                        match s.stage {
+                            Stage::Fates => {
+                                let e = s.enemies[s.idx];
+                                if v == TARGET_UNSUMMON
+                                    && s.base
+                                        .piece_at(e)
+                                        .is_some_and(|(_, u)| u.stats().persistent)
+                                {
+                                    continue;
+                                }
+                                spec.targets[e as usize] = v;
+                            }
+                            _ => spec.moves[s.friends[s.idx] as usize] = v,
+                        }
+                        let te = std::time::Instant::now();
+                        let r = exact_realize(&s.base, &spec, decided, fated, EXACT_BUDGET);
+                        exact_ns += te.elapsed().as_nanos();
+                        let is_offered = opts.contains(&v);
+                        match r {
+                            Exact::Found(..) => {
+                                if is_offered {
+                                    offered += 1;
+                                } else {
+                                    dropped += 1;
+                                    dropped_stage[usize::from(s.stage == Stage::Moves)] += 1;
+                                    if s.stage == Stage::Moves && dropped <= 8 {
+                                        let c = s.friends[s.idx];
+                                        let d = MOVE_DEST[c as usize][v as usize];
+                                        let mut stay_e: Bb = 0;
+                                        for e in bitboard::cells(side_bb(&s.base, 1)) {
+                                            if s.spec.targets[e as usize] == TARGET_STAY {
+                                                stay_e |= bit(e);
+                                            }
+                                        }
+                                        let stayers = s.friends[..s.idx]
+                                            .iter()
+                                            .filter(|&&f| s.spec.moves[f as usize] == 0)
+                                            .fold(0, |b, &f| b | bit(f));
+                                        let mut sp2 = s.spec;
+                                        sp2.moves[c as usize] = v;
+                                        let dec: Vec<u8> = s.friends[..=s.idx].to_vec();
+                                        eprintln!(
+                                            "gates: movers_completable {} relaxed_feasible {}",
+                                            s.movers_completable(&sp2, s.claimed | bit(d), c, v),
+                                            relaxed_feasible(&s.base, &sp2, &dec, 0)
+                                        );
+                                        eprintln!(
+                                            "DROP move c {c} k {v} d {d}: claimed {} stay_enemy {} stayer {} cycle {} can_move {} last {} witness_k {}",
+                                            has(s.claimed, d), has(stay_e, d), has(stayers, d),
+                                            v != 0 && s.closes_cycle(c, d), s.base.can_move_piece(c),
+                                            s.idx + 1 == s.friends.len(), s.witness.moves[c as usize],
+                                        );
+                                    }
+                                }
+                            }
+                            Exact::Impossible => {
+                                if is_offered {
+                                    false_offer += 1;
+                                    if false_offer <= 6 {
+                                        let (o, ws) = match s.stage {
+                                            Stage::Fates => s.fate_options(),
+                                            _ => s.move_options(),
+                                        };
+                                        let w = ws[o.iter().position(|&x| x == v).unwrap()];
+                                        let mut sp = w;
+                                        sp.spawns = [0; NUM_CELLS];
+                                        let r = crate::turn::realize_attack(&s.base, &sp);
+                                        let full = exact_realize(
+                                            &s.base,
+                                            &w,
+                                            side_bb(&s.base, 0),
+                                            side_bb(&s.base, 1),
+                                            1_000_000,
+                                        );
+                                        let mut diffs = Vec::new();
+                                        for c in 0..NUM_CELLS {
+                                            if w.targets[c] != r.spec.targets[c] {
+                                                diffs.push(format!(
+                                                    "target {c}: decl {} got {}",
+                                                    w.targets[c], r.spec.targets[c]
+                                                ));
+                                            }
+                                            if s.base
+                                                .piece_at(c as u8)
+                                                .is_some_and(|(sd, _)| sd == 0)
+                                                && w.moves[c] != r.spec.moves[c]
+                                                && !(w.moves[c] == NO_MOVE && r.spec.moves[c] == 0)
+                                            {
+                                                diffs.push(format!(
+                                                    "move {c}: decl {} got {}",
+                                                    w.moves[c], r.spec.moves[c]
+                                                ));
+                                            }
+                                        }
+                                        eprintln!(
+                                            "FALSE OFFER stage {:?} v {v}: witness vs fast realize: fid {:?} winner {} diffs {:?}; exact on full witness: {}; fates {:?}",
+                                            s.stage, r.fidelity, r.next.winner, diffs,
+                                            match full { Exact::Found(..) => "found", Exact::Impossible => "impossible", Exact::Unknown => "unknown" },
+                                            s.enemies[..s.idx.min(s.enemies.len())].iter().map(|&e| (e, s.spec.targets[e as usize])).collect::<Vec<_>>(),
+                                        );
+                                    }
+                                } else {
+                                    rejected += 1;
+                                }
+                            }
+                            Exact::Unknown => unknown += 1,
+                        }
+                    }
+                }
+                let before = (s.flipped, s.base.turn);
+                s = s.child(opts[rng.gen_range(0..opts.len())]);
+                if (s.flipped, s.base.turn) != before {
+                    turns += 1;
+                }
+            }
+            eprintln!(
+                "game {g}: {steps} steps, dropped {dropped}, offered {offered}, false offers {false_offer}, unknown {unknown}, exact {:.1}s",
+                exact_ns as f64 * 1e-9
+            );
+        }
+        eprintln!(
+            "{steps} fate/move steps: offered+feasible {offered}, rejected+infeasible {rejected}, \
+             DROPPED (feasible, not offered) {dropped} [fates {}, moves {}], offered but exact says \
+             impossible {false_offer}, exact budget-out {unknown}; exact search {:.1}s of {:.1}s",
+            dropped_stage[0],
+            dropped_stage[1],
+            exact_ns as f64 * 1e-9,
+            t0.elapsed().as_secs_f64()
+        );
+    }
+
     /// `turn_actions` replays each turn the step tree plays: the atomic moves
     /// lead from the turn's real start to the real position the tree reached.
     #[test]

@@ -18,10 +18,16 @@ and statically evaluated.
 
 A turn is built one variable at a time:
 
-1. **Fates.** Each enemy piece, in a per-turn shuffled order, is declared
-   stay / kill / unsummon.
-2. **Moves.** Each friendly unit, in a per-turn shuffled order, picks one of
-   its 37 destination offsets.
+1. **Fates.** Each enemy piece is declared stay / kill / unsummon. The enemy
+   necromancer goes first (from 2026-09-27): "kill" is a terminal win node
+   (the option's witness realizes it), and "spare" means no later witness
+   can win its way past the remaining declarations. The rest follow in a
+   per-turn shuffled order.
+2. **Moves.** Each friendly unit picks one of its 37 destination offsets.
+   Units that could in theory attack some enemy this turn (reach ignoring
+   blockers; lumbering or immobile units only from where they stand) go
+   first, shuffled within each group, since their moves constrain the rest
+   most.
 3. **Spawns.** Each open spawn cell, in a shuffled order, gets nothing or one
    affordable unit.
 
@@ -43,11 +49,51 @@ exists. Measured: 0 dead ends in self-play (earlier relaxation-only versions
 hit ~0.8 per turn in random walks and made the post-search play-through walk
 thrash).
 
-*Tradeoff:* the witness is conservative. Legal options with no witness found
-(within `WITNESS_ATTEMPTS` / `POSITION_BUDGET`) are dropped. Options per step
-fell from ~4.2 to ~2.3 in random walks; part of that was genuinely
-infeasible kills, part is lost legal turns (crowded formations that need
-shuffles). Not yet quantified.
+**Exact fallback (2026-09-27).** The witness constructor is a one-shot
+heuristic, not a search: undecided non-attackers stay put, an evacuating unit
+takes the first free hex with no backtracking, undecided attackers may not use
+each other's origins, and it gives up after `WITNESS_ATTEMPTS` /
+`POSITION_BUDGET`. The fast realizers are incomplete too (all kills planned
+at once, then six target rotations with greedy attacker choice), and the
+relaxations used as gates were not even necessary conditions:
+`relaxed_feasible` assumed undecided enemies stay (killing one can open a
+path), and `movers_completable` routes evacuating units on vertex-disjoint
+paths although friends pass through friends. Now `relaxed_feasible` with the
+unfated enemies treated as removable is the (necessary) hard gate, the old
+forms only gate the cheap constructor, and when that fails
+`exact_realize` decides: a memoized DFS over the attack phase's legal
+atomic actions (`Minions::legal_moves`), goal-directed (attacks on open
+targets matching the declared fate type; decided units straight to their
+hex; undecided units only to a hex they can attack from, or off a hex
+someone needs), pruned by a reachability bound that is relaxed while the
+enemy necromancer can still be hit. Budget `EXACT_BUDGET` = 20000 nodes;
+found paths are cached by (position, declaration) so committing never re-runs
+a search that could run out of budget.
+
+Measured by `witness_drop_rate` (6 random games, every candidate option at
+every fates/moves step checked by the exact search):
+
+| | before (8 games) | exact fallback | + necro first | + sound gates (10 games) |
+|---|---|---|---|---|
+| feasible options dropped | 700 / 9682 (7.2%) | 345 | 0 | **0** / 9147 |
+| offered but infeasible | 273 | 0 | 0 | **0** |
+| exact search out of budget (undecided) | 1510 | 182 | 1366 | 2372 (6.1% of candidates) |
+
+Cost in self-play (gen31 net, 32 workers x 32 descents, 30 s moves): with
+the exact search behind unsound-only gates, 95% of thread time went to it
+(846k fates-stage calls, 1.75 ms each) and expansions fell to 8.5k/s; with
+the removable-enemy gate, 33.5k expansions/s, exact 38% of thread time
+(fates 470 s, moves 270 s, complete declarations 10 s per 60 s x 32
+threads). The next speedup is here (the `assign` SAT/matching solver as a
+faster exact check).
+
+The "offered but infeasible" cases were witnesses that kill the necromancer:
+the game ends mid-turn, so every other declared fate was moot and the fast
+realizers accepted them; necromancer-first removes that leniency (which is
+also why more candidates now need a full impossibility proof and the
+budget-outs rose). The remaining budget-outs are the next thing to fix if
+they matter (the old `assign` SAT/matching solver is a candidate for a
+faster exact check).
 
 **Realizer fallback.** `turn::realize` plans all kills at once and misses
 turns where one kill must open a hex that a unit moves into before attacking
@@ -61,10 +107,14 @@ turn boundary, so a node's mover never changes under it.
 **Features** (`View`): the turn so far *projected* onto the board (fated
 enemies removed with their rebate/reinforcement, decided units at their
 destinations, spawns placed) plus marker planes: decided friends, decided
-enemies, decided spawn cells, and the next variable to decide. Sparse layout
-`plane * 49 + cell` over 17 planes (12 unit planes, graveyards, 4 markers) =
-833 bits, plus 16 scalars (money, reinforcements, turns left, stage one-hot).
-Dense net input is those 849 values.
+enemies, decided spawn cells, and the next variable to decide. From
+2026-09-27 also the fated enemies, which the projection removes but which
+still restrict the remaining moves: per hex a killed bit, an unsummoned bit
+and a one-hot of the unit that stood there (8 planes). Sparse layout
+`plane * 49 + cell` over 25 planes = 1225 bits, plus 16 scalars (money,
+reinforcements, turns left, stage one-hot); dense input 1241. Nets from the
+17-plane layout load with zero weights on the new planes
+(`load_compatible`), so they compute exactly what they did.
 
 ## The search (`bfs.rs`)
 
@@ -88,17 +138,39 @@ Best-first over the step tree with **K heads** per iteration:
 Node states are stored at creation (no replays); a move keeps the chosen
 subtree (`reroot`).
 
+**Descent (self-play only, from 2026-09-27).** Best-first stays the eval
+search; self-play uses Descent (Cohen-Solal 2020): K descents in lockstep,
+each following the best child from the root all the way to a terminal node,
+expanding every leaf it meets (one per descent per wave, one evaluator batch
+per wave) and backing up at once; a finished descent is replaced by a fresh
+one from the root. A node's visit count is the number of descents that
+entered it (the power-mean weights and the record threshold use it).
+Concurrent descents are split by virtual loss: a child's value is averaged
+with one pending loss per descent in flight through it, weighted like its
+visits.
+
 ## Self-play (`stepsp.rs`, `steps-selfplay`)
 
-- Random starting positions: `selfplay::random_opening` (random bid, a
-  geometric number of random turns).
-- Per move: search until `--expansions` leaf expansions (or `--move-secs`,
-  or the candidate pool starves -- the PV runs into decided lines).
+- Starts from the opening with a random bid; no random turns
+  (`--opening-max 0` default since 2026-09-27: the Dirichlet noise already
+  randomizes games, and the number of games does not matter, only records).
+- Per move: `--search descent` (default) for `--move-secs`; `--search bfs`
+  searches until `--expansions` leaf expansions (or the candidate pool
+  starves -- the PV runs into decided lines).
 - Play one whole turn step by step: descents with temperature + Dirichlet
   noise; by value where nothing below was descended; dead picks backed out.
-- Records: every expanded node with `>= --min-visits` descents, written when
+- Descent visit counts (one 2.5-minute run, gen31 net, `--min-visits 1`,
+  9.6M records): 0.4% zero visits (terminal records), **97.7% exactly one**,
+  0.5% two, 0.7% 3-4, 0.4% 5-9, 0.2% 10-19, 0.1% 20+. A descent runs ~300
+  expansions to the end of the game, so almost every node lies on a single
+  descent's path. Terminal records: 310k (target mean 0.95 -- mostly
+  necromancer kills from the winner's side). RSS ~12 GB at 32 workers
+  (~275k nodes per tree).
+- Records: every expanded node with `>= --min-visits` descents, plus every
+  terminal node (exact labels, once per distinct position), written when
   it leaves the tree (not in the kept subtree) or at game end. 272-byte
-  records, layout in `stepsp.rs`.
+  records, layout in `stepsp.rs`. Targets are the backed-up tree values
+  only; the game result is stamped into the record but not trained on.
 
 ## Evaluators
 

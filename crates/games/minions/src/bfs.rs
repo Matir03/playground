@@ -101,6 +101,10 @@ pub struct Tree {
     pub root: StepState,
     pub params: Params,
     pub stats: SearchStats,
+    /// Descent mode: the paths (root first) of the descents in flight, and
+    /// per node how many of them pass through it.
+    cursors: Vec<Vec<u32>>,
+    inflight: Vec<u32>,
 }
 
 impl Tree {
@@ -128,6 +132,8 @@ impl Tree {
             root,
             params,
             stats: SearchStats::default(),
+            cursors: Vec::new(),
+            inflight: Vec::new(),
         })
     }
 
@@ -313,6 +319,7 @@ impl Tree {
                     kids.push((v, flip, None, c));
                 }
             }
+            s.drop_options();
             self.states[leaf as usize] = Some(s);
             pend.push(Pending {
                 leaf,
@@ -433,6 +440,117 @@ impl Tree {
         Ok(leaves.len())
     }
 
+    /// One wave of Descent (Cohen-Solal 2020), the self-play search: `k`
+    /// descents run in lockstep, each following the best child from the root
+    /// all the way to a terminal node, expanding every leaf it meets on the
+    /// way (one per descent per wave, all in one evaluator batch) and backing
+    /// the new values up at once. A descent that ends makes room for a fresh
+    /// one from the root. Every node a descent enters counts one visit.
+    ///
+    /// Concurrent descents are kept apart by virtual loss: a child's value is
+    /// averaged with one pending loss per descent in flight through it,
+    /// weighted like its visits, so near-ties split and clear bests do not.
+    ///
+    /// Returns the number of leaves expanded (0 when nothing is left).
+    pub fn descent_wave(&mut self, eval: &dyn Evaluator, k: usize) -> anyhow::Result<usize> {
+        let t = Instant::now();
+        let k = k.max(1);
+        let mut leaves: Vec<u32> = Vec::with_capacity(k);
+        // Each descent advances to a leaf; ended ones are replaced, with a cap
+        // so a fully decided tree cannot spin.
+        let mut starts = 0usize;
+        let mut i = 0usize;
+        loop {
+            if i == self.cursors.len() {
+                if self.cursors.len() >= k || starts >= 4 * k || self.is_solved() {
+                    break;
+                }
+                starts += 1;
+                self.cursors.push(vec![0]);
+                self.enter(0);
+            }
+            match self.advance(i) {
+                Some(leaf) => {
+                    if !leaves.contains(&leaf) {
+                        leaves.push(leaf);
+                    }
+                    i += 1;
+                }
+                None => {
+                    let path = self.cursors.swap_remove(i);
+                    for n in path {
+                        self.inflight[n as usize] -= 1;
+                    }
+                }
+            }
+        }
+        self.stats.select_ns += t.elapsed().as_nanos() as u64;
+        if leaves.is_empty() {
+            return Ok(0);
+        }
+        self.expand(&leaves, eval)?;
+        self.backup(&leaves);
+        self.stats.iterations += 1;
+        Ok(leaves.len())
+    }
+
+    /// Abandon the descents in flight (their visits stay counted).
+    pub fn clear_descents(&mut self) {
+        self.cursors.clear();
+        self.inflight.clear();
+    }
+
+    fn enter(&mut self, n: u32) {
+        if self.inflight.len() < self.nodes.len() {
+            self.inflight.resize(self.nodes.len(), 0);
+        }
+        self.inflight[n as usize] += 1;
+        self.nodes[n as usize].visits += 1;
+    }
+
+    /// Walk descent `i` down to a leaf that needs expanding (`Some`), or to
+    /// its end at a terminal or dead node (`None`).
+    fn advance(&mut self, i: usize) -> Option<u32> {
+        loop {
+            let n = *self.cursors[i].last().expect("a descent path");
+            match self.nodes[n as usize].kind {
+                LEAF => return Some(n),
+                EXPANDED => {}
+                _ => {
+                    if self.nodes[n as usize].kind == TERMINAL {
+                        self.stats.terminal_leaves += 1;
+                    }
+                    return None;
+                }
+            }
+            let mut best = None;
+            let mut bq = f32::NEG_INFINITY;
+            for c in self.children(n) {
+                let nd = &self.nodes[c as usize];
+                if nd.kind == DEAD {
+                    continue;
+                }
+                let m = self.inflight.get(c as usize).copied().unwrap_or(0) as f32;
+                let w = (1 + nd.visits) as f32 - m;
+                let q = self.q_parent(c) * w / (w + m);
+                if q > bq {
+                    bq = q;
+                    best = Some(c);
+                }
+            }
+            let c = best?;
+            self.cursors[i].push(c);
+            self.enter(c);
+        }
+    }
+
+    /// Every terminal node (game over).
+    pub fn terminal_nodes(&self) -> Vec<u32> {
+        (0..self.nodes.len() as u32)
+            .filter(|&n| self.nodes[n as usize].kind == TERMINAL)
+            .collect()
+    }
+
     /// Nodes with at least `min_visits` descents that are not terminal/dead.
     pub fn trained_nodes(&self, min_visits: u32) -> Vec<u32> {
         (0..self.nodes.len() as u32)
@@ -547,6 +665,8 @@ impl Tree {
             root,
             params: self.params.clone(),
             stats: SearchStats::default(),
+            cursors: Vec::new(),
+            inflight: Vec::new(),
         }
     }
 }
@@ -914,6 +1034,46 @@ mod tests {
 
     use super::MaterialEval as Material;
 
+    /// Descent reaches terminal nodes, keeps the power-mean invariant, and
+    /// counts visits consistently: a descent entering a child entered its
+    /// parent first, and in-flight counts return to zero.
+    #[test]
+    fn descent_reaches_terminals() {
+        let s = StepState::begin(&MinionsState::with_bid(0), 5);
+        let mut t = Tree::new(
+            s,
+            Params {
+                heads: 8,
+                power: 2.0,
+            },
+            &Material,
+        )
+        .unwrap();
+        for _ in 0..3000 {
+            if t.descent_wave(&Material, 8).unwrap() == 0 {
+                break;
+            }
+            if t.stats.terminal_leaves >= 20 {
+                break;
+            }
+        }
+        assert!(t.stats.terminal_leaves > 0, "{:?}", t.stats);
+        for n in 0..t.nodes.len() as u32 {
+            if t.kind(n) != EXPANDED {
+                continue;
+            }
+            let below: u32 = t.children(n).map(|c| t.nodes[c as usize].visits).sum();
+            assert!(below <= t.nodes[n as usize].visits, "node {n}");
+        }
+        let paths: Vec<Vec<u32>> = t.cursors.clone();
+        for (n, &m) in t.inflight.iter().enumerate() {
+            let on = paths.iter().filter(|p| p.contains(&(n as u32))).count() as u32;
+            assert_eq!(m, on, "inflight of {n}");
+        }
+        t.clear_descents();
+        assert!(t.inflight.is_empty());
+    }
+
     #[test]
     fn search_runs_and_backs_up_consistently() {
         let s = StepState::begin(&MinionsState::with_bid(0), 5);
@@ -944,6 +1104,8 @@ mod tests {
                 root: t.root.clone(),
                 params: t.params.clone(),
                 stats: Default::default(),
+                cursors: Vec::new(),
+                inflight: Vec::new(),
             };
             assert!(tt.recompute(n));
             assert!(

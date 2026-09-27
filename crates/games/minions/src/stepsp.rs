@@ -46,6 +46,9 @@ pub struct Config {
     pub dirichlet_eps: f32,
     pub opening_max: u32,
     pub opening_decay: f32,
+    /// Search with Descent ([`Tree::descent_wave`], `params.heads` descents in
+    /// flight) instead of best-first.
+    pub descent: bool,
     /// Stop once this many records are written.
     pub target_records: u64,
     pub chunk_records: usize,
@@ -222,6 +225,21 @@ fn record_nodes(
         w.push(&st.view(), st.flipped, nd.value, nd.prior, nd.visits);
         n += 1;
     }
+    // Terminal nodes are exact labels: all of them, visited or not, once per
+    // distinct position (many step orders reach the same end).
+    let mut seen = std::collections::HashSet::new();
+    for id in tree.terminal_nodes() {
+        if inside[id as usize] {
+            continue;
+        }
+        let nd = &tree.nodes[id as usize];
+        let st = tree.state_of(id);
+        if !seen.insert(st.base.key()) {
+            continue;
+        }
+        w.push(&st.view(), st.flipped, nd.value, nd.prior, nd.visits);
+        n += 1;
+    }
     Ok(n)
 }
 
@@ -249,9 +267,16 @@ fn play_game(
             if cfg.move_secs > 0.0 && t.elapsed().as_secs_f64() > cfg.move_secs {
                 break;
             }
-            let got = tree.iterate(eval)?;
+            let got = if cfg.descent {
+                tree.descent_wave(eval, cfg.params.heads)?
+            } else {
+                tree.iterate(eval)?
+            };
             if got == 0 {
                 break;
+            }
+            if cfg.descent {
+                continue;
             }
             // The PV runs into decided positions (terminal lines) and the
             // candidate pool dries up: stop rather than trickle tiny batches.
@@ -265,6 +290,7 @@ fn play_game(
                 starved = 0;
             }
         }
+        tree.clear_descents();
         c.search_ns
             .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if t.elapsed().as_secs_f64() > 10.0 {
@@ -415,6 +441,21 @@ pub fn run(cfg: Config, eval: Arc<dyn Evaluator>, out: &Path) -> anyhow::Result<
                 g(&c.turns) as f64 / g(&c.games).max(1) as f64,
                 g(&c.search_ns) as f64 * 1e-9,
                 g(&c.walk_ns) as f64 * 1e-9,
+            );
+            let x = &crate::steps::EXACT_STATS;
+            println!(
+                "  exact search: found {} impossible {} out-of-budget {} | {:.0} thread-s",
+                g(&x[0]),
+                g(&x[1]),
+                g(&x[2]),
+                g(&x[3]) as f64 * 1e-9
+            );
+            let y = &crate::steps::EXACT_SITES;
+            println!(
+                "  exact by site: fates {} calls {:.0}s, moves {} calls {:.0}s, complete {} calls {:.0}s",
+                g(&y[0][0]), g(&y[0][1]) as f64 * 1e-9,
+                g(&y[1][0]), g(&y[1][1]) as f64 * 1e-9,
+                g(&y[2][0]), g(&y[2][1]) as f64 * 1e-9
             );
             last = (Instant::now(), e, v, r, m);
         }

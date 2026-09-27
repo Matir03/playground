@@ -672,10 +672,16 @@ enum Cmd {
         dirichlet_alpha: f32,
         #[arg(long, default_value_t = 0.25)]
         dirichlet_eps: f32,
-        #[arg(long, default_value_t = 22)]
+        /// Random turns before the search takes over (0 = none: the game is
+        /// already randomized by the Dirichlet noise and the bid).
+        #[arg(long, default_value_t = 0)]
         opening_max: u32,
         #[arg(long, default_value_t = 1.0884)]
         opening_decay: f32,
+        /// Search: `descent` (to the end of the game, the self-play search) or
+        /// `bfs` (best-first, the eval search).
+        #[arg(long, default_value = "descent")]
+        search: String,
         #[arg(long, default_value_t = 1_000_000)]
         target_records: u64,
         #[arg(long, default_value_t = 20_000)]
@@ -1248,11 +1254,13 @@ async fn main() -> anyhow::Result<()> {
             dirichlet_eps,
             opening_max,
             opening_decay,
+            search,
             target_records,
             chunk_records,
             seed,
         } => {
             use std::sync::Arc;
+            anyhow::ensure!(search == "descent" || search == "bfs", "--search descent|bfs");
             let eval: Arc<dyn minions_engine::bfs::Evaluator> = match (old_net, onnx) {
                 (Some(dir), None) => {
                     let dir = std::path::Path::new(&dir);
@@ -1286,6 +1294,7 @@ async fn main() -> anyhow::Result<()> {
                 dirichlet_eps,
                 opening_max,
                 opening_decay,
+                descent: search == "descent",
                 target_records,
                 chunk_records,
                 seed,
