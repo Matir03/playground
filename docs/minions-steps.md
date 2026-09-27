@@ -237,6 +237,18 @@ checkpoint, 32 workers x 2 batcher runners.
 | 2 | 2.0M / 489 games, 140-149k exp/s | 0.0069 -> 0.0063 | 0.505 | 0.55 | **0.595** | 0.395 |
 | 3 | 2.0M / 446 games | 0.0060 -> 0.0060 (step 0 kept: gen3 = gen2) | 0.515 | 0.54 | 0.56 | 0.38 |
 | 4 | 2.0M / 431 games | 0.0058 -> 0.0057 | 0.46 | 0.46 | 0.54 | 0.40 |
+| 5 | 2.0M / 469 games, sparse graph 170-193k exp/s; EMA from here | 0.0051 | 0.445 | (failed) | 0.535 | 0.345 |
+| 6 | 2.0M / 472 games; gen 0 data leaves the window | 0.0013 | 0.47 | (failed) | 0.50 | 0.405 |
+| 7 | 2.0M / 506 games | 0.0015 | 0.485 | (failed) | -- | -- |
+| 8 | 2.0M; records carry game results from here | 0.0014 | 0.47 | (failed) | 0.55 | 0.34 |
+| 9 | outcome-mixed targets from here (w 0.5, decay 0.9) | 0.0016 | 0.525 | (failed) | 0.55 | 0.305 |
+| 10 | | 0.0016 | 0.525 | 0.50 | 0.585 | 0.375 |
+
+"(failed)": the search match between two nets died on TensorRT CUDA error
+906 until c37aed0 (one session per batch shape). Gen 9 and 10 kept an early
+checkpoint judged on pure search targets; from gen 11 the holdout is judged
+on the same mixed target the net trains on. Search vs greedy with the same
+net: 0.485 (gen 9), 0.512 (gen 10).
 
 **Training fixes after gen 4.** Learner experiments (gen 3 init, gen 0-4
 data, same holdout): plain 1 epoch best-checkpoint 0.00561; with a weight EMA

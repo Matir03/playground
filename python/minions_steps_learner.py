@@ -338,9 +338,13 @@ def main():
     z_tr, known_tr = outcome_value(train)
     print(f"game results known for {known_tr.mean():.3f} of training records")
     if args.outcome_weight > 0:
-        left = (train["outcome"] >> 2).astype(np.float32)
-        w = args.outcome_weight * args.outcome_decay**left * known_tr
-        y_tr = ((1 - w) * y_tr + w * z_tr).astype(np.float32)
+        # Train and judge (holdout, keep-best) on the same mixed target.
+        def mix(recs, y, z, known):
+            w = args.outcome_weight * args.outcome_decay ** (recs["outcome"] >> 2).astype(np.float32) * known
+            return ((1 - w) * y + w * z).astype(np.float32)
+
+        y_tr = mix(train, y_tr, z_tr, known_tr)
+        y_ho = mix(hold, y_ho, *z_ho)
     print(f"loaded {len(train) + len(hold)} records from {nfiles} chunks in {time.time() - t0:.1f}s; train {len(train)} holdout {len(hold)} (whole files)")
     print(f"target mean {y_tr.mean():.3f} std {y_tr.std():.3f}; stage mix {np.bincount(train['stage'], minlength=4).tolist()}")
 
