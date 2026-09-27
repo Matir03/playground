@@ -313,8 +313,15 @@ spends 2000 expansions per move instead of 6000: 1322 games per generation
 instead of ~480 in the same ~4 minutes (~1.5k records per game), and trains
 0.3 epochs.
 
-Gen 13 (first at 2000): search vs greedy with the same net 0.56, search vs
-gen 0 0.61.
+| gen | games | search vs prev | search vs greedy (same net) | search vs gen 0 |
+|---|---|---|---|---|
+| 12 (6000 exp) | ~480 | 0.505 | 0.49 | 0.565 |
+| 13 (2000 exp) | 1322 | 0.525 | 0.56 | 0.608 |
+| 14 | ~1300 | 0.497 | 0.51 | 0.630 |
+| 15 | 1243 | 0.57 | 0.53 | **0.665** |
+
+Strength vs gen 0 rises every generation after the switch (gens 2-12 sat at
+0.50-0.605).
 
 **The old champion's value net as a fixed reference, under the step search**
 (both sides search 2000 expansions, 100 pairs): gen 0 scores 0.29, gen 13
