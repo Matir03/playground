@@ -322,12 +322,19 @@ instead of ~480 in the same ~4 minutes (~1.5k records per game), and trains
 | 16 | 1218 | 0.51 | 0.575 | 0.71 |
 | 17 | 1224 | 0.56 | 0.625 | 0.715 |
 | 18 | 1193 | 0.505 | 0.595 | 0.71 |
-| 19 | 1173 | 0.57 | 0.615 | **0.79** |
+| 19 | 1173 | 0.57 | 0.615 | 0.79 |
+| 20 | | 0.51 | 0.635 | **0.80** |
 
 Strength vs gen 0 rises after the switch (gens 2-12 sat at 0.50-0.605), and
 the search now beats greedy with the same net (0.58-0.63 from gen 16): the
 fixed point is broken. Search vs the old champion's value net (both sides
 search 2000, 100 pairs): gen 0 0.29, gen 13 0.375, **gen 18 0.46**.
+Greedy vs the old net, which fell to 0.31-0.35 by gen 13-16, recovered to
+0.455 (gen 19) and **0.525 (gen 20)**.
+
+(The cycle died after gen 20 on a bash syntax error: cycle.sh had been
+rewritten in place while bash was still reading it. Restarted at gen 21;
+from there the old-net match is by search.)
 
 **The old champion's value net as a fixed reference, under the step search**
 (both sides search 2000 expansions, 100 pairs): gen 0 scores 0.29, gen 13
