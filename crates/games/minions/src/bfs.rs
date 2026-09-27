@@ -715,10 +715,26 @@ impl BatchedOnnxEval {
         let rows = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let mut sparse = false;
         for _ in 0..runners.max(1) {
-            let sess = crate::ort_net::build(path, ep, fp16, cache)?;
-            sparse = sess.inputs().iter().any(|i| i.name() == "idx");
+            // One session per shape, each run once here (one at a time): a
+            // TensorRT context that switches shapes can fail with CUDA error
+            // 906 ("legacy stream depends on a capturing stream") when other
+            // sessions run concurrently, which killed matches between two nets.
+            let mut sessions = Vec::new();
+            for &shape in &BATCH_SHAPES {
+                let mut sess = crate::ort_net::build(path, ep, fp16, cache)?;
+                sparse = sess.inputs().iter().any(|i| i.name() == "idx");
+                let _warm = WARMUP.lock().unwrap_or_else(|p| p.into_inner());
+                run_batch(
+                    &mut sess,
+                    sparse,
+                    shape,
+                    vec![0f32; shape * input_width(sparse)],
+                    sparse_pad(sparse, shape),
+                )?;
+                sessions.push(sess);
+            }
             let (queue, calls, rows) = (queue.clone(), calls.clone(), rows.clone());
-            std::thread::spawn(move || batch_runner(sess, sparse, &queue, &calls, &rows));
+            std::thread::spawn(move || batch_runner(sessions, sparse, &queue, &calls, &rows));
         }
         Ok(Self {
             queue,
@@ -729,14 +745,56 @@ impl BatchedOnnxEval {
     }
 }
 
+/// Serializes session warm-up runs across the process.
+static WARMUP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn input_width(sparse: bool) -> usize {
+    if sparse {
+        crate::steps::N_SCALARS
+    } else {
+        DENSE_DIM
+    }
+}
+
+fn sparse_pad(sparse: bool, shape: usize) -> Vec<i32> {
+    if sparse {
+        vec![crate::steps::SPARSE_DIM as i32; shape * crate::steps::MAX_ACTIVE]
+    } else {
+        Vec::new()
+    }
+}
+
+/// One padded call: `x` is `[shape, input_width]`, `idx` `[shape, MAX_ACTIVE]`
+/// for a sparse graph. Returns all `shape` values.
+fn run_batch(
+    sess: &mut ort::session::Session,
+    sparse: bool,
+    shape: usize,
+    x: Vec<f32>,
+    idx: Vec<i32>,
+) -> anyhow::Result<Vec<f32>> {
+    use ort::value::Tensor;
+    let e = |e: ort::Error| anyhow::anyhow!("{e}");
+    let t = Tensor::from_array((vec![shape as i64, input_width(sparse) as i64], x)).map_err(e)?;
+    let outs = if sparse {
+        let ti = Tensor::from_array((vec![shape as i64, crate::steps::MAX_ACTIVE as i64], idx))
+            .map_err(e)?;
+        sess.run(ort::inputs!["idx" => ti, "scal" => t])
+    } else {
+        sess.run(ort::inputs!["x" => t])
+    }
+    .map_err(e)?;
+    let (_, v) = outs["v"].try_extract_tensor::<f32>().map_err(e)?;
+    Ok(v.to_vec())
+}
+
 fn batch_runner(
-    mut sess: ort::session::Session,
+    mut sessions: Vec<ort::session::Session>,
     sparse: bool,
     queue: &BatchQueue,
     calls: &std::sync::atomic::AtomicU64,
     rows: &std::sync::atomic::AtomicU64,
 ) {
-    use ort::value::Tensor;
     let max = *BATCH_SHAPES.last().unwrap();
     loop {
         let mut batch = Vec::new();
@@ -754,18 +812,10 @@ fn batch_runner(
                 batch.push(q.pop_front().unwrap());
             }
         }
-        let shape = *BATCH_SHAPES.iter().find(|&&s| s >= total).unwrap();
-        let width = if sparse {
-            crate::steps::N_SCALARS
-        } else {
-            DENSE_DIM
-        };
-        let mut x = vec![0f32; shape * width];
-        let mut idx = if sparse {
-            vec![crate::steps::SPARSE_DIM as i32; shape * crate::steps::MAX_ACTIVE]
-        } else {
-            Vec::new()
-        };
+        let k = BATCH_SHAPES.iter().position(|&s| s >= total).unwrap();
+        let shape = BATCH_SHAPES[k];
+        let mut x = vec![0f32; shape * input_width(sparse)];
+        let mut idx = sparse_pad(sparse, shape);
         let (mut at, mut ai) = (0, 0);
         for r in &batch {
             x[at..at + r.x.len()].copy_from_slice(&r.x);
@@ -775,23 +825,7 @@ fn batch_runner(
         }
         calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         rows.fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
-        let res = (|| -> anyhow::Result<Vec<f32>> {
-            let e = |e: ort::Error| anyhow::anyhow!("{e}");
-            let t = Tensor::from_array((vec![shape as i64, width as i64], x)).map_err(e)?;
-            let outs = if sparse {
-                let ti =
-                    Tensor::from_array((vec![shape as i64, crate::steps::MAX_ACTIVE as i64], idx))
-                        .map_err(e)?;
-                sess.run(ort::inputs!["idx" => ti, "scal" => t])
-            } else {
-                sess.run(ort::inputs!["x" => t])
-            }
-            .map_err(e)?;
-            let (_, v) = outs["v"]
-                .try_extract_tensor::<f32>()
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            Ok(v[..total].to_vec())
-        })();
+        let res = run_batch(&mut sessions[k], sparse, shape, x, idx);
         let mut at = 0;
         for r in batch {
             let part = match &res {
