@@ -301,3 +301,23 @@ self-play still picks moves with temperature 1 + Dirichlet at every step, so
 results measure that exploratory policy. The cycle also logs search vs
 greedy with the same net each generation (the improvement the search still
 offers).
+
+## Data diversity over search depth (from gen 13)
+
+Every generation kept a checkpoint from the first ~5% of its epoch; after
+that the holdout (other games) worsens steadily, past the init net (gen 11:
+0.00446 at step 558 -> 0.00602 at the end). With ~4k near-duplicate records
+per game and ~2.9k games in the window, the net memorizes games. Since the
+search adds little over the net at this fixed point, self-play from gen 13
+spends 2000 expansions per move instead of 6000: 1322 games per generation
+instead of ~480 in the same ~4 minutes (~1.5k records per game), and trains
+0.3 epochs.
+
+Gen 13 (first at 2000): search vs greedy with the same net 0.56, search vs
+gen 0 0.61.
+
+**The old champion's value net as a fixed reference, under the step search**
+(both sides search 2000 expansions, 100 pairs): gen 0 scores 0.29, gen 13
+0.375. The greedy-vs-old column falls over the generations (0.43 -> 0.31)
+but that is a greedy artefact; with search the step nets gain on the fixed
+reference. The cycle logs the search version from its next restart.
