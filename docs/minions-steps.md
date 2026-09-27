@@ -476,6 +476,13 @@ consecutive generations within noise of each other. The cycle stopped after
 gen 31 for the switch to Descent self-play, complete witnesses and the
 25-plane input.
 
+Gen 32 is the first Descent generation (30 s/move, `--min-visits 2`,
+before completion / depth heuristic / ordinal walk): 2.18M records from 30
+finished games in ~9 min of self-play (exact search 39% of thread time);
+holdout mse 0.00114; greedy vs gen 31 0.535 +- 0.035. Its search matches
+were cut off when the cycle was restarted at gen 33 with the Athenan
+components (next section).
+
 **Backup exponent.** p = 1 (the visit-weighted mean) vs p = 2, gen 31 on
 both sides, best-first 2000 expansions: 0.490 +- 0.035 (200 games). No
 measurable difference at this budget.
