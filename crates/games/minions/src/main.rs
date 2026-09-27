@@ -48,6 +48,16 @@ enum Cmd {
         /// `--net-dir`.
         #[arg(long)]
         search_config: Option<String>,
+        /// Play the "net" seat with the best-first step search instead
+        /// (docs/minions-steps.md): a step net (`.onnx`, `.bin` MLP, or
+        /// `old:<dir>`). Each turn searches for the UI's time budget, else
+        /// `--steps-secs`.
+        #[arg(long)]
+        steps_net: Option<String>,
+        #[arg(long, default_value_t = 5.0)]
+        steps_secs: f64,
+        #[arg(long, default_value_t = 32)]
+        steps_heads: usize,
     },
     SelfPlay {
         #[arg(long, default_value = "127.0.0.1:7105")]
@@ -681,8 +691,19 @@ async fn main() -> anyhow::Result<()> {
             fp16,
             cuda,
             search_config,
+            steps_net,
+            steps_secs,
+            steps_heads,
         } => {
-            if let Some(dir) = net_dir {
+            if let Some(spec) = steps_net {
+                eprintln!("net seat: step search with {spec}, {steps_secs}s per turn, {steps_heads} heads");
+                minions_engine::net_seat::configure_steps(minions_engine::net_seat::StepsSeat {
+                    eval: load_step_eval(&spec, &ep)?,
+                    params: minions_engine::bfs::Params { heads: steps_heads, ..Default::default() },
+                    secs: steps_secs,
+                    max_expansions: u64::MAX,
+                });
+            } else if let Some(dir) = net_dir {
                 let path = search_config.ok_or_else(|| {
                     anyhow::anyhow!(
                         "--net-dir needs --search-config (the live dir's search.json), so the \

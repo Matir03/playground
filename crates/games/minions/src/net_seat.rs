@@ -29,6 +29,27 @@ use crate::game::{Minions, MinionsMove, MinionsState};
 use crate::sampler::{MinionsModel, SamplerConfig};
 use crate::turn::{realize, MinionsTurns, TurnSpec};
 
+/// The best-first step search as the seat instead (`serve --steps-net`),
+/// see [`configure_steps`].
+static STEPS: Mutex<Option<StepsSeat>> = Mutex::new(None);
+
+/// A step-search seat (docs/minions-steps.md): per turn a fresh best-first
+/// search for a fixed time (the UI's `max_millis`, else `secs`), then the
+/// principal variation's turn, handed out one action at a time like the net's.
+#[derive(Clone)]
+pub struct StepsSeat {
+    pub eval: std::sync::Arc<dyn crate::bfs::Evaluator>,
+    pub params: crate::bfs::Params,
+    pub secs: f64,
+    /// Expansion cap per turn (the UI's `max_visits` overrides it).
+    pub max_expansions: u64,
+}
+
+pub fn configure_steps(seat: StepsSeat) {
+    *STEPS.lock().unwrap() = Some(seat);
+    *PLAN.lock().unwrap() = None;
+}
+
 /// Where the weights live, and how to run them. Set once at startup by `serve`.
 static CONFIG: Mutex<Option<NetSeatConfig>> = Mutex::new(None);
 /// The model, built on first use so `serve` starts instantly even without a GPU.
@@ -166,7 +187,45 @@ fn set_search(json: Option<&str>) -> anyhow::Result<playground_core::SearchConfi
 }
 
 pub fn is_configured() -> bool {
-    CONFIG.lock().unwrap().is_some()
+    CONFIG.lock().unwrap().is_some() || STEPS.lock().unwrap().is_some()
+}
+
+/// Plan a whole turn with the step search, then return its first action.
+fn plan_steps_turn(
+    state: &MinionsState,
+    budget: &SolverBudget,
+    seat: StepsSeat,
+) -> anyhow::Result<SearchOutcome<MinionsMove>> {
+    let secs = budget
+        .max_millis
+        .map(|ms| f64::from(ms) / 1000.0)
+        .unwrap_or(seat.secs);
+    let cap = budget
+        .max_visits
+        .map(u64::from)
+        .unwrap_or(seat.max_expansions);
+    let salt = SEARCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ^ Minions::encode_state(state)
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+    let t = crate::stepsp::search_turn(state, seat.eval.as_ref(), &seat.params, cap, secs, salt)?;
+    let mut actions: VecDeque<MinionsMove> = crate::steps::turn_actions(state, &t.done)?.into();
+    let first = actions
+        .pop_front()
+        .ok_or_else(|| anyhow::anyhow!("the searched turn was empty"))?;
+    // The value shown is the side to move's win probability as -1..1.
+    let value = 2.0 * f64::from(t.value) - 1.0;
+    let next_state = Minions::apply(state, &first);
+    *PLAN.lock().unwrap() = Some(Plan {
+        expect: Minions::encode_state(&next_state),
+        actions,
+        value,
+    });
+    Ok(SearchOutcome {
+        best_move: first,
+        value,
+        nodes: t.expansions,
+    })
 }
 
 /// Plan a whole turn from `state`, then return its first action.
@@ -174,6 +233,10 @@ fn plan_turn(
     state: &MinionsState,
     budget: &SolverBudget,
 ) -> anyhow::Result<SearchOutcome<MinionsMove>> {
+    let steps = STEPS.lock().unwrap().clone();
+    if let Some(seat) = steps {
+        return plan_steps_turn(state, budget, seat);
+    }
     let cfg = CONFIG
         .lock()
         .unwrap()

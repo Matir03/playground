@@ -462,19 +462,35 @@ pub fn bid(eval: &dyn Evaluator, salt: u64) -> anyhow::Result<i16> {
     Ok(lo)
 }
 
+/// A turn chosen by [`search_turn`].
+pub struct SearchedTurn {
+    /// The real position after the turn.
+    pub next: crate::game::MinionsState,
+    /// The turn's declaration, for [`crate::steps::turn_actions`].
+    pub done: crate::turn::TurnSpec,
+    /// The root's backed-up value for the mover.
+    pub value: f32,
+    pub expansions: u64,
+}
+
 /// One turn by search: a fresh tree searched for `expansions` leaf
-/// expansions (or until the candidate pool starves), then the principal
-/// variation played to the end of the turn.
+/// expansions (or `secs` seconds if positive, or until the candidate pool
+/// starves), then the principal variation played to the end of the turn.
 pub fn search_turn(
     real: &crate::game::MinionsState,
     eval: &dyn Evaluator,
     params: &Params,
     expansions: u64,
+    secs: f64,
     salt: u64,
-) -> anyhow::Result<crate::game::MinionsState> {
+) -> anyhow::Result<SearchedTurn> {
+    let t = Instant::now();
     let mut tree = Tree::new(StepState::begin(real, salt), params.clone(), eval)?;
     let mut starved = 0;
     while !tree.is_solved() && tree.stats.expansions < expansions {
+        if secs > 0.0 && t.elapsed().as_secs_f64() > secs {
+            break;
+        }
         let got = tree.iterate(eval)?;
         if got == 0 {
             break;
@@ -500,7 +516,13 @@ pub fn search_turn(
             anyhow::bail!("no live child in a search turn");
         };
         if tree.nodes[ch as usize].flip || tree.kind(ch) == 2 {
-            return Ok(tree.state_of(ch).real_base());
+            let fin = tree.state_of(ch);
+            return Ok(SearchedTurn {
+                next: fin.real_base(),
+                done: fin.done,
+                value: tree.nodes[0].value,
+                expansions: tree.stats.expansions,
+            });
         }
         n = ch;
     }
@@ -530,8 +552,10 @@ impl Player {
                 self.eval.as_ref(),
                 &self.params,
                 self.expansions,
+                0.0,
                 salt,
             )
+            .map(|t| t.next)
         }
     }
 }

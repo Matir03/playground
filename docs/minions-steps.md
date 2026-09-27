@@ -194,6 +194,16 @@ parallel (`--threads`). Greedy matches are mostly decided by the opening
 (76 of 100 pairs split 1-1 at gen 1), so the cycle also logs search matches
 vs the previous generation and vs gen 0.
 
+## Playing it in the UI
+
+`serve --steps-net <net> [--steps-secs 5] [--steps-heads 32]` makes the UI's
+external-engine seat (`ENGINE_PLAYER_EXTERNAL`) the step search: per turn a
+fresh tree searched for the UI's `max_millis` (else `--steps-secs`), then the
+principal variation's turn. `StepState::done` carries the finished turn's
+declaration across the turn boundary and `steps::turn_actions` realizes it
+into atomic moves (the sequential fallback included), handed out one per
+request like the sampled-AZ seat's plans.
+
 ## Generation log
 
 | gen | data | holdout MSE | greedy vs prev | greedy vs old champion |

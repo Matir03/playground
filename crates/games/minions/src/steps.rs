@@ -52,6 +52,10 @@ pub struct StepState {
     /// Whether `base` is the real position rotated (the real mover is side 1).
     pub flipped: bool,
     pub spec: TurnSpec,
+    /// The complete declaration of the turn that led to this one, in that
+    /// turn's canonical frame (empty at a tree's start): what
+    /// [`turn_actions`] turns back into atomic moves.
+    pub done: TurnSpec,
     pub enemies: Vec<u8>,
     pub friends: Vec<u8>,
     pub spawn_cells: Vec<u8>,
@@ -157,6 +161,7 @@ impl StepState {
             base,
             flipped,
             spec: TurnSpec::empty(),
+            done: TurnSpec::empty(),
             enemies: Vec::new(),
             friends: Vec::new(),
             spawn_cells: Vec::new(),
@@ -231,7 +236,9 @@ impl StepState {
     /// Start the next turn from `next` (in this turn's canonical frame).
     fn next_turn(&mut self, next: MinionsState) {
         let real = if self.flipped { next.rotated() } else { next };
+        let done = self.spec;
         *self = StepState::begin(&real, self.salt);
+        self.done = done;
     }
 
     /// Realize the fates and moves. On success moves to `Spawns` (or on to the
@@ -244,7 +251,9 @@ impl StepState {
             // Game over, or turn 0 (no spawn phase): `post` is already the next turn.
             if post.winner != 0 {
                 let real = if self.flipped { post.rotated() } else { post };
+                let done = self.spec;
                 *self = StepState::begin(&real, self.salt);
+                self.done = done;
             } else {
                 self.next_turn(post);
             }
@@ -350,6 +359,7 @@ impl StepState {
             base: self.base.clone(),
             flipped: self.flipped,
             spec: self.spec,
+            done: self.done,
             enemies: self.enemies.clone(),
             friends: self.friends.clone(),
             spawn_cells: self.spawn_cells.clone(),
@@ -950,13 +960,67 @@ pub fn attack_part(base: &MinionsState, spec: &TurnSpec) -> Option<MinionsState>
     let n_targets = (0..NUM_CELLS)
         .filter(|&c| sp.targets[c] != TARGET_STAY)
         .count();
-    (0..n_targets.min(6)).find_map(|first| realize_sequential(base, &sp, first))
+    (0..n_targets.min(6)).find_map(|first| realize_sequential(base, &sp, first, None))
+}
+
+/// The atomic moves that play `done` -- a complete declaration in the
+/// canonical frame of `real`'s mover, as [`StepState::done`] holds it -- from
+/// the real position `real`, the way the step tree realized it.
+pub fn turn_actions(real: &MinionsState, done: &TurnSpec) -> anyhow::Result<Vec<MinionsMove>> {
+    let base = real.canonical();
+    let mut sp = *done;
+    sp.spawns = [0; NUM_CELLS];
+    let r = crate::turn::realize_attack(&base, &sp);
+    let f = r.fidelity;
+    let (mut acts, mut s) = if r.next.winner != 0
+        || (f.done_moves == f.declared_moves && f.done_kills == f.declared_kills)
+    {
+        (r.actions, r.next)
+    } else {
+        let n_targets = (0..NUM_CELLS)
+            .filter(|&c| sp.targets[c] != TARGET_STAY)
+            .count();
+        (0..n_targets.min(6))
+            .find_map(|first| {
+                let mut log = Vec::new();
+                realize_sequential(&base, &sp, first, Some(&mut log)).map(|s| (log, s))
+            })
+            .ok_or_else(|| anyhow::anyhow!("the declared attack part does not realize"))?
+    };
+    if s.winner == 0 && s.phase == PHASE_SPAWN {
+        for at in 0..NUM_CELLS as u8 {
+            let v = done.spawns[at as usize];
+            if v == 0 {
+                continue;
+            }
+            let unit = Unit::from_index(v).ok_or_else(|| anyhow::anyhow!("bad spawn code {v}"))?;
+            let slot = unit
+                .reinforcement_slot()
+                .ok_or_else(|| anyhow::anyhow!("{unit:?} is not buyable"))?;
+            if s.reinforcements[0][slot] == 0 {
+                acts.push(MinionsMove::Buy(unit));
+                s = Minions::apply(&s, &MinionsMove::Buy(unit));
+            }
+            acts.push(MinionsMove::Spawn { unit, at });
+            s = Minions::apply(&s, &MinionsMove::Spawn { unit, at });
+        }
+        acts.push(MinionsMove::EndPhase);
+    }
+    if real.side == 1 {
+        acts.iter_mut().for_each(|m| *m = m.rotated());
+    }
+    Ok(acts)
 }
 
 /// Moves whenever possible, then a single declared kill (targets tried from
 /// `first` onward), repeat. Returns the position after the attack phase if every
 /// declared move and kill happened.
-fn realize_sequential(base: &MinionsState, spec: &TurnSpec, first: usize) -> Option<MinionsState> {
+fn realize_sequential(
+    base: &MinionsState,
+    spec: &TurnSpec,
+    first: usize,
+    mut log: Option<&mut Vec<MinionsMove>>,
+) -> Option<MinionsState> {
     let me = 0u8;
     let mut s = base.clone();
     let mut want = [NO_CELL; NUM_CELLS];
@@ -999,7 +1063,11 @@ fn realize_sequential(base: &MinionsState, spec: &TurnSpec, first: usize) -> Opt
                 if !has(bitboard::reachable(bit(o), st.speed, pass), d) {
                     continue;
                 }
-                s = Minions::apply(&s, &MinionsMove::Move { from: o, to: d });
+                let mv = MinionsMove::Move { from: o, to: d };
+                s = Minions::apply(&s, &mv);
+                if let Some(l) = log.as_deref_mut() {
+                    l.push(mv);
+                }
                 want[o as usize] = NO_CELL;
                 moved = true;
             }
@@ -1058,7 +1126,11 @@ fn realize_sequential(base: &MinionsState, spec: &TurnSpec, first: usize) -> Opt
                 continue;
             }
             for a in use_ {
-                s = Minions::apply(&s, &MinionsMove::Attack { from: a, to: t });
+                let mv = MinionsMove::Attack { from: a, to: t };
+                s = Minions::apply(&s, &mv);
+                if let Some(l) = log.as_deref_mut() {
+                    l.push(mv);
+                }
                 if s.winner != 0 {
                     return Some(s);
                 }
@@ -1075,6 +1147,9 @@ fn realize_sequential(base: &MinionsState, spec: &TurnSpec, first: usize) -> Opt
         return None;
     }
     let s = Minions::apply(&s, &MinionsMove::EndPhase);
+    if let Some(l) = log {
+        l.push(MinionsMove::EndPhase);
+    }
     Some(s)
 }
 
@@ -1453,6 +1528,47 @@ mod tests {
     /// Walk random step paths through whole games. Every completed path must
     /// be a legal turn that hands over the move, and dead ends (a step with no
     /// option) must be rare; the search prunes them. Restarts the turn on one.
+    /// `turn_actions` replays each turn the step tree plays: the atomic moves
+    /// lead from the turn's real start to the real position the tree reached.
+    #[test]
+    fn turn_actions_replay_step_turns() {
+        use rand::Rng;
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(11);
+        let (mut turns, mut games) = (0, 0);
+        for g in 0..30u64 {
+            let (mut real, _) = crate::selfplay::random_opening(8, 1.0884, &mut rng);
+            let mut s = StepState::begin(&real, g);
+            while !s.is_terminal() && turns < 2000 {
+                let ch = s.children();
+                assert!(!ch.is_empty(), "dead end");
+                let before = s.flipped;
+                let turn_no = s.base.turn;
+                s = s.child(ch[rng.gen_range(0..ch.len())]);
+                if s.flipped != before || s.is_terminal() || s.base.turn != turn_no {
+                    let acts = turn_actions(&real, &s.done).unwrap();
+                    let mut r = real.clone();
+                    for a in &acts {
+                        assert!(
+                            Minions::legal_moves(&r).contains(a),
+                            "illegal {a:?} in turn {turns}"
+                        );
+                        r = Minions::apply(&r, a);
+                    }
+                    assert_eq!(
+                        Minions::encode_state(&r),
+                        Minions::encode_state(&s.real_base()),
+                        "turn {turns}: actions {acts:?}"
+                    );
+                    real = s.real_base();
+                    turns += 1;
+                }
+            }
+            games += 1;
+        }
+        eprintln!("{turns} turns over {games} games replayed");
+        assert!(turns > 200);
+    }
+
     #[test]
     fn random_step_paths_are_legal_turns() {
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7);
