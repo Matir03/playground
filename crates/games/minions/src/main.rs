@@ -699,6 +699,10 @@ enum Cmd {
         /// searches a single game tree with the whole machine.
         #[arg(long, default_value_t = 1)]
         expand_threads: usize,
+        /// Games sharing one search tree (one worker, --expand-threads > 1):
+        /// the descents are spread over their positions each round.
+        #[arg(long, default_value_t = 1)]
+        games: usize,
         #[arg(long, default_value_t = 2.0)]
         power: f32,
         /// Leaf expansions per move.
@@ -1322,6 +1326,7 @@ async fn main() -> anyhow::Result<()> {
             batcher,
             heads,
             expand_threads,
+            games,
             power,
             expansions,
             move_secs,
@@ -1384,7 +1389,9 @@ async fn main() -> anyhow::Result<()> {
                 target_records,
                 chunk_records,
                 seed,
+                games,
             };
+            anyhow::ensure!(games == 1 || workers == 1 && expand_threads > 1, "--games needs --workers 1 and --expand-threads > 1");
             minions_engine::stepsp::run(cfg, eval, std::path::Path::new(&out))?;
         }
     }

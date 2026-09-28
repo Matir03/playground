@@ -63,6 +63,8 @@ pub struct Config {
     pub target_records: u64,
     pub chunk_records: usize,
     pub seed: u64,
+    /// Games sharing one search tree (with one worker); 1 = a tree per game.
+    pub games: usize,
 }
 
 pub fn encode_record(v: &View, target: f32, prior: f32, visits: u32, out: &mut Vec<u8>) {
@@ -216,7 +218,7 @@ impl Counters {
 /// uniform).
 fn record_nodes(
     tree: &Tree,
-    keep: Option<u32>,
+    keep: &[u32],
     min_visits: u32,
     frac: f64,
     alpha: f64,
@@ -225,11 +227,13 @@ fn record_nodes(
 ) -> anyhow::Result<u64> {
     use rand::Rng;
     let mut inside = vec![false; tree.nodes.len()];
-    if let Some(k) = keep {
-        // Children are always created after their parent, so one forward pass
-        // marks the whole subtree.
+    // Children are always created after their parent, so one forward pass
+    // marks the kept subtrees.
+    for &k in keep {
         inside[k as usize] = true;
-        for i in (k as usize + 1)..tree.nodes.len() {
+    }
+    if let Some(&lo) = keep.iter().min() {
+        for i in (lo as usize + 1)..tree.nodes.len() {
             let p = tree.nodes[i].parent;
             if p != u32::MAX && inside[p as usize] {
                 inside[i] = true;
@@ -346,60 +350,14 @@ fn play_game(
         }
         c.nodes_at_move
             .fetch_add(tree.nodes.len() as u64, Ordering::Relaxed);
-        // Play one whole turn: steps until the move passes or the game ends.
-        // A pick that lands on a dead end is backed out of: expanding it marks
-        // it dead, and the walk resumes from its parent.
         let tp = Instant::now();
-        let (mut walk_exp, mut walk_steps) = (0u32, 0u32);
-        let mut n = 0u32;
-        let next = loop {
-            walk_steps += 1;
-            if tree.kind(n) == 0 {
-                walk_exp += 1;
-            }
-            tree.ensure_expanded(n, eval)?;
-            if tree.kind(n) == 3
-                && std::env::var("STEPS_DEBUG_DEAD").is_ok()
-                && DEAD_SHOWN.fetch_add(1, Ordering::Relaxed) < 6
-            {
-                eprintln!("dead in walk: {}", tree.state_of(n).debug_dead());
-            }
-            if tree.kind(n) == 3 {
-                if n == 0 {
-                    break None;
-                }
-                n = tree.nodes[n as usize].parent;
-                continue;
-            }
-            let pick = if cfg.ordinal {
-                tree.pick_ordinal(n, rng)
-            } else {
-                tree.pick_child(n, cfg.temp, (cfg.dirichlet_alpha, cfg.dirichlet_eps), rng)
-            };
-            let Some(ch) = pick else {
-                break None;
-            };
-            if tree.nodes[ch as usize].flip || tree.kind(ch) == 2 {
-                break Some(ch);
-            }
-            n = ch;
-        };
-        if next.is_none() {
-            c.stuck.fetch_add(1, Ordering::Relaxed);
-        }
+        let next = walk_turn(&mut tree, 0, cfg, eval, rng, c)?;
         c.walk_ns
             .fetch_add(tp.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        if tp.elapsed().as_secs_f64() > 5.0 {
-            eprintln!(
-                "slow walk {:.1}s: {walk_steps} steps, {walk_exp} single expansions, turn {}",
-                tp.elapsed().as_secs_f64(),
-                tree.root.base.turn
-            );
-        }
         let Some(next) = next else { break };
         let rec = record_nodes(
             &tree,
-            Some(next),
+            &[next],
             cfg.min_visits,
             cfg.record_frac,
             cfg.record_alpha,
@@ -414,7 +372,7 @@ fn play_game(
     }
     let rec = record_nodes(
         &tree,
-        None,
+        &[],
         cfg.min_visits,
         cfg.record_frac,
         cfg.record_alpha,
@@ -431,6 +389,184 @@ fn play_game(
         c.decisive.fetch_add(1, Ordering::Relaxed);
     }
     Ok(())
+}
+
+/// Play one whole turn from `from`: steps until the move passes or the game
+/// ends; the node reached, or `None` if the walk got stuck. A pick that
+/// lands on a dead end is backed out of: expanding it marks it dead, and the
+/// walk resumes from its parent.
+fn walk_turn(
+    tree: &mut Tree,
+    from: u32,
+    cfg: &Config,
+    eval: &dyn Evaluator,
+    rng: &mut rand_chacha::ChaCha8Rng,
+    c: &Counters,
+) -> anyhow::Result<Option<u32>> {
+    let tp = Instant::now();
+    let (mut walk_exp, mut walk_steps) = (0u32, 0u32);
+    let mut n = from;
+    let next = loop {
+        walk_steps += 1;
+        if tree.kind(n) == 0 {
+            walk_exp += 1;
+        }
+        tree.ensure_expanded(n, eval)?;
+        if tree.kind(n) == 3
+            && std::env::var("STEPS_DEBUG_DEAD").is_ok()
+            && DEAD_SHOWN.fetch_add(1, Ordering::Relaxed) < 6
+        {
+            eprintln!("dead in walk: {}", tree.state_of(n).debug_dead());
+        }
+        if tree.kind(n) == 3 {
+            if n == from {
+                break None;
+            }
+            n = tree.nodes[n as usize].parent;
+            continue;
+        }
+        let pick = if cfg.ordinal {
+            tree.pick_ordinal(n, rng)
+        } else {
+            tree.pick_child(n, cfg.temp, (cfg.dirichlet_alpha, cfg.dirichlet_eps), rng)
+        };
+        let Some(ch) = pick else {
+            break None;
+        };
+        if tree.nodes[ch as usize].flip || tree.kind(ch) == 2 {
+            break Some(ch);
+        }
+        n = ch;
+    };
+    if next.is_none() {
+        c.stuck.fetch_add(1, Ordering::Relaxed);
+    }
+    if tp.elapsed().as_secs_f64() > 5.0 {
+        eprintln!(
+            "slow walk {:.1}s: {walk_steps} steps, {walk_exp} single expansions, turn {}",
+            tp.elapsed().as_secs_f64(),
+            tree.state_of(from).base.turn
+        );
+    }
+    Ok(next)
+}
+
+/// `cfg.games` games from the same start, searched in one shared tree: each
+/// round the descents are spread over the games' positions (games at the
+/// same position share them), then every game plays one turn from its own
+/// position. Afterwards only the subtrees under the games' new positions are
+/// kept; everything else is recorded with its final values, as a rerooting
+/// does for one game. Outcomes are left unknown in the records (they are
+/// shared between games).
+fn play_shared(
+    cfg: &Config,
+    eval: &dyn Evaluator,
+    rng: &mut rand_chacha::ChaCha8Rng,
+    w: &mut Writer,
+    c: &Counters,
+    stop: &AtomicBool,
+) -> anyhow::Result<()> {
+    use rand::Rng;
+    let salt: u64 = rng.gen();
+    let start = if cfg.opening_max == 0 {
+        let b = bid(eval, salt)?;
+        c.bids[(b - crate::game::BID_MIN) as usize].fetch_add(1, Ordering::Relaxed);
+        crate::game::MinionsState::with_bid(b)
+    } else {
+        crate::selfplay::random_opening(cfg.opening_max, cfg.opening_decay, rng).0
+    };
+    let mut tree = Tree::new(StepState::begin(&start, salt), cfg.params.clone(), eval)?;
+    // Each game's position, or None once it is over.
+    let mut games: Vec<Option<u32>> = vec![Some(0); cfg.games.max(1)];
+    let mut turns = vec![0u64; games.len()];
+    let over = |tree: &Tree, n: u32| {
+        let nd = &tree.nodes[n as usize];
+        nd.kind == 2 || nd.kind == 3 || nd.resolved
+    };
+    loop {
+        for g in games.iter_mut() {
+            if g.is_some_and(|n| over(&tree, n)) {
+                *g = None;
+            }
+        }
+        let mut at: Vec<u32> = games.iter().flatten().copied().collect();
+        at.sort_unstable();
+        at.dedup();
+        if at.is_empty() || stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let t = Instant::now();
+        let before = tree.stats.expansions;
+        tree.set_starts(&at);
+        let (budget, secs) = (cfg.expansions, cfg.move_secs);
+        tree.descent_run(eval, cfg.params.heads, &mut |tr| {
+            tr.stats.expansions - before >= budget || secs > 0.0 && t.elapsed().as_secs_f64() > secs
+        })?;
+        tree.clear_descents();
+        crate::steps::prof::flush();
+        c.search_ns
+            .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        c.nodes_at_move
+            .fetch_add(tree.nodes.len() as u64, Ordering::Relaxed);
+        let tp = Instant::now();
+        for (g, pos) in games.iter_mut().enumerate() {
+            let Some(n) = *pos else { continue };
+            *pos = walk_turn(&mut tree, n, cfg, eval, rng, c)?;
+            c.moves.fetch_add(1, Ordering::Relaxed);
+            turns[g] += 1;
+            if pos.is_none() {
+                finished(c, &turns[g], None);
+            }
+        }
+        c.walk_ns
+            .fetch_add(tp.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        // Games that just ended are counted; their positions are not kept.
+        let mut keep = Vec::new();
+        for (g, pos) in games.iter_mut().enumerate() {
+            if let Some(n) = *pos {
+                if over(&tree, n) {
+                    finished(c, &turns[g], Some(&tree.state_of(n)));
+                    *pos = None;
+                } else {
+                    keep.push(n);
+                }
+            }
+        }
+        keep.sort_unstable();
+        keep.dedup();
+        let rec = record_nodes(
+            &tree,
+            &keep,
+            cfg.min_visits,
+            cfg.record_frac,
+            cfg.record_alpha,
+            rng,
+            w,
+        )?;
+        w.finish_game(0, 0)?;
+        c.records.fetch_add(rec, Ordering::Relaxed);
+        c.add_stats(&tree.stats);
+        let (t2, map) = tree.retain(&keep);
+        tree = t2;
+        for pos in games.iter_mut() {
+            if let Some(n) = pos {
+                *n = map[*n as usize];
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Count one finished game of [`play_shared`] (`end`: its final position,
+/// `None` if its walk got stuck).
+fn finished(c: &Counters, turns: &u64, end: Option<&StepState>) {
+    c.games.fetch_add(1, Ordering::Relaxed);
+    c.turns.fetch_add(*turns, Ordering::Relaxed);
+    if let Some(e) = end {
+        if e.is_terminal() && e.base.winner != 3 {
+            c.decisive.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Run `cfg.workers` self-play threads until `cfg.target_records` are written.
@@ -465,7 +601,11 @@ pub fn run(cfg: Config, eval: Arc<dyn Evaluator>, out: &Path) -> anyhow::Result<
                 movers: Vec::new(),
             };
             while !stop.load(Ordering::Relaxed) {
-                play_game(&cfg, eval.as_ref(), &mut rng, &mut w, &c, &stop)?;
+                if cfg.games > 1 {
+                    play_shared(&cfg, eval.as_ref(), &mut rng, &mut w, &c, &stop)?;
+                } else {
+                    play_game(&cfg, eval.as_ref(), &mut rng, &mut w, &c, &stop)?;
+                }
                 if c.records.load(Ordering::Relaxed) >= cfg.target_records {
                     stop.store(true, Ordering::Relaxed);
                 }

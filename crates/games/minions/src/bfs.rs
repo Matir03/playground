@@ -120,6 +120,10 @@ pub struct Tree {
     inflight: Vec<u32>,
     /// Leaves whose expansion is being evaluated ([`Tree::descent_run`]).
     pending: Vec<bool>,
+    /// Where new descents start, round robin (empty: node 0). Several games
+    /// sharing one tree each start descents at their own position.
+    starts: Vec<u32>,
+    next_start: usize,
 }
 
 impl Tree {
@@ -153,11 +157,28 @@ impl Tree {
             cursors_b: Vec::new(),
             inflight: Vec::new(),
             pending: Vec::new(),
+            starts: Vec::new(),
+            next_start: 0,
         })
     }
 
+    /// Nothing left to search: the root (or every descent start) is decided.
     pub fn is_solved(&self) -> bool {
-        matches!(self.nodes[0].kind, TERMINAL | DEAD) || self.nodes[0].resolved
+        let done = |n: u32| {
+            let nd = &self.nodes[n as usize];
+            matches!(nd.kind, TERMINAL | DEAD) || nd.resolved
+        };
+        if self.starts.is_empty() {
+            done(0)
+        } else {
+            self.starts.iter().all(|&n| done(n))
+        }
+    }
+
+    /// Start new descents at these nodes, round robin (empty: node 0).
+    pub fn set_starts(&mut self, starts: &[u32]) {
+        self.starts = starts.to_vec();
+        self.next_start = 0;
     }
 
     pub fn children(&self, n: u32) -> std::ops::Range<u32> {
@@ -207,7 +228,7 @@ impl Tree {
     /// The step path from the root to `n`.
     pub fn path(&self, mut n: u32) -> Vec<u8> {
         let mut steps = Vec::new();
-        while n != 0 {
+        while self.nodes[n as usize].parent != u32::MAX {
             steps.push(self.nodes[n as usize].step);
             n = self.nodes[n as usize].parent;
         }
@@ -215,13 +236,23 @@ impl Tree {
         steps
     }
 
-    /// `n`'s state: stored, or replayed from the root along its path.
+    /// `n`'s state: stored, or replayed from its nearest ancestor with a
+    /// stored state (every root of a forest keeps one).
     pub fn state_of(&self, n: u32) -> StepState {
-        if let Some(Some(s)) = self.states.get(n as usize) {
-            return s.clone();
-        }
-        let mut s = self.root.clone();
-        for v in self.path(n) {
+        let mut steps = Vec::new();
+        let mut a = n;
+        let mut s = loop {
+            if let Some(Some(s)) = self.states.get(a as usize) {
+                break s.clone();
+            }
+            let nd = &self.nodes[a as usize];
+            if nd.parent == u32::MAX {
+                break self.root.clone();
+            }
+            steps.push(nd.step);
+            a = nd.parent;
+        };
+        for &v in steps.iter().rev() {
             s.apply(v);
         }
         s
@@ -497,7 +528,7 @@ impl Tree {
                 self.nodes[n as usize].kind = DEAD;
                 self.stats.dead += 1;
             }
-            if n == 0 {
+            if self.nodes[n as usize].parent == u32::MAX {
                 continue;
             }
             let after = &self.nodes[n as usize];
@@ -570,8 +601,9 @@ impl Tree {
                     break;
                 }
                 starts += 1;
-                self.cursors.push(vec![0]);
-                self.enter(0);
+                let s = self.pick_start();
+                self.cursors.push(vec![s]);
+                self.enter(s);
             }
             match self.advance(i) {
                 Some(leaf) => {
@@ -886,6 +918,78 @@ impl Tree {
         self.nodes[n as usize].kind
     }
 
+    /// The next descent start: round robin over the undecided starts.
+    fn pick_start(&mut self) -> u32 {
+        for _ in 0..self.starts.len() {
+            let n = self.starts[self.next_start % self.starts.len()];
+            self.next_start += 1;
+            let nd = &self.nodes[n as usize];
+            if !(matches!(nd.kind, TERMINAL | DEAD) || nd.resolved) {
+                return n;
+            }
+        }
+        self.starts.first().copied().unwrap_or(0)
+    }
+
+    /// A forest of `roots`' subtrees, re-indexed (a root inside another's
+    /// subtree stays where it is), and the old-to-new index map (`u32::MAX`
+    /// for dropped nodes). Each new root keeps its state; descents are
+    /// cleared and the starts reset.
+    pub fn retain(&self, roots: &[u32]) -> (Tree, Vec<u32>) {
+        let mut map = vec![u32::MAX; self.nodes.len()];
+        let mut inside = vec![false; self.nodes.len()];
+        for &r in roots {
+            inside[r as usize] = true;
+        }
+        // Children come after their parents, so one forward pass marks every
+        // subtree; the kept nodes keep their relative order, so the new
+        // arena has parents before children and siblings contiguous.
+        let mut nodes = Vec::new();
+        let mut states = Vec::new();
+        for i in 0..self.nodes.len() {
+            let p = self.nodes[i].parent;
+            if !inside[i] && p != u32::MAX && inside[p as usize] {
+                inside[i] = true;
+            }
+            if !inside[i] {
+                continue;
+            }
+            map[i] = nodes.len() as u32;
+            let mut nd = self.nodes[i];
+            if p == u32::MAX || !inside[p as usize] {
+                nd.parent = u32::MAX;
+                states.push(Some(self.state_of(i as u32)));
+            } else {
+                nd.parent = map[p as usize];
+                states.push(self.states[i].clone());
+            }
+            nodes.push(nd);
+        }
+        for nd in nodes.iter_mut() {
+            if nd.nch > 0 {
+                nd.first = map[nd.first as usize];
+            }
+        }
+        let root = states
+            .first()
+            .and_then(|s| s.clone())
+            .unwrap_or_else(|| self.root.clone());
+        let tree = Tree {
+            nodes,
+            states,
+            root,
+            params: self.params.clone(),
+            stats: SearchStats::default(),
+            cursors: Vec::new(),
+            cursors_b: Vec::new(),
+            inflight: Vec::new(),
+            pending: Vec::new(),
+            starts: Vec::new(),
+            next_start: 0,
+        };
+        (tree, map)
+    }
+
     /// A new tree rooted at `n` (its subtree kept, re-indexed).
     pub fn reroot(&self, n: u32) -> Tree {
         let root = self.state_of(n);
@@ -923,6 +1027,8 @@ impl Tree {
             cursors_b: Vec::new(),
             inflight: Vec::new(),
             pending: Vec::new(),
+            starts: Vec::new(),
+            next_start: 0,
         }
     }
 }
@@ -1454,6 +1560,62 @@ mod tests {
     }
 
     #[test]
+    fn retain_keeps_a_forest_of_subtrees() {
+        let s = StepState::begin(&MinionsState::with_bid(0), 5);
+        let mut t = Tree::new(
+            s,
+            Params {
+                heads: 8,
+                power: 2.0,
+                threads: 1,
+            },
+            &Material,
+        )
+        .unwrap();
+        for _ in 0..300 {
+            t.descent_wave(&Material, 8).unwrap();
+        }
+        t.clear_descents();
+        // Two grandchildren-level roots in different subtrees, plus one
+        // inside the first's subtree (it must not become a root).
+        let kids: Vec<u32> = t.children(0).filter(|&c| t.kind(c) == EXPANDED).collect();
+        assert!(kids.len() >= 2, "need two expanded children");
+        let (a, b) = (kids[0], kids[1]);
+        let inner = t.children(a).next().unwrap();
+        let (f, map) = t.retain(&[a, b, inner]);
+        assert_eq!(f.nodes[map[a as usize] as usize].parent, u32::MAX);
+        assert_eq!(f.nodes[map[b as usize] as usize].parent, u32::MAX);
+        assert_eq!(
+            f.nodes[map[inner as usize] as usize].parent,
+            map[a as usize]
+        );
+        assert_eq!(map[0], u32::MAX);
+        for (old, &new) in map.iter().enumerate() {
+            if new == u32::MAX {
+                continue;
+            }
+            let (o, n) = (&t.nodes[old], &f.nodes[new as usize]);
+            assert_eq!(
+                (o.value, o.visits, o.kind, o.nch),
+                (n.value, n.visits, n.kind, n.nch)
+            );
+            if n.parent != u32::MAX {
+                assert!(n.parent < new);
+            }
+            if n.nch > 0 {
+                for c in n.first..n.first + u32::from(n.nch) {
+                    assert_eq!(f.nodes[c as usize].parent, new, "children contiguous");
+                }
+            }
+            assert_eq!(
+                f.state_of(new).base.key(),
+                t.state_of(old as u32).base.key(),
+                "state of {old}"
+            );
+        }
+    }
+
+    #[test]
     fn search_runs_and_backs_up_consistently() {
         let s = StepState::begin(&MinionsState::with_bid(0), 5);
         let mut t = Tree::new(
@@ -1488,6 +1650,8 @@ mod tests {
                 cursors_b: Vec::new(),
                 inflight: Vec::new(),
                 pending: Vec::new(),
+                starts: Vec::new(),
+                next_start: 0,
             };
             assert!(tt.recompute(n));
             assert!(
