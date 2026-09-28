@@ -1519,8 +1519,11 @@ pub mod prof {
     }
 }
 
-/// Search nodes [`exact_realize`] may visit before giving up.
-pub const EXACT_BUDGET: u32 = 5_000;
+/// Search nodes [`exact_realize`] may visit before giving up. An exhausted
+/// budget is a dead end, the same as "impossible". Self-play ABBA on gen55
+/// (2026-09-28): 5000 -> 1000 is +30% expansions/s for ~7% of exact-found
+/// witnesses lost; 400 is another +12% for ~13% lost.
+pub const EXACT_BUDGET: u32 = 1_000;
 
 /// Transpositions the exact search may meet per node of budget before it
 /// gives up (they are cheap but not free: a clone, an apply and a hash).
