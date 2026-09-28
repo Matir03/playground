@@ -678,6 +678,14 @@ enum Cmd {
         budget: u32,
         #[arg(long, default_value_t = 0)]
         limit: usize,
+        /// Write each query's outcome at this budget (one byte: 0 found,
+        /// 1 impossible, 2 unknown) for `steps-exact-diag`.
+        #[arg(long)]
+        labels_out: Option<String>,
+        /// Instead of replaying: profile the queries against these labels and
+        /// score the candidate impossibility checks.
+        #[arg(long)]
+        diag: Option<String>,
     },
     StepsSelfplay {
         /// Record output directory.
@@ -1326,8 +1334,12 @@ async fn main() -> anyhow::Result<()> {
             let mean = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).sum::<f32>() / a.len() as f32;
             println!("{} positions: max |a - b| {d:.2e}, mean {mean:.2e}; a mean value {:.3}", a.len(), a.iter().sum::<f32>() / a.len() as f32);
         }
-        Cmd::StepsExactBench { corpus, budget, limit } => {
-            minions_engine::steps::exact_bench(std::path::Path::new(&corpus), budget, limit)?;
+        Cmd::StepsExactBench { corpus, budget, limit, labels_out, diag } => {
+            let corpus = std::path::Path::new(&corpus);
+            match diag {
+                Some(labels) => minions_engine::steps::exact_diag(corpus, std::path::Path::new(&labels))?,
+                None => minions_engine::steps::exact_bench(corpus, budget, limit, labels_out.as_deref().map(std::path::Path::new))?,
+            }
         }
         Cmd::StepsSelfplay {
             out,

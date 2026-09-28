@@ -1446,6 +1446,26 @@ fn exact_site(site: usize, t0: std::time::Instant) {
 /// at the cap.
 pub const DEPTH_LAMBDA: f32 = 0.5;
 
+/// Budget for the first (declared-targets-only) phase of the exact search:
+/// `STEPS_EXACT_TWO_PHASE` as a fraction of the budget (default 0 = one phase).
+fn two_phase_budget(budget: u32) -> u32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    let f = *V.get_or_init(|| {
+        std::env::var("STEPS_EXACT_TWO_PHASE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0)
+    });
+    (budget as f32 * f) as u32
+}
+
+/// Prune on the enemy necromancer's remaining health rather than on its
+/// being hittable at all (`STEPS_EXACT_NECRO_BOUND=0` restores the old test).
+fn necro_bound() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("STEPS_EXACT_NECRO_BOUND").map_or(true, |v| v != "0"))
+}
+
 /// Benchmark switch: the per-target reachability bound instead of the
 /// assignment bound (`STEPS_EXACT_OLD_BOUND`).
 fn exact_old_bound() -> bool {
@@ -1666,16 +1686,28 @@ pub fn encode_query(
 
 /// Replay a query corpus through [`exact_realize`] at `budget`: outcome counts
 /// against the recorded ones, and time. `limit` 0 = all.
-pub fn exact_bench(path: &std::path::Path, budget: u32, limit: usize) -> anyhow::Result<()> {
+pub fn exact_bench(
+    path: &std::path::Path,
+    budget: u32,
+    limit: usize,
+    labels_out: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
     let bytes = std::fs::read(path)?;
     let n = bytes.len() / QUERY_BYTES;
     let n = if limit > 0 { n.min(limit) } else { n };
+    // Rows by ground truth instead of the recorded outcome, if given.
+    let truth = std::env::var("EXACT_TRUTH")
+        .ok()
+        .map(std::fs::read)
+        .transpose()?;
     // [recorded][now]: found / impossible / unknown
     let mut table = [[0u64; 3]; 3];
     let mut ns_by = [[0u64; 3]; 3];
     let mut nodes_found = Vec::new();
-    for r in bytes.chunks_exact(QUERY_BYTES).take(n) {
+    let mut labels = Vec::with_capacity(n);
+    for (qi, r) in bytes.chunks_exact(QUERY_BYTES).take(n).enumerate() {
         let (base, spec, decided, fated, was, _, _) = decode_query(r);
+        let was = truth.as_ref().map_or(was, |t| t[qi]);
         let t0 = std::time::Instant::now();
         let now = match exact_realize(&base, &spec, decided, fated, budget) {
             Exact::Found(..) => 0,
@@ -1683,11 +1715,15 @@ pub fn exact_bench(path: &std::path::Path, budget: u32, limit: usize) -> anyhow:
             Exact::Unknown => 2,
         };
         let ns = t0.elapsed().as_nanos() as u64;
+        labels.push(now as u8);
         table[was.min(2) as usize][now] += 1;
         ns_by[was.min(2) as usize][now] += ns;
         if now == 0 {
             nodes_found.push(ns);
         }
+    }
+    if let Some(p) = labels_out {
+        std::fs::write(p, &labels)?;
     }
     println!("{n} queries at budget {budget} (rows: recorded found/impossible/unknown; cols: now)");
     let name = ["found", "impossible", "unknown"];
@@ -1715,6 +1751,237 @@ pub fn exact_bench(path: &std::path::Path, budget: u32, limit: usize) -> anyhow:
         );
     }
     Ok(())
+}
+
+/// Profile a query corpus against ground-truth `labels` (from
+/// `steps-exact-bench --labels-out` at a large budget), and score the
+/// candidate impossibility checks in [`impossible_checks`]: how many
+/// labelled-impossible queries each catches, and how many feasible ones it
+/// wrongly rejects (must be 0).
+pub fn exact_diag(path: &std::path::Path, labels: &std::path::Path) -> anyhow::Result<()> {
+    let bytes = std::fs::read(path)?;
+    let labels = std::fs::read(labels)?;
+    let qs: Vec<Query> = bytes.chunks_exact(QUERY_BYTES).map(decode_query).collect();
+    anyhow::ensure!(labels.len() <= qs.len(), "more labels than queries");
+    // Feature profile of the hard queries (recorded out of budget).
+    let name = ["found", "impossible", "unknown"];
+    for lab in 0..3u8 {
+        let hard: Vec<&Query> = qs
+            .iter()
+            .zip(&labels)
+            .filter(|(q, &l)| q.4 == 2 && l == lab)
+            .map(|(q, _)| q)
+            .collect();
+        if hard.is_empty() {
+            continue;
+        }
+        let n = hard.len() as f64;
+        let mean = |f: &dyn Fn(&Query) -> f64| hard.iter().map(|q| f(q)).sum::<f64>() / n;
+        let friends = |q: &Query| {
+            (0..NUM_CELLS as u8)
+                .filter(|&c| q.0.piece_at(c).is_some_and(|(sd, _)| sd == 0))
+                .count() as f64
+        };
+        let enemies = |q: &Query| {
+            (0..NUM_CELLS as u8)
+                .filter(|&c| q.0.piece_at(c).is_some_and(|(sd, _)| sd != 0))
+                .count() as f64
+        };
+        let kills = |q: &Query| {
+            bitboard::cells(q.3)
+                .filter(|&e| q.1.targets[e as usize] != TARGET_STAY)
+                .count() as f64
+        };
+        println!(
+            "hard {:>10}: {:>5} | moves-stage {:.2} | friends {:.1} enemies {:.1} fated {:.1} kills {:.1} decided {:.1}",
+            name[lab as usize],
+            hard.len(),
+            mean(&|q| f64::from(u8::from(q.2 != 0))),
+            mean(&friends),
+            mean(&enemies),
+            mean(&|q| q.3.count_ones() as f64),
+            mean(&kills),
+            mean(&|q| q.2.count_ones() as f64),
+        );
+    }
+    // Moves-stage queries: are the ones still needing search those where some
+    // friend that could reach a fated target is undecided?
+    {
+        let relevant_undecided = |q: &Query| -> bool {
+            let (base, spec, decided, fated) = (&q.0, &q.1, q.2, q.3);
+            let targets: Vec<u8> = bitboard::cells(fated)
+                .filter(|&e| spec.targets[e as usize] != TARGET_STAY)
+                .collect();
+            (0..NUM_CELLS as u8).any(|a| {
+                let Some((sd, u)) = base.piece_at(a) else {
+                    return false;
+                };
+                if sd != 0 || has(decided, a) || !base.can_attack_piece(a, u) {
+                    return false;
+                }
+                let st = u.stats();
+                let ends = if base.can_move_piece(a) && !st.lumbering {
+                    bitboard::reachable(bit(a), st.speed, FULL)
+                } else {
+                    bit(a)
+                };
+                targets
+                    .iter()
+                    .any(|&t| ends & bitboard::reachable(bit(t), st.range, FULL) & !bit(t) != 0)
+            })
+        };
+        let mut rows = [[0u64; 2]; 3];
+        let mut ns = [[0u64; 2]; 3];
+        let mut shown = 0;
+        let show_moves: usize = std::env::var("DIAG_SHOW_MOVES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        for (q, &l) in qs.iter().zip(&labels) {
+            if q.2 == 0 {
+                continue;
+            }
+            let r = usize::from(relevant_undecided(q));
+            if r == 0 && q.4 == 2 && shown < show_moves {
+                shown += 1;
+                println!(
+                    "truth {}:\n{}",
+                    ["found", "impossible", "unknown"][l.min(2) as usize],
+                    describe_query(q)
+                );
+            }
+            rows[q.4.min(2) as usize][r] += 1;
+            ns[q.4.min(2) as usize][r] += q.6;
+            let _ = l;
+        }
+        for (i, n) in ["found", "impossible", "out of budget"].iter().enumerate() {
+            println!(
+                "moves-stage, recorded {n:>13}: attack-relevant all decided {} ({:.0} ms) | some undecided {} ({:.0} ms)",
+                rows[i][0], ns[i][0] as f64 * 1e-6, rows[i][1], ns[i][1] as f64 * 1e-6
+            );
+        }
+    }
+    // Fate-stage hard queries: how many declare the enemy necromancer killed,
+    // and how many unfated enemies are still open.
+    {
+        let mut rows = [[0u64; 2]; 3];
+        let mut unf = [0f64; 3];
+        for (q, &l) in qs.iter().zip(&labels) {
+            if q.2 != 0 || q.4 != 2 {
+                continue;
+            }
+            let necro_kill = bitboard::cells(q.3).any(|e| {
+                q.1.targets[e as usize] == TARGET_KILL
+                    && q.0
+                        .piece_at(e)
+                        .is_some_and(|(sd, u)| sd != 0 && u.stats().necromancer)
+            });
+            rows[l.min(2) as usize][usize::from(necro_kill)] += 1;
+            let enemies = (0..NUM_CELLS as u8)
+                .filter(|&c| q.0.piece_at(c).is_some_and(|(sd, _)| sd != 0))
+                .count();
+            unf[l.min(2) as usize] += (enemies - q.3.count_ones() as usize) as f64;
+        }
+        for (i, n) in name.iter().enumerate() {
+            let tot = (rows[i][0] + rows[i][1]).max(1);
+            println!(
+                "fates-stage hard, truth {n:>10}: {tot} | necromancer KILL declared {} | mean unfated enemies {:.1}",
+                rows[i][1],
+                unf[i] / tot as f64
+            );
+        }
+    }
+    // Candidate checks.
+    for (cname, check) in impossible_checks() {
+        let (mut caught, mut imp, mut wrong, mut feas) = (0, 0, 0, 0);
+        let (mut caught_easy, mut imp_easy) = (0, 0);
+        let t0 = std::time::Instant::now();
+        for (q, &l) in qs.iter().zip(&labels) {
+            let says = check(q);
+            match l {
+                0 => {
+                    feas += 1;
+                    if says {
+                        wrong += 1;
+                    }
+                }
+                1 if q.4 == 2 => {
+                    imp += 1;
+                    if says {
+                        caught += 1;
+                    }
+                }
+                1 => {
+                    imp_easy += 1;
+                    if says {
+                        caught_easy += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        println!(
+            "check {cname:>18}: hard impossible caught {caught}/{imp}, easy impossible {caught_easy}/{imp_easy}, feasible wrongly rejected {wrong}/{feas}, {:.1} us/query",
+            t0.elapsed().as_secs_f64() * 1e6 / labels.len() as f64
+        );
+    }
+    // A few hard impossible queries, readable.
+    let show: usize = std::env::var("DIAG_SHOW")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    for q in qs
+        .iter()
+        .zip(&labels)
+        .filter(|(q, &l)| q.4 == 2 && l == 1)
+        .map(|(q, _)| q)
+        .take(show)
+    {
+        println!("{}", describe_query(q));
+    }
+    Ok(())
+}
+
+/// A query as text: every piece with its fate or declared move.
+pub fn describe_query(q: &Query) -> String {
+    let (base, spec, decided, fated) = (&q.0, &q.1, q.2, q.3);
+    let mut out = format!("turn {} money {:?}\n", base.turn, base.money);
+    for c in 0..NUM_CELLS as u8 {
+        let Some((sd, u)) = base.piece_at(c) else {
+            continue;
+        };
+        let what = if sd == 0 {
+            if has(decided, c) {
+                let k = spec.moves[c as usize];
+                let d = if k == NO_MOVE || k == 0 {
+                    c
+                } else {
+                    MOVE_DEST[c as usize][k as usize]
+                };
+                format!("-> {}", crate::map::cell_name(d))
+            } else {
+                "free".to_string()
+            }
+        } else if has(fated, c) {
+            ["stay", "KILL", "UNSUMMON"][spec.targets[c as usize] as usize].to_string()
+        } else {
+            "unfated".to_string()
+        };
+        out += &format!(
+            "  {} {} {:?} dmg {} {}\n",
+            if sd == 0 { "F" } else { "E" },
+            crate::map::cell_name(c),
+            u,
+            base.damage_on(c),
+            what
+        );
+    }
+    out
+}
+
+/// Candidate necessary conditions: `true` means "provably impossible".
+fn impossible_checks() -> Vec<(&'static str, fn(&Query) -> bool)> {
+    vec![("none", |_q: &Query| false)]
 }
 
 /// A query decoded from [`encode_query`]:
@@ -1783,6 +2050,8 @@ pub fn exact_realize(
         decided: Bb,
         fated: Bb,
         budget: u32,
+        /// Phase 1 of the two-phase search: attack declared targets only.
+        only_fated: bool,
         seen: HashSet<u64>,
         path: Vec<MinionsMove>,
         found: Option<TurnSpec>,
@@ -1853,7 +2122,11 @@ pub fn exact_realize(
                     .s
                     .piece_at(e)
                     .is_some_and(|(sd, u)| sd == 1 && u.stats().necromancer)
-                && hittable(c, st, e, spared)
+                && if necro_bound() {
+                    lethal(c, st, e, spared)
+                } else {
+                    hittable(c, st, e, spared)
+                }
         });
         if necro_open {
             return false;
@@ -1941,6 +2214,51 @@ pub fn exact_realize(
             })
             .collect();
         assign::hall_violation(&targets, &attackers).is_some()
+    }
+    // Whether the friends that can still end their turn in range of `t` and
+    // attack could together deal its remaining health (one attack each,
+    // blockers other than spared enemies ignored): a necessary condition
+    // for killing it this turn.
+    fn lethal(c: &Ctx, st: &St, t: u8, spared: Bb) -> bool {
+        let s = &st.s;
+        let Some((_, tu)) = s.piece_at(t) else {
+            return false;
+        };
+        let need = u32::from(tu.stats().defense.saturating_sub(s.damage_on(t)));
+        let mut supply = 0u32;
+        for a in 0..NUM_CELLS as u8 {
+            let Some((sd, u)) = s.piece_at(a) else {
+                continue;
+            };
+            if sd != 0 || !s.can_attack_piece(a, u) {
+                continue;
+            }
+            let st_ = u.stats();
+            let ring = bitboard::reachable(bit(t), st_.range, FULL) & !bit(t);
+            let o = st.origin_at[a as usize];
+            let ends = if has(c.decided, o) {
+                let d = dest_of(c.spec, o);
+                if d == a || !s.can_move_piece(a) {
+                    bit(a)
+                } else if st_.lumbering {
+                    0
+                } else {
+                    bit(d)
+                }
+            } else if s.can_move_piece(a) && !st_.lumbering {
+                let pass = if st_.flying { FULL } else { FULL & !spared };
+                bitboard::reachable(bit(a), st_.speed, pass)
+            } else {
+                bit(a)
+            };
+            if ends & ring != 0 {
+                supply += u32::from(kill_damage_against(u, tu));
+                if supply >= need {
+                    return true;
+                }
+            }
+        }
+        false
     }
     // Whether some friend can still end its turn in range of `t` and attack.
     fn hittable(c: &Ctx, st: &St, t: u8, spared: Bb) -> bool {
@@ -2044,6 +2362,7 @@ pub fn exact_realize(
                 st.gone[e as usize] == 0
                     && st.s.piece_at(e).is_some_and(|(sd, _)| sd == 1)
                     && !(has(c.fated, e) && c.spec.targets[e as usize] == TARGET_STAY)
+                    && (!c.only_fated || has(c.fated, e))
             })
             .fold(0, |b, e| b | bit(e));
         let rmax = (0..6u8)
@@ -2150,6 +2469,7 @@ pub fn exact_realize(
         decided,
         fated,
         budget,
+        only_fated: false,
         seen: HashSet::new(),
         path: Vec::new(),
         found: None,
@@ -2175,7 +2495,29 @@ pub fn exact_realize(
         }
     }
     let t0 = std::time::Instant::now();
-    let ok = dfs(&mut c, &root);
+    // Two phases: first with only the declared targets attackable (any
+    // witness found is a real one), then the full search, where unfated
+    // enemies may also be killed to open paths and hexes.
+    let first = two_phase_budget(budget);
+    let ok = if first > 0 && fated != 0 {
+        c.only_fated = true;
+        c.budget = first;
+        let ok1 = dfs(&mut c, &root);
+        if ok1 {
+            c.budget += budget - first;
+            true
+        } else {
+            let left = budget - first + c.budget;
+            c.only_fated = false;
+            c.budget = left;
+            c.seen.clear();
+            c.hits = 0;
+            c.out_of_budget = false;
+            dfs(&mut c, &root)
+        }
+    } else {
+        dfs(&mut c, &root)
+    };
     let ns = t0.elapsed().as_nanos() as u64;
     EXACT_STATS[3].fetch_add(ns, Relaxed);
     let o = if ok {
