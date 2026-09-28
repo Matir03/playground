@@ -649,6 +649,10 @@ enum Cmd {
         /// Step-player threads.
         #[arg(long, default_value_t = 8)]
         threads: usize,
+        /// Rescale the step budget each round to the MCTS's time per move
+        /// (`--expansions` is then only the first round's budget).
+        #[arg(long)]
+        equal_time: bool,
     },
     /// Check a step-trained MLP's CPU evaluator against its ONNX graph on
     /// random step-tree positions.
@@ -1253,7 +1257,7 @@ async fn main() -> anyhow::Result<()> {
                 2 * pairs, wdl[0], wdl[1], wdl[2], t.elapsed().as_secs_f64()
             );
         }
-        Cmd::StepsVsMcts { a, old, pairs, ep, seed, expansions, heads, sims, candidates, t_steps, resample_every, threads } => {
+        Cmd::StepsVsMcts { a, old, pairs, ep, seed, expansions, heads, sims, candidates, t_steps, resample_every, threads, equal_time } => {
             let t = std::time::Instant::now();
             let steps = minions_engine::stepsp::Player {
                 eval: load_step_eval(&a, &ep)?,
@@ -1264,7 +1268,7 @@ async fn main() -> anyhow::Result<()> {
             let params = playground_core::sampled_mcts::SampledParams { resample_every, ..params };
             let kind = minions_engine::net::BackendKind::parse("ort", &ep, true, false)?;
             let seat = minions_engine::eval::load_seat(std::path::Path::new(&old), &kind, sampler, None)?;
-            let (score, wdl, (tw, tl)) = minions_engine::stepsp::play_vs_mcts(&steps, &seat, &params, pairs, seed, threads)?;
+            let (score, wdl, (tw, tl)) = minions_engine::stepsp::play_vs_mcts(&steps, &seat, &params, pairs, seed, threads, equal_time)?;
             let n = (2 * pairs) as f64;
             let se = (score * (1.0 - score) / n).sqrt();
             println!(

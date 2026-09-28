@@ -191,6 +191,8 @@ pub struct Counters {
     pub stuck: AtomicU64,
     pub starved: AtomicU64,
     pub walk_ns: AtomicU64,
+    /// Starting bids, indexed from `BID_MIN`.
+    pub bids: [AtomicU64; (crate::game::BID_MAX - crate::game::BID_MIN + 1) as usize],
 }
 
 impl Counters {
@@ -273,8 +275,16 @@ fn play_game(
     stop: &AtomicBool,
 ) -> anyhow::Result<()> {
     use rand::Rng;
-    let (start, _) = crate::selfplay::random_opening(cfg.opening_max, cfg.opening_decay, rng);
     let salt: u64 = rng.gen();
+    // The standard opening starts at the net's own bid, so the game itself is
+    // the only source of randomness.
+    let start = if cfg.opening_max == 0 {
+        let b = bid(eval, salt)?;
+        c.bids[(b - crate::game::BID_MIN) as usize].fetch_add(1, Ordering::Relaxed);
+        crate::game::MinionsState::with_bid(b)
+    } else {
+        crate::selfplay::random_opening(cfg.opening_max, cfg.opening_decay, rng).0
+    };
     let mut tree = Tree::new(StepState::begin(&start, salt), cfg.params.clone(), eval)?;
     let mut turns = 0u64;
     while !tree.root.is_terminal() && !tree.is_solved() {
@@ -534,6 +544,15 @@ pub fn run(cfg: Config, eval: Arc<dyn Evaluator>, out: &Path) -> anyhow::Result<
         c.records.load(Ordering::Relaxed),
         c.games.load(Ordering::Relaxed)
     );
+    let bids: Vec<String> = (c.bids.iter().zip(crate::game::BID_MIN..))
+        .filter_map(|(n, b)| {
+            let n = n.load(Ordering::Relaxed);
+            (n > 0).then(|| format!("{b}:{n}"))
+        })
+        .collect();
+    if !bids.is_empty() {
+        println!("bids: {}", bids.join(" "));
+    }
     Ok(())
 }
 
@@ -849,6 +868,7 @@ pub fn play_vs_mcts(
     pairs: usize,
     seed: u64,
     threads: usize,
+    equal_time: bool,
 ) -> anyhow::Result<(f64, [u32; 3], (f64, f64))> {
     use crate::game::{Minions, MinionsState};
     use crate::turn::{realize, TurnSpec};
@@ -882,10 +902,28 @@ pub fn play_vs_mcts(
     eprintln!("bids: steps per pair, mcts {mcts_bid:?}");
     let done = |g: &G| Minions::outcome(&g.real).is_terminal() || g.turns >= 200;
     let mut round = 0u32;
+    // Wall time and moves per side; each side has the whole machine while it moves.
+    let (mut t_mcts, mut n_mcts, mut t_steps, mut n_steps) = (0f64, 0usize, 0f64, 0usize);
+    let per = |t: f64, n: usize| t / n.max(1) as f64;
+    // Under `equal_time` the step budget is reset every round to what the
+    // MCTS spent per move that round, at the step side's measured rate.
+    let mut player = steps.clone();
+    let mut expanded = 0f64;
+    let mut last_rate = 0f64;
+    let mut round_mcts = 0f64;
     loop {
         let live: Vec<usize> = (0..games.len()).filter(|&i| !done(&games[i])).collect();
         if live.is_empty() {
             break;
+        }
+        if round % 10 == 0 {
+            eprintln!(
+                "round {round}: {} live; s/move mcts {:.3} ({n_mcts}), steps {:.3} ({n_steps}); {} expansions",
+                live.len(),
+                per(t_mcts, n_mcts),
+                per(t_steps, n_steps),
+                player.expansions
+            );
         }
         let steps_moves = |g: &G| (g.real.side == 0) == g.steps_first;
         // The old MCTS, batched over its games.
@@ -895,6 +933,7 @@ pub fn play_vs_mcts(
             .filter(|&i| !steps_moves(&games[i]))
             .collect();
         if !mi.is_empty() {
+            let t0 = std::time::Instant::now();
             let states: Vec<MinionsState> = mi.iter().map(|&i| games[i].real.clone()).collect();
             let plies: Vec<u32> = mi.iter().map(|&i| games[i].real.turn as u32).collect();
             let mut p = *params;
@@ -911,6 +950,9 @@ pub fn play_vs_mcts(
                 };
                 games[i].turns += 1;
             }
+            round_mcts = t0.elapsed().as_secs_f64() / mi.len() as f64;
+            t_mcts += t0.elapsed().as_secs_f64();
+            n_mcts += mi.len();
         }
         // The step player, in parallel.
         // Games the old MCTS just finished are over.
@@ -919,6 +961,13 @@ pub fn play_vs_mcts(
             .copied()
             .filter(|&i| !mi.contains(&i) && !done(&games[i]) && steps_moves(&games[i]))
             .collect();
+        if equal_time && last_rate > 0.0 && round_mcts > 0.0 {
+            // Last round's rate (cost per expansion grows with the budget),
+            // and a correction that pulls the cumulative totals together.
+            let gap = (per(t_mcts, n_mcts) / per(t_steps, n_steps)).clamp(0.5, 2.0);
+            player.expansions = ((last_rate * round_mcts * gap) as u64).clamp(100, 200_000);
+        }
+        let t0 = std::time::Instant::now();
         let next = std::sync::atomic::AtomicUsize::new(0);
         let out: std::sync::Mutex<Vec<(usize, anyhow::Result<MinionsState>)>> =
             std::sync::Mutex::new(Vec::new());
@@ -930,7 +979,7 @@ pub fn play_vs_mcts(
                         return;
                     };
                     let g = &games[i];
-                    let r = steps.turn(&g.real, g.salt ^ u64::from(g.turns));
+                    let r = player.turn(&g.real, g.salt ^ u64::from(g.turns));
                     out.lock().unwrap().push((i, r));
                 });
             }
@@ -939,8 +988,21 @@ pub fn play_vs_mcts(
             games[i].real = r?;
             games[i].turns += 1;
         }
+        let dt = t0.elapsed().as_secs_f64();
+        if !si.is_empty() && dt > 0.0 {
+            last_rate = (player.expansions * si.len() as u64) as f64 / dt;
+        }
+        t_steps += dt;
+        n_steps += si.len();
+        expanded += (player.expansions * si.len() as u64) as f64;
         round += 1;
     }
+    eprintln!(
+        "time per move (machine-amortized): mcts {:.3}s over {n_mcts}, steps {:.3}s over {n_steps}; mean {:.0} expansions",
+        per(t_mcts, n_mcts),
+        per(t_steps, n_steps),
+        expanded / n_steps.max(1) as f64
+    );
     let (mut score, mut wdl) = (0f64, [0u32; 3]);
     let (mut win_turns, mut loss_turns) = (Vec::new(), Vec::new());
     for g in &games {
