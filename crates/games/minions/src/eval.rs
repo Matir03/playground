@@ -197,7 +197,7 @@ pub fn settle_bids<R: rand::Rng + ?Sized>(a_bid: f64, b_bid: f64, rng: &mut R) -
 /// That was invisible at 100 simulations and became the dominant cost of the
 /// cycle at 800 — a single 40-game match was ~600k essentially unbatched
 /// expansions, around 25 minutes. Here the whole group advances together.
-fn pick_many(
+pub(crate) fn pick_many(
     seat: &Seat,
     states: &[MinionsState],
     plies: &[u32],
@@ -397,7 +397,7 @@ struct RootEdge {
 
 /// One turn's search at its root, mirroring `AnalyzeNode`.
 #[derive(serde::Serialize, Clone)]
-struct RootSearch {
+pub(crate) struct RootSearch {
     /// Which seat searched this turn: "a" or "b".
     mover: String,
     total_visits: u32,

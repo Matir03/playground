@@ -617,6 +617,39 @@ enum Cmd {
         #[arg(long, default_value_t = 1)]
         threads: usize,
     },
+    /// The step search (best-first) against the old sampled-AZ MCTS, standard
+    /// openings with bidding. Old side defaults to the old ladder's eval
+    /// search: 400 sims, 16 candidates, 4 diffusion steps, no refinement.
+    StepsVsMcts {
+        /// Step net (`.onnx`).
+        #[arg(long)]
+        a: String,
+        /// Old model directory (trunk/diffusion/energy ONNX + config.json).
+        #[arg(long)]
+        old: String,
+        #[arg(long, default_value_t = 50)]
+        pairs: usize,
+        #[arg(long, default_value = "trt")]
+        ep: String,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Step side: leaf expansions per turn (best-first).
+        #[arg(long, default_value_t = 2000)]
+        expansions: u64,
+        #[arg(long, default_value_t = 32)]
+        heads: usize,
+        #[arg(long, default_value_t = 400)]
+        sims: u32,
+        #[arg(long, default_value_t = 16)]
+        candidates: usize,
+        #[arg(long, default_value_t = 4)]
+        t_steps: usize,
+        #[arg(long, default_value_t = 0.0)]
+        resample_every: f32,
+        /// Step-player threads.
+        #[arg(long, default_value_t = 8)]
+        threads: usize,
+    },
     /// Check a step-trained MLP's CPU evaluator against its ONNX graph on
     /// random step-tree positions.
     StepsCheck {
@@ -1217,6 +1250,25 @@ async fn main() -> anyhow::Result<()> {
             let se = (score * (1.0 - score) / n).sqrt();
             println!(
                 "A {a}\nB {b}\nA score {score:.3} +- {se:.3} over {} games (A wins {}, B wins {}, draws {}) in {:.0}s",
+                2 * pairs, wdl[0], wdl[1], wdl[2], t.elapsed().as_secs_f64()
+            );
+        }
+        Cmd::StepsVsMcts { a, old, pairs, ep, seed, expansions, heads, sims, candidates, t_steps, resample_every, threads } => {
+            let t = std::time::Instant::now();
+            let steps = minions_engine::stepsp::Player {
+                eval: load_step_eval(&a, &ep)?,
+                expansions,
+                params: minions_engine::bfs::Params { heads, ..Default::default() },
+            };
+            let (sampler, params) = minions_engine::eval::match_search(sims, candidates, t_steps, 2 * pairs, seed);
+            let params = playground_core::sampled_mcts::SampledParams { resample_every, ..params };
+            let kind = minions_engine::net::BackendKind::parse("ort", &ep, true, false)?;
+            let seat = minions_engine::eval::load_seat(std::path::Path::new(&old), &kind, sampler, None)?;
+            let (score, wdl, (tw, tl)) = minions_engine::stepsp::play_vs_mcts(&steps, &seat, &params, pairs, seed, threads)?;
+            let n = (2 * pairs) as f64;
+            let se = (score * (1.0 - score) / n).sqrt();
+            println!(
+                "steps {a} ({expansions} expansions) vs old MCTS {old} ({sims} sims, {candidates} candidates)\nsteps score {score:.3} +- {se:.3} over {} games (steps wins {}, MCTS wins {}, draws {}); mean turn of steps wins {tw:.1}, losses {tl:.1}; {:.0}s",
                 2 * pairs, wdl[0], wdl[1], wdl[2], t.elapsed().as_secs_f64()
             );
         }

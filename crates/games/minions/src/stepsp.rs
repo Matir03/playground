@@ -664,7 +664,16 @@ pub fn search_turn(
             continue;
         }
         let Some(ch) = tree.best_child(n) else {
-            anyhow::bail!("no live child in a search turn");
+            let nd = &tree.nodes[n as usize];
+            let kinds: Vec<u8> = tree.children(n).map(|c| tree.kind(c)).collect();
+            anyhow::bail!(
+                "no live child in a search turn: node {n} kind {} nch {} resolved {} comp {} children kinds {kinds:?}\n{}",
+                nd.kind,
+                nd.nch,
+                nd.resolved,
+                nd.comp,
+                real.render()
+            );
         };
         if tree.nodes[ch as usize].flip || tree.kind(ch) == 2 {
             let fin = tree.state_of(ch);
@@ -825,6 +834,145 @@ pub fn play_match(
         2 * pairs
     );
     Ok((score / (2 * pairs) as f64, wdl))
+}
+
+/// The step player (seat A, `steps`) against the old sampled-AZ MCTS
+/// (`seat` with `params`). Pairs share a bid start (each side's own bid,
+/// averaged) with seats swapped. Each round, the old MCTS moves in every live
+/// game where it is to move in one lockstep batch (as its own eval did), and
+/// the step player moves in the rest on `threads` threads. Returns A's score
+/// and (A wins, B wins, draws), plus mean turns of A's wins and losses.
+pub fn play_vs_mcts(
+    steps: &Player,
+    seat: &crate::eval::Seat,
+    params: &playground_core::sampled_mcts::SampledParams,
+    pairs: usize,
+    seed: u64,
+    threads: usize,
+) -> anyhow::Result<(f64, [u32; 3], (f64, f64))> {
+    use crate::game::{Minions, MinionsState};
+    use crate::turn::{realize, TurnSpec};
+    use playground_core::{Game, Outcome};
+    use rand::Rng;
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+    let mcts_bid = crate::eval::bid_of(seat, params)?;
+    struct G {
+        real: MinionsState,
+        steps_first: bool,
+        salt: u64,
+        turns: u32,
+    }
+    let mut games = Vec::with_capacity(2 * pairs);
+    for _ in 0..pairs {
+        let salt: u64 = rng.gen();
+        let sb = f64::from(bid(steps.eval.as_ref(), salt)?);
+        let b = match mcts_bid {
+            Some(m) => ((sb + m) / 2.0).trunc() as i16,
+            None => sb as i16,
+        };
+        for steps_first in [true, false] {
+            games.push(G {
+                real: MinionsState::with_bid(b),
+                steps_first,
+                salt,
+                turns: 0,
+            });
+        }
+    }
+    eprintln!("bids: steps per pair, mcts {mcts_bid:?}");
+    let done = |g: &G| Minions::outcome(&g.real).is_terminal() || g.turns >= 200;
+    let mut round = 0u32;
+    loop {
+        let live: Vec<usize> = (0..games.len()).filter(|&i| !done(&games[i])).collect();
+        if live.is_empty() {
+            break;
+        }
+        let steps_moves = |g: &G| (g.real.side == 0) == g.steps_first;
+        // The old MCTS, batched over its games.
+        let mi: Vec<usize> = live
+            .iter()
+            .copied()
+            .filter(|&i| !steps_moves(&games[i]))
+            .collect();
+        if !mi.is_empty() {
+            let states: Vec<MinionsState> = mi.iter().map(|&i| games[i].real.clone()).collect();
+            let plies: Vec<u32> = mi.iter().map(|&i| games[i].real.turn as u32).collect();
+            let mut p = *params;
+            p.seed = params.seed ^ (u64::from(round) << 32);
+            let (specs, _, _) = crate::eval::pick_many(seat, &states, &plies, &p, false)?;
+            for (&i, spec) in mi.iter().zip(specs) {
+                let prev = games[i].real.clone();
+                let next = realize(&prev, &spec).next;
+                // A declaration that changes nothing would loop forever.
+                games[i].real = if Minions::encode_state(&next) == Minions::encode_state(&prev) {
+                    realize(&prev, &TurnSpec::empty()).next
+                } else {
+                    next
+                };
+                games[i].turns += 1;
+            }
+        }
+        // The step player, in parallel.
+        // Games the old MCTS just finished are over.
+        let si: Vec<usize> = live
+            .iter()
+            .copied()
+            .filter(|&i| !mi.contains(&i) && !done(&games[i]) && steps_moves(&games[i]))
+            .collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let out: std::sync::Mutex<Vec<(usize, anyhow::Result<MinionsState>)>> =
+            std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|sc| {
+            for _ in 0..threads.max(1) {
+                sc.spawn(|| loop {
+                    let k = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&i) = si.get(k) else {
+                        return;
+                    };
+                    let g = &games[i];
+                    let r = steps.turn(&g.real, g.salt ^ u64::from(g.turns));
+                    out.lock().unwrap().push((i, r));
+                });
+            }
+        });
+        for (i, r) in out.into_inner().unwrap() {
+            games[i].real = r?;
+            games[i].turns += 1;
+        }
+        round += 1;
+    }
+    let (mut score, mut wdl) = (0f64, [0u32; 3]);
+    let (mut win_turns, mut loss_turns) = (Vec::new(), Vec::new());
+    for g in &games {
+        match Minions::outcome(&g.real) {
+            r @ (Outcome::FirstWins | Outcome::SecondWins) => {
+                if (r == Outcome::FirstWins) == g.steps_first {
+                    wdl[0] += 1;
+                    score += 1.0;
+                    win_turns.push(f64::from(g.real.turn));
+                } else {
+                    wdl[1] += 1;
+                    loss_turns.push(f64::from(g.real.turn));
+                }
+            }
+            _ => {
+                wdl[2] += 1;
+                score += 0.5;
+            }
+        }
+    }
+    let mean = |v: &[f64]| {
+        if v.is_empty() {
+            0.0
+        } else {
+            v.iter().sum::<f64>() / v.len() as f64
+        }
+    };
+    Ok((
+        score / games.len() as f64,
+        wdl,
+        (mean(&win_turns), mean(&loss_turns)),
+    ))
 }
 
 #[cfg(test)]
