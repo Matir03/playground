@@ -35,6 +35,8 @@ use crate::turn::{
 use crate::units::{Attack, Unit, BUYABLE};
 use playground_core::Game;
 
+mod plan;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
     Fates,
@@ -1446,6 +1448,40 @@ fn exact_site(site: usize, t0: std::time::Instant) {
 /// at the cap.
 pub const DEPTH_LAMBDA: f32 = 0.5;
 
+/// The plan-space search in front of the atomic one (`STEPS_PLAN=0` turns
+/// it off).
+fn plan_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("STEPS_PLAN").map_or(true, |v| v != "0"))
+}
+
+/// Caps multiplier for a second plan search when the first ends unknown
+/// (`STEPS_PLAN_RETRY`, default 0 = go straight to the atomic search).
+fn plan_retry_scale() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("STEPS_PLAN_RETRY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Plan-space search outcomes: found, impossible, handed to the atomic
+/// search.
+pub static PLAN_STATS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Validation mode (`STEPS_EXACT_FULL_MOVES=1`): the exact search tries every
+/// move of every undecided unit, not only attacking and vacating ones.
+fn full_moves() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("STEPS_EXACT_FULL_MOVES").is_ok_and(|v| v == "1"))
+}
+
 /// Budget for the first (declared-targets-only) phase of the exact search:
 /// `STEPS_EXACT_TWO_PHASE` as a fraction of the budget (default 0 = one phase).
 fn two_phase_budget(budget: u32) -> u32 {
@@ -1700,6 +1736,19 @@ pub fn exact_bench(
         .ok()
         .map(std::fs::read)
         .transpose()?;
+    // Score the plan-space search alone (`EXACT_PLAN_ONLY=1`).
+    let plan_only = std::env::var("EXACT_PLAN_ONLY").is_ok_and(|v| v == "1");
+    let mut bad_witness = 0u64;
+    let mut explained = 0;
+    let (mut replay_ok, mut replay_bad) = (0u64, 0u64);
+    // Validate plan "impossible" claims with the unrestricted exact search
+    // (`EXACT_PLAN_VALIDATE=<n>` hard queries; run with STEPS_EXACT_FULL_MOVES=1).
+    let mut validate_left: u64 = std::env::var("EXACT_PLAN_VALIDATE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let (mut validate_wrong, mut validate_imp, mut validate_unk) = (0u64, 0u64, 0u64);
+    let q_hard = |rec: u8| rec != 0;
     // [recorded][now]: found / impossible / unknown
     let mut table = [[0u64; 3]; 3];
     let mut ns_by = [[0u64; 3]; 3];
@@ -1707,12 +1756,89 @@ pub fn exact_bench(
     let mut labels = Vec::with_capacity(n);
     for (qi, r) in bytes.chunks_exact(QUERY_BYTES).take(n).enumerate() {
         let (base, spec, decided, fated, was, _, _) = decode_query(r);
+        let was_rec = was;
         let was = truth.as_ref().map_or(was, |t| t[qi]);
         let t0 = std::time::Instant::now();
-        let now = match exact_realize(&base, &spec, decided, fated, budget) {
-            Exact::Found(..) => 0,
-            Exact::Impossible => 1,
-            Exact::Unknown => 2,
+        let now = if plan_only {
+            match plan::plan_realize(&base, &spec, decided, fated) {
+                plan::Plan::Found(w) => {
+                    // A plan's witness must be a real completion.
+                    let ok = (0..NUM_CELLS).all(|c| {
+                        (!has(decided, c as u8) || w.moves[c] == spec.moves[c])
+                            && (!has(fated, c as u8) || w.targets[c] == spec.targets[c])
+                    }) && (attack_part_fast(&base, &w).is_some()
+                        || matches!(
+                            exact_realize(&base, &w, side_bb(&base, 0), side_bb(&base, 1), 200_000),
+                            Exact::Found(..)
+                        ));
+                    if !ok {
+                        bad_witness += 1;
+                    }
+                    if truth.as_ref().is_some_and(|t| t[qi] != 0) {
+                        match replay_check(&base, &w) {
+                            Ok(()) => replay_ok += 1,
+                            Err(e) => {
+                                replay_bad += 1;
+                                if replay_bad <= 5 {
+                                    println!("replay failed: {e}");
+                                }
+                            }
+                        }
+                    }
+                    0
+                }
+                plan::Plan::Impossible => {
+                    if validate_left > 0 && q_hard(was_rec) {
+                        validate_left -= 1;
+                        match exact_realize(&base, &spec, decided, fated, 300_000) {
+                            Exact::Found(w, _) => {
+                                validate_wrong += 1;
+                                if validate_wrong <= 3 {
+                                    println!(
+                                        "PLAN WRONG: {}",
+                                        describe_query(&(
+                                            base.clone(),
+                                            spec,
+                                            decided,
+                                            fated,
+                                            0,
+                                            0,
+                                            0
+                                        ))
+                                    );
+                                    println!("  witness moves/targets differ from plan model; replay {:?}", replay_check(&base, &w));
+                                }
+                            }
+                            Exact::Impossible => validate_imp += 1,
+                            Exact::Unknown => validate_unk += 1,
+                        }
+                    }
+                    if std::env::var("EXACT_PLAN_EXPLAIN").is_ok()
+                        && truth.as_ref().is_some_and(|t| t[qi] == 0)
+                        && explained < 12
+                    {
+                        if let Exact::Found(w, _) =
+                            exact_realize(&base, &spec, decided, fated, 200_000)
+                        {
+                            explained += 1;
+                            println!(
+                                "MISS (decided {}, fated {}): {}",
+                                decided.count_ones(),
+                                fated.count_ones(),
+                                plan::explain_miss(&base, &spec, decided, fated, &w)
+                            );
+                        }
+                    }
+                    1
+                }
+                plan::Plan::Unknown => 2,
+            }
+        } else {
+            match exact_realize(&base, &spec, decided, fated, budget) {
+                Exact::Found(..) => 0,
+                Exact::Impossible => 1,
+                Exact::Unknown => 2,
+            }
         };
         let ns = t0.elapsed().as_nanos() as u64;
         labels.push(now as u8);
@@ -1724,6 +1850,16 @@ pub fn exact_bench(
     }
     if let Some(p) = labels_out {
         std::fs::write(p, &labels)?;
+    }
+    if plan_only {
+        println!("plan witnesses that do not realize or contradict the query: {bad_witness}");
+        println!("plan witnesses for queries labelled not-found, replayed move by move: {replay_ok} legal, {replay_bad} not");
+        let w: Vec<u64> = plan::INCOMPLETE
+            .iter()
+            .map(|x| x.load(std::sync::atomic::Ordering::Relaxed))
+            .collect();
+        println!("plan incomplete reasons: extras over cap {}, placement nodes {}, verifications {}, exact verify out of budget {}", w[0], w[1], w[2], w[3]);
+        println!("plan impossible claims checked by the unrestricted search: {validate_imp} confirmed, {validate_wrong} WRONG, {validate_unk} undecided");
     }
     println!("{n} queries at budget {budget} (rows: recorded found/impossible/unknown; cols: now)");
     let name = ["found", "impossible", "unknown"];
@@ -1982,6 +2118,82 @@ pub fn describe_query(q: &Query) -> String {
 /// Candidate necessary conditions: `true` means "provably impossible".
 fn impossible_checks() -> Vec<(&'static str, fn(&Query) -> bool)> {
     vec![("none", |_q: &Query| false)]
+}
+
+/// Independent check of a complete declaration `w` (debugging): an action
+/// sequence from any realizer, replayed move by move against the rules, and
+/// the end position checked against every declared fate and destination.
+pub(crate) fn replay_check(base: &MinionsState, w: &TurnSpec) -> Result<(), String> {
+    let mut sp = *w;
+    sp.spawns = [0; NUM_CELLS];
+    let r = crate::turn::realize_attack(base, &sp);
+    let f = r.fidelity;
+    let acts = if r.next.winner != 0
+        || (f.done_moves == f.declared_moves
+            && f.done_kills == f.declared_kills
+            && r.spec.targets == sp.targets)
+    {
+        r.actions
+    } else {
+        let n_targets = (0..NUM_CELLS)
+            .filter(|&c| sp.targets[c] != TARGET_STAY)
+            .count();
+        (0..n_targets.min(6))
+            .find_map(|first| {
+                let mut log = Vec::new();
+                realize_sequential(base, &sp, first, Some(&mut log)).map(|_| log)
+            })
+            .or_else(|| {
+                match exact_realize(base, &sp, side_bb(base, 0), side_bb(base, 1), 200_000) {
+                    Exact::Found(_, p) => Some(p),
+                    _ => None,
+                }
+            })
+            .ok_or("no realizer produced actions")?
+    };
+    let mut s = base.clone();
+    for mv in &acts {
+        if !Minions::legal_moves(&s).contains(mv) {
+            return Err(format!("illegal {mv:?}"));
+        }
+        s = Minions::apply(&s, mv);
+    }
+    if s.winner == 1 {
+        return Ok(());
+    }
+    for c in 0..NUM_CELLS as u8 {
+        if let Some((sd, u)) = base.piece_at(c) {
+            if sd != 0 {
+                let here = s.piece_at(c);
+                let alive = here.is_some_and(|(sd2, u2)| sd2 != 0 && u2 == u);
+                match w.targets[c as usize] {
+                    TARGET_STAY if !alive || s.damage_on(c) != 0 => {
+                        return Err(format!("{} should stay unhurt", crate::map::cell_name(c)))
+                    }
+                    TARGET_KILL | TARGET_UNSUMMON if alive => {
+                        return Err(format!("{} should be gone", crate::map::cell_name(c)))
+                    }
+                    _ => {}
+                }
+            } else {
+                let k = w.moves[c as usize];
+                let d = if k == NO_MOVE || k == 0 {
+                    c
+                } else {
+                    MOVE_DEST[c as usize][k as usize]
+                };
+                if !s.piece_at(d).is_some_and(|(sd2, u2)| sd2 == 0 && u2 == u) {
+                    return Err(format!(
+                        "{:?} from {} not at {}",
+                        u,
+                        crate::map::cell_name(c),
+                        crate::map::cell_name(d)
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A query decoded from [`encode_query`]:
@@ -2411,6 +2623,9 @@ pub fn exact_realize(
                     } else if has(want | rings, from) {
                         // Vacate, preferably to a hex nobody wants.
                         moves.push((if has(want | rings, to) { 3 } else { 2 }, mv));
+                    } else if full_moves() {
+                        // Validation only: every move of every unit.
+                        moves.push((4, mv));
                     }
                 }
                 _ => {}
@@ -2493,6 +2708,31 @@ pub fn exact_realize(
         if !set.lock().unwrap().insert(h.finish()) {
             EXACT_OUTCOME[3][0].fetch_add(1, Relaxed);
         }
+    }
+    // A partial declaration goes to the plan-space search first (see
+    // `plan`); its complete declarations come back here for verification.
+    if plan_enabled() && (decided != side_bb(base, 0) || fated != side_bb(base, 1)) {
+        let t0 = std::time::Instant::now();
+        let mut r = plan::plan_realize(base, spec, decided, fated);
+        let retry = plan_retry_scale();
+        if retry > 1 && matches!(r, plan::Plan::Unknown) {
+            r = plan::plan_realize_scaled(base, spec, decided, fated, retry);
+        }
+        let ns = t0.elapsed().as_nanos() as u64;
+        let out = match r {
+            plan::Plan::Found(w) => Some((0, Exact::Found(w, Vec::new()))),
+            plan::Plan::Impossible => Some((1, Exact::Impossible)),
+            plan::Plan::Unknown => None,
+        };
+        if let Some((o, e)) = out {
+            dump_query(base, spec, decided, fated, o as u8, 0, ns);
+            EXACT_OUTCOME[o][0].fetch_add(ns, Relaxed);
+            EXACT_STATS[3].fetch_add(ns, Relaxed);
+            EXACT_STATS[o].fetch_add(1, Relaxed);
+            PLAN_STATS[o].fetch_add(1, Relaxed);
+            return e;
+        }
+        PLAN_STATS[2].fetch_add(1, Relaxed);
     }
     let t0 = std::time::Instant::now();
     // Two phases: first with only the declared targets attackable (any
