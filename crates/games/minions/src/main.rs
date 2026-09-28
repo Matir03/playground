@@ -669,6 +669,16 @@ enum Cmd {
     },
     /// Self-play with the best-first step search (docs/minions-steps.md):
     /// writes every well-visited search node as a value record.
+    /// Replay a dumped exact-search query corpus (`STEPS_EXACT_DUMP`) at a
+    /// given budget.
+    StepsExactBench {
+        #[arg(long)]
+        corpus: String,
+        #[arg(long, default_value_t = 1000)]
+        budget: u32,
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
+    },
     StepsSelfplay {
         /// Record output directory.
         #[arg(long)]
@@ -1315,6 +1325,9 @@ async fn main() -> anyhow::Result<()> {
             let d = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
             let mean = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).sum::<f32>() / a.len() as f32;
             println!("{} positions: max |a - b| {d:.2e}, mean {mean:.2e}; a mean value {:.3}", a.len(), a.iter().sum::<f32>() / a.len() as f32);
+        }
+        Cmd::StepsExactBench { corpus, budget, limit } => {
+            minions_engine::steps::exact_bench(std::path::Path::new(&corpus), budget, limit)?;
         }
         Cmd::StepsSelfplay {
             out,

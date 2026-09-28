@@ -1571,6 +1571,193 @@ pub static EXACT_STATS: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0), // nanoseconds spent
 ];
 
+/// Exact-search queries to a file for offline solver work: every
+/// `STEPS_EXACT_DUMP_EVERY`-th call (default 1) is appended to the file named
+/// by `STEPS_EXACT_DUMP`, as a fixed-size [`encode_query`] record.
+static EXACT_DUMP: std::sync::OnceLock<Option<(std::sync::Mutex<std::fs::File>, u64)>> =
+    std::sync::OnceLock::new();
+static EXACT_DUMP_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn dump_query(
+    base: &MinionsState,
+    spec: &TurnSpec,
+    decided: Bb,
+    fated: Bb,
+    outcome: u8,
+    nodes: u32,
+    ns: u64,
+) {
+    use std::io::Write;
+    let d = EXACT_DUMP.get_or_init(|| {
+        let path = std::env::var("STEPS_EXACT_DUMP").ok()?;
+        let every = std::env::var("STEPS_EXACT_DUMP_EVERY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1u64)
+            .max(1);
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()?;
+        Some((std::sync::Mutex::new(f), every))
+    });
+    let Some((f, every)) = d else { return };
+    if EXACT_DUMP_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % every != 0 {
+        return;
+    }
+    let rec = encode_query(base, spec, decided, fated, outcome, nodes, ns);
+    let _ = f.lock().unwrap().write_all(&rec);
+}
+
+/// Bytes per [`encode_query`] record.
+pub const QUERY_BYTES: usize = 49 * 2
+    + 4
+    + 2 * crate::units::BUYABLE.len()
+    + 4
+    + 2 * crate::game::ADJ_WINDOW
+    + 5
+    + 49 * 3
+    + 32
+    + 1
+    + 4
+    + 8;
+
+/// One exact-search query: the state, the partial declaration, the decided
+/// and fated masks, and how the search that met it ended (0 found,
+/// 1 impossible, 2 out of budget) with its node count and time.
+pub fn encode_query(
+    base: &MinionsState,
+    spec: &TurnSpec,
+    decided: Bb,
+    fated: Bb,
+    outcome: u8,
+    nodes: u32,
+    ns: u64,
+) -> Vec<u8> {
+    let mut r = Vec::with_capacity(QUERY_BYTES);
+    r.extend_from_slice(&base.cells);
+    r.extend_from_slice(&base.pstate);
+    for m in base.money {
+        r.extend_from_slice(&m.to_le_bytes());
+    }
+    for side in base.reinforcements {
+        r.extend_from_slice(&side);
+    }
+    r.push(base.side);
+    r.push(base.phase);
+    r.extend_from_slice(&base.turn.to_le_bytes());
+    for h in base.nw_hist {
+        r.extend_from_slice(&h.to_le_bytes());
+    }
+    r.extend_from_slice(&base.ply.to_le_bytes());
+    r.push(base.winner);
+    r.extend_from_slice(&spec.moves);
+    r.extend_from_slice(&spec.targets);
+    r.extend_from_slice(&spec.spawns);
+    r.extend_from_slice(&decided.to_le_bytes());
+    r.extend_from_slice(&fated.to_le_bytes());
+    r.push(outcome);
+    r.extend_from_slice(&nodes.to_le_bytes());
+    r.extend_from_slice(&ns.to_le_bytes());
+    debug_assert_eq!(r.len(), QUERY_BYTES);
+    r
+}
+
+/// Replay a query corpus through [`exact_realize`] at `budget`: outcome counts
+/// against the recorded ones, and time. `limit` 0 = all.
+pub fn exact_bench(path: &std::path::Path, budget: u32, limit: usize) -> anyhow::Result<()> {
+    let bytes = std::fs::read(path)?;
+    let n = bytes.len() / QUERY_BYTES;
+    let n = if limit > 0 { n.min(limit) } else { n };
+    // [recorded][now]: found / impossible / unknown
+    let mut table = [[0u64; 3]; 3];
+    let mut ns_by = [[0u64; 3]; 3];
+    let mut nodes_found = Vec::new();
+    for r in bytes.chunks_exact(QUERY_BYTES).take(n) {
+        let (base, spec, decided, fated, was, _, _) = decode_query(r);
+        let t0 = std::time::Instant::now();
+        let now = match exact_realize(&base, &spec, decided, fated, budget) {
+            Exact::Found(..) => 0,
+            Exact::Impossible => 1,
+            Exact::Unknown => 2,
+        };
+        let ns = t0.elapsed().as_nanos() as u64;
+        table[was.min(2) as usize][now] += 1;
+        ns_by[was.min(2) as usize][now] += ns;
+        if now == 0 {
+            nodes_found.push(ns);
+        }
+    }
+    println!("{n} queries at budget {budget} (rows: recorded found/impossible/unknown; cols: now)");
+    let name = ["found", "impossible", "unknown"];
+    for (i, row) in table.iter().enumerate() {
+        println!(
+            "  {:>10}: {:>8} {:>8} {:>8}   ms: {:>9.1} {:>9.1} {:>9.1}",
+            name[i],
+            row[0],
+            row[1],
+            row[2],
+            ns_by[i][0] as f64 * 1e-6,
+            ns_by[i][1] as f64 * 1e-6,
+            ns_by[i][2] as f64 * 1e-6
+        );
+    }
+    nodes_found.sort_unstable();
+    if !nodes_found.is_empty() {
+        let q = |f: f64| nodes_found[((nodes_found.len() - 1) as f64 * f) as usize] as f64 * 1e-3;
+        println!(
+            "  time of found calls, us: p50 {:.0} p90 {:.0} p99 {:.0} max {:.0}",
+            q(0.5),
+            q(0.9),
+            q(0.99),
+            q(1.0)
+        );
+    }
+    Ok(())
+}
+
+/// A query decoded from [`encode_query`]:
+/// (state, declaration, decided, fated, outcome, nodes, ns).
+pub type Query = (MinionsState, TurnSpec, Bb, Bb, u8, u32, u64);
+
+pub fn decode_query(r: &[u8]) -> Query {
+    let mut at = 0;
+    let mut take = |n: usize| {
+        let s = &r[at..at + n];
+        at += n;
+        s
+    };
+    let mut base = MinionsState::with_bid(0);
+    base.cells.copy_from_slice(take(49));
+    base.pstate.copy_from_slice(take(49));
+    for m in base.money.iter_mut() {
+        *m = u16::from_le_bytes(take(2).try_into().unwrap());
+    }
+    for side in base.reinforcements.iter_mut() {
+        let n = side.len();
+        side.copy_from_slice(take(n));
+    }
+    base.side = take(1)[0];
+    base.phase = take(1)[0];
+    base.turn = u16::from_le_bytes(take(2).try_into().unwrap());
+    for h in base.nw_hist.iter_mut() {
+        *h = i16::from_le_bytes(take(2).try_into().unwrap());
+    }
+    base.ply = u32::from_le_bytes(take(4).try_into().unwrap());
+    base.winner = take(1)[0];
+    let mut spec = TurnSpec::empty();
+    spec.moves.copy_from_slice(take(49));
+    spec.targets.copy_from_slice(take(49));
+    spec.spawns.copy_from_slice(take(49));
+    let decided = Bb::from_le_bytes(take(16).try_into().unwrap());
+    let fated = Bb::from_le_bytes(take(16).try_into().unwrap());
+    let outcome = take(1)[0];
+    let nodes = u32::from_le_bytes(take(4).try_into().unwrap());
+    let ns = u64::from_le_bytes(take(8).try_into().unwrap());
+    (base, spec, decided, fated, outcome, nodes, ns)
+}
+
 /// Exhaustive search over the attack phase's legal atomic actions for a
 /// sequence that realizes the decisions in `spec`: every friend in `decided`
 /// ends on its declared hex, every enemy in `fated` meets its declared fate
@@ -1998,6 +2185,7 @@ pub fn exact_realize(
     } else {
         1
     };
+    dump_query(base, spec, decided, fated, o as u8, budget - c.budget, ns);
     EXACT_OUTCOME[o][0].fetch_add(ns, Relaxed);
     EXACT_OUTCOME[o][1].fetch_add(u64::from(budget - c.budget), Relaxed);
     EXACT_OUTCOME[3][1].fetch_add(c.hits, Relaxed);
@@ -2553,6 +2741,31 @@ fn positions_dfs(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn query_codec_round_trips() {
+        let base = crate::game::MinionsState::with_bid(3);
+        let mut spec = TurnSpec::empty();
+        spec.moves[7] = 4;
+        spec.targets[40] = TARGET_KILL;
+        let r = super::encode_query(
+            &base,
+            &spec,
+            1 << 7,
+            (1u128 << 40) | (1 << 100),
+            2,
+            999,
+            12345,
+        );
+        assert_eq!(r.len(), super::QUERY_BYTES);
+        let (b, sp, d, f, o, n, ns) = super::decode_query(&r);
+        assert_eq!(b, base);
+        assert_eq!(sp, spec);
+        assert_eq!(
+            (d, f, o, n, ns),
+            (1 << 7, (1u128 << 40) | (1 << 100), 2, 999, 12345)
+        );
+    }
+
     use super::*;
     use rand::Rng;
 
