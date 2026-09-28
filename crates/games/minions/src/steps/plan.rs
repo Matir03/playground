@@ -31,13 +31,16 @@ pub(super) enum Plan {
 }
 
 /// Caps per query: placement-search nodes, and complete declarations
-/// verified.
+/// verified. Kept small on purpose: self-play waits for the slowest leaf of
+/// each wave, so a long plan query stalls every build thread. At 128
+/// verifies x 20k nodes x 2048 sets, self-play lost 10% for 190 unknowns
+/// per 25k queries instead of 428.
 const NODE_CAP: u32 = 20_000;
-const VERIFY_CAP: u32 = 128;
+const VERIFY_CAP: u32 = 48;
 /// Exact-search nodes for verifying one complete declaration.
-const VERIFY_BUDGET: u32 = 20_000;
+const VERIFY_BUDGET: u32 = 5_000;
 /// Kill sets (with their fate variants) tried per branch.
-const SETS_CAP: u32 = 2048;
+const SETS_CAP: u32 = 512;
 
 /// Why plan searches ended incomplete: too many extra kill candidates,
 /// placement nodes, verifications, an exact verification out of budget.
