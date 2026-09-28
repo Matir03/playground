@@ -1630,7 +1630,9 @@ pub static EXACT_STATS: [std::sync::atomic::AtomicU64; 4] = [
 /// Exact-search queries to a file for offline solver work: every
 /// `STEPS_EXACT_DUMP_EVERY`-th call (default 1) is appended to the file named
 /// by `STEPS_EXACT_DUMP`, as a fixed-size [`encode_query`] record.
-static EXACT_DUMP: std::sync::OnceLock<Option<(std::sync::Mutex<std::fs::File>, u64)>> =
+/// `STEPS_EXACT_DUMP_MIN_US` keeps only calls that took at least that long.
+#[allow(clippy::type_complexity)]
+static EXACT_DUMP: std::sync::OnceLock<Option<(std::sync::Mutex<std::fs::File>, u64, u64)>> =
     std::sync::OnceLock::new();
 static EXACT_DUMP_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1651,14 +1653,22 @@ fn dump_query(
             .and_then(|v| v.parse().ok())
             .unwrap_or(1u64)
             .max(1);
+        let min_ns = std::env::var("STEPS_EXACT_DUMP_MIN_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+            * 1000;
         let f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
             .ok()?;
-        Some((std::sync::Mutex::new(f), every))
+        Some((std::sync::Mutex::new(f), every, min_ns))
     });
-    let Some((f, every)) = d else { return };
+    let Some((f, every, min_ns)) = d else { return };
+    if ns < *min_ns {
+        return;
+    }
     if EXACT_DUMP_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % every != 0 {
         return;
     }
@@ -2711,6 +2721,7 @@ pub fn exact_realize(
     }
     // A partial declaration goes to the plan-space search first (see
     // `plan`); its complete declarations come back here for verification.
+    let mut plan_ns = 0;
     if plan_enabled() && (decided != side_bb(base, 0) || fated != side_bb(base, 1)) {
         let t0 = std::time::Instant::now();
         let mut r = plan::plan_realize(base, spec, decided, fated);
@@ -2733,6 +2744,7 @@ pub fn exact_realize(
             return e;
         }
         PLAN_STATS[2].fetch_add(1, Relaxed);
+        plan_ns = ns;
     }
     let t0 = std::time::Instant::now();
     // Two phases: first with only the declared targets attackable (any
@@ -2767,7 +2779,15 @@ pub fn exact_realize(
     } else {
         1
     };
-    dump_query(base, spec, decided, fated, o as u8, budget - c.budget, ns);
+    dump_query(
+        base,
+        spec,
+        decided,
+        fated,
+        o as u8,
+        budget - c.budget,
+        plan_ns + ns,
+    );
     EXACT_OUTCOME[o][0].fetch_add(ns, Relaxed);
     EXACT_OUTCOME[o][1].fetch_add(u64::from(budget - c.budget), Relaxed);
     EXACT_OUTCOME[3][1].fetch_add(c.hits, Relaxed);

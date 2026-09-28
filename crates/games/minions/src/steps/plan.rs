@@ -36,9 +36,16 @@ pub(super) enum Plan {
 /// verifies x 20k nodes x 2048 sets, self-play lost 10% for 190 unknowns
 /// per 25k queries instead of 428.
 const NODE_CAP: u32 = 20_000;
-const VERIFY_CAP: u32 = 48;
-/// Exact-search nodes for verifying one complete declaration.
+const VERIFY_CAP: u32 = 256;
+/// Exact-search nodes for verifying one complete declaration: the first
+/// `VERIFY_DEEP` get `VERIFY_BUDGET`, the rest `VERIFY_SHALLOW`. Big late-game
+/// positions have hundreds of placements that each verify in a few nodes, so
+/// 48 deep verifies spent up to 240k nodes on one query and a best-first eval
+/// game took 15 minutes; this schedule finds 9% more witnesses on those
+/// queries in a sixth of the time, and as many on self-play's.
 const VERIFY_BUDGET: u32 = 5_000;
+const VERIFY_DEEP: u32 = 2;
+const VERIFY_SHALLOW: u32 = 25;
 /// Kill sets (with their fate variants) tried per branch.
 const SETS_CAP: u32 = 512;
 
@@ -70,6 +77,8 @@ struct Budget {
     sets: u32,
     /// Some branch was cut short: "nothing found" proves nothing.
     incomplete: bool,
+    /// Complete declarations verified so far.
+    verified: u32,
 }
 
 fn dest(spec: &TurnSpec, o: u8) -> u8 {
@@ -123,6 +132,7 @@ pub(super) fn plan_realize_scaled(
         verifies: plan_env("PLAN_VERIFY_CAP", VERIFY_CAP) * scale,
         sets: plan_env("PLAN_SETS_CAP", SETS_CAP) * scale,
         incomplete: false,
+        verified: 0,
     };
 
     // Branch A: every declared fate happens, plus extra kills.
@@ -600,13 +610,13 @@ fn verify(base: &MinionsState, w: &TurnSpec, b: &mut Budget) -> bool {
     if known_realizable(base, w) {
         return true;
     }
-    match exact_realize(
-        base,
-        w,
-        side_bb(base, 0),
-        side_bb(base, 1),
-        plan_env("PLAN_VERIFY_BUDGET", VERIFY_BUDGET),
-    ) {
+    let budget = if b.verified < plan_env("PLAN_VERIFY_DEEP", VERIFY_DEEP) {
+        plan_env("PLAN_VERIFY_BUDGET", VERIFY_BUDGET)
+    } else {
+        plan_env("PLAN_VERIFY_SHALLOW", VERIFY_SHALLOW)
+    };
+    b.verified += 1;
+    match exact_realize(base, w, side_bb(base, 0), side_bb(base, 1), budget) {
         Exact::Found(..) => true,
         Exact::Impossible => false,
         Exact::Unknown => {
@@ -686,6 +696,7 @@ pub(super) fn explain_miss(
         verifies: VERIFY_CAP,
         sets: SETS_CAP,
         incomplete: false,
+        verified: 0,
     };
     let r = placements(base, &sp, &decided_list, &friends, &mut b);
     notes += &format!(
