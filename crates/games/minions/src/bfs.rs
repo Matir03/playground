@@ -63,6 +63,9 @@ pub struct Params {
     pub heads: usize,
     /// Power-mean exponent of the backup.
     pub power: f32,
+    /// Threads that build a wave's leaf expansions (option enumeration and
+    /// witnesses, the CPU cost); 1 builds them on the calling thread.
+    pub threads: usize,
 }
 
 impl Default for Params {
@@ -70,6 +73,7 @@ impl Default for Params {
         Self {
             heads: 32,
             power: 2.0,
+            threads: 1,
         }
     }
 }
@@ -111,7 +115,11 @@ pub struct Tree {
     /// Descent mode: the paths (root first) of the descents in flight, and
     /// per node how many of them pass through it.
     cursors: Vec<Vec<u32>>,
+    /// The second descent group of [`Tree::descent_run`].
+    cursors_b: Vec<Vec<u32>>,
     inflight: Vec<u32>,
+    /// Leaves whose expansion is being evaluated ([`Tree::descent_run`]).
+    pending: Vec<bool>,
 }
 
 impl Tree {
@@ -142,7 +150,9 @@ impl Tree {
             params,
             stats: SearchStats::default(),
             cursors: Vec::new(),
+            cursors_b: Vec::new(),
             inflight: Vec::new(),
+            pending: Vec::new(),
         })
     }
 
@@ -302,60 +312,9 @@ impl Tree {
 
     /// Expand `leaves`: enumerate, evaluate every child in one batch.
     fn expand(&mut self, leaves: &[u32], eval: &dyn Evaluator) -> anyhow::Result<()> {
+        let mut batch = self.prepare(leaves);
         let t = Instant::now();
-        struct Pending {
-            leaf: u32,
-            kids: Vec<(u8, bool, Option<(f32, i8)>, StepState)>, // (step, flip, terminal value + result, state)
-            first_view: usize,
-        }
-        let mut views: Vec<View> = Vec::new();
-        let mut pend: Vec<Pending> = Vec::with_capacity(leaves.len());
-        for &leaf in leaves {
-            let mut s = match self.states[leaf as usize].take() {
-                Some(s) => s,
-                None => self.state_of(leaf),
-            };
-            let tp = Instant::now();
-            let opts = s.collapse_forced();
-            crate::steps::prof::add(0, tp);
-            if opts.is_empty() {
-                if std::env::var("STEPS_DEBUG_DEAD").is_ok()
-                    && DEAD_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8
-                {
-                    eprintln!("no-option leaf: {}", s.debug_dead());
-                }
-                self.states[leaf as usize] = Some(s);
-                self.nodes[leaf as usize].kind = DEAD;
-                self.stats.dead += 1;
-                continue;
-            }
-            let first_view = views.len();
-            let mut kids = Vec::with_capacity(opts.len());
-            for v in opts {
-                let tp = Instant::now();
-                let c = s.child(v);
-                crate::steps::prof::add(1, tp);
-                let flip = c.flipped != s.flipped;
-                if c.is_terminal() {
-                    let tv = (c.terminal_value(), c.terminal_outcome());
-                    kids.push((v, flip, Some(tv), c));
-                } else {
-                    let tp = Instant::now();
-                    views.push(c.view());
-                    crate::steps::prof::add(2, tp);
-                    kids.push((v, flip, None, c));
-                }
-            }
-            s.drop_options();
-            self.states[leaf as usize] = Some(s);
-            pend.push(Pending {
-                leaf,
-                kids,
-                first_view,
-            });
-        }
-        self.stats.expand_ns += t.elapsed().as_nanos() as u64;
-        let t = Instant::now();
+        let views = std::mem::take(&mut batch.views);
         let vals = if views.is_empty() {
             Vec::new()
         } else {
@@ -363,11 +322,66 @@ impl Tree {
         };
         self.stats.eval_ns += t.elapsed().as_nanos() as u64;
         self.stats.evals += views.len() as u64;
-        for p in pend {
+        self.commit(batch, &vals);
+        Ok(())
+    }
+
+    /// Build `leaves`' children and the views to evaluate, on
+    /// `params.threads` threads (option enumeration and witnesses are the CPU
+    /// cost). Leaves with no options become dead ends here.
+    fn prepare(&mut self, leaves: &[u32]) -> Batch {
+        let t = Instant::now();
+        let mut work = self.take_states(leaves);
+        build_all(&mut work, self.params.threads);
+        self.stats.expand_ns += t.elapsed().as_nanos() as u64;
+        self.finish(leaves, work)
+    }
+
+    /// Move `leaves`' states out of the tree for [`build_all`].
+    fn take_states(&mut self, leaves: &[u32]) -> Vec<Work> {
+        leaves
+            .iter()
+            .map(|&leaf| {
+                let s = match self.states[leaf as usize].take() {
+                    Some(s) => s,
+                    None => self.state_of(leaf),
+                };
+                (s, None)
+            })
+            .collect()
+    }
+
+    /// Put built states back, mark dead ends, and collect the batch.
+    fn finish(&mut self, leaves: &[u32], work: Vec<Work>) -> Batch {
+        let mut batch = Batch {
+            leaves: leaves.to_vec(),
+            pend: Vec::with_capacity(leaves.len()),
+            views: Vec::new(),
+        };
+        for (&leaf, (s, out)) in leaves.iter().zip(work) {
+            self.states[leaf as usize] = Some(s);
+            match out.expect("built") {
+                Some((kids, vs)) => {
+                    batch.views.extend(vs);
+                    batch.pend.push((leaf, kids));
+                }
+                None => {
+                    self.nodes[leaf as usize].kind = DEAD;
+                    self.stats.dead += 1;
+                }
+            }
+        }
+        batch
+    }
+
+    /// Attach a prepared batch's children with their values (`vals`, in view
+    /// order); the leaves become expanded.
+    fn commit(&mut self, batch: Batch, vals: &[f32]) {
+        let mut vi = 0;
+        for (leaf, kids) in batch.pend {
             let first = self.nodes.len() as u32;
-            let mut vi = p.first_view;
-            let nk = p.kids.len();
-            for (step, flip, term, st) in p.kids {
+            let nk = kids.len();
+            for (step, flip, term, st) in kids {
                 let (kind, value, comp) = match term {
                     Some((v, r)) => (TERMINAL, v, r),
                     None => {
@@ -377,7 +391,7 @@ impl Tree {
                     }
                 };
                 self.nodes.push(Node {
-                    parent: p.leaf,
+                    parent: leaf,
                     first: 0,
                     nch: 0,
                     step,
@@ -391,13 +405,13 @@ impl Tree {
                 });
                 self.states.push(Some(st));
             }
-            let nd = &mut self.nodes[p.leaf as usize];
+            let nd = &mut self.nodes[leaf as usize];
             nd.first = first;
             nd.nch = nk as u16;
             nd.kind = EXPANDED;
             self.stats.expansions += 1;
         }
-        Ok(())
+        debug_assert_eq!(vi, vals.len());
     }
 
     /// Recompute `n`'s value from its children; `false` if all are dead.
@@ -457,18 +471,44 @@ impl Tree {
 
     fn backup(&mut self, leaves: &[u32]) {
         let t = Instant::now();
+        // Every node on some leaf's root path, recomputed once. A child's
+        // index is always above its parent's, so taking the highest pending
+        // index first settles children before parents: the same result as
+        // backing up leaf by leaf, without recomputing shared ancestors once
+        // per leaf. With `backup_eps() > 0`, a node whose value moved less
+        // than that (and whose proof state did not change) does not pass the
+        // update on to its parent.
+        let eps = backup_eps();
+        let mut seen = vec![0u64; self.nodes.len().div_ceil(64)];
+        let mut heap: std::collections::BinaryHeap<u32> = std::collections::BinaryHeap::new();
+        let push = |n: u32, seen: &mut Vec<u64>, heap: &mut std::collections::BinaryHeap<u32>| {
+            let (w, b) = (n as usize / 64, 1u64 << (n % 64));
+            if seen[w] & b == 0 {
+                seen[w] |= b;
+                heap.push(n);
+            }
+        };
         for &l in leaves {
-            let mut n = l;
-            loop {
-                let kind = self.nodes[n as usize].kind;
-                if kind == EXPANDED && !self.recompute(n) {
-                    self.nodes[n as usize].kind = DEAD;
-                    self.stats.dead += 1;
-                }
-                if n == 0 {
-                    break;
-                }
-                n = self.nodes[n as usize].parent;
+            push(l, &mut seen, &mut heap);
+        }
+        while let Some(n) = heap.pop() {
+            let before = self.nodes[n as usize];
+            if before.kind == EXPANDED && !self.recompute(n) {
+                self.nodes[n as usize].kind = DEAD;
+                self.stats.dead += 1;
+            }
+            if n == 0 {
+                continue;
+            }
+            let after = &self.nodes[n as usize];
+            let settled = eps > 0.0
+                && before.kind == EXPANDED
+                && after.kind == EXPANDED
+                && (after.value - before.value).abs() < eps
+                && after.comp == before.comp
+                && after.resolved == before.resolved;
+            if !settled {
+                push(after.parent, &mut seen, &mut heap);
             }
         }
         self.stats.backup_ns += t.elapsed().as_nanos() as u64;
@@ -503,6 +543,20 @@ impl Tree {
     ///
     /// Returns the number of leaves expanded (0 when nothing is left).
     pub fn descent_wave(&mut self, eval: &dyn Evaluator, k: usize) -> anyhow::Result<usize> {
+        let leaves = self.select_descents(k);
+        if leaves.is_empty() {
+            return Ok(0);
+        }
+        self.expand(&leaves, eval)?;
+        self.backup(&leaves);
+        self.stats.iterations += 1;
+        Ok(leaves.len())
+    }
+
+    /// Advance every descent in flight by one leaf (starting new ones up to
+    /// `k`) and return the distinct leaves to expand. A descent that reaches
+    /// a leaf still being evaluated by the other pipeline group waits there.
+    fn select_descents(&mut self, k: usize) -> Vec<u32> {
         let t = Instant::now();
         let k = k.max(1);
         let mut leaves: Vec<u32> = Vec::with_capacity(k);
@@ -521,7 +575,8 @@ impl Tree {
             }
             match self.advance(i) {
                 Some(leaf) => {
-                    if !leaves.contains(&leaf) {
+                    let busy = self.pending.get(leaf as usize).copied().unwrap_or(false);
+                    if !busy && !leaves.contains(&leaf) {
                         leaves.push(leaf);
                     }
                     i += 1;
@@ -535,18 +590,121 @@ impl Tree {
             }
         }
         self.stats.select_ns += t.elapsed().as_nanos() as u64;
-        if leaves.is_empty() {
-            return Ok(0);
-        }
-        self.expand(&leaves, eval)?;
-        self.backup(&leaves);
-        self.stats.iterations += 1;
-        Ok(leaves.len())
+        leaves
+    }
+
+    /// Descent with the evaluator and the CPU overlapped on one tree: the
+    /// descents are split into two groups of `k / 2`, and while one group's
+    /// children are on the GPU the other group is selected and built. Runs
+    /// until `stop` says so (checked between groups) or the tree is solved;
+    /// returns the leaves expanded.
+    pub fn descent_run(
+        &mut self,
+        eval: &dyn Evaluator,
+        k: usize,
+        stop: &mut dyn FnMut(&Tree) -> bool,
+    ) -> anyhow::Result<usize> {
+        let half = (k / 2).max(1);
+        let mut total = 0usize;
+        let threads = self.params.threads;
+        std::thread::scope(|sc| -> anyhow::Result<()> {
+            type Flight<'s> = (
+                Batch,
+                std::thread::ScopedJoinHandle<'s, anyhow::Result<Vec<f32>>>,
+            );
+            let mut flight: Option<Flight> = None;
+            let mut group = 0;
+            loop {
+                // Select the next group and start building it in the
+                // background (its states are moved out of the tree, so
+                // landing the other group below cannot touch them).
+                let building = if stop(self) || self.is_solved() {
+                    None
+                } else {
+                    if group == 1 {
+                        std::mem::swap(&mut self.cursors, &mut self.cursors_b);
+                    }
+                    let leaves = self.select_descents(half);
+                    if group == 1 {
+                        std::mem::swap(&mut self.cursors, &mut self.cursors_b);
+                    }
+                    (!leaves.is_empty()).then(|| {
+                        if self.pending.len() < self.nodes.len() {
+                            self.pending.resize(self.nodes.len(), false);
+                        }
+                        for &l in &leaves {
+                            self.pending[l as usize] = true;
+                        }
+                        let mut work = self.take_states(&leaves);
+                        let h = sc.spawn(move || {
+                            let t = Instant::now();
+                            build_all(&mut work, threads);
+                            (work, t.elapsed().as_nanos() as u64)
+                        });
+                        (leaves, h)
+                    })
+                };
+                // Take the finished evaluation, put the new group on the GPU
+                // straight away, then land the old one (commit and back up)
+                // while the GPU works.
+                let landed = flight.take();
+                let got = match landed {
+                    Some((batch, h)) => {
+                        let t = Instant::now();
+                        let vals = h
+                            .join()
+                            .map_err(|_| anyhow::anyhow!("evaluator panicked"))??;
+                        self.stats.eval_ns += t.elapsed().as_nanos() as u64;
+                        self.stats.evals += vals.len() as u64;
+                        Some((batch, vals))
+                    }
+                    None => None,
+                };
+                let launched = building.is_some();
+                if let Some((leaves, h)) = building {
+                    let t = Instant::now();
+                    let (work, _) = h.join().map_err(|_| anyhow::anyhow!("builder panicked"))?;
+                    self.stats.expand_ns += t.elapsed().as_nanos() as u64;
+                    let mut batch = self.finish(&leaves, work);
+                    let views = std::mem::take(&mut batch.views);
+                    let h = sc.spawn(move || {
+                        if views.is_empty() {
+                            Ok(Vec::new())
+                        } else {
+                            eval.eval(&views)
+                        }
+                    });
+                    flight = Some((batch, h));
+                }
+                let had = got.is_some();
+                if let Some((batch, vals)) = got {
+                    for &l in &batch.leaves {
+                        self.pending[l as usize] = false;
+                    }
+                    let leaves = batch.leaves.clone();
+                    self.commit(batch, &vals);
+                    self.backup(&leaves);
+                    self.stats.iterations += 1;
+                    total += leaves.len();
+                }
+                group ^= 1;
+                // Nothing new and nothing in flight: done. A group that found
+                // nothing while the other was in flight may find leaves once
+                // it has landed, so go round again.
+                if !launched && (!had || stop(self) || self.is_solved()) {
+                    break;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(total)
     }
 
     /// Abandon the descents in flight (their visits stay counted).
     pub fn clear_descents(&mut self) {
         self.cursors.clear();
+        self.cursors_b.clear();
+        self.pending.clear();
         self.inflight.clear();
     }
 
@@ -762,12 +920,105 @@ impl Tree {
             params: self.params.clone(),
             stats: SearchStats::default(),
             cursors: Vec::new(),
+            cursors_b: Vec::new(),
             inflight: Vec::new(),
+            pending: Vec::new(),
         }
     }
 }
 
 // ── Evaluators ──────────────────────────────────────────────────────────────
+
+/// Backup stops at a node whose value moved less than this
+/// (`STEPS_BACKUP_EPS`; 0 = always back up to the root).
+fn backup_eps() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("STEPS_BACKUP_EPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0)
+    })
+}
+
+/// A child built during expansion: (step, flip, terminal value + result, state).
+type Kid = (u8, bool, Option<(f32, i8)>, StepState);
+
+/// A leaf's state and, once built, its children and their views (`None`
+/// inside for a dead end).
+type Work = (StepState, Option<Option<(Vec<Kid>, Vec<View>)>>);
+
+/// One leaf's children and their views; `None` for a dead end.
+fn build_one(s: &mut StepState) -> Option<(Vec<Kid>, Vec<View>)> {
+    let tp = Instant::now();
+    let opts = s.collapse_forced();
+    crate::steps::prof::add(0, tp);
+    if opts.is_empty() {
+        if std::env::var("STEPS_DEBUG_DEAD").is_ok()
+            && DEAD_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8
+        {
+            eprintln!("no-option leaf: {}", s.debug_dead());
+        }
+        return None;
+    }
+    let mut kids = Vec::with_capacity(opts.len());
+    let mut views = Vec::with_capacity(opts.len());
+    for v in opts {
+        let tp = Instant::now();
+        let c = s.child(v);
+        crate::steps::prof::add(1, tp);
+        let flip = c.flipped != s.flipped;
+        if c.is_terminal() {
+            let tv = (c.terminal_value(), c.terminal_outcome());
+            kids.push((v, flip, Some(tv), c));
+        } else {
+            let tp = Instant::now();
+            views.push(c.view());
+            crate::steps::prof::add(2, tp);
+            kids.push((v, flip, None, c));
+        }
+    }
+    s.drop_options();
+    Some((kids, views))
+}
+
+/// Build every leaf in `work` on `threads` threads. Leaves are handed out one
+/// at a time since their costs vary by orders of magnitude (exact witness
+/// searches).
+fn build_all(work: &mut [Work], threads: usize) {
+    let threads = threads.clamp(1, work.len().max(1));
+    if threads == 1 {
+        for (s, out) in work.iter_mut() {
+            *out = Some(build_one(s));
+        }
+        return;
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<std::sync::Mutex<&mut Work>> =
+        work.iter_mut().map(std::sync::Mutex::new).collect();
+    std::thread::scope(|sc| {
+        for _ in 0..threads {
+            sc.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(slot) = slots.get(i) else { break };
+                    let mut w = slot.lock().unwrap();
+                    let (s, out) = &mut **w;
+                    *out = Some(build_one(s));
+                }
+                crate::steps::prof::flush();
+            });
+        }
+    });
+}
+
+/// Leaves whose children are built but not yet evaluated.
+struct Batch {
+    leaves: Vec<u32>,
+    /// Live leaves and their children, in view order.
+    pend: Vec<(u32, Vec<Kid>)>,
+    views: Vec<View>,
+}
 
 /// Pads a batch to a multiple of this, so TensorRT sees few distinct shapes.
 pub const BATCH_QUANTUM: usize = 64;
@@ -1135,22 +1386,40 @@ mod tests {
     /// parent first, and in-flight counts return to zero.
     #[test]
     fn descent_reaches_terminals() {
+        descent_invariants(false);
+    }
+
+    #[test]
+    fn pipelined_descent_reaches_terminals() {
+        descent_invariants(true);
+    }
+
+    fn descent_invariants(pipelined: bool) {
         let s = StepState::begin(&MinionsState::with_bid(0), 5);
         let mut t = Tree::new(
             s,
             Params {
                 heads: 8,
                 power: 2.0,
+                threads: 4, // exercises the parallel expansion
             },
             &Material,
         )
         .unwrap();
-        for _ in 0..3000 {
-            if t.descent_wave(&Material, 8).unwrap() == 0 {
-                break;
-            }
-            if t.stats.terminal_leaves >= 20 {
-                break;
+        if pipelined {
+            t.descent_run(&Material, 16, &mut |t| {
+                t.stats.terminal_leaves >= 20 || t.stats.iterations >= 3000
+            })
+            .unwrap();
+            assert!(t.pending.iter().all(|&p| !p), "a leaf left pending");
+        } else {
+            for _ in 0..3000 {
+                if t.descent_wave(&Material, 8).unwrap() == 0 {
+                    break;
+                }
+                if t.stats.terminal_leaves >= 20 {
+                    break;
+                }
             }
         }
         assert!(t.stats.terminal_leaves > 0, "{:?}", t.stats);
@@ -1175,7 +1444,7 @@ mod tests {
             let all = live.iter().all(|&c| t.nodes[c as usize].resolved);
             assert_eq!(nd.resolved, want != 0 || all, "node {n} resolution");
         }
-        let paths: Vec<Vec<u32>> = t.cursors.clone();
+        let paths: Vec<Vec<u32>> = t.cursors.iter().chain(&t.cursors_b).cloned().collect();
         for (n, &m) in t.inflight.iter().enumerate() {
             let on = paths.iter().filter(|p| p.contains(&(n as u32))).count() as u32;
             assert_eq!(m, on, "inflight of {n}");
@@ -1192,6 +1461,7 @@ mod tests {
             Params {
                 heads: 8,
                 power: 2.0,
+                threads: 1,
             },
             &Material,
         )
@@ -1215,7 +1485,9 @@ mod tests {
                 params: t.params.clone(),
                 stats: Default::default(),
                 cursors: Vec::new(),
+                cursors_b: Vec::new(),
                 inflight: Vec::new(),
+                pending: Vec::new(),
             };
             assert!(tt.recompute(n));
             assert!(
@@ -1236,6 +1508,7 @@ mod tests {
             Params {
                 heads: 8,
                 power: 2.0,
+                threads: 1,
             },
             &Material,
         )

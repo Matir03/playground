@@ -294,7 +294,17 @@ fn play_game(
         let t = Instant::now();
         let before = tree.stats.expansions;
         let mut starved = 0;
-        while tree.stats.expansions - before < cfg.expansions {
+        if cfg.descent && cfg.params.threads > 1 {
+            // One tree with the whole machine: GPU and CPU overlapped.
+            let (budget, secs) = (cfg.expansions, cfg.move_secs);
+            tree.descent_run(eval, cfg.params.heads, &mut |tr| {
+                tr.stats.expansions - before >= budget
+                    || secs > 0.0 && t.elapsed().as_secs_f64() > secs
+            })?;
+        }
+        while !(cfg.descent && cfg.params.threads > 1)
+            && tree.stats.expansions - before < cfg.expansions
+        {
             if cfg.move_secs > 0.0 && t.elapsed().as_secs_f64() > cfg.move_secs {
                 break;
             }

@@ -694,6 +694,11 @@ enum Cmd {
         batcher: usize,
         #[arg(long, default_value_t = 32)]
         heads: usize,
+        /// Threads building each wave's leaf expansions, per worker. With one
+        /// worker, a large --heads and this at the core count, self-play
+        /// searches a single game tree with the whole machine.
+        #[arg(long, default_value_t = 1)]
+        expand_threads: usize,
         #[arg(long, default_value_t = 2.0)]
         power: f32,
         /// Leaf expansions per move.
@@ -1316,6 +1321,7 @@ async fn main() -> anyhow::Result<()> {
             sessions,
             batcher,
             heads,
+            expand_threads,
             power,
             expansions,
             move_secs,
@@ -1362,7 +1368,7 @@ async fn main() -> anyhow::Result<()> {
             };
             let cfg = minions_engine::stepsp::Config {
                 workers,
-                params: minions_engine::bfs::Params { heads, power },
+                params: minions_engine::bfs::Params { heads, power, threads: expand_threads },
                 expansions,
                 move_secs,
                 min_visits,
