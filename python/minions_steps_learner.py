@@ -81,11 +81,12 @@ def load_chunks(dirs, max_records=None, holdout_every=0):
             continue
         parts.append(arr)
         total += len(arr)
-        if max_records and total >= max_records:
-            break
     recs = np.concatenate(parts)
-    if max_records:
-        recs = recs[:max_records]
+    if max_records and len(recs) > max_records:
+        # A uniform sample: truncating would drop the newest generations.
+        keep = np.random.default_rng(0).choice(len(recs), max_records, replace=False)
+        keep.sort()
+        recs = recs[keep]
     held = np.concatenate(hold) if hold else recs[:0]
     return recs, held, len(files)
 
