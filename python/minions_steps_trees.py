@@ -5,12 +5,18 @@ summarise its shape.
     python/.venv/bin/python python/minions_steps_trees.py \
         data/models/minions/steps/trees/gen108-test/b000
 
+`--index TREES_DIR` instead rewrites TREES_DIR/index.json (the web viewer's
+list) from the runs found there, keeping existing entries' labels and notes.
+
 Node ids (gid) are assigned in creation order, so a parent's gid is always
 below its children's and depths come out of one ascending pass.
 """
 
 import argparse
+import glob
+import json
 import os
+import re
 
 import numpy as np
 
@@ -70,10 +76,52 @@ def depths(nodes):
     return step_d, turn_d
 
 
+def write_index(trees_dir):
+    """Rewrite `trees_dir/index.json` from the runs in it: cycle generations
+    (`genN`) newest first, then the rest."""
+    path = os.path.join(trees_dir, "index.json")
+    old = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            old = {e["run"]: e for e in json.load(f)}
+    runs = []
+    for run in sorted(os.listdir(trees_dir)):
+        metas = sorted(glob.glob(os.path.join(trees_dir, run, "b*", "meta.json")))
+        if not metas:
+            continue
+        batches = [os.path.basename(os.path.dirname(m)) for m in metas]
+        cycle = re.fullmatch(r"gen\d+", run) is not None
+        # Cycle generations are labelled from their metadata (a redone
+        # generation is relabelled); other runs keep a hand-set label.
+        entry = {} if cycle else dict(old.get(run, {}))
+        entry["run"], entry["batches"] = run, batches
+        if "label" not in entry:
+            ms = [json.load(open(m)) for m in metas]
+            moves = sum(len(m["moves"]) for m in ms)
+            nodes = sum(m["nodes"] for m in ms)
+            entry["label"] = (
+                f"{run} self-play: {len(ms)} tree(s), {ms[0]['games']} games, "
+                f"{moves} rounds, {nodes / 1e6:.0f}M nodes"
+            )
+        runs.append(entry)
+    gen = lambda e: int(e["run"][3:]) if re.fullmatch(r"gen\d+", e["run"]) else -1
+    runs.sort(key=lambda e: (gen(e) < 0, -gen(e), e["run"]))
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(runs, f, indent=2)
+    os.replace(tmp, path)
+    print(f"{path}: {len(runs)} runs")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("batch_dir")
+    ap.add_argument("batch_dir", nargs="?")
+    ap.add_argument("--index", metavar="TREES_DIR")
     args = ap.parse_args()
+    if args.index:
+        write_index(args.index)
+        return
+    head, nodes = load(args.batch_dir)
     head, nodes = load(args.batch_dir)
     n = len(nodes)
     kind = nodes["kind"]
