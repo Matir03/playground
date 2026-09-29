@@ -10,7 +10,8 @@ the games' positions. Format 1 (the first runs): one `nodes.bin` with the
 batch's whole tree, depths from the batch start.
 
 `--index TREES_DIR` instead rewrites TREES_DIR/index.json (the web viewer's
-list) from the runs found there.
+list) from the runs found there; with `--keep N` it first deletes all but
+the newest N cycle generations (`genN` directories; other runs are kept).
 """
 
 import argparse
@@ -139,6 +140,20 @@ def summarise(nodes, parent, what):
     print("steps down at the end of turns 1..10:", ", ".join(f"{x:.0f}" for x in ends))
 
 
+def prune(trees_dir, keep):
+    """Delete all but the newest `keep` cycle generations (`genN`)."""
+    import shutil
+
+    gens = sorted(
+        (int(d[3:]), d)
+        for d in os.listdir(trees_dir)
+        if re.fullmatch(r"gen\d+", d) and os.path.isdir(os.path.join(trees_dir, d))
+    )
+    for _, d in gens[:-keep] if keep > 0 else []:
+        shutil.rmtree(os.path.join(trees_dir, d))
+        print(f"deleted {d}")
+
+
 def write_index(trees_dir):
     """Rewrite `trees_dir/index.json` from the runs in it: cycle generations
     (`genN`) newest first, then the rest; other runs keep a hand-set label."""
@@ -183,8 +198,11 @@ def main():
     ap.add_argument("batch_dir", nargs="?")
     ap.add_argument("--round", type=int, help="format 2: the round to summarise (default: the largest tree)")
     ap.add_argument("--index", metavar="TREES_DIR")
+    ap.add_argument("--keep", type=int, default=0, help="with --index: keep only the newest N cycle generations (0 = all)")
     args = ap.parse_args()
     if args.index:
+        if args.keep:
+            prune(args.index, args.keep)
         write_index(args.index)
         return
     meta = json.load(open(os.path.join(args.batch_dir, "meta.json")))
