@@ -671,6 +671,15 @@ enum Cmd {
     /// writes every well-visited search node as a value record.
     /// Replay a dumped exact-search query corpus (`STEPS_EXACT_DUMP`) at a
     /// given budget.
+    /// Serve saved self-play trees (`steps-selfplay --save-trees`) to the web
+    /// viewer, node by node (`tree_serve`).
+    StepsTreeServe {
+        /// The directory holding the runs (`data/models/minions/steps/trees`).
+        #[arg(long)]
+        dir: String,
+        #[arg(long, default_value = "127.0.0.1:7106")]
+        addr: String,
+    },
     StepsExactBench {
         #[arg(long)]
         corpus: String,
@@ -767,13 +776,10 @@ enum Cmd {
         chunk_records: usize,
         #[arg(long, default_value_t = 0)]
         seed: u64,
-        /// Save each shared tree (full tree + per-move views) under this
+        /// Save each shared tree (the whole tree at every round) under this
         /// directory, for the web viewer (`tree_save`). Needs --games > 1.
         #[arg(long)]
         save_trees: Option<String>,
-        /// Expanded nodes per saved move view (most visited first).
-        #[arg(long, default_value_t = 300)]
-        view_nodes: usize,
     },
 }
 
@@ -1341,6 +1347,9 @@ async fn main() -> anyhow::Result<()> {
             let mean = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).sum::<f32>() / a.len() as f32;
             println!("{} positions: max |a - b| {d:.2e}, mean {mean:.2e}; a mean value {:.3}", a.len(), a.iter().sum::<f32>() / a.len() as f32);
         }
+        Cmd::StepsTreeServe { dir, addr } => {
+            minions_engine::tree_serve::serve(std::path::Path::new(&dir), &addr)?;
+        }
         Cmd::StepsExactBench { corpus, budget, limit, labels_out, diag } => {
             let corpus = std::path::Path::new(&corpus);
             match diag {
@@ -1377,7 +1386,6 @@ async fn main() -> anyhow::Result<()> {
             chunk_records,
             seed,
             save_trees,
-            view_nodes,
         } => {
             use std::sync::Arc;
             anyhow::ensure!(search == "descent" || search == "bfs", "--search descent|bfs");
@@ -1426,7 +1434,6 @@ async fn main() -> anyhow::Result<()> {
                 seed,
                 games,
                 save_trees: save_trees.map(std::path::PathBuf::from),
-                view_nodes,
             };
             anyhow::ensure!(games == 1 || workers == 1 && expand_threads > 1, "--games needs --workers 1 and --expand-threads > 1");
             minions_engine::stepsp::run(cfg, eval, std::path::Path::new(&out))?;

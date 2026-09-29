@@ -36,6 +36,12 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (p) => p.replace(/^\/mi/, ""),
       },
+      // Saved self-play trees, node by node (`minions-engine steps-tree-serve`).
+      "/treeapi": {
+        target: "http://127.0.0.1:7106",
+        changeOrigin: true,
+        rewrite: (p) => p.replace(/^\/treeapi/, ""),
+      },
     },
   },
 });

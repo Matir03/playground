@@ -69,8 +69,6 @@ pub struct Config {
     pub games: usize,
     /// Save each shared tree here ([`crate::tree_save`]).
     pub save_trees: Option<PathBuf>,
-    /// Expanded nodes per saved move view.
-    pub view_nodes: usize,
 }
 
 /// Shared-tree batches started, numbering the saved trees.
@@ -534,7 +532,6 @@ fn play_shared(
             cfg.games.max(1),
             &start,
             salt,
-            cfg.view_nodes,
         )?),
         None => None,
     };
@@ -619,14 +616,12 @@ fn play_shared(
         c.walk_ns
             .fetch_add(tp.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if let Some(s) = saver.as_mut() {
-            s.sync(&tree);
-            let mut moved = Vec::new();
-            for (g, from) in froms.iter().enumerate() {
-                let Some(from) = *from else { continue };
-                let view = s.view(&tree, mv, g, from, games[g])?;
-                moved.push((g, from, games[g], view));
-            }
-            s.add_move(&tree, moved);
+            let moved: Vec<_> = froms
+                .iter()
+                .enumerate()
+                .filter_map(|(g, from)| from.map(|f| (g, f, games[g])))
+                .collect();
+            s.snapshot(&tree, &format!("r{mv:03}.bin"), &moved)?;
         }
         mv += 1;
         // Games that just ended are counted; their positions are not kept.
@@ -656,12 +651,9 @@ fn play_shared(
         c.records.fetch_add(rec, Ordering::Relaxed);
         c.eligible.fetch_add(elig, Ordering::Relaxed);
         c.add_stats(&tree.stats);
-        if let Some(s) = saver.as_mut() {
-            s.write_outside(&tree, &keep)?;
-        }
         let (t2, map) = tree.retain(&keep);
         if let Some(s) = saver.as_mut() {
-            s.remap(&map);
+            s.retained(&tree, &keep, &map);
         }
         tree = t2;
         for pos in games.iter_mut() {

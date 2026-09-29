@@ -1,25 +1,25 @@
 /** Viewer for self-play trees saved by `steps-selfplay --save-trees`
  * (crates/games/minions/src/tree_save.rs).
  *
- * Engine-free, like `Recordings`: the files are static JSON under
- * `/trees/<run>/<batch>/`. A batch is one shared search tree with several
- * games walking through it. For each move and game, self-play wrote the
- * subtree under the game's position *as it stood when the move was made* —
- * its most visited expanded nodes and every live edge of each — which this
- * page renders with the analysis window's own `AnalysisTree`. Clicking a line
- * shows the board at the end of it: the turn so far projected (fated enemies
+ * A batch is one shared search tree with several games walking through it;
+ * self-play saved the whole tree at every round, as it stood when that round's
+ * moves were made. A round's tree has millions of nodes, so they are fetched
+ * as rows are opened, from `minions-engine steps-tree-serve` (proxied under
+ * `/treeapi`), which replays each node's state for its labels and boards.
+ * Nothing is cut off: every expanded node can be opened, at any depth.
+ *
+ * The first runs (format 1) saved only each move's 300 most visited nodes as
+ * static JSON; those are shown as they are, without the server.
+ *
+ * The rows are the analysis window's own `AnalysisTree`. Clicking one shows
+ * the board at the end of its line: the turn so far projected (fated enemies
  * gone, decided units moved), as in the live step analysis.
  *
- * The full tree (`nodes.bin`, every node the batch created) is far too big
- * for a browser; read it with `python/minions_steps_trees.py`.
- *
- * Publish a run with: `steps-selfplay ... --games 16 --save-trees
- * data/models/minions/steps/trees/<run>` and list it in
- * `data/models/minions/steps/trees/index.json` (`web/public/trees` links
- * there).
+ * Runs live in `data/models/minions/steps/trees` (`web/public/trees` links
+ * there), listed in its `index.json`; the cycle saves every generation.
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { create } from "@bufbuild/protobuf";
 import { GameId, GameStateSchema, Outcome, type GameState } from "../../gen/playground/game/game_pb";
 import {
@@ -28,10 +28,10 @@ import {
   type AnalyzeNode,
 } from "../../gen/playground/engine/engine_pb";
 import { decode, SIDE_FILL } from "./Board";
-import { AnalysisTree, lineKeys, nodeAt, type SortKey } from "./Analysis";
+import { AnalysisTree, lineKeys, type SortKey } from "./Analysis";
 import { Position } from "./Recordings";
 
-// ── the files (tree_save.rs) ─────────────────────────────────────────────────
+// ── the files ────────────────────────────────────────────────────────────────
 
 interface IndexEntry {
   run: string;
@@ -40,50 +40,99 @@ interface IndexEntry {
   note?: string;
 }
 
-interface GameMove {
-  game: number;
-  turn: number;
-  from: number;
-  to: number | null;
-  view: string;
+/** Format 2 (`tree_save.rs`): the whole tree per round, served node by node. */
+interface MetaV2 {
+  version: 2;
+  games: number;
+  rounds: { file: string; nodes: number; games: { game: number; turn: number; from: number; to: number | null }[] }[];
+  distinct: number;
+  ended: string;
 }
 
-interface Meta {
-  batch: number;
+/** Format 1: static per-move views. */
+interface MetaV1 {
   games: number;
-  start: string;
-  salt: number;
-  moves: { games: GameMove[]; nodes_written: number }[];
+  moves: { games: { game: number; turn: number; to: number | null; view: string }[] }[];
   nodes: number;
   ended: string;
 }
 
-/** `[label, visits, value | null, prior value, child | -1, played]`, values in
- *  [-1, 1] for the parent's mover. */
-type ViewEdge = [string, number, number | null, number, number, boolean];
+/** A format-1 move view. */
+interface V1View {
+  tree_nodes: number;
+  nodes: { p: number; n: number; q: number; pq: number; t: boolean; b: string; e: Edge[] }[];
+}
 
-interface ViewNode {
-  p: number;
+type Meta = MetaV2 | MetaV1;
+const isV2 = (m: Meta): m is MetaV2 => (m as MetaV2).version === 2;
+
+/** `[label, visits, value | null, static value, child, played, expandable,
+ *  child board]`, values for the node's mover. Format 1 has only the first
+ *  six, with `child` -1 past the view's cut. */
+type Edge = [string, number, number | null, number, number, boolean, boolean?, string?];
+
+interface SNode {
+  /** The node's id: its index in the round's snapshot (format 2) or in the
+   *  view (format 1). */
+  i: number;
   n: number;
   q: number;
   pq: number;
   t: boolean;
+  /** The server's replay offered exactly the saved children. */
+  ok?: boolean;
   b: string;
-  e: ViewEdge[];
+  e: Edge[];
 }
 
-interface View {
-  batch: number;
-  game: number;
-  move: number;
-  turn: number;
-  value: number;
-  tree_nodes: number;
-  nodes: ViewNode[];
-  chosen: number | null;
+// ── the node store ───────────────────────────────────────────────────────────
+
+/** Loaded nodes by id, plus the local indices `AnalysisTree` sees. Local
+ *  indices only ever grow, so the tree's expand keys (`c<local>`) stay valid
+ *  as nodes arrive; a node that is not loaded yet shows as an empty
+ *  placeholder until it is opened. */
+interface Store {
+  nodes: Map<number, SNode>;
+  order: number[];
+  local: Map<number, number>;
 }
 
-// ── conversion ───────────────────────────────────────────────────────────────
+const emptyStore = (): Store => ({ nodes: new Map(), order: [], local: new Map() });
+
+function expandable(e: Edge): boolean {
+  return e[6] ?? e[4] >= 0;
+}
+
+function addNodes(s: Store, add: SNode[]): Store {
+  const nodes = new Map(s.nodes);
+  const order = [...s.order];
+  const local = new Map(s.local);
+  const alloc = (id: number) => {
+    if (!local.has(id)) {
+      local.set(id, order.length);
+      order.push(id);
+    }
+  };
+  for (const n of add) {
+    nodes.set(n.i, n);
+    alloc(n.i);
+  }
+  for (const n of add) for (const e of n.e) if (expandable(e)) alloc(e[4]);
+  return { nodes, order, local };
+}
+
+/** A format-1 view as store nodes (children's boards filled in). */
+function fromView(v: V1View): SNode[] {
+  return v.nodes.map((n, i) => ({
+    i,
+    n: n.n,
+    q: n.q,
+    pq: n.pq,
+    t: n.t,
+    b: n.b,
+    e: n.e.map((e) => [e[0], e[1], e[2], e[3], e[4], e[5], e[4] >= 0, e[4] >= 0 ? v.nodes[e[4]].b : undefined] as Edge),
+  }));
+}
 
 function hexToBytes(s: string): Uint8Array {
   const out = new Uint8Array(s.length >> 1);
@@ -94,37 +143,45 @@ function hexToBytes(s: string): Uint8Array {
 const board = (hex: string): GameState =>
   create(GameStateSchema, { gameId: GameId.MINIONS, payload: hexToBytes(hex), outcome: Outcome.IN_PROGRESS });
 
-/** An edge's `turn`: its node and edge index, which is all a line needs to
- *  identify it here (there is no engine to send it to). */
+/** An edge's `turn`: its node's local index and the edge's index. There is no
+ *  engine to send it to; it only has to identify the edge. */
 function edgeId(node: number, edge: number): Uint8Array {
-  return new Uint8Array([node & 0xff, (node >> 8) & 0xff, (node >> 16) & 0xff, edge & 0xff, (edge >> 8) & 0xff]);
+  return new Uint8Array([node & 0xff, (node >> 8) & 0xff, (node >> 16) & 0xff, (node >> 24) & 0xff, edge & 0xff, (edge >> 8) & 0xff]);
 }
 
-function toAnalysis(v: View): AnalyzeNode[] {
-  return v.nodes.map((n, ni) => {
+function parseEdgeId(t: Uint8Array): [number, number] {
+  return [t[0] | (t[1] << 8) | (t[2] << 16) | (t[3] << 24), t[4] | (t[5] << 8)];
+}
+
+function toAnalysis(s: Store): AnalyzeNode[] {
+  return s.order.map((id) => {
+    const n = s.nodes.get(id);
+    if (!n) {
+      // Not loaded yet: opening it fetches it.
+      return create(AnalyzeNodeSchema, { totalVisits: 0, terminal: false, termValue: 0, edges: [], kernel: [] });
+    }
     const live = Math.max(n.e.length, 1);
     return create(AnalyzeNodeSchema, {
-      parent: n.p >= 0 ? n.p : undefined,
       totalVisits: n.n,
       value: n.q,
       terminal: n.t,
       termValue: n.q,
       priorValue: n.pq,
       kernel: [],
-      edges: n.e.map(([label, visits, value, pq, child, played], ei) =>
+      edges: n.e.map((e, ei) =>
         create(AnalyzeEdgeSchema, {
-          turn: edgeId(ni, ei),
+          turn: edgeId(s.local.get(id)!, ei),
           // Every option is enumerated and statically evaluated: no policy.
           prior: 1 / live,
           energy: 0,
-          visits,
-          value: value ?? undefined,
-          child: child >= 0 ? child : undefined,
+          visits: e[1],
+          value: e[2] ?? undefined,
+          child: expandable(e) ? s.local.get(e[4]) : undefined,
           explore: false,
           forced: 0,
-          label: played ? `${label}  ◀ played` : label,
+          label: e[5] ? `${e[0]}  ◀ played` : e[0],
           draws: 1,
-          priorValue: pq,
+          priorValue: e[3],
           manual: false,
         }),
       ),
@@ -132,19 +189,17 @@ function toAnalysis(v: View): AnalyzeNode[] {
   });
 }
 
-/** The played line, as deep as the view has it, and its labels. */
-function playedLine(v: View): { line: Uint8Array[]; labels: string[] } {
+/** The played line from the root through the loaded nodes, and its labels. */
+function playedLine(s: Store, root: number): { line: Uint8Array[]; labels: string[] } {
   const line: Uint8Array[] = [];
   const labels: string[] = [];
-  let cur = 0;
-  for (;;) {
-    const ei = v.nodes[cur].e.findIndex((e) => e[5]);
+  let cur = s.nodes.get(root);
+  while (cur) {
+    const ei = cur.e.findIndex((e) => e[5]);
     if (ei < 0) break;
-    line.push(edgeId(cur, ei));
-    labels.push(v.nodes[cur].e[ei][0]);
-    const child = v.nodes[cur].e[ei][4];
-    if (child < 0) break;
-    cur = child;
+    line.push(edgeId(s.local.get(cur.i)!, ei));
+    labels.push(cur.e[ei][0]);
+    cur = expandable(cur.e[ei]) ? s.nodes.get(cur.e[ei][4]) : undefined;
   }
   return { line, labels };
 }
@@ -153,6 +208,16 @@ function playedLine(v: View): { line: Uint8Array[]; labels: string[] } {
 
 const muted = { fontSize: "0.9rem", color: "#555" } as const;
 
+async function getJson<T>(url: string): Promise<T> {
+  const r = await fetch(url);
+  const body = await r.json().catch(() => null);
+  if (!r.ok) {
+    const why = body && typeof body === "object" && "error" in body ? String(body.error) : `${r.status}`;
+    throw new Error(`${url}: ${why}`);
+  }
+  return body as T;
+}
+
 export function Trees({ onBack }: { onBack: () => void }) {
   const [index, setIndex] = useState<IndexEntry[] | null>(null);
   const [run, setRun] = useState<string | null>(null);
@@ -160,100 +225,144 @@ export function Trees({ onBack }: { onBack: () => void }) {
   const [meta, setMeta] = useState<Meta | null>(null);
   const [game, setGame] = useState(0);
   const [move, setMove] = useState(0);
-  const [view, setView] = useState<View | null>(null);
+  const [store, setStore] = useState<Store>(emptyStore);
+  const [root, setRoot] = useState<number | null>(null);
+  const [treeNodes, setTreeNodes] = useState(0);
   const [line, setLine] = useState<Uint8Array[]>([]);
   const [labels, setLabels] = useState<string[]>([]);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [sort, setSort] = useState<SortKey>("visits");
+  const [loading, setLoading] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
   const entry = index?.find((e) => e.run === run) ?? null;
 
   useEffect(() => {
-    (async () => {
-      try {
-        const r = await fetch("/trees/index.json");
-        if (!r.ok) throw new Error(`trees/index.json: ${r.status}`);
-        const idx = (await r.json()) as IndexEntry[];
+    getJson<IndexEntry[]>("/trees/index.json")
+      .then((idx) => {
         setIndex(idx);
         if (idx.length > 0) {
           setRun(idx[0].run);
           setBatch(idx[0].batches[0] ?? null);
         }
-      } catch (e) {
-        setError((e as Error).message);
-      }
-    })();
+      })
+      .catch((e) => setError((e as Error).message));
   }, []);
 
   useEffect(() => {
     if (run == null || batch == null) return;
-    (async () => {
-      try {
-        setError(null);
-        const r = await fetch(`/trees/${run}/${batch}/meta.json`);
-        if (!r.ok) throw new Error(`${run}/${batch}/meta.json: ${r.status}`);
-        setMeta((await r.json()) as Meta);
+    setError(null);
+    getJson<Meta>(`/trees/${run}/${batch}/meta.json`)
+      .then((m) => {
+        setMeta(m);
         setGame(0);
         setMove(0);
-      } catch (e) {
+      })
+      .catch((e) => {
         setMeta(null);
         setError((e as Error).message);
-      }
-    })();
+      });
   }, [run, batch]);
 
-  /** This game's moves: index into `meta.moves`, and its entry there. */
+  /** This game's moves: the round (format 2) or move (format 1) and its turn. */
   const gameMoves = useMemo(() => {
     if (!meta) return [];
-    const out: { mi: number; gm: GameMove }[] = [];
-    meta.moves.forEach((m, mi) => {
-      const gm = m.games.find((g) => g.game === game);
-      if (gm) out.push({ mi, gm });
-    });
+    const out: { round: number; turn: number; view?: string; stuck: boolean }[] = [];
+    if (isV2(meta)) {
+      meta.rounds.forEach((r, ri) => {
+        const g = r.games.find((x) => x.game === game);
+        if (g) out.push({ round: ri, turn: g.turn, stuck: g.to == null });
+      });
+    } else {
+      meta.moves.forEach((m, mi) => {
+        const g = m.games.find((x) => x.game === game);
+        if (g) out.push({ round: mi, turn: g.turn, view: g.view, stuck: g.to == null });
+      });
+    }
     return out;
   }, [meta, game]);
 
   const current = gameMoves[Math.min(move, gameMoves.length - 1)];
+  const query = current && run && batch ? `run=${run}&batch=${batch}&round=${current.round}&game=${game}` : null;
 
   useEffect(() => {
-    if (!current || run == null || batch == null) {
-      setView(null);
+    if (!current || !meta || run == null || batch == null) {
+      setStore(emptyStore());
+      setRoot(null);
       return;
     }
+    let cancelled = false;
     (async () => {
       try {
-        const r = await fetch(`/trees/${run}/${batch}/${current.gm.view}`);
-        if (!r.ok) throw new Error(`${current.gm.view}: ${r.status}`);
-        const v = (await r.json()) as View;
-        setView(v);
-        // Open the played line, and show where it ends.
-        const pl = playedLine(v).line;
-        const nodes = toAnalysis(v);
-        setExpanded(new Set(lineKeys(nodes, pl)));
+        setError(null);
+        setLoading((x) => x + 1);
+        let nodes: SNode[];
+        if (isV2(meta)) {
+          const r = await getJson<{ nodes: SNode[]; tree_nodes: number }>(`/treeapi/line?${query}`);
+          nodes = r.nodes;
+          setTreeNodes(r.tree_nodes);
+        } else {
+          const v = await getJson<V1View>(`/trees/${run}/${batch}/${current.view}`);
+          nodes = fromView(v);
+          setTreeNodes(v.tree_nodes);
+        }
+        if (cancelled) return;
+        const s = addNodes(emptyStore(), nodes);
+        setStore(s);
+        setRoot(nodes[0]?.i ?? null);
+        // Open the played line.
+        const pl = playedLine(s, nodes[0].i).line;
+        setExpanded(new Set(lineKeys(toAnalysis(s), pl)));
         setLine([]);
         setLabels([]);
       } catch (e) {
-        setView(null);
-        setError((e as Error).message);
+        if (!cancelled) {
+          setStore(emptyStore());
+          setRoot(null);
+          setError((e as Error).message);
+        }
+      } finally {
+        setLoading((x) => x - 1);
       }
     })();
-  }, [current?.gm.view, run, batch]); // eslint-disable-line react-hooks/exhaustive-deps
+    return () => {
+      cancelled = true;
+    };
+  }, [query, meta]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const nodes = useMemo(() => (view ? toAnalysis(view) : []), [view]);
+  const nodes = useMemo(() => toAnalysis(store), [store]);
 
-  // The board at the end of the shown line: the node it reaches, or, past the
-  // view's cut, the deepest node on it (edges below it carry no board).
-  const shownNode = useMemo(() => {
-    if (!view) return undefined;
-    for (let k = line.length; k >= 0; k--) {
-      const n = nodeAt(nodes, line.slice(0, k));
-      if (n !== undefined) return { n, exact: k === line.length };
-    }
-    return undefined;
-  }, [view, nodes, line]);
+  /** Open (or close) a row; opening a node not loaded yet fetches it. */
+  const toggle = useCallback(
+    (key: string) => {
+      const opening = !expanded.has(key);
+      setExpanded((prev) => {
+        const next = new Set(prev);
+        if (next.has(key)) next.delete(key);
+        else next.add(key);
+        return next;
+      });
+      if (!opening || !query || !meta || !isV2(meta) || !key.startsWith("c")) return;
+      const id = store.order[Number(key.slice(1))];
+      if (id === undefined || store.nodes.has(id)) return;
+      setLoading((x) => x + 1);
+      getJson<{ nodes: SNode[] }>(`/treeapi/nodes?${query}&idx=${id}`)
+        .then((r) => setStore((s) => addNodes(s, r.nodes)))
+        .catch((e) => setError((e as Error).message))
+        .finally(() => setLoading((x) => x - 1));
+    },
+    [expanded, query, meta, store],
+  );
 
-  const shown = view && shownNode ? board(view.nodes[shownNode.n].b) : null;
+  // The board at the end of the shown line: the last edge's own board.
+  const shown = useMemo(() => {
+    if (root == null) return null;
+    if (line.length === 0) return board(store.nodes.get(root)!.b);
+    const [li, ei] = parseEdgeId(line[line.length - 1]);
+    const n = store.nodes.get(store.order[li]);
+    const e = n?.e[ei];
+    return e ? board(e[7] ?? n!.b) : null;
+  }, [store, root, line]);
   const info = shown ? decode(shown.payload) : null;
 
   useEffect(() => {
@@ -266,7 +375,11 @@ export function Trees({ onBack }: { onBack: () => void }) {
     return () => window.removeEventListener("keydown", onKey);
   }, [gameMoves.length]);
 
-  const played = view ? playedLine(view) : { line: [], labels: [] };
+  const rootNode = root != null ? store.nodes.get(root) : undefined;
+  const played = root != null ? playedLine(store, root) : { line: [], labels: [] };
+  const chosen = rootNode ? rootNode.e.findIndex((e) => e[5]) : -1;
+  const drift = [...store.nodes.values()].filter((n) => n.ok === false).length;
+  const v2 = meta != null && isV2(meta);
 
   return (
     <>
@@ -280,9 +393,13 @@ export function Trees({ onBack }: { onBack: () => void }) {
 
       {error && (
         <p style={{ color: "crimson" }}>
-          {error}. Save a run with <code>steps-selfplay --games 16 --save-trees
-          data/models/minions/steps/trees/&lt;run&gt;</code> and list it in{" "}
-          <code>data/models/minions/steps/trees/index.json</code>.
+          {error}
+          {error.includes("/treeapi/") && (
+            <>
+              {" "}
+              — start the tree server: <code>minions-engine steps-tree-serve --dir data/models/minions/steps/trees</code>
+            </>
+          )}
         </p>
       )}
 
@@ -315,8 +432,11 @@ export function Trees({ onBack }: { onBack: () => void }) {
           )}
           {meta && (
             <span style={muted}>
-              {meta.games} games in one tree · {meta.moves.length} moves ·{" "}
-              {meta.nodes.toLocaleString()} nodes in all · ended: {meta.ended}
+              {meta.games} games in one tree ·{" "}
+              {isV2(meta)
+                ? `${meta.rounds.filter((r) => r.games.length > 0).length} rounds · ${meta.distinct.toLocaleString()} distinct nodes`
+                : `${meta.moves.length} moves · ${meta.nodes.toLocaleString()} nodes · top 300 per move only (old format)`}
+              {meta.ended ? ` · ended: ${meta.ended}` : " · still running"}
             </span>
           )}
         </div>
@@ -343,15 +463,16 @@ export function Trees({ onBack }: { onBack: () => void }) {
             <button onClick={() => setMove((m) => Math.max(0, m - 1))}>←</button>
             <span style={muted}>
               move {Math.min(move, gameMoves.length - 1) + 1} / {gameMoves.length}
-              {current && <> · turn {current.gm.turn}</>}
+              {current && <> · turn {current.turn}</>}
             </span>
             <button onClick={() => setMove((m) => Math.min(gameMoves.length - 1, m + 1))}>→</button>
           </span>
-          {current && current.gm.to == null && <span style={{ color: "crimson" }}>walk got stuck</span>}
+          {current?.stuck && <span style={{ color: "crimson" }}>walk got stuck</span>}
+          {loading > 0 && <span style={muted}>loading…</span>}
         </div>
       )}
 
-      {view && (
+      {rootNode && (
         <div style={{ display: "flex", gap: "1.5rem", alignItems: "flex-start", flexWrap: "wrap" }}>
           <div style={{ flex: "0 0 auto" }}>
             {shown && <Position state={shown} />}
@@ -366,7 +487,6 @@ export function Trees({ onBack }: { onBack: () => void }) {
             )}
             <div style={{ ...muted, marginTop: "0.35rem", maxWidth: 420 }}>
               {labels.length === 0 ? "The position the move was searched from." : labels.join(" → ")}
-              {shownNode && !shownNode.exact && " (past the saved view: showing its deepest saved node)"}
             </div>
             <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem" }}>
               <button onClick={() => { setLine([]); setLabels([]); }}>root</button>
@@ -384,9 +504,9 @@ export function Trees({ onBack }: { onBack: () => void }) {
           <div style={{ flex: "1 1 520px", minWidth: 0 }}>
             <div style={{ display: "flex", gap: "1rem", alignItems: "baseline", flexWrap: "wrap", marginBottom: "0.35rem" }}>
               <span style={muted}>
-                {view.nodes[0].n.toLocaleString()} descents · search {view.value.toFixed(3)} · net{" "}
-                {view.nodes[0].pq.toFixed(3)} · {view.nodes.length} of the subtree's expanded nodes shown ·{" "}
-                {view.tree_nodes.toLocaleString()} nodes in the shared tree
+                {rootNode.n.toLocaleString()} descents · search {rootNode.q.toFixed(3)} · net {rootNode.pq.toFixed(3)} ·{" "}
+                {treeNodes.toLocaleString()} nodes in the shared tree ·{" "}
+                {v2 ? `${store.nodes.size.toLocaleString()} loaded (open any row for more)` : `${store.nodes.size} saved`}
               </span>
               <label style={muted}>
                 sort{" "}
@@ -397,25 +517,23 @@ export function Trees({ onBack }: { onBack: () => void }) {
                 </select>
               </label>
             </div>
+            {drift > 0 && (
+              <p style={{ color: "crimson", fontSize: "0.85rem", margin: "0 0 0.35rem" }}>
+                {drift} loaded node(s) replayed with different options than the saved tree: their labels and boards may be wrong.
+              </p>
+            )}
             <div style={{ background: "#20242b", borderRadius: 8, padding: "0.35rem 0.5rem", color: "#ccc", maxHeight: "75vh", overflow: "auto" }}>
               <AnalysisTree
                 nodes={nodes}
-                chosen={view.chosen ?? undefined}
+                chosen={chosen >= 0 ? chosen : undefined}
                 sort={sort}
                 expanded={expanded}
-                onToggle={(k) =>
-                  setExpanded((prev) => {
-                    const next = new Set(prev);
-                    if (next.has(k)) next.delete(k);
-                    else next.add(k);
-                    return next;
-                  })
-                }
+                onToggle={toggle}
                 onPlay={(l, ls) => {
                   setLine(l);
                   setLabels(ls);
                 }}
-                maxDepth={256}
+                maxDepth={1024}
                 shown={line}
               />
             </div>
@@ -425,4 +543,3 @@ export function Trees({ onBack }: { onBack: () => void }) {
     </>
   );
 }
-

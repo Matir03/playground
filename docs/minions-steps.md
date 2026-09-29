@@ -196,15 +196,21 @@ losses: a win on turn t is worth 0.5 + 0.5 (1 - 0.5 t / 30), so 1.0 on turn
   sampled (it samples at 1.25x `record_frac` and holds the records in memory).
   Before (to gen 109) a generation ran whole 16-game batches to the end and
   overshot: 2.6-2.8M records at 5 s/move, 3.6M at 20 s/move.
-- `--save-trees DIR` (shared tree only) saves each batch's tree: the full
-  tree streamed to `nodes.bin` as the per-move pruning drops nodes (global
-  ids stable across it; `python/minions_steps_trees.py` reads it), and per
-  move and game the subtree the move was decided on (`m{move}_g{game}.json`,
-  top `--view-nodes` expanded nodes by visits, played line marked), which the
-  web UI's "Minions self-play trees" screen shows with the analysis tree view
-  (`web/public/trees` links to `data/models/minions/steps/trees`, listed in
-  its `index.json`). About 7M nodes (170 MB) per 20 s round of 16 games, so a
-  whole generation is ~4.5 GB: a study flag, not a cycle default.
+- `--save-trees DIR` (shared tree only) saves each batch's tree: the whole
+  tree at every round as the moves were made (`r{K}.bin`, 26 B/node in the
+  tree's own order, stable global ids; the retained part is negligible, so
+  the rounds add up to the batch's distinct nodes, ~170M and ~4 GB per
+  generation). The cycle saves every generation under
+  `data/models/minions/steps/trees/genN` (`SAVE_TREES`, skipped below
+  `TREES_MIN_GB` free) and rewrites its `index.json`
+  (`python/minions_steps_trees.py --index`, which also summarises a round).
+  The web UI's "Minions self-play trees" screen shows them with the analysis
+  tree view, fetching nodes as rows open from `minions-engine
+  steps-tree-serve` (Vite proxies `/treeapi` to :7106). The server replays a
+  node's state from the batch start the way an expansion does
+  (`collapse_forced`, then `child`); a plain `apply` chain diverges within a
+  few steps under lazy witnesses. Each served node says whether its replay
+  offered exactly the saved children (0 mismatches in 4800 sampled).
 - Descent visit counts (one 2.5-minute run, gen31 net, `--min-visits 1`,
   9.6M records): 0.4% zero visits (terminal records), **97.7% exactly one**,
   0.5% two, 0.7% 3-4, 0.4% 5-9, 0.2% 10-19, 0.1% 20+. A descent runs ~300
