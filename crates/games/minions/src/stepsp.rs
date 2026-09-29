@@ -67,7 +67,14 @@ pub struct Config {
     pub seed: u64,
     /// Games sharing one search tree (with one worker); 1 = a tree per game.
     pub games: usize,
+    /// Save each shared tree here ([`crate::tree_save`]).
+    pub save_trees: Option<PathBuf>,
+    /// Expanded nodes per saved move view.
+    pub view_nodes: usize,
 }
+
+/// Shared-tree batches started, numbering the saved trees.
+static BATCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 pub fn encode_record(v: &View, target: f32, prior: f32, visits: u32, out: &mut Vec<u8>) {
     let mut act = Vec::with_capacity(MAX_ACTIVE);
@@ -254,16 +261,8 @@ impl Counters {
 /// at 1), `w = max(visits, 1)^alpha`, so the expected count stays `frac` of
 /// the eligible nodes while well-visited nodes are favoured (`alpha = 0` is
 /// uniform).
-fn record_nodes(
-    tree: &Tree,
-    keep: &[u32],
-    min_visits: u32,
-    frac: f64,
-    alpha: f64,
-    rng: &mut rand_chacha::ChaCha8Rng,
-    w: &mut Writer,
-) -> anyhow::Result<(u64, u64)> {
-    use rand::Rng;
+/// Which nodes lie in `keep`'s subtrees.
+pub(crate) fn inside_mask(tree: &Tree, keep: &[u32]) -> Vec<bool> {
     let mut inside = vec![false; tree.nodes.len()];
     // Children are always created after their parent, so one forward pass
     // marks the kept subtrees.
@@ -278,6 +277,20 @@ fn record_nodes(
             }
         }
     }
+    inside
+}
+
+fn record_nodes(
+    tree: &Tree,
+    keep: &[u32],
+    min_visits: u32,
+    frac: f64,
+    alpha: f64,
+    rng: &mut rand_chacha::ChaCha8Rng,
+    w: &mut Writer,
+) -> anyhow::Result<(u64, u64)> {
+    use rand::Rng;
+    let inside = inside_mask(tree, keep);
     let mut cand: Vec<u32> = tree
         .trained_nodes(min_visits)
         .into_iter()
@@ -514,6 +527,18 @@ fn play_shared(
         crate::selfplay::random_opening(cfg.opening_max, cfg.opening_decay, rng).0
     };
     let mut tree = Tree::new(StepState::begin(&start, salt), cfg.params.clone(), eval)?;
+    let mut saver = match &cfg.save_trees {
+        Some(dir) => Some(crate::tree_save::TreeSaver::new(
+            dir,
+            BATCH.fetch_add(1, Ordering::Relaxed),
+            cfg.games.max(1),
+            &start,
+            salt,
+            cfg.view_nodes,
+        )?),
+        None => None,
+    };
+    let mut mv = 0usize;
     // Each game's position, or None once it is over.
     let mut games: Vec<Option<u32>> = vec![Some(0); cfg.games.max(1)];
     let mut turns = vec![0u64; games.len()];
@@ -555,6 +580,16 @@ fn play_shared(
             if enough {
                 stop.store(true, Ordering::Relaxed);
             }
+            if let Some(s) = saver.take() {
+                let why = if at.is_empty() {
+                    "games over"
+                } else if enough {
+                    "enough records"
+                } else {
+                    "stopped"
+                };
+                s.finish(&tree, why)?;
+            }
             break;
         }
         let t = Instant::now();
@@ -571,6 +606,7 @@ fn play_shared(
         c.nodes_at_move
             .fetch_add(tree.nodes.len() as u64, Ordering::Relaxed);
         let tp = Instant::now();
+        let froms = games.clone();
         for (g, pos) in games.iter_mut().enumerate() {
             let Some(n) = *pos else { continue };
             *pos = walk_turn(&mut tree, n, cfg, eval, rng, c)?;
@@ -582,6 +618,17 @@ fn play_shared(
         }
         c.walk_ns
             .fetch_add(tp.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if let Some(s) = saver.as_mut() {
+            s.sync(&tree);
+            let mut moved = Vec::new();
+            for (g, from) in froms.iter().enumerate() {
+                let Some(from) = *from else { continue };
+                let view = s.view(&tree, mv, g, from, games[g])?;
+                moved.push((g, from, games[g], view));
+            }
+            s.add_move(&tree, moved);
+        }
+        mv += 1;
         // Games that just ended are counted; their positions are not kept.
         let mut keep = Vec::new();
         for (g, pos) in games.iter_mut().enumerate() {
@@ -609,7 +656,13 @@ fn play_shared(
         c.records.fetch_add(rec, Ordering::Relaxed);
         c.eligible.fetch_add(elig, Ordering::Relaxed);
         c.add_stats(&tree.stats);
+        if let Some(s) = saver.as_mut() {
+            s.write_outside(&tree, &keep)?;
+        }
         let (t2, map) = tree.retain(&keep);
+        if let Some(s) = saver.as_mut() {
+            s.remap(&map);
+        }
         tree = t2;
         for pos in games.iter_mut() {
             if let Some(n) = pos {

@@ -64,7 +64,7 @@ fn salt_for(state: &MinionsState) -> u64 {
 }
 
 /// The board node `n` shows, in the real frame.
-fn board_at(tree: &Tree, n: u32) -> MinionsState {
+pub(crate) fn board_at(tree: &Tree, n: u32) -> MinionsState {
     let st = tree.state_of(n);
     if n == 0 || tree.nodes[n as usize].flip || st.is_terminal() {
         return st.real_base();
@@ -152,7 +152,7 @@ fn complete_turn(
     }
 }
 
-fn to_pm(v: f32) -> f32 {
+pub(crate) fn to_pm(v: f32) -> f32 {
     2.0 * v - 1.0
 }
 

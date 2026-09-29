@@ -256,7 +256,7 @@ function SearchPanel({
 
 // ── board ────────────────────────────────────────────────────────────────────
 
-function Position({ state }: { state: GameState }) {
+export function Position({ state }: { state: GameState }) {
   const d = decode(state.payload);
   return (
     <svg width={SVG_W} height={SVG_H} style={{ background: "#20242b", borderRadius: 8, flex: "0 0 auto" }}>

@@ -6,6 +6,7 @@ import { AmazonsBoard } from "./games/amazons/Board";
 import { HexBoard } from "./games/hex/Board";
 import { MinionsBoard } from "./games/minions/Board";
 import { Recordings } from "./games/minions/Recordings";
+import { Trees } from "./games/minions/Trees";
 
 // Engines are reached under same-origin proxy paths (see vite.config.ts), so the
 // whole app works behind one origin without CORS.
@@ -60,6 +61,8 @@ export function App() {
   // a `GAMES` entry: everything in GAMES gets health-checked against an engine
   // URL and given a client, and a static recording needs neither.
   const [recordings, setRecordings] = useState(false);
+  // Saved self-play trees: static too, for the same reason.
+  const [trees, setTrees] = useState(false);
   const [healths, setHealths] = useState<Record<string, EngineHealth>>(
     Object.fromEntries(GAMES.map((g) => [g.id, { status: "unknown" }])),
   );
@@ -83,11 +86,18 @@ export function App() {
     // Wider while a game is open: a board with an analysis panel beside it
     // does not fit in 720px, and wrapping the panel underneath puts the board
     // off screen exactly when the panel is driving it.
-    <main style={{ fontFamily: "system-ui, sans-serif", padding: "2rem", maxWidth: game == null && !recordings ? 720 : 1400 }}>
+    <main style={{ fontFamily: "system-ui, sans-serif", padding: "2rem", maxWidth: game == null && !recordings && !trees ? 720 : 1400 }}>
       {recordings ? (
         <Recordings onBack={() => setRecordings(false)} />
+      ) : trees ? (
+        <Trees onBack={() => setTrees(false)} />
       ) : game == null ? (
-        <Menu healths={healths} onPick={setSelected} onRecordings={() => setRecordings(true)} />
+        <Menu
+          healths={healths}
+          onPick={setSelected}
+          onRecordings={() => setRecordings(true)}
+          onTrees={() => setTrees(true)}
+        />
       ) : (
         <GameView game={game} health={healths[game.id]} onBack={() => setSelected(null)} />
       )}
@@ -99,10 +109,12 @@ function Menu({
   healths,
   onPick,
   onRecordings,
+  onTrees,
 }: {
   healths: Record<string, EngineHealth>;
   onPick: (id: GameId) => void;
   onRecordings: () => void;
+  onTrees: () => void;
 }) {
   return (
     <>
@@ -148,6 +160,19 @@ function Menu({
         <div style={{ color: "#666", fontSize: "0.9rem", marginTop: 4 }}>
           Replay games from an <code>eval-match</code> run, turn by turn. Served from static
           JSON, so no engine has to be running.
+        </div>
+      </button>
+      <button
+        onClick={onTrees}
+        style={{
+          marginTop: "0.75rem", textAlign: "left", padding: "1rem 1.25rem", borderRadius: 10,
+          border: "1px solid #ddd", background: "#fff", cursor: "pointer", font: "inherit", width: "100%",
+        }}
+      >
+        <strong style={{ fontSize: "1.1rem" }}>Minions self-play trees</strong>
+        <div style={{ color: "#666", fontSize: "0.9rem", marginTop: 4 }}>
+          Browse the shared step-search trees saved by <code>steps-selfplay --save-trees</code>:
+          what each game's move was decided on, in the analysis window's tree view.
         </div>
       </button>
     </>

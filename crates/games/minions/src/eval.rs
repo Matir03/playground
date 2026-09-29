@@ -370,7 +370,7 @@ pub fn match_search(
 /// Hex rather than base64 because no base64 crate is in the tree, and the
 /// doubling costs about half a megabyte on an 80-game match. Not worth a
 /// dependency, and not worth a fourth hand-rolled copy of the state format.
-fn hex_state(s: &MinionsState) -> String {
+pub(crate) fn hex_state(s: &MinionsState) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(266);
     for b in Minions::encode_state(s) {

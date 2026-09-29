@@ -767,6 +767,13 @@ enum Cmd {
         chunk_records: usize,
         #[arg(long, default_value_t = 0)]
         seed: u64,
+        /// Save each shared tree (full tree + per-move views) under this
+        /// directory, for the web viewer (`tree_save`). Needs --games > 1.
+        #[arg(long)]
+        save_trees: Option<String>,
+        /// Expanded nodes per saved move view (most visited first).
+        #[arg(long, default_value_t = 300)]
+        view_nodes: usize,
     },
 }
 
@@ -1369,9 +1376,12 @@ async fn main() -> anyhow::Result<()> {
             target_records,
             chunk_records,
             seed,
+            save_trees,
+            view_nodes,
         } => {
             use std::sync::Arc;
             anyhow::ensure!(search == "descent" || search == "bfs", "--search descent|bfs");
+            anyhow::ensure!(save_trees.is_none() || games > 1, "--save-trees needs --games > 1");
             anyhow::ensure!(select == "ordinal" || select == "visits", "--select ordinal|visits");
             minions_engine::steps::LAZY_WITNESS.store(lazy_witness, std::sync::atomic::Ordering::Relaxed);
             let eval: Arc<dyn minions_engine::bfs::Evaluator> = match (old_net, onnx) {
@@ -1415,6 +1425,8 @@ async fn main() -> anyhow::Result<()> {
                 chunk_records,
                 seed,
                 games,
+                save_trees: save_trees.map(std::path::PathBuf::from),
+                view_nodes,
             };
             anyhow::ensure!(games == 1 || workers == 1 && expand_threads > 1, "--games needs --workers 1 and --expand-threads > 1");
             minions_engine::stepsp::run(cfg, eval, std::path::Path::new(&out))?;

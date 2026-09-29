@@ -29,6 +29,7 @@ pub mod selfplay;
 pub mod solver;
 pub mod steps;
 pub mod steps_analysis;
+pub mod tree_save;
 pub mod stepsp;
 pub mod turn;
 pub mod units;
