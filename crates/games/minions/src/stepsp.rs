@@ -59,7 +59,9 @@ pub struct Config {
     pub record_frac: f64,
     /// Sampling weight exponent on visits (see `record_nodes`).
     pub record_alpha: f64,
-    /// Stop once this many records are written.
+    /// Stop once this many records are written. Shared-tree self-play
+    /// instead stops once `target_records / record_frac` nodes were eligible
+    /// and writes exactly this many of them.
     pub target_records: u64,
     pub chunk_records: usize,
     pub seed: u64,
@@ -126,6 +128,9 @@ struct Writer {
     /// each record's real mover (0 = first player).
     game: Vec<u8>,
     movers: Vec<u8>,
+    /// Keep every record in memory until [`Writer::finish_held`] (shared-tree
+    /// self-play, which trims a generation to an exact count).
+    hold: bool,
 }
 
 impl Writer {
@@ -145,12 +150,41 @@ impl Writer {
             let code = outcome_code(self.movers[i], winner, turn, end_turn);
             self.buf[at + OUTCOME_AT..at + OUTCOME_AT + 2].copy_from_slice(&code.to_le_bytes());
             self.n += 1;
-            if self.n >= self.per_chunk {
+            if !self.hold && self.n >= self.per_chunk {
                 self.flush()?;
             }
         }
         self.movers.clear();
         Ok(())
+    }
+
+    /// Write a uniform sample of `keep` of the held records (all of them if
+    /// there are fewer), in the order they were made, as chunks. Returns how
+    /// many were written.
+    fn finish_held(
+        &mut self,
+        keep: usize,
+        rng: &mut rand_chacha::ChaCha8Rng,
+    ) -> anyhow::Result<usize> {
+        let all = std::mem::take(&mut self.buf);
+        let n = all.len() / REC_BYTES;
+        let mut idx: Vec<usize> = if n > keep {
+            rand::seq::index::sample(rng, n, keep).into_vec()
+        } else {
+            (0..n).collect()
+        };
+        idx.sort_unstable();
+        self.n = 0;
+        for &i in &idx {
+            self.buf
+                .extend_from_slice(&all[i * REC_BYTES..(i + 1) * REC_BYTES]);
+            self.n += 1;
+            if self.n >= self.per_chunk {
+                self.flush()?;
+            }
+        }
+        self.flush()?;
+        Ok(idx.len())
     }
 
     fn flush(&mut self) -> anyhow::Result<()> {
@@ -179,6 +213,10 @@ pub struct Counters {
     pub games: AtomicU64,
     pub moves: AtomicU64,
     pub records: AtomicU64,
+    /// Nodes eligible for recording (visited, or distinct terminals) so far.
+    pub eligible: AtomicU64,
+    /// Records written after trimming (shared-tree self-play).
+    pub written: AtomicU64,
     pub expansions: AtomicU64,
     pub evals: AtomicU64,
     pub dead: AtomicU64,
@@ -224,7 +262,7 @@ fn record_nodes(
     alpha: f64,
     rng: &mut rand_chacha::ChaCha8Rng,
     w: &mut Writer,
-) -> anyhow::Result<u64> {
+) -> anyhow::Result<(u64, u64)> {
     use rand::Rng;
     let mut inside = vec![false; tree.nodes.len()];
     // Children are always created after their parent, so one forward pass
@@ -257,7 +295,7 @@ fn record_nodes(
     } else {
         cand.iter().map(|&id| weight(id)).sum::<f64>() / cand.len() as f64
     };
-    let mut n = 0;
+    let (mut n, eligible) = (0, cand.len() as u64);
     for id in cand {
         if frac < 1.0 && rng.gen::<f64>() >= frac * weight(id) / mean {
             continue;
@@ -267,7 +305,7 @@ fn record_nodes(
         w.push(&st.view(), st.flipped, nd.value, nd.prior, nd.visits);
         n += 1;
     }
-    Ok(n)
+    Ok((n, eligible))
 }
 
 fn play_game(
@@ -355,7 +393,7 @@ fn play_game(
         c.walk_ns
             .fetch_add(tp.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let Some(next) = next else { break };
-        let rec = record_nodes(
+        let (rec, _) = record_nodes(
             &tree,
             &[next],
             cfg.min_visits,
@@ -370,7 +408,7 @@ fn play_game(
         c.moves.fetch_add(1, Ordering::Relaxed);
         turns += 1;
     }
-    let rec = record_nodes(
+    let (rec, _) = record_nodes(
         &tree,
         &[],
         cfg.min_visits,
@@ -492,7 +530,31 @@ fn play_shared(
         let mut at: Vec<u32> = games.iter().flatten().copied().collect();
         at.sort_unstable();
         at.dedup();
-        if at.is_empty() || stop.load(Ordering::Relaxed) {
+        // The generation ends once enough nodes were eligible, mid-game: the
+        // subtrees under the games still going are recorded as they stand.
+        // (Visit weighting caps some keep probabilities at 1, so the sample
+        // can fall short of the target even with the oversampling.)
+        let enough = c.eligible.load(Ordering::Relaxed) >= eligible_target(cfg)
+            && c.records.load(Ordering::Relaxed) >= cfg.target_records;
+        if at.is_empty() || enough || stop.load(Ordering::Relaxed) {
+            if !at.is_empty() {
+                let (rec, elig) = record_nodes(
+                    &tree,
+                    &[],
+                    cfg.min_visits,
+                    oversampled(cfg.record_frac),
+                    cfg.record_alpha,
+                    rng,
+                    w,
+                )?;
+                w.finish_game(0, 0)?;
+                c.records.fetch_add(rec, Ordering::Relaxed);
+                c.eligible.fetch_add(elig, Ordering::Relaxed);
+                c.add_stats(&tree.stats);
+            }
+            if enough {
+                stop.store(true, Ordering::Relaxed);
+            }
             break;
         }
         let t = Instant::now();
@@ -534,17 +596,18 @@ fn play_shared(
         }
         keep.sort_unstable();
         keep.dedup();
-        let rec = record_nodes(
+        let (rec, elig) = record_nodes(
             &tree,
             &keep,
             cfg.min_visits,
-            cfg.record_frac,
+            oversampled(cfg.record_frac),
             cfg.record_alpha,
             rng,
             w,
         )?;
         w.finish_game(0, 0)?;
         c.records.fetch_add(rec, Ordering::Relaxed);
+        c.eligible.fetch_add(elig, Ordering::Relaxed);
         c.add_stats(&tree.stats);
         let (t2, map) = tree.retain(&keep);
         tree = t2;
@@ -555,6 +618,24 @@ fn play_shared(
         }
     }
     Ok(())
+}
+
+/// Shared-tree self-play samples this much more than `record_frac` and then
+/// trims the generation to exactly `target_records` ([`Writer::finish_held`]).
+const OVERSAMPLE: f64 = 1.25;
+
+fn oversampled(frac: f64) -> f64 {
+    if frac < 1.0 {
+        (frac * OVERSAMPLE).min(1.0)
+    } else {
+        frac
+    }
+}
+
+/// Eligible nodes after which shared-tree self-play stops: `record_frac` of
+/// them is the target.
+fn eligible_target(cfg: &Config) -> u64 {
+    (cfg.target_records as f64 / cfg.record_frac.min(1.0)).ceil() as u64
 }
 
 /// Count one finished game of [`play_shared`] (`end`: its final position,
@@ -599,6 +680,7 @@ pub fn run(cfg: Config, eval: Arc<dyn Evaluator>, out: &Path) -> anyhow::Result<
                 per_chunk: cfg.chunk_records,
                 game: Vec::new(),
                 movers: Vec::new(),
+                hold: cfg.games > 1,
             };
             while !stop.load(Ordering::Relaxed) {
                 if cfg.games > 1 {
@@ -606,9 +688,14 @@ pub fn run(cfg: Config, eval: Arc<dyn Evaluator>, out: &Path) -> anyhow::Result<
                 } else {
                     play_game(&cfg, eval.as_ref(), &mut rng, &mut w, &c, &stop)?;
                 }
-                if c.records.load(Ordering::Relaxed) >= cfg.target_records {
+                if cfg.games <= 1 && c.records.load(Ordering::Relaxed) >= cfg.target_records {
                     stop.store(true, Ordering::Relaxed);
                 }
+            }
+            if w.hold {
+                let n = w.finish_held(cfg.target_records as usize, &mut rng)?;
+                c.written.fetch_add(n as u64, Ordering::Relaxed);
+                return Ok(());
             }
             w.flush()
         }));
@@ -689,11 +776,21 @@ pub fn run(cfg: Config, eval: Arc<dyn Evaluator>, out: &Path) -> anyhow::Result<
     for h in handles {
         h.join().map_err(|_| anyhow::anyhow!("worker panicked"))??;
     }
-    println!(
-        "done: {} records, {} games",
-        c.records.load(Ordering::Relaxed),
-        c.games.load(Ordering::Relaxed)
-    );
+    if cfg.games > 1 {
+        println!(
+            "done: {} records ({} sampled from {} eligible nodes), {} games finished",
+            c.written.load(Ordering::Relaxed),
+            c.records.load(Ordering::Relaxed),
+            c.eligible.load(Ordering::Relaxed),
+            c.games.load(Ordering::Relaxed)
+        );
+    } else {
+        println!(
+            "done: {} records, {} games",
+            c.records.load(Ordering::Relaxed),
+            c.games.load(Ordering::Relaxed)
+        );
+    }
     let bids: Vec<String> = (c.bids.iter().zip(crate::game::BID_MIN..))
         .filter_map(|(n, b)| {
             let n = n.load(Ordering::Relaxed);
