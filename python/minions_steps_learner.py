@@ -410,6 +410,13 @@ def main():
     # EMA of parameters and BN buffers; `judged` is what gets evaluated/kept.
     ema = copy.deepcopy(net) if args.ema > 0 else None
     judged = ema if ema is not None else net
+    if ema is not None:
+        # The state dicts alias the live tensors (all updates are in place),
+        # so they are collected once; floats blend in two fused launches.
+        e_sd, n_sd = ema.state_dict(), net.state_dict()
+        fl = [k for k in e_sd if e_sd[k].dtype.is_floating_point]
+        ema_f, net_f = [e_sd[k] for k in fl], [n_sd[k] for k in fl]
+        ema_i = [(e_sd[k], n_sd[k]) for k in e_sd if not e_sd[k].dtype.is_floating_point]
     for step in range(steps):
         idx = torch.randint(0, len(train), (args.batch,), device=dev)
         xb = x_tr.dense(idx)
@@ -421,11 +428,10 @@ def main():
         sched.step()
         if ema is not None:
             with torch.no_grad():
-                for pe, pn in zip(ema.state_dict().values(), net.state_dict().values()):
-                    if pe.dtype.is_floating_point:
-                        pe.mul_(args.ema).add_(pn, alpha=1 - args.ema)
-                    else:
-                        pe.copy_(pn)
+                torch._foreach_mul_(ema_f, args.ema)
+                torch._foreach_add_(ema_f, net_f, alpha=1 - args.ema)
+                for pe, pn in ema_i:
+                    pe.copy_(pn)
         if (step + 1) % log_every == 0 or step + 1 == steps:
             m = evaluate(judged, x_ho, y_ho, dev, z=z_ho)
             print(f"step {step + 1}/{steps} loss {loss.item():.4f} holdout mse {m['mse']:.5f} mae {m['mae']:.4f} r {m['r']:.4f} bce+ {m['bce_excess']:.5f} z-mse {m.get('outcome_mse', float('nan')):.4f} ({time.time() - t0:.0f}s)", flush=True)
