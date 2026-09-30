@@ -115,6 +115,9 @@ pub struct TreeSaver {
     next: u32,
     /// The current tree's forest roots: their step paths from the start.
     roots: HashMap<u32, Vec<u8>>,
+    /// The last snapshot's file and metadata, being written in the
+    /// background (self-play does not wait for the disk).
+    writing: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
 }
 
 impl TreeSaver {
@@ -142,6 +145,7 @@ impl TreeSaver {
             gid: Vec::new(),
             next: 0,
             roots: HashMap::from([(0, Vec::new())]),
+            writing: None,
         })
     }
 
@@ -161,8 +165,7 @@ impl TreeSaver {
         games: &[(usize, u32, Option<u32>)],
     ) -> anyhow::Result<()> {
         self.sync(tree);
-        let mut out =
-            std::io::BufWriter::with_capacity(1 << 22, std::fs::File::create(self.dir.join(file))?);
+        let mut out = Vec::with_capacity(12 + tree.nodes.len() * NODE_BYTES);
         out.write_all(b"MSTS")?;
         out.write_all(&VERSION.to_le_bytes())?;
         out.write_all(&(tree.nodes.len() as u32).to_le_bytes())?;
@@ -180,7 +183,6 @@ impl TreeSaver {
             r[25] = nd.comp as u8;
             out.write_all(&r)?;
         }
-        out.flush()?;
         let mut roots: Vec<Root> = self
             .roots
             .iter()
@@ -201,16 +203,27 @@ impl TreeSaver {
                 .collect(),
             roots,
         });
-        // Rewritten every round, so a run that dies mid-batch stays readable.
-        self.write_meta()
+        // The metadata is rewritten every round (after its file), so a run
+        // that dies mid-batch stays readable.
+        self.meta.distinct = u64::from(self.next);
+        let meta = serde_json::to_vec(&self.meta)?;
+        self.wait()?;
+        let (path, dir) = (self.dir.join(file), self.dir.clone());
+        self.writing = Some(std::thread::spawn(move || {
+            std::fs::write(path, out)?;
+            write_meta(&dir, &meta)
+        }));
+        Ok(())
     }
 
-    fn write_meta(&mut self) -> anyhow::Result<()> {
-        self.meta.distinct = u64::from(self.next);
-        let tmp = self.dir.join(".meta.json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec(&self.meta)?)?;
-        std::fs::rename(tmp, self.dir.join("meta.json"))?;
-        Ok(())
+    /// Wait for the snapshot being written, if any.
+    fn wait(&mut self) -> anyhow::Result<()> {
+        match self.writing.take() {
+            Some(h) => h
+                .join()
+                .map_err(|_| anyhow::anyhow!("tree writer panicked"))?,
+            None => Ok(()),
+        }
     }
 
     /// Carry ids and root paths over `tree.retain(keep)`, whose old-to-new
@@ -244,6 +257,15 @@ impl TreeSaver {
             self.snapshot(tree, "final.bin", &[])?;
         }
         self.meta.ended = ended.to_string();
-        self.write_meta()
+        self.meta.distinct = u64::from(self.next);
+        self.wait()?;
+        write_meta(&self.dir, &serde_json::to_vec(&self.meta)?)
     }
+}
+
+fn write_meta(dir: &Path, meta: &[u8]) -> anyhow::Result<()> {
+    let tmp = dir.join(".meta.json.tmp");
+    std::fs::write(&tmp, meta)?;
+    std::fs::rename(tmp, dir.join("meta.json"))?;
+    Ok(())
 }

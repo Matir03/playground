@@ -139,9 +139,10 @@ struct Writer {
 }
 
 impl Writer {
-    fn push(&mut self, v: &View, flipped: bool, target: f32, prior: f32, visits: u32) {
-        encode_record(v, target, prior, visits, &mut self.game);
-        self.movers.push(u8::from(flipped));
+    /// Records already encoded (by [`encode_record`]), with their movers.
+    fn push_encoded(&mut self, recs: &[u8], movers: &[u8]) {
+        self.game.extend_from_slice(recs);
+        self.movers.extend_from_slice(movers);
     }
 
     /// Stamp the held records with the game's result (`winner` as in
@@ -316,17 +317,39 @@ fn record_nodes(
     } else {
         cand.iter().map(|&id| weight(id)).sum::<f64>() / cand.len() as f64
     };
-    let (mut n, eligible) = (0, cand.len() as u64);
-    for id in cand {
-        if frac < 1.0 && rng.gen::<f64>() >= frac * weight(id) / mean {
-            continue;
-        }
-        let nd = &tree.nodes[id as usize];
-        let st = tree.state_of(id);
-        w.push(&st.view(), st.flipped, nd.value, nd.prior, nd.visits);
-        n += 1;
+    let eligible = cand.len() as u64;
+    let picked: Vec<u32> = cand
+        .into_iter()
+        .filter(|&id| frac >= 1.0 || rng.gen::<f64>() < frac * weight(id) / mean)
+        .collect();
+    // Encoding (a state replay or copy, its view) in parallel over slices,
+    // appended in order: the same bytes as one thread pushing each record.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let per = picked.len().div_ceil(threads).max(1);
+    let parts: Vec<(Vec<u8>, Vec<u8>)> = std::thread::scope(|sc| {
+        let hs: Vec<_> = picked
+            .chunks(per)
+            .map(|ids| {
+                sc.spawn(move || {
+                    let (mut recs, mut movers) = (Vec::new(), Vec::with_capacity(ids.len()));
+                    for &id in ids {
+                        let nd = &tree.nodes[id as usize];
+                        let st = tree.state_of(id);
+                        encode_record(&st.view(), nd.value, nd.prior, nd.visits, &mut recs);
+                        movers.push(u8::from(st.flipped));
+                    }
+                    (recs, movers)
+                })
+            })
+            .collect();
+        hs.into_iter()
+            .map(|h| h.join().expect("record encoder"))
+            .collect()
+    });
+    for (recs, movers) in &parts {
+        w.push_encoded(recs, movers);
     }
-    Ok((n, eligible))
+    Ok((picked.len() as u64, eligible))
 }
 
 fn play_game(
