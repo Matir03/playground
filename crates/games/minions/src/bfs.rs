@@ -1408,7 +1408,10 @@ fn batch_runner(
         rows.fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
         let t = Instant::now();
         let res = run_batch(&mut sessions[k], sparse, shape, x, idx);
-        EVAL_PROF[2].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        EVAL_PROF[2].fetch_add(
+            t.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let mut at = 0;
         for r in batch {
             let part = match &res {
