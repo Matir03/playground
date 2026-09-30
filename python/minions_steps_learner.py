@@ -67,27 +67,32 @@ def load_chunks(dirs, max_records=None, holdout_every=0):
     files = []
     for d in dirs:
         files += sorted(glob.glob(os.path.join(d, "chunk_*.bin")))
-    parts, hold = [], []
-    total = 0
-    for fi, f in enumerate(files):
+    counts = []
+    for f in files:
         with open(f, "rb") as fh:
             head = fh.read(16)
-            assert head[:4] == b"MSTP", f
-            ver, count, rb = np.frombuffer(head[4:], "<u4")
-            assert rb == REC_BYTES, (f, rb)
-            arr = np.frombuffer(fh.read(), REC_DTYPE, count=count)
-        if holdout_every and fi % holdout_every == holdout_every - 1:
-            hold.append(arr)
-            continue
-        parts.append(arr)
-        total += len(arr)
-    recs = np.concatenate(parts)
+        assert head[:4] == b"MSTP", f
+        ver, count, rb = np.frombuffer(head[4:], "<u4")
+        assert rb == REC_BYTES, (f, rb)
+        counts.append(int(count))
+    held_out = [bool(holdout_every) and fi % holdout_every == holdout_every - 1 for fi in range(len(files))]
+    # Read straight into the final arrays (one copy, no concatenate).
+    recs = np.empty(sum(c for c, h in zip(counts, held_out) if not h), REC_DTYPE)
+    held = np.empty(sum(c for c, h in zip(counts, held_out) if h), REC_DTYPE)
+    pos = [0, 0]
+    for f, count, h in zip(files, counts, held_out):
+        dest = held if h else recs
+        view = dest[pos[h] : pos[h] + count].view(np.uint8)
+        with open(f, "rb") as fh:
+            fh.seek(16)
+            got = fh.readinto(view)
+        assert got == count * REC_BYTES, (f, got)
+        pos[h] += count
     if max_records and len(recs) > max_records:
         # A uniform sample: truncating would drop the newest generations.
         keep = np.random.default_rng(0).choice(len(recs), max_records, replace=False)
         keep.sort()
         recs = recs[keep]
-    held = np.concatenate(hold) if hold else recs[:0]
     return recs, held, len(files)
 
 
@@ -97,11 +102,16 @@ class SparseSet:
 
     def __init__(self, recs, dev):
         n = len(recs)
-        act = recs["active"].astype(np.int64)
-        cnt = recs["n_active"].astype(np.int64)
-        # Inactive slots point at a spare column that is dropped after the scatter.
-        act[np.arange(MAX_ACTIVE)[None, :] >= cnt[:, None]] = DENSE_DIM
-        self.act = torch.from_numpy(act.astype(np.int16)).to(dev)
+        # Indices are below 2^15, so the u16 field moves as int16 unchanged.
+        # Inactive slots point at a spare column that is dropped after the
+        # scatter; they are masked on the device in slices (the host-side
+        # int64 copy of 12M x 96 indices was most of the learner's load time).
+        self.act = torch.from_numpy(np.ascontiguousarray(recs["active"]).view(np.int16)).to(dev)
+        cnt = torch.from_numpy(np.ascontiguousarray(recs["n_active"])).to(dev)
+        slots = torch.arange(MAX_ACTIVE, device=dev)[None, :]
+        for i in range(0, n, 1 << 20):
+            a = self.act[i : i + (1 << 20)]
+            a.masked_fill_(slots >= cnt[i : i + (1 << 20), None].long(), DENSE_DIM)
         self.scal = torch.from_numpy(recs["scalars"].astype(np.float32)).to(dev)
         self.n = n
 
