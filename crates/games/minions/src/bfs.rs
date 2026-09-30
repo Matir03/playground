@@ -89,6 +89,9 @@ pub struct SearchStats {
     pub expand_ns: u64,
     pub eval_ns: u64,
     pub backup_ns: u64,
+    /// `descent_run`: the main thread's wait for the group in flight (build
+    /// and evaluation, which overlap the other group's landing).
+    pub wait_ns: u64,
 }
 
 impl SearchStats {
@@ -102,6 +105,7 @@ impl SearchStats {
         self.expand_ns += o.expand_ns;
         self.eval_ns += o.eval_ns;
         self.backup_ns += o.backup_ns;
+        self.wait_ns += o.wait_ns;
     }
 }
 
@@ -626,8 +630,11 @@ impl Tree {
     }
 
     /// Descent with the evaluator and the CPU overlapped on one tree: the
-    /// descents are split into two groups of `k / 2`, and while one group's
-    /// children are on the GPU the other group is selected and built. Runs
+    /// descents are split into two groups of `k / 2`. Each group is built and
+    /// then evaluated on a thread of its own, so its evaluation queues behind
+    /// the other group's as soon as it is built; meanwhile the main thread
+    /// lands (commits and backs up) the other group and selects the next.
+    /// The GPU, the bottleneck, then never waits for the main thread. Runs
     /// until `stop` says so (checked between groups) or the tree is solved;
     /// returns the leaves expanded.
     pub fn descent_run(
@@ -640,16 +647,17 @@ impl Tree {
         let mut total = 0usize;
         let threads = self.params.threads;
         std::thread::scope(|sc| -> anyhow::Result<()> {
+            type Built = (Vec<Work>, u64, u64, Vec<f32>);
             type Flight<'s> = (
-                Batch,
-                std::thread::ScopedJoinHandle<'s, anyhow::Result<Vec<f32>>>,
+                Vec<u32>,
+                std::thread::ScopedJoinHandle<'s, anyhow::Result<Built>>,
             );
             let mut flight: Option<Flight> = None;
             let mut group = 0;
             loop {
-                // Select the next group and start building it in the
-                // background (its states are moved out of the tree, so
-                // landing the other group below cannot touch them).
+                // Select the next group and start building and evaluating it
+                // in the background (its states are moved out of the tree,
+                // so landing the other group below cannot touch them).
                 let building = if stop(self) || self.is_solved() {
                     None
                 } else {
@@ -668,57 +676,51 @@ impl Tree {
                             self.pending[l as usize] = true;
                         }
                         let mut work = self.take_states(&leaves);
-                        let h = sc.spawn(move || {
+                        let h = sc.spawn(move || -> anyhow::Result<Built> {
                             let t = Instant::now();
                             build_all(&mut work, threads);
-                            (work, t.elapsed().as_nanos() as u64)
+                            let built = t.elapsed().as_nanos() as u64;
+                            // In leaf order, as `finish` would collect them.
+                            let mut views = Vec::new();
+                            for (_, out) in work.iter_mut() {
+                                if let Some(Some((_, vs))) = out.as_mut() {
+                                    views.append(vs);
+                                }
+                            }
+                            let t = Instant::now();
+                            let vals = if views.is_empty() {
+                                Vec::new()
+                            } else {
+                                eval.eval(&views)?
+                            };
+                            Ok((work, built, t.elapsed().as_nanos() as u64, vals))
                         });
                         (leaves, h)
                     })
                 };
-                // Take the finished evaluation and land it (commit and back
-                // up) while the new group is still building, then put the
-                // new group on the GPU as soon as it is built.
+                // Land the group in flight: its children, their values.
                 let landed = flight.take();
-                let got = match landed {
-                    Some((batch, h)) => {
-                        let t = Instant::now();
-                        let vals = h
-                            .join()
-                            .map_err(|_| anyhow::anyhow!("evaluator panicked"))??;
-                        self.stats.eval_ns += t.elapsed().as_nanos() as u64;
-                        self.stats.evals += vals.len() as u64;
-                        Some((batch, vals))
-                    }
-                    None => None,
-                };
-                let had = got.is_some();
-                if let Some((batch, vals)) = got {
+                let had = landed.is_some();
+                if let Some((leaves, h)) = landed {
+                    let t = Instant::now();
+                    let (work, built, evaled, vals) = h
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("builder panicked"))??;
+                    self.stats.wait_ns += t.elapsed().as_nanos() as u64;
+                    self.stats.expand_ns += built;
+                    self.stats.eval_ns += evaled;
+                    self.stats.evals += vals.len() as u64;
+                    let batch = self.finish(&leaves, work);
                     for &l in &batch.leaves {
                         self.pending[l as usize] = false;
                     }
-                    let leaves = batch.leaves.clone();
                     self.commit(batch, &vals);
                     self.backup(&leaves);
                     self.stats.iterations += 1;
                     total += leaves.len();
                 }
                 let launched = building.is_some();
-                if let Some((leaves, h)) = building {
-                    let t = Instant::now();
-                    let (work, _) = h.join().map_err(|_| anyhow::anyhow!("builder panicked"))?;
-                    self.stats.expand_ns += t.elapsed().as_nanos() as u64;
-                    let mut batch = self.finish(&leaves, work);
-                    let views = std::mem::take(&mut batch.views);
-                    let h = sc.spawn(move || {
-                        if views.is_empty() {
-                            Ok(Vec::new())
-                        } else {
-                            eval.eval(&views)
-                        }
-                    });
-                    flight = Some((batch, h));
-                }
+                flight = building;
                 group ^= 1;
                 // Nothing new and nothing in flight: done. A group that found
                 // nothing while the other was in flight may find leaves once
