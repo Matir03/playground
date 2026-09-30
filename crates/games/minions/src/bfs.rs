@@ -676,9 +676,9 @@ impl Tree {
                         (leaves, h)
                     })
                 };
-                // Take the finished evaluation, put the new group on the GPU
-                // straight away, then land the old one (commit and back up)
-                // while the GPU works.
+                // Take the finished evaluation and land it (commit and back
+                // up) while the new group is still building, then put the
+                // new group on the GPU as soon as it is built.
                 let landed = flight.take();
                 let got = match landed {
                     Some((batch, h)) => {
@@ -692,6 +692,17 @@ impl Tree {
                     }
                     None => None,
                 };
+                let had = got.is_some();
+                if let Some((batch, vals)) = got {
+                    for &l in &batch.leaves {
+                        self.pending[l as usize] = false;
+                    }
+                    let leaves = batch.leaves.clone();
+                    self.commit(batch, &vals);
+                    self.backup(&leaves);
+                    self.stats.iterations += 1;
+                    total += leaves.len();
+                }
                 let launched = building.is_some();
                 if let Some((leaves, h)) = building {
                     let t = Instant::now();
@@ -707,17 +718,6 @@ impl Tree {
                         }
                     });
                     flight = Some((batch, h));
-                }
-                let had = got.is_some();
-                if let Some((batch, vals)) = got {
-                    for &l in &batch.leaves {
-                        self.pending[l as usize] = false;
-                    }
-                    let leaves = batch.leaves.clone();
-                    self.commit(batch, &vals);
-                    self.backup(&leaves);
-                    self.stats.iterations += 1;
-                    total += leaves.len();
                 }
                 group ^= 1;
                 // Nothing new and nothing in flight: done. A group that found

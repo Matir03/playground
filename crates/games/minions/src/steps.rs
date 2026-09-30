@@ -1482,6 +1482,66 @@ fn full_moves() -> bool {
     *V.get_or_init(|| std::env::var("STEPS_EXACT_FULL_MOVES").is_ok_and(|v| v == "1"))
 }
 
+/// Wall-clock cap on one top-level exact query, plan search and nested
+/// verifications included (`STEPS_EXACT_DEADLINE_US`, default 0 = none). A
+/// query past it ends unknown, which is a dead end like an exhausted budget.
+/// Self-play waits for the slowest leaf of each wave, and 1% of queries took
+/// 35% of the solver's time (gen 146 corpus).
+fn exact_deadline() -> Option<std::time::Duration> {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let us = *V.get_or_init(|| {
+        std::env::var("STEPS_EXACT_DEADLINE_US")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    });
+    (us > 0).then(|| std::time::Duration::from_micros(us))
+}
+
+thread_local!(static DEADLINE: std::cell::Cell<Option<std::time::Instant>> =
+    const { std::cell::Cell::new(None) });
+
+/// Whether the current top-level query is past its deadline.
+pub(crate) fn past_deadline() -> bool {
+    DEADLINE.with(|d| d.get().is_some_and(|t| std::time::Instant::now() >= t))
+}
+
+/// Arms the deadline for a top-level query (nested calls inherit it) and
+/// disarms it when the query that armed it returns.
+struct DeadlineGuard(bool);
+
+impl DeadlineGuard {
+    fn arm() -> Self {
+        let Some(d) = exact_deadline() else {
+            return Self(false);
+        };
+        DEADLINE.with(|c| {
+            if c.get().is_some() {
+                Self(false)
+            } else {
+                c.set(Some(std::time::Instant::now() + d));
+                Self(true)
+            }
+        })
+    }
+}
+
+impl Drop for DeadlineGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            DEADLINE.with(|c| c.set(None));
+        }
+    }
+}
+
+/// Whether a fates-stage query the plan search left unknown goes on to the
+/// atomic search (`STEPS_FATES_ATOMIC=0` skips it: on the gen 146 corpus it
+/// found 6 witnesses in 297 queries for 6.6% of the solver's time).
+fn fates_atomic() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("STEPS_FATES_ATOMIC").map_or(true, |v| v != "0"))
+}
+
 /// Budget for the first (declared-targets-only) phase of the exact search:
 /// `STEPS_EXACT_TWO_PHASE` as a fraction of the budget (default 0 = one phase).
 fn two_phase_budget(budget: u32) -> u32 {
@@ -2560,7 +2620,7 @@ pub fn exact_realize(
             }
             return false;
         }
-        if c.budget == 0 {
+        if c.budget == 0 || c.budget % 32 == 0 && past_deadline() {
             c.out_of_budget = true;
             return false;
         }
@@ -2678,6 +2738,7 @@ pub fn exact_realize(
         }
         false
     }
+    let _deadline = DeadlineGuard::arm();
     let mut origin_at = [NO_CELL; NUM_CELLS];
     for cell in 0..NUM_CELLS as u8 {
         if base.piece_at(cell).is_some_and(|(sd, _)| sd == 0) {
@@ -2745,6 +2806,13 @@ pub fn exact_realize(
         }
         PLAN_STATS[2].fetch_add(1, Relaxed);
         plan_ns = ns;
+        if past_deadline() || (decided == 0 && !fates_atomic()) {
+            dump_query(base, spec, decided, fated, 2, 0, ns);
+            EXACT_OUTCOME[2][0].fetch_add(ns, Relaxed);
+            EXACT_STATS[3].fetch_add(ns, Relaxed);
+            EXACT_STATS[2].fetch_add(1, Relaxed);
+            return Exact::Unknown;
+        }
     }
     let t0 = std::time::Instant::now();
     // Two phases: first with only the declared targets attackable (any

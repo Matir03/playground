@@ -435,6 +435,9 @@ fn place_dfs(
         }
         return Some(found(chosen, b));
     }
+    if b.nodes % 32 == 0 && past_deadline() {
+        b.nodes = 0;
+    }
     if b.nodes == 0 {
         return None;
     }
@@ -609,6 +612,11 @@ fn relocate(
 fn verify(base: &MinionsState, w: &TurnSpec, b: &mut Budget) -> bool {
     if known_realizable(base, w) {
         return true;
+    }
+    if past_deadline() {
+        b.verifies = 0;
+        b.incomplete = true;
+        return false;
     }
     let budget = if b.verified < plan_env("PLAN_VERIFY_DEEP", VERIFY_DEEP) {
         plan_env("PLAN_VERIFY_BUDGET", VERIFY_BUDGET)

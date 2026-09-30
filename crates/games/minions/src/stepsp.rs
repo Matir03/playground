@@ -236,6 +236,9 @@ pub struct Counters {
     pub stuck: AtomicU64,
     pub starved: AtomicU64,
     pub walk_ns: AtomicU64,
+    /// Shared-tree work between rounds (thread-ns): snapshot, records,
+    /// retain, and freeing the old tree (on a background thread).
+    pub between_ns: [AtomicU64; 4],
     /// Starting bids, indexed from `BID_MIN`.
     pub bids: [AtomicU64; (crate::game::BID_MAX - crate::game::BID_MIN + 1) as usize],
 }
@@ -615,6 +618,7 @@ fn play_shared(
         }
         c.walk_ns
             .fetch_add(tp.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let tb = Instant::now();
         if let Some(s) = saver.as_mut() {
             let moved: Vec<_> = froms
                 .iter()
@@ -623,6 +627,7 @@ fn play_shared(
                 .collect();
             s.snapshot(&tree, &format!("r{mv:03}.bin"), &moved)?;
         }
+        c.between_ns[0].fetch_add(tb.elapsed().as_nanos() as u64, Ordering::Relaxed);
         mv += 1;
         // Games that just ended are counted; their positions are not kept.
         let mut keep = Vec::new();
@@ -638,6 +643,7 @@ fn play_shared(
         }
         keep.sort_unstable();
         keep.dedup();
+        let tb = Instant::now();
         let (rec, elig) = record_nodes(
             &tree,
             &keep,
@@ -651,11 +657,21 @@ fn play_shared(
         c.records.fetch_add(rec, Ordering::Relaxed);
         c.eligible.fetch_add(elig, Ordering::Relaxed);
         c.add_stats(&tree.stats);
+        c.between_ns[1].fetch_add(tb.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let tb = Instant::now();
         let (t2, map) = tree.retain(&keep);
         if let Some(s) = saver.as_mut() {
             s.retained(&tree, &keep, &map);
         }
-        tree = t2;
+        c.between_ns[2].fetch_add(tb.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        // Freeing millions of node states takes a while; the next round
+        // does not wait for it.
+        let old = std::mem::replace(&mut tree, t2);
+        std::thread::spawn(move || {
+            let tb = Instant::now();
+            drop(old);
+            BETWEEN_DROP_NS.fetch_add(tb.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        });
         for pos in games.iter_mut() {
             if let Some(n) = pos {
                 *n = map[*n as usize];
@@ -664,6 +680,9 @@ fn play_shared(
     }
     Ok(())
 }
+
+/// Time spent freeing old trees in the background (see [`play_shared`]).
+static BETWEEN_DROP_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Shared-tree self-play samples this much more than `record_frac` and then
 /// trims the generation to exactly `target_records` ([`Writer::finish_held`]).
@@ -808,6 +827,14 @@ pub fn run(cfg: Config, eval: Arc<dyn Evaluator>, out: &Path) -> anyhow::Result<
                     g(&lz[2])
                 );
             }
+            let b = &c.between_ns;
+            println!(
+                "  between rounds (s): snapshot {:.1}, records {:.1}, retain {:.1}, free old tree {:.1} (background)",
+                g(&b[0]) as f64 * 1e-9,
+                g(&b[1]) as f64 * 1e-9,
+                g(&b[2]) as f64 * 1e-9,
+                g(&BETWEEN_DROP_NS) as f64 * 1e-9
+            );
             let y = &crate::steps::EXACT_SITES;
             println!(
                 "  exact by site: fates {} calls {:.0}s, moves {} calls {:.0}s, complete {} calls {:.0}s",
