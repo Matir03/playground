@@ -52,7 +52,9 @@ timeout 120 powershell.exe -NoProfile -Command "
 
 echo; echo "== verdict (heuristic)"
 W="$HOME/.wsl-crashcheck.last"
-if grep -q "WindowsUpdateClient 43.*Linux" "$W"; then
+if journalctl -b "$B" --no-pager -k 2>/dev/null | grep -q "Write-error on swap-device\|Device offlined"; then
+  echo "the VM's swap disk failed (hv_storvsc write errors, device offlined) under memory pressure; check the sysmon samples for what was growing"
+elif grep -q "WindowsUpdateClient 43.*Linux" "$W"; then
   echo "Store auto-update of WSL restarted the VM (turn off automatic app updates in Microsoft Store, or update WSL by hand)"
 elif grep -q "Kernel-Power 506" "$W"; then
   echo "the laptop entered Modern Standby; the VM froze and did not survive it (keep the host awake while jobs run)"
