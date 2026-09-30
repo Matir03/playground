@@ -799,10 +799,11 @@ pub fn run(cfg: Config, eval: Arc<dyn Evaluator>, out: &Path) -> anyhow::Result<
             );
             let x = &crate::steps::EXACT_STATS;
             println!(
-                "  exact search: found {} impossible {} out-of-budget {} | {:.0} thread-s",
+                "  exact search: found {} impossible {} out-of-budget {} (deadline {}) | {:.0} thread-s",
                 g(&x[0]),
                 g(&x[1]),
                 g(&x[2]),
+                g(&crate::steps::DEADLINE_HITS),
                 g(&x[3]) as f64 * 1e-9
             );
             let z = &crate::steps::EXACT_OUTCOME;
@@ -834,6 +835,13 @@ pub fn run(cfg: Config, eval: Arc<dyn Evaluator>, out: &Path) -> anyhow::Result<
                 g(&b[1]) as f64 * 1e-9,
                 g(&b[2]) as f64 * 1e-9,
                 g(&BETWEEN_DROP_NS) as f64 * 1e-9
+            );
+            let ep = &crate::bfs::EVAL_PROF;
+            println!(
+                "  evaluator (s): featurize {:.1}, wait for values {:.1}, in ONNX calls {:.1} (runners summed)",
+                g(&ep[0]) as f64 * 1e-9,
+                g(&ep[1]) as f64 * 1e-9,
+                g(&ep[2]) as f64 * 1e-9
             );
             let y = &crate::steps::EXACT_SITES;
             println!(

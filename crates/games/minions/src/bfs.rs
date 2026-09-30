@@ -1361,6 +1361,12 @@ fn run_batch(
     Ok(v.to_vec())
 }
 
+/// Batched evaluator profile (ns): featurizing on the calling thread, the
+/// caller's wait for its values after the last chunk was queued, and time
+/// inside ONNX calls (summed over runners).
+pub static EVAL_PROF: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 fn batch_runner(
     mut sessions: Vec<ort::session::Session>,
     sparse: bool,
@@ -1398,7 +1404,9 @@ fn batch_runner(
         }
         calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         rows.fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
+        let t = Instant::now();
         let res = run_batch(&mut sessions[k], sparse, shape, x, idx);
+        EVAL_PROF[2].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         let mut at = 0;
         for r in batch {
             let part = match &res {
@@ -1416,7 +1424,9 @@ impl Evaluator for BatchedOnnxEval {
         let max = *BATCH_SHAPES.last().unwrap();
         let mut act = Vec::new();
         let mut waits = Vec::new();
+        let mut feat_ns = 0u64;
         for part in views.chunks(max) {
+            let t = Instant::now();
             let (x, idx) = if self.sparse {
                 use crate::steps::{MAX_ACTIVE, N_SCALARS, SPARSE_DIM};
                 let mut x = vec![0f32; part.len() * N_SCALARS];
@@ -1437,6 +1447,7 @@ impl Evaluator for BatchedOnnxEval {
                 }
                 (x, Vec::new())
             };
+            feat_ns += t.elapsed().as_nanos() as u64;
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             self.queue.q.lock().unwrap().push_back(BatchReq {
                 x,
@@ -1447,10 +1458,14 @@ impl Evaluator for BatchedOnnxEval {
             self.queue.cv.notify_one();
             waits.push(rx);
         }
+        let t = Instant::now();
         let mut out = Vec::with_capacity(views.len());
         for rx in waits {
             out.extend(rx.recv().map_err(|e| anyhow::anyhow!("{e}"))??);
         }
+        use std::sync::atomic::Ordering::Relaxed;
+        EVAL_PROF[0].fetch_add(feat_ns, Relaxed);
+        EVAL_PROF[1].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
         Ok(out)
     }
 }

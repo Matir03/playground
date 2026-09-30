@@ -1501,6 +1501,9 @@ fn exact_deadline() -> Option<std::time::Duration> {
 thread_local!(static DEADLINE: std::cell::Cell<Option<std::time::Instant>> =
     const { std::cell::Cell::new(None) });
 
+/// Top-level exact queries that ended unknown because of the deadline.
+pub static DEADLINE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Whether the current top-level query is past its deadline.
 pub(crate) fn past_deadline() -> bool {
     DEADLINE.with(|d| d.get().is_some_and(|t| std::time::Instant::now() >= t))
@@ -2807,6 +2810,9 @@ pub fn exact_realize(
         PLAN_STATS[2].fetch_add(1, Relaxed);
         plan_ns = ns;
         if past_deadline() || (decided == 0 && !fates_atomic()) {
+            if past_deadline() && _deadline.0 {
+                DEADLINE_HITS.fetch_add(1, Relaxed);
+            }
             dump_query(base, spec, decided, fated, 2, 0, ns);
             EXACT_OUTCOME[2][0].fetch_add(ns, Relaxed);
             EXACT_STATS[3].fetch_add(ns, Relaxed);
@@ -2873,6 +2879,9 @@ pub fn exact_realize(
         exact_cache_put(base, &w, &path);
         Exact::Found(w, path)
     } else if c.out_of_budget {
+        if _deadline.0 && past_deadline() {
+            DEADLINE_HITS.fetch_add(1, Relaxed);
+        }
         EXACT_STATS[2].fetch_add(1, Relaxed);
         Exact::Unknown
     } else {
