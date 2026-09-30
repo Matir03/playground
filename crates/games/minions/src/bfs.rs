@@ -92,6 +92,10 @@ pub struct SearchStats {
     /// `descent_run`: the main thread's wait for the group in flight (build
     /// and evaluation, which overlap the other group's landing).
     pub wait_ns: u64,
+    /// `descent_run`, main thread: moving leaf states out, and landing a
+    /// group (`finish` + `commit`).
+    pub take_ns: u64,
+    pub land_ns: u64,
 }
 
 impl SearchStats {
@@ -106,6 +110,8 @@ impl SearchStats {
         self.eval_ns += o.eval_ns;
         self.backup_ns += o.backup_ns;
         self.wait_ns += o.wait_ns;
+        self.take_ns += o.take_ns;
+        self.land_ns += o.land_ns;
     }
 }
 
@@ -675,7 +681,9 @@ impl Tree {
                         for &l in &leaves {
                             self.pending[l as usize] = true;
                         }
+                        let t = Instant::now();
                         let mut work = self.take_states(&leaves);
+                        self.stats.take_ns += t.elapsed().as_nanos() as u64;
                         let h = sc.spawn(move || -> anyhow::Result<Built> {
                             let t = Instant::now();
                             build_all(&mut work, threads);
@@ -710,11 +718,13 @@ impl Tree {
                     self.stats.expand_ns += built;
                     self.stats.eval_ns += evaled;
                     self.stats.evals += vals.len() as u64;
+                    let t = Instant::now();
                     let batch = self.finish(&leaves, work);
                     for &l in &batch.leaves {
                         self.pending[l as usize] = false;
                     }
                     self.commit(batch, &vals);
+                    self.stats.land_ns += t.elapsed().as_nanos() as u64;
                     self.backup(&leaves);
                     self.stats.iterations += 1;
                     total += leaves.len();

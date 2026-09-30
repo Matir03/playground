@@ -238,6 +238,8 @@ pub struct Counters {
     pub walk_ns: AtomicU64,
     /// Main-thread wait for the group in flight (see `SearchStats::wait_ns`).
     pub wait_ns: AtomicU64,
+    pub take_ns: AtomicU64,
+    pub land_ns: AtomicU64,
     /// Shared-tree work between rounds (thread-ns): snapshot, records,
     /// retain, and freeing the old tree (on a background thread).
     pub between_ns: [AtomicU64; 4],
@@ -255,6 +257,8 @@ impl Counters {
         self.select_ns.fetch_add(s.select_ns, Ordering::Relaxed);
         self.backup_ns.fetch_add(s.backup_ns, Ordering::Relaxed);
         self.wait_ns.fetch_add(s.wait_ns, Ordering::Relaxed);
+        self.take_ns.fetch_add(s.take_ns, Ordering::Relaxed);
+        self.land_ns.fetch_add(s.land_ns, Ordering::Relaxed);
     }
 }
 
@@ -846,6 +850,14 @@ pub fn run(cfg: Config, eval: Arc<dyn Evaluator>, out: &Path) -> anyhow::Result<
                 g(&ep[1]) as f64 * 1e-9,
                 g(&ep[2]) as f64 * 1e-9,
                 g(&c.wait_ns) as f64 * 1e-9
+            );
+            println!(
+                "  main thread (s): select {:.1}, take states {:.1}, wait for groups {:.1}, land {:.1}, backup {:.1}",
+                g(&c.select_ns) as f64 * 1e-9,
+                g(&c.take_ns) as f64 * 1e-9,
+                g(&c.wait_ns) as f64 * 1e-9,
+                g(&c.land_ns) as f64 * 1e-9,
+                g(&c.backup_ns) as f64 * 1e-9
             );
             let y = &crate::steps::EXACT_SITES;
             println!(
