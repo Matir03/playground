@@ -49,9 +49,9 @@
 
 use playground_core::{Game, Outcome, Player, SearchOutcome, Solver};
 
-use crate::map::{
-    self, cell_name, dist, IS_GRAVEYARD, NEIGHBORS, NECRO_START, NO_CELL, NUM_CELLS,
-};
+use crate::map::{self, cell_name, dist, IS_GRAVEYARD, NECRO_START, NUM_CELLS};
+#[cfg(test)]
+use crate::map::{NEIGHBORS, NO_CELL};
 use crate::units::{Attack, Unit, BUYABLE, NUM_UNITS};
 
 pub use crate::map::GRAVEYARDS_TO_WIN;

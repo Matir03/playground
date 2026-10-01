@@ -172,6 +172,32 @@ impl Tree {
         })
     }
 
+    /// Add another root (a forest: e.g. one per self-play game, each from its
+    /// own opening), evaluated like [`Tree::new`]'s. Returns its node.
+    pub fn add_root(&mut self, root: StepState, eval: &dyn Evaluator) -> anyhow::Result<u32> {
+        let (kind, value, comp) = if root.is_terminal() {
+            (TERMINAL, root.terminal_value(), root.terminal_outcome())
+        } else {
+            (LEAF, eval.eval(&[root.view()])?[0], 0)
+        };
+        let n = self.nodes.len() as u32;
+        self.nodes.push(Node {
+            parent: u32::MAX,
+            first: 0,
+            nch: 0,
+            step: 0,
+            flip: false,
+            kind,
+            visits: 0,
+            value,
+            prior: value,
+            comp,
+            resolved: kind == TERMINAL,
+        });
+        self.states.push(Some(root));
+        Ok(n)
+    }
+
     /// Nothing left to search: the root (or every descent start) is decided.
     pub fn is_solved(&self) -> bool {
         let done = |n: u32| {

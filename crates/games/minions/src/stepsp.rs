@@ -569,8 +569,16 @@ fn play_shared(
         None => None,
     };
     let mut mv = 0usize;
-    // Each game's position, or None once it is over.
+    // Each game's position, or None once it is over. Random openings
+    // (`opening_max` > 0): every game starts from its own, as one more root
+    // of the forest; otherwise all start at the standard opening (node 0).
     let mut games: Vec<Option<u32>> = vec![Some(0); cfg.games.max(1)];
+    if cfg.opening_max != 0 {
+        for (g, pos) in games.iter_mut().enumerate().skip(1) {
+            let s = crate::selfplay::random_opening(cfg.opening_max, cfg.opening_decay, rng).0;
+            *pos = Some(tree.add_root(StepState::begin(&s, salt ^ g as u64), eval)?);
+        }
+    }
     let mut turns = vec![0u64; games.len()];
     let over = |tree: &Tree, n: u32| {
         let nd = &tree.nodes[n as usize];
