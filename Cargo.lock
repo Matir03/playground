@@ -1535,6 +1535,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "clap",
+ "foldhash 0.2.0",
  "half",
  "libloading 0.8.9",
  "mimalloc",

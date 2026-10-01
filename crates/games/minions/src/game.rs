@@ -226,6 +226,40 @@ fn cell_unit(c: u8) -> Unit {
     Unit::from_index((c - 1) % NUM_UNITS as u8).expect("cell holds a valid unit")
 }
 
+/// Bit `i` set where `lo <= cells[i] <= hi`. Three SSE2 compares on x86_64
+/// (the exact search's move generation calls this per node), a scalar loop
+/// elsewhere.
+#[inline]
+fn byte_mask(cells: &[u8; NUM_CELLS], lo: u8, hi: u8) -> u64 {
+    const _: () = assert!(NUM_CELLS <= 64);
+    let mut m = 0u64;
+    #[cfg(target_arch = "x86_64")]
+    let full = {
+        use std::arch::x86_64::*;
+        let full = NUM_CELLS / 16 * 16;
+        // SAFETY: SSE2 is part of the x86_64 baseline, and every load reads
+        // 16 bytes inside `cells` (`k + 16 <= full <= NUM_CELLS`).
+        unsafe {
+            let (vlo, span) = (_mm_set1_epi8(lo as i8), _mm_set1_epi8((hi - lo) as i8));
+            let mut k = 0;
+            while k < full {
+                let v = _mm_sub_epi8(_mm_loadu_si128(cells.as_ptr().add(k) as *const __m128i), vlo);
+                // Unsigned v <= span: min(v, span) == v.
+                let inside = _mm_cmpeq_epi8(_mm_min_epu8(v, span), v);
+                m |= u64::from(_mm_movemask_epi8(inside) as u16) << k;
+                k += 16;
+            }
+        }
+        full
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let full = 0;
+    for (i, &c) in cells.iter().enumerate().skip(full) {
+        m |= u64::from(c.wrapping_sub(lo) <= hi - lo) << i;
+    }
+    m
+}
+
 #[inline]
 fn damage_of(p: u8) -> u8 {
     (p & DAMAGE_MASK) >> DAMAGE_SHIFT
@@ -424,27 +458,18 @@ impl MinionsState {
         self.nw_hist = [v; ADJ_WINDOW];
     }
 
-    /// The cells holding a `side` unit: [`Self::piece_at`]'s side test without
-    /// decoding the unit (whose `expect` kept the loop from vectorising).
+    /// The cells holding a `side` unit: [`Self::piece_at`]'s side test on the
+    /// cell bytes, without decoding the unit.
     #[inline]
     pub fn side_bb(&self, side: u8) -> crate::bitboard::Bb {
-        const _: () = assert!(NUM_CELLS <= 64);
         let lo = 1 + NUM_UNITS as u8 * side;
-        let mut m = 0u64;
-        for (i, &c) in self.cells.iter().enumerate() {
-            m |= u64::from(c.wrapping_sub(lo) < NUM_UNITS as u8) << i;
-        }
-        crate::bitboard::Bb::from(m)
+        crate::bitboard::Bb::from(byte_mask(&self.cells, lo, lo + NUM_UNITS as u8 - 1))
     }
 
     /// The empty cells.
     #[inline]
     pub fn empty_bb(&self) -> crate::bitboard::Bb {
-        let mut m = 0u64;
-        for (i, &c) in self.cells.iter().enumerate() {
-            m |= u64::from(c == 0) << i;
-        }
-        crate::bitboard::Bb::from(m)
+        crate::bitboard::Bb::from(byte_mask(&self.cells, 0, 0))
     }
 
     #[inline]
@@ -495,8 +520,14 @@ impl MinionsState {
     /// Cells a piece at `from` may move to: empty, and reachable within its
     /// speed through cells that are empty or friendly (or anything, if flying).
     pub fn move_targets(&self, from: u8) -> Vec<u8> {
+        crate::bitboard::cells(self.move_target_bb(from)).collect()
+    }
+
+    /// [`Self::move_targets`] as a bitboard (no allocation; read it lowest
+    /// cell first for the same order).
+    pub fn move_target_bb(&self, from: u8) -> crate::bitboard::Bb {
         let Some((side, unit)) = self.piece_at(from) else {
-            return Vec::new();
+            return 0;
         };
         let stats = unit.stats();
         let flying = stats.flying;
@@ -513,8 +544,7 @@ impl MinionsState {
         let mut next = [0u8; NUM_CELLS];
         frontier[0] = from;
         let mut n_front = 1usize;
-        // Speed-1 units (most of them) reach at most their six neighbours.
-        let mut out = Vec::with_capacity(if stats.speed <= 1 { 8 } else { 40 });
+        let mut out: crate::bitboard::Bb = 0;
 
         for step in 1..=stats.speed {
             let mut n_next = 0usize;
@@ -530,7 +560,7 @@ impl MinionsState {
                     }
                     steps[n as usize] = step;
                     if occ == 0 {
-                        out.push(n);
+                        out |= crate::bitboard::bit(n);
                     }
                     next[n_next] = n;
                     n_next += 1;
@@ -542,7 +572,6 @@ impl MinionsState {
                 break;
             }
         }
-        out.sort_unstable();
         out
     }
 
@@ -580,6 +609,15 @@ impl MinionsState {
             return Vec::new();
         }
         let range = unit.stats().range as u32;
+        if range == 1 {
+            // Every unit today: the enemies among the six neighbours, lowest
+            // cell first like the scan below (the exact search's move
+            // generation spent ~20% of its time in that scan).
+            let near = self.side_bb(1 - side) & crate::bitboard::dilate(crate::bitboard::bit(from));
+            let mut out = Vec::with_capacity(near.count_ones() as usize);
+            out.extend(crate::bitboard::cells(near));
+            return out;
+        }
         // `collect` from a filter has no useful size hint, so it reallocated as
         // it grew; a unit rarely has more than a handful of targets in range.
         let mut out = Vec::with_capacity(8);
@@ -783,18 +821,28 @@ impl Game for Minions {
         let mut out = Vec::with_capacity(64);
 
         if state.phase == PHASE_ATTACK {
-            for i in 0..NUM_CELLS as u8 {
-                let Some((s, _)) = state.piece_at(i) else { continue };
-                if s != side {
-                    continue;
-                }
+            // Bitboards read lowest cell first: the same order as scanning the
+            // cells, without two vectors per unit (this runs at every node of
+            // the exact witness search).
+            let enemies = state.side_bb(1 - side);
+            for i in crate::bitboard::cells(state.side_bb(side)) {
                 if state.can_move_piece(i) {
-                    for to in state.move_targets(i) {
+                    for to in crate::bitboard::cells(state.move_target_bb(i)) {
                         out.push(MinionsMove::Move { from: i, to });
                     }
                 }
-                for to in state.attack_targets(i) {
-                    out.push(MinionsMove::Attack { from: i, to });
+                let (_, unit) = state.piece_at(i).expect("own unit");
+                if unit.stats().range == 1 {
+                    if state.can_attack_piece(i, unit) {
+                        let near = enemies & crate::bitboard::dilate(crate::bitboard::bit(i));
+                        for to in crate::bitboard::cells(near) {
+                            out.push(MinionsMove::Attack { from: i, to });
+                        }
+                    }
+                } else {
+                    for to in state.attack_targets(i) {
+                        out.push(MinionsMove::Attack { from: i, to });
+                    }
                 }
             }
         } else {

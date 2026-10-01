@@ -1215,7 +1215,7 @@ pub fn attack_part(base: &MinionsState, spec: &TurnSpec) -> Option<MinionsState>
 /// destination and every enemy's fate (spawns ignored).
 fn exact_key(base: &MinionsState, spec: &TurnSpec) -> u64 {
     use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut h = key_hasher();
     base.key().hash(&mut h);
     for c in 0..NUM_CELLS as u8 {
         if base.piece_at(c).is_some_and(|(sd, _)| sd == 0) {
@@ -1236,7 +1236,33 @@ fn exact_key(base: &MinionsState, spec: &TurnSpec) -> u64 {
 /// so committing a declaration never re-runs a search that could run out of
 /// budget where the one that offered it did not.
 /// Sharded by key so the self-play workers do not serialize on one lock.
-type ExactShard = std::sync::Mutex<Option<std::collections::HashMap<u64, Vec<MinionsMove>>>>;
+type ExactShard =
+    std::sync::Mutex<Option<std::collections::HashMap<u64, Vec<MinionsMove>, KeyBuild>>>;
+
+/// The hasher for transposition and cache keys (foldhash, fixed seed: a
+/// key's value never leaves the process).
+fn key_hasher() -> impl std::hash::Hasher {
+    use std::hash::BuildHasher;
+    foldhash::quality::FixedState::with_seed(0x6d69_6e69_6f6e_73).build_hasher()
+}
+
+/// Sets and maps keyed by [`key_hasher`] values, which need no second hash.
+type KeyBuild = std::hash::BuildHasherDefault<KeyPass>;
+
+#[derive(Default)]
+struct KeyPass(u64);
+
+impl std::hash::Hasher for KeyPass {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("only u64 keys")
+    }
+    fn write_u64(&mut self, k: u64) {
+        self.0 = k;
+    }
+}
 const EXACT_SHARDS: usize = 64;
 static EXACT_CACHE: [ExactShard; EXACT_SHARDS] =
     [const { std::sync::Mutex::new(None) }; EXACT_SHARDS];
@@ -2331,7 +2357,7 @@ pub fn exact_realize(
         budget: u32,
         /// Phase 1 of the two-phase search: attack declared targets only.
         only_fated: bool,
-        seen: HashSet<u64>,
+        seen: HashSet<u64, KeyBuild>,
         path: Vec<MinionsMove>,
         found: Option<TurnSpec>,
         out_of_budget: bool,
@@ -2606,7 +2632,7 @@ pub fn exact_realize(
         }
         // Transpositions (the same position by another action order) are
         // over half the nodes; they cost a hash, not budget.
-        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut h = key_hasher();
         st.s.key().hash(&mut h);
         st.origin_at.hash(&mut h);
         st.gone.hash(&mut h);
@@ -2753,7 +2779,7 @@ pub fn exact_realize(
         fated,
         budget,
         only_fated: false,
-        seen: HashSet::new(),
+        seen: HashSet::default(),
         path: Vec::new(),
         found: None,
         out_of_budget: false,
