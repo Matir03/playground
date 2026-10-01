@@ -583,7 +583,8 @@ enum Cmd {
     },
     /// Greedy match between two step evaluators (each step: evaluate every
     /// option, take the best). Evaluators: `old:<dir>`, `<path>.onnx`, or an
-    /// MLP's `<path>.bin` (CPU).
+    /// MLP's `<path>.bin` (CPU). `--b` may list several, comma-separated: one
+    /// match against each, in turn.
     StepsMatch {
         #[arg(long)]
         a: String,
@@ -1282,20 +1283,35 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::NnueBench { active, reps } => minions_engine::nnue::bench_sweep(active, reps),
         Cmd::StepsMatch { a, b, pairs, opening_max, opening_decay, ep, seed, expansions, expansions_b, power, power_b, heads, threads } => {
+            // A match evaluates one batch at a time per game thread, so one
+            // runner (two sessions per net, not four) is enough: the session
+            // builds were most of a short match's time and memory.
             let player = |spec: &str, expansions: u64, power: f32| -> anyhow::Result<minions_engine::stepsp::Player> {
                 let params = minions_engine::bfs::Params { heads, power, ..Default::default() };
-                Ok(minions_engine::stepsp::Player { eval: load_step_eval(spec, &ep)?, expansions, params })
+                Ok(minions_engine::stepsp::Player { eval: load_step_eval_runners(spec, &ep, 1)?, expansions, params })
             };
             let pa = player(&a, expansions, power)?;
-            let pb = player(&b, expansions_b.unwrap_or(expansions), power_b.unwrap_or(power))?;
-            let t = std::time::Instant::now();
-            let (score, wdl) = minions_engine::stepsp::play_match(&pa, &pb, pairs, opening_max, opening_decay, seed, threads)?;
-            let n = (2 * pairs) as f64;
-            let se = (score * (1.0 - score) / n).sqrt();
-            println!(
-                "A {a}\nB {b}\nA score {score:.3} +- {se:.3} over {} games (A wins {}, B wins {}, draws {}) in {:.0}s",
-                2 * pairs, wdl[0], wdl[1], wdl[2], t.elapsed().as_secs_f64()
-            );
+            // `--b x,y,...`: a match against each in turn (seed + its index),
+            // A loaded once and each B freed after its match.
+            for (k, b) in b.split(',').enumerate() {
+                let t = std::time::Instant::now();
+                let res = player(b, expansions_b.unwrap_or(expansions), power_b.unwrap_or(power)).and_then(|pb| {
+                    minions_engine::stepsp::play_match(&pa, &pb, pairs, opening_max, opening_decay, seed + k as u64, threads)
+                });
+                let (score, wdl) = match res {
+                    Ok(r) => r,
+                    Err(e) => {
+                        println!("A {a}\nB {b}\nError: {e:#}");
+                        continue;
+                    }
+                };
+                let n = (2 * pairs) as f64;
+                let se = (score * (1.0 - score) / n).sqrt();
+                println!(
+                    "A {a}\nB {b}\nA score {score:.3} +- {se:.3} over {} games (A wins {}, B wins {}, draws {}) in {:.0}s",
+                    2 * pairs, wdl[0], wdl[1], wdl[2], t.elapsed().as_secs_f64()
+                );
+            }
         }
         Cmd::StepsVsMcts { a, old, pairs, ep, seed, expansions, heads, sims, candidates, t_steps, resample_every, threads, equal_time } => {
             let t = std::time::Instant::now();
@@ -1445,6 +1461,12 @@ async fn main() -> anyhow::Result<()> {
 /// A step evaluator by spec: `old:<dir>` (the sampled-AZ champion's value head
 /// on projected boards), `<path>.bin` (a step MLP on the CPU), or an ONNX graph.
 fn load_step_eval(spec: &str, ep: &str) -> anyhow::Result<std::sync::Arc<dyn minions_engine::bfs::Evaluator>> {
+    load_step_eval_runners(spec, ep, 2)
+}
+
+/// [`load_step_eval`] with `runners` GPU threads for an ONNX net (each holds
+/// one session, i.e. one TensorRT engine load, per batch shape).
+fn load_step_eval_runners(spec: &str, ep: &str, runners: usize) -> anyhow::Result<std::sync::Arc<dyn minions_engine::bfs::Evaluator>> {
     use std::sync::Arc;
     if spec == "material" {
         return Ok(Arc::new(minions_engine::bfs::MaterialEval));
@@ -1460,7 +1482,7 @@ fn load_step_eval(spec: &str, ep: &str) -> anyhow::Result<std::sync::Arc<dyn min
         return Ok(Arc::new(minions_engine::bfs::CpuMlpEval::load(p)?));
     }
     let cache = p.with_extension("trt_cache").to_string_lossy().into_owned();
-    Ok(Arc::new(minions_engine::bfs::BatchedOnnxEval::load(p, ep, true, &cache, 2)?))
+    Ok(Arc::new(minions_engine::bfs::BatchedOnnxEval::load(p, ep, true, &cache, runners)?))
 }
 
 fn greedy_games(games: u32, verbose: bool) {

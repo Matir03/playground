@@ -1271,6 +1271,9 @@ struct BatchReq {
 struct BatchQueue {
     q: std::sync::Mutex<std::collections::VecDeque<BatchReq>>,
     cv: std::sync::Condvar,
+    /// Set when the evaluator is dropped: the runners exit (freeing their
+    /// sessions) once the queue is empty.
+    closed: std::sync::atomic::AtomicBool,
 }
 
 /// [`OnnxEval`] behind a shared queue: worker threads featurize their own
@@ -1327,6 +1330,18 @@ impl BatchedOnnxEval {
             calls,
             rows,
         })
+    }
+}
+
+impl Drop for BatchedOnnxEval {
+    fn drop(&mut self) {
+        // Under the queue lock, so a runner cannot miss the wake-up between
+        // its closed check and its wait.
+        let _q = self.queue.q.lock().unwrap_or_else(|p| p.into_inner());
+        self.queue
+            .closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.queue.cv.notify_all();
     }
 }
 
@@ -1393,6 +1408,9 @@ fn batch_runner(
         {
             let mut q = queue.q.lock().unwrap();
             while q.is_empty() {
+                if queue.closed.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
                 q = queue.cv.wait(q).unwrap();
             }
             while let Some(r) = q.front() {
