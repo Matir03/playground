@@ -184,13 +184,7 @@ fn could_attack(base: &MinionsState, c: u8, enemies: Bb) -> bool {
 }
 
 fn side_bb(s: &MinionsState, side: u8) -> Bb {
-    let mut b = 0;
-    for c in 0..NUM_CELLS as u8 {
-        if s.piece_at(c).is_some_and(|(sd, _)| sd == side) {
-            b |= bit(c);
-        }
-    }
-    b
+    s.side_bb(side)
 }
 
 impl StepState {
@@ -3420,6 +3414,68 @@ fn positions_dfs(
 
 #[cfg(test)]
 mod tests {
+    /// Option-building speed and a checksum of every option list: expands up
+    /// to `STEPS_BENCH_NODES` (300) step nodes from each of
+    /// `STEPS_BENCH_POSITIONS` (60) random openings, one thread, lazy
+    /// witnesses as in self-play. A refactor of the realizers must keep the
+    /// checksum. `cargo test --release -p minions-engine --lib expand_bench
+    /// -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn expand_bench() {
+        use rand::{Rng, SeedableRng};
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let (positions, per) = (
+            env("STEPS_BENCH_POSITIONS", 60),
+            env("STEPS_BENCH_NODES", 300),
+        );
+        super::LAZY_WITNESS.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7);
+        let starts: Vec<_> = (0..positions)
+            .map(|_| crate::selfplay::random_opening(22, 1.0884, &mut rng).0)
+            .filter(|s| !crate::game::Minions::outcome(s).is_terminal())
+            .collect();
+        let t = std::time::Instant::now();
+        let (mut sum, mut nodes, mut opts_total) = (0xcbf29ce484222325u64, 0usize, 0usize);
+        for (i, real) in starts.iter().enumerate() {
+            let mut stack = vec![super::StepState::begin(real, i as u64)];
+            let mut n = 0;
+            while let Some(mut s) = stack.pop() {
+                if n >= per {
+                    break;
+                }
+                n += 1;
+                let opts = s.collapse_forced();
+                opts_total += opts.len();
+                for &v in &opts {
+                    sum = (sum ^ u64::from(v)).wrapping_mul(0x100000001b3);
+                }
+                sum = (sum ^ opts.len() as u64).wrapping_mul(0x100000001b3);
+                // Depth first through a few children, so turns get finished.
+                let mut kids: Vec<_> = opts
+                    .iter()
+                    .map(|&v| s.child(v))
+                    .filter(|c| !c.is_terminal())
+                    .collect();
+                while kids.len() > 3 {
+                    kids.swap_remove(rng.gen_range(0..kids.len()));
+                }
+                stack.extend(kids);
+            }
+            nodes += n;
+        }
+        println!(
+            "expand_bench: {} positions, {nodes} nodes, {opts_total} options, checksum {sum:016x}, {:.2}s",
+            starts.len(),
+            t.elapsed().as_secs_f64()
+        );
+    }
+
     #[test]
     fn query_codec_round_trips() {
         let base = crate::game::MinionsState::with_bid(3);

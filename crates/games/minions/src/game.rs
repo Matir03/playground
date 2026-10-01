@@ -424,6 +424,29 @@ impl MinionsState {
         self.nw_hist = [v; ADJ_WINDOW];
     }
 
+    /// The cells holding a `side` unit: [`Self::piece_at`]'s side test without
+    /// decoding the unit (whose `expect` kept the loop from vectorising).
+    #[inline]
+    pub fn side_bb(&self, side: u8) -> crate::bitboard::Bb {
+        const _: () = assert!(NUM_CELLS <= 64);
+        let lo = 1 + NUM_UNITS as u8 * side;
+        let mut m = 0u64;
+        for (i, &c) in self.cells.iter().enumerate() {
+            m |= u64::from(c.wrapping_sub(lo) < NUM_UNITS as u8) << i;
+        }
+        crate::bitboard::Bb::from(m)
+    }
+
+    /// The empty cells.
+    #[inline]
+    pub fn empty_bb(&self) -> crate::bitboard::Bb {
+        let mut m = 0u64;
+        for (i, &c) in self.cells.iter().enumerate() {
+            m |= u64::from(c == 0) << i;
+        }
+        crate::bitboard::Bb::from(m)
+    }
+
     #[inline]
     pub fn piece_at(&self, i: u8) -> Option<(u8, Unit)> {
         let c = self.cells[i as usize];

@@ -659,24 +659,12 @@ pub struct Realized {
 
 #[inline]
 fn side_bb(s: &MinionsState, side: u8) -> Bb {
-    let mut b = 0;
-    for c in 0..NUM_CELLS as u8 {
-        if s.piece_at(c).is_some_and(|(sd, _)| sd == side) {
-            b |= bit(c);
-        }
-    }
-    b
+    s.side_bb(side)
 }
 
 #[inline]
 fn empty_bb(s: &MinionsState) -> Bb {
-    let mut b = 0;
-    for c in 0..NUM_CELLS as u8 {
-        if s.cells[c as usize] == 0 {
-            b |= bit(c);
-        }
-    }
-    b
+    s.empty_bb()
 }
 
 /// Damage `attacker` contributes toward killing `target`.
