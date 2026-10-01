@@ -693,6 +693,10 @@ impl Tree {
                             for (_, out) in work.iter_mut() {
                                 if let Some(Some((_, vs))) = out.as_mut() {
                                     views.append(vs);
+                                    // Freed here, on the thread whose malloc
+                                    // arena holds it: from the main thread
+                                    // each free waited on that arena's lock.
+                                    *vs = Vec::new();
                                 }
                             }
                             let t = Instant::now();
