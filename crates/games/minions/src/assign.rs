@@ -100,6 +100,58 @@ pub fn hall_violation(targets: &[Target], attackers: &[Attacker]) -> Option<Vec<
     None
 }
 
+/// Whether [`hall_violation`] finds a violation, without building its
+/// witness: union-find on the stack, demand and supply summed per component.
+/// The exact search's dead-end test calls it at every node.
+pub fn hall_violated(targets: &[Target], attackers: &[Attacker]) -> bool {
+    const MAX: usize = 128;
+    let (n_a, n_t) = (attackers.len(), targets.len());
+    if n_a + n_t > MAX {
+        return hall_violation(targets, attackers).is_some();
+    }
+    // Singletons, as in `hall_violation`.
+    for t in targets {
+        let supply: u32 = t
+            .reach
+            .iter()
+            .map(|&(a, d)| d * attackers[a].attacks as u32)
+            .sum();
+        if supply < t.need {
+            return true;
+        }
+    }
+    let mut parent = [0u8; MAX];
+    for (i, p) in parent.iter_mut().enumerate().take(n_a + n_t) {
+        *p = i as u8;
+    }
+    fn find(p: &mut [u8; MAX], mut x: usize) -> usize {
+        while p[x] as usize != x {
+            p[x] = p[p[x] as usize];
+            x = p[x] as usize;
+        }
+        x
+    }
+    // Each attacker's best damage over the targets it reaches.
+    let mut best = [0u32; MAX];
+    for (ti, t) in targets.iter().enumerate() {
+        for &(a, d) in &t.reach {
+            best[a] = best[a].max(d);
+            let (ra, rt) = (find(&mut parent, a), find(&mut parent, n_a + ti));
+            if ra != rt {
+                parent[ra] = rt as u8;
+            }
+        }
+    }
+    let (mut demand, mut supply) = ([0u32; MAX], [0u32; MAX]);
+    for (ti, t) in targets.iter().enumerate() {
+        demand[find(&mut parent, n_a + ti)] += t.need;
+    }
+    for (a, at) in attackers.iter().enumerate() {
+        supply[find(&mut parent, a)] += best[a] * at.attacks as u32;
+    }
+    (0..n_a + n_t).any(|r| demand[r] > 0 && supply[r] < demand[r])
+}
+
 struct Component {
     targets: Vec<usize>,
     attackers: Vec<usize>,
@@ -363,6 +415,41 @@ fn search(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The allocation-free check agrees with the witness-building one.
+    #[test]
+    fn hall_violated_matches_hall_violation() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(3);
+        let mut hits = 0;
+        for _ in 0..20_000 {
+            let n_a = rng.gen_range(0..8);
+            let attackers: Vec<Attacker> = (0..n_a)
+                .map(|i| Attacker {
+                    cell: i as u8,
+                    attacks: rng.gen_range(1..3),
+                })
+                .collect();
+            let mut targets = Vec::new();
+            for i in 0..rng.gen_range(0..6) {
+                let mut reach = Vec::new();
+                for a in 0..n_a {
+                    if rng.gen_bool(0.35) {
+                        reach.push((a, rng.gen_range(0..3)));
+                    }
+                }
+                targets.push(Target {
+                    cell: i as u8,
+                    need: rng.gen_range(0..5),
+                    reach,
+                });
+            }
+            let want = hall_violation(&targets, &attackers).is_some();
+            hits += usize::from(want);
+            assert_eq!(hall_violated(&targets, &attackers), want);
+        }
+        assert!(hits > 1000, "too few violations to mean anything: {hits}");
+    }
 
     fn t(cell: u8, need: u32, reach: &[(usize, u32)]) -> Target {
         Target {

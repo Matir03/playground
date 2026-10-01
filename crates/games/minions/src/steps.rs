@@ -2421,12 +2421,9 @@ pub fn exact_realize(
         let spared: Bb = bitboard::cells(c.fated)
             .filter(|&e| c.spec.targets[e as usize] == TARGET_STAY)
             .fold(0, |b, e| b | bit(e));
-        let necro_open = (0..NUM_CELLS as u8).any(|e| {
+        let necro_open = bitboard::cells(st.s.side_bb(1)).any(|e| {
             !has(spared, e)
-                && st
-                    .s
-                    .piece_at(e)
-                    .is_some_and(|(sd, u)| sd == 1 && u.stats().necromancer)
+                && st.s.piece_at(e).is_some_and(|(_, u)| u.stats().necromancer)
                 && if necro_bound() {
                     lethal(c, st, e, spared)
                 } else {
@@ -2445,12 +2442,13 @@ pub fn exact_realize(
         // Each friend that can still attack, with the hexes it could end its
         // turn on (ignoring blockers other than spared enemies).
         let s = &st.s;
-        let mut atk: Vec<(Unit, Bb)> = Vec::new();
-        for a in 0..NUM_CELLS as u8 {
-            let Some((sd, u)) = s.piece_at(a) else {
+        let friends = s.side_bb(0);
+        let mut atk: Vec<(Unit, Bb)> = Vec::with_capacity(friends.count_ones() as usize);
+        for a in bitboard::cells(friends) {
+            let Some((_, u)) = s.piece_at(a) else {
                 continue;
             };
-            if sd != 0 || !s.can_attack_piece(a, u) {
+            if !s.can_attack_piece(a, u) {
                 continue;
             }
             let st_ = u.stats();
@@ -2477,15 +2475,22 @@ pub fn exact_realize(
         // The remaining targets as an assignment problem (one attack per
         // unit, damage by fate type): a Hall violation proves the rest
         // cannot all happen.
-        let mut targets = Vec::new();
+        let mut targets = Vec::with_capacity(rem.count_ones() as usize);
         for t in bitboard::cells(rem) {
             let Some((_, tu)) = s.piece_at(t) else {
                 continue;
             };
             let unsummon = c.spec.targets[t as usize] == TARGET_UNSUMMON;
-            let mut reach = Vec::new();
+            let mut reach = Vec::with_capacity(atk.len());
+            // Range 1 (every unit today): the six neighbours.
+            let ring1 = bitboard::dilate(bit(t));
             for (i, &(u, ends)) in atk.iter().enumerate() {
-                let ring = bitboard::reachable(bit(t), u.stats().range, FULL) & !bit(t);
+                let range = u.stats().range;
+                let ring = if range == 1 {
+                    ring1
+                } else {
+                    bitboard::reachable(bit(t), range, FULL) & !bit(t)
+                };
                 if ends & ring == 0 {
                     continue;
                 }
@@ -2518,7 +2523,7 @@ pub fn exact_realize(
                 attacks: 1,
             })
             .collect();
-        assign::hall_violation(&targets, &attackers).is_some()
+        assign::hall_violated(&targets, &attackers)
     }
     // Whether the friends that can still end their turn in range of `t` and
     // attack could together deal its remaining health (one attack each,

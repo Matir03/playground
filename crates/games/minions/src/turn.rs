@@ -1044,7 +1044,7 @@ fn attack_pass(
         // deficiency bound settles those in O(targets x reach) without paying
         // for a search. Counting them separately keeps `solver_calls` an honest
         // measure of how often the expensive path actually runs.
-        if assign::hall_violation(&targets, &attackers).is_some() {
+        if assign::hall_violated(&targets, &attackers) {
             fid.certified_infeasible += 1;
         } else {
             fid.solver_calls += 1;
