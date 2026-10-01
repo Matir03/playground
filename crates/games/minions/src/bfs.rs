@@ -1288,6 +1288,9 @@ pub struct BatchedOnnxEval {
     /// Calls and rows run, for the padding ratio.
     pub calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub rows: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Joined on drop, so the sessions are gone before it returns (a
+    /// process exiting while a runner still frees them segfaults in ORT).
+    runners: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl BatchedOnnxEval {
@@ -1302,6 +1305,7 @@ impl BatchedOnnxEval {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let rows = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let mut sparse = false;
+        let mut handles = Vec::new();
         for _ in 0..runners.max(1) {
             // One session per shape, each run once here (one at a time): a
             // TensorRT context that switches shapes can fail with CUDA error
@@ -1322,13 +1326,16 @@ impl BatchedOnnxEval {
                 sessions.push(sess);
             }
             let (queue, calls, rows) = (queue.clone(), calls.clone(), rows.clone());
-            std::thread::spawn(move || batch_runner(sessions, sparse, &queue, &calls, &rows));
+            handles.push(std::thread::spawn(move || {
+                batch_runner(sessions, sparse, &queue, &calls, &rows)
+            }));
         }
         Ok(Self {
             queue,
             sparse,
             calls,
             rows,
+            runners: handles,
         })
     }
 }
@@ -1337,11 +1344,16 @@ impl Drop for BatchedOnnxEval {
     fn drop(&mut self) {
         // Under the queue lock, so a runner cannot miss the wake-up between
         // its closed check and its wait.
-        let _q = self.queue.q.lock().unwrap_or_else(|p| p.into_inner());
-        self.queue
-            .closed
-            .store(true, std::sync::atomic::Ordering::Release);
-        self.queue.cv.notify_all();
+        {
+            let _q = self.queue.q.lock().unwrap_or_else(|p| p.into_inner());
+            self.queue
+                .closed
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.queue.cv.notify_all();
+        }
+        for h in self.runners.drain(..) {
+            let _ = h.join();
+        }
     }
 }
 
