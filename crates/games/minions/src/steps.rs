@@ -2927,11 +2927,14 @@ fn realize_sequential(
     let me = 0u8;
     let mut s = base.clone();
     let mut want = [NO_CELL; NUM_CELLS];
-    for c in 0..NUM_CELLS as u8 {
-        if s.piece_at(c).is_some_and(|(sd, _)| sd == me) {
-            let k = spec.moves[c as usize];
-            if k != NO_MOVE && k != 0 {
-                want[c as usize] = MOVE_DEST[c as usize][k as usize];
+    // Origins with a pending move (`want` set), walked lowest first.
+    let mut pending: Bb = 0;
+    for c in bitboard::cells(s.side_bb(me)) {
+        let k = spec.moves[c as usize];
+        if k != NO_MOVE && k != 0 {
+            want[c as usize] = MOVE_DEST[c as usize][k as usize];
+            if want[c as usize] != NO_CELL {
+                pending |= bit(c);
             }
         }
     }
@@ -2950,11 +2953,8 @@ fn realize_sequential(
         while moved {
             moved = false;
             let enemy = side_bb(&s, 1);
-            for o in 0..NUM_CELLS as u8 {
+            for o in bitboard::cells(pending) {
                 let d = want[o as usize];
-                if d == NO_CELL {
-                    continue;
-                }
                 let Some((sd, u)) = s.piece_at(o) else {
                     return None;
                 };
@@ -2972,6 +2972,7 @@ fn realize_sequential(
                     l.push(mv);
                 }
                 want[o as usize] = NO_CELL;
+                pending &= !bit(o);
                 moved = true;
             }
         }
@@ -2989,16 +2990,15 @@ fn realize_sequential(
                 continue;
             };
             let unsummon = spec.targets[t as usize] == TARGET_UNSUMMON;
-            // Attackers in range, those with no pending move first.
-            let mut atk: Vec<(u8, u32)> = Vec::new();
-            for a in 0..NUM_CELLS as u8 {
-                let Some((sd, u)) = s.piece_at(a) else {
+            // Attackers in range, those with no pending move first (a stack
+            // buffer, sorted stably like the vector it replaced).
+            let mut atk_buf = [(0u8, 0u32); NUM_CELLS];
+            let mut n_atk = 0;
+            for a in bitboard::cells(s.side_bb(me)) {
+                let Some((_, u)) = s.piece_at(a) else {
                     continue;
                 };
-                if sd != me
-                    || !s.can_attack_piece(a, u)
-                    || crate::map::dist(a, t) > u.stats().range as u32
-                {
+                if !s.can_attack_piece(a, u) || crate::map::dist(a, t) > u.stats().range as u32 {
                     continue;
                 }
                 let dmg = if unsummon {
@@ -3007,9 +3007,11 @@ fn realize_sequential(
                     kill_damage_against(u, tu) as u32
                 };
                 if dmg > 0 {
-                    atk.push((a, dmg));
+                    atk_buf[n_atk] = (a, dmg);
+                    n_atk += 1;
                 }
             }
+            let atk = &mut atk_buf[..n_atk];
             atk.sort_by_key(|&(a, d)| (want[a as usize] != NO_CELL, std::cmp::Reverse(d)));
             let need = if unsummon {
                 1
@@ -3017,18 +3019,19 @@ fn realize_sequential(
                 tu.stats().defense.saturating_sub(s.damage_on(t)) as u32
             };
             let mut got = 0;
-            let mut use_: Vec<u8> = Vec::new();
-            for &(a, d) in &atk {
+            let mut n_use = 0;
+            for &(_, d) in atk.iter() {
                 if got >= need {
                     break;
                 }
                 got += d;
-                use_.push(a);
+                n_use += 1;
             }
             if got < need {
                 continue;
             }
-            for a in use_ {
+            for i in 0..n_use {
+                let a = atk_buf[i].0;
                 let mv = MinionsMove::Attack { from: a, to: t };
                 s = Minions::apply(&s, &mv);
                 if let Some(l) = log.as_deref_mut() {
