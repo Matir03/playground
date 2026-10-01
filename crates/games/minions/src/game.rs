@@ -526,53 +526,29 @@ impl MinionsState {
     /// [`Self::move_targets`] as a bitboard (no allocation; read it lowest
     /// cell first for the same order).
     pub fn move_target_bb(&self, from: u8) -> crate::bitboard::Bb {
-        let Some((side, unit)) = self.piece_at(from) else {
+        let Some((side, _)) = self.piece_at(from) else {
+            return 0;
+        };
+        self.move_target_bb_in(from, self.side_bb(1 - side), self.empty_bb())
+    }
+
+    /// [`Self::move_target_bb`] given the mover's enemies and the empty cells.
+    /// A flood fill through cells that are empty or friendly (anything, if
+    /// flying) -- the breadth-first search it replaced, three bitboard
+    /// dilations at most.
+    #[inline]
+    pub fn move_target_bb_in(
+        &self,
+        from: u8,
+        enemies: crate::bitboard::Bb,
+        empty: crate::bitboard::Bb,
+    ) -> crate::bitboard::Bb {
+        let Some((_, unit)) = self.piece_at(from) else {
             return 0;
         };
         let stats = unit.stats();
-        let flying = stats.flying;
-
-        // Stack buffers, not `Vec`s. This is the hot path of the forced-
-        // exploration playout: `random_playout` calls `legal_moves` once per
-        // action and 85% of that is here, so the old version's five allocations
-        // per call (`frontier`, `out`, and a fresh `next` on every BFS step)
-        // came to roughly 600 allocations per playout. A frontier can never
-        // exceed the board.
-        let mut steps = [u8::MAX; NUM_CELLS];
-        steps[from as usize] = 0;
-        let mut frontier = [0u8; NUM_CELLS];
-        let mut next = [0u8; NUM_CELLS];
-        frontier[0] = from;
-        let mut n_front = 1usize;
-        let mut out: crate::bitboard::Bb = 0;
-
-        for step in 1..=stats.speed {
-            let mut n_next = 0usize;
-            for &cur in &frontier[..n_front] {
-                for &n in &NEIGHBORS[cur as usize] {
-                    if n == NO_CELL || steps[n as usize] != u8::MAX {
-                        continue;
-                    }
-                    let occ = self.cells[n as usize];
-                    // Enemy units block the path unless we fly over them.
-                    if occ != 0 && !flying && cell_side(occ) != side {
-                        continue;
-                    }
-                    steps[n as usize] = step;
-                    if occ == 0 {
-                        out |= crate::bitboard::bit(n);
-                    }
-                    next[n_next] = n;
-                    n_next += 1;
-                }
-            }
-            frontier[..n_next].copy_from_slice(&next[..n_next]);
-            n_front = n_next;
-            if n_front == 0 {
-                break;
-            }
-        }
-        out
+        let pass = if stats.flying { crate::bitboard::FULL } else { !enemies };
+        crate::bitboard::reachable(crate::bitboard::bit(from), stats.speed, pass) & empty
     }
 
     /// Damage a piece has taken so far this turn.
@@ -824,10 +800,10 @@ impl Game for Minions {
             // Bitboards read lowest cell first: the same order as scanning the
             // cells, without two vectors per unit (this runs at every node of
             // the exact witness search).
-            let enemies = state.side_bb(1 - side);
+            let (enemies, empty) = (state.side_bb(1 - side), state.empty_bb());
             for i in crate::bitboard::cells(state.side_bb(side)) {
                 if state.can_move_piece(i) {
-                    for to in crate::bitboard::cells(state.move_target_bb(i)) {
+                    for to in crate::bitboard::cells(state.move_target_bb_in(i, enemies, empty)) {
                         out.push(MinionsMove::Move { from: i, to });
                     }
                 }

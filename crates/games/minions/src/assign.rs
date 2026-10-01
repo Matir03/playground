@@ -127,25 +127,28 @@ fn components(targets: &[Target], attackers: &[Attacker]) -> Vec<Component> {
             }
         }
     }
-    let mut by_root: std::collections::HashMap<usize, Component> = Default::default();
+    // Components in order of their first target (the HashMap this replaced
+    // hashed every target, and its order changed from run to run).
+    let mut slot = vec![usize::MAX; parent.len()];
+    let mut out: Vec<Component> = Vec::new();
     for ti in 0..targets.len() {
         let r = find(&mut parent, n_a + ti);
-        by_root
-            .entry(r)
-            .or_insert_with(|| Component {
+        if slot[r] == usize::MAX {
+            slot[r] = out.len();
+            out.push(Component {
                 targets: vec![],
                 attackers: vec![],
-            })
-            .targets
-            .push(ti);
+            });
+        }
+        out[slot[r]].targets.push(ti);
     }
     for ai in 0..n_a {
         let r = find(&mut parent, ai);
-        if let Some(c) = by_root.get_mut(&r) {
-            c.attackers.push(ai);
+        if slot[r] != usize::MAX {
+            out[slot[r]].attackers.push(ai);
         }
     }
-    by_root.into_values().collect()
+    out
 }
 
 /// Widest reachable set we will enumerate exhaustively. Beyond this the search
