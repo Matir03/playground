@@ -2443,7 +2443,9 @@ pub fn exact_realize(
         // turn on (ignoring blockers other than spared enemies).
         let s = &st.s;
         let friends = s.side_bb(0);
-        let mut atk: Vec<(Unit, Bb)> = Vec::with_capacity(friends.count_ones() as usize);
+        // On the stack: this runs at every node of the search.
+        let mut atk_buf = [(Unit::Necromancer, 0 as Bb); NUM_CELLS];
+        let mut n_atk = 0;
         for a in bitboard::cells(friends) {
             let Some((_, u)) = s.piece_at(a) else {
                 continue;
@@ -2469,19 +2471,39 @@ pub fn exact_realize(
                 bit(a)
             };
             if ends != 0 {
-                atk.push((u, ends));
+                atk_buf[n_atk] = (u, ends);
+                n_atk += 1;
             }
         }
+        let atk = &atk_buf[..n_atk];
         // The remaining targets as an assignment problem (one attack per
         // unit, damage by fate type): a Hall violation proves the rest
-        // cannot all happen.
-        let mut targets = Vec::with_capacity(rem.count_ones() as usize);
+        // cannot all happen. `assign::hall_violated` with every unit
+        // attacking once, inlined so no target owns a vector: a target
+        // nobody can damage, a target its attackers together cannot finish,
+        // or a group of targets linked by shared attackers whose best damage
+        // falls short of their total health.
+        let mut best = [0u32; NUM_CELLS]; // per attacker, over the targets it reaches
+        let mut first = [u8::MAX; NUM_CELLS]; // per attacker, the first target it reaches
+        let mut parent = [0u8; NUM_CELLS]; // union-find over targets
+        let mut need_of = [0u32; NUM_CELLS];
+        fn find(p: &mut [u8; NUM_CELLS], mut x: usize) -> usize {
+            while p[x] as usize != x {
+                p[x] = p[p[x] as usize];
+                x = p[x] as usize;
+            }
+            x
+        }
+        let mut n_t = 0;
         for t in bitboard::cells(rem) {
             let Some((_, tu)) = s.piece_at(t) else {
                 continue;
             };
             let unsummon = c.spec.targets[t as usize] == TARGET_UNSUMMON;
-            let mut reach = Vec::with_capacity(atk.len());
+            let ti = n_t;
+            n_t += 1;
+            parent[ti] = ti as u8;
+            let (mut supply, mut reached) = (0u32, false);
             // Range 1 (every unit today): the six neighbours.
             let ring1 = bitboard::dilate(bit(t));
             for (i, &(u, ends)) in atk.iter().enumerate() {
@@ -2499,11 +2521,22 @@ pub fn exact_realize(
                 } else {
                     kill_damage_against(u, tu) as u32
                 };
-                if dmg > 0 {
-                    reach.push((i, dmg));
+                if dmg == 0 {
+                    continue;
+                }
+                reached = true;
+                supply += dmg;
+                best[i] = best[i].max(dmg);
+                if first[i] == u8::MAX {
+                    first[i] = ti as u8;
+                } else {
+                    let (a, b) = (find(&mut parent, ti), find(&mut parent, first[i] as usize));
+                    if a != b {
+                        parent[a] = b as u8;
+                    }
                 }
             }
-            if reach.is_empty() {
+            if !reached {
                 return true;
             }
             let need = if unsummon {
@@ -2511,19 +2544,21 @@ pub fn exact_realize(
             } else {
                 tu.stats().defense.saturating_sub(s.damage_on(t)) as u32
             };
-            targets.push(assign::Target {
-                cell: t,
-                need,
-                reach,
-            });
+            if supply < need {
+                return true;
+            }
+            need_of[ti] = need;
         }
-        let attackers: Vec<assign::Attacker> = (0..atk.len())
-            .map(|i| assign::Attacker {
-                cell: i as u8,
-                attacks: 1,
-            })
-            .collect();
-        assign::hall_violated(&targets, &attackers)
+        let (mut demand, mut supply) = ([0u32; NUM_CELLS], [0u32; NUM_CELLS]);
+        for ti in 0..n_t {
+            demand[find(&mut parent, ti)] += need_of[ti];
+        }
+        for i in 0..atk.len() {
+            if first[i] != u8::MAX {
+                supply[find(&mut parent, first[i] as usize)] += best[i];
+            }
+        }
+        (0..n_t).any(|r| demand[r] > 0 && supply[r] < demand[r])
     }
     // Whether the friends that can still end their turn in range of `t` and
     // attack could together deal its remaining health (one attack each,
@@ -2667,10 +2702,9 @@ pub fn exact_realize(
                 want |= bit(d);
             }
         }
-        let open_targets: Bb = (0..NUM_CELLS as u8)
+        let open_targets: Bb = bitboard::cells(st.s.side_bb(1))
             .filter(|&e| {
                 st.gone[e as usize] == 0
-                    && st.s.piece_at(e).is_some_and(|(sd, _)| sd == 1)
                     && !(has(c.fated, e) && c.spec.targets[e as usize] == TARGET_STAY)
                     && (!c.only_fated || has(c.fated, e))
             })
@@ -2684,9 +2718,10 @@ pub fn exact_realize(
         for t in bitboard::cells(open_targets) {
             rings |= bitboard::reachable(bit(t), rmax, FULL) & !bit(t);
         }
-        let mut attacks = Vec::new();
-        let mut moves = Vec::new();
-        for mv in Minions::legal_moves(&st.s) {
+        let legal = Minions::legal_moves(&st.s);
+        let mut attacks = Vec::with_capacity(legal.len());
+        let mut moves = Vec::with_capacity(legal.len());
+        for mv in legal {
             match mv {
                 MinionsMove::Attack { from, to } => {
                     if !has(open_targets, to) {
@@ -2730,8 +2765,7 @@ pub fn exact_realize(
             }
         }
         moves.sort_by_key(|&(p, _)| p);
-        let actions = attacks.into_iter().chain(moves.into_iter().map(|(_, m)| m));
-        for mv in actions.collect::<Vec<_>>() {
+        for &mv in attacks.iter().chain(moves.iter().map(|(_, m)| m)) {
             let mut nx = st.clone();
             nx.s = Minions::apply(&st.s, &mv);
             match mv {
