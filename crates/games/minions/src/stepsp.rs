@@ -334,7 +334,11 @@ fn record_nodes(
                     let (mut recs, mut movers) = (Vec::new(), Vec::with_capacity(ids.len()));
                     for &id in ids {
                         let nd = &tree.nodes[id as usize];
-                        let st = tree.state_of(id);
+                        // The view the node's prior was evaluated on, and the
+                        // one search evaluates: before its expansion collapsed
+                        // forced steps (e.g. the enemy necromancer's "spare"
+                        // that starts nearly every turn) into the stored state.
+                        let st = tree.created_state(id);
                         encode_record(&st.view(), nd.value, nd.prior, nd.visits, &mut recs);
                         movers.push(u8::from(st.flipped));
                     }

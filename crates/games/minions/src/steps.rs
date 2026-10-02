@@ -514,6 +514,18 @@ impl StepState {
                 o.iter().position(|&x| x == v).map(|i| w[i])
             }
         };
+        self.child_with(v, witness.unwrap_or(self.witness))
+    }
+
+    /// [`Self::child`] without the option search: the witness is left as
+    /// this state's, so the result is only good for its view (which no
+    /// witness enters) -- e.g. to rebuild a node as it was created, before
+    /// its expansion collapsed forced steps into it.
+    pub fn child_unchecked(&self, v: u8) -> StepState {
+        self.child_with(v, self.witness)
+    }
+
+    fn child_with(&self, v: u8, witness: TurnSpec) -> StepState {
         let mut c = StepState {
             base: self.base.clone(),
             flipped: self.flipped,
@@ -528,7 +540,7 @@ impl StepState {
             post: self.post.clone(),
             salt: self.salt,
             opts: None,
-            witness: witness.unwrap_or(self.witness),
+            witness,
         };
         c.apply_step(v);
         c.settle();

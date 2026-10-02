@@ -134,6 +134,8 @@ pub struct Tree {
     /// sharing one tree each start descents at their own position.
     starts: Vec<u32>,
     next_start: usize,
+    /// Parentless nodes' states as created (see [`Tree::created_state`]).
+    created_roots: std::collections::HashMap<u32, StepState>,
 }
 
 impl Tree {
@@ -160,6 +162,7 @@ impl Tree {
         Ok(Self {
             nodes: vec![node],
             states: vec![Some(root.clone())],
+            created_roots: [(0, root.clone())].into(),
             root,
             params,
             stats: SearchStats::default(),
@@ -194,8 +197,24 @@ impl Tree {
             comp,
             resolved: kind == TERMINAL,
         });
+        self.created_roots.insert(n, root.clone());
         self.states.push(Some(root));
         Ok(n)
+    }
+
+    /// `n`'s state as it was created and statically evaluated (its `prior`):
+    /// before its own expansion collapsed forced steps into it. The stored
+    /// state is the collapsed one; the two have the same value but not the
+    /// same view, and the net must learn the one search evaluates.
+    pub fn created_state(&self, n: u32) -> StepState {
+        let nd = &self.nodes[n as usize];
+        if nd.parent == u32::MAX {
+            return match self.created_roots.get(&n) {
+                Some(s) => s.clone(),
+                None => self.state_of(n),
+            };
+        }
+        self.state_of(nd.parent).child_unchecked(nd.step)
     }
 
     /// Nothing left to search: the root (or every descent start) is decided.
@@ -988,6 +1007,7 @@ impl Tree {
         // arena has parents before children and siblings contiguous.
         let mut nodes = Vec::new();
         let mut states = Vec::new();
+        let mut created_roots = std::collections::HashMap::new();
         for i in 0..self.nodes.len() {
             let p = self.nodes[i].parent;
             if !inside[i] && p != u32::MAX && inside[p as usize] {
@@ -1000,6 +1020,7 @@ impl Tree {
             let mut nd = self.nodes[i];
             if p == u32::MAX || !inside[p as usize] {
                 nd.parent = u32::MAX;
+                created_roots.insert(map[i], self.created_state(i as u32));
                 states.push(Some(self.state_of(i as u32)));
             } else {
                 nd.parent = map[p as usize];
@@ -1028,6 +1049,7 @@ impl Tree {
             pending: Vec::new(),
             starts: Vec::new(),
             next_start: 0,
+            created_roots,
         };
         (tree, map)
     }
@@ -1035,6 +1057,7 @@ impl Tree {
     /// A new tree rooted at `n` (its subtree kept, re-indexed).
     pub fn reroot(&self, n: u32) -> Tree {
         let root = self.state_of(n);
+        let created_roots = [(0, self.created_state(n))].into();
         let mut nodes = Vec::new();
         let mut states = vec![Some(root.clone())];
         let mut r = self.nodes[n as usize];
@@ -1071,6 +1094,7 @@ impl Tree {
             pending: Vec::new(),
             starts: Vec::new(),
             next_start: 0,
+            created_roots,
         }
     }
 }
@@ -1577,6 +1601,72 @@ mod tests {
 
     use super::MaterialEval as Material;
 
+    /// A pseudo-random value per distinct view: equal values mean equal views.
+    struct HashEval;
+
+    impl Evaluator for HashEval {
+        fn eval(&self, views: &[View]) -> anyhow::Result<Vec<f32>> {
+            use std::hash::{Hash, Hasher};
+            Ok(views
+                .iter()
+                .map(|v| {
+                    let mut bytes = Vec::new();
+                    crate::stepsp::encode_record(v, 0.0, 0.0, 0, &mut bytes);
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    bytes.hash(&mut h);
+                    (h.finish() % 1_000_000) as f32 / 1e6
+                })
+                .collect())
+        }
+    }
+
+    /// Every node's prior is the evaluation of its `created_state`'s view --
+    /// not of its stored state, which an expansion may have collapsed forced
+    /// steps into -- also for the roots `retain` and `reroot` make.
+    #[test]
+    fn created_state_is_what_was_evaluated() {
+        let s = StepState::begin(&MinionsState::with_bid(0), 7);
+        let params = Params {
+            heads: 8,
+            power: 2.0,
+            threads: 4,
+        };
+        let mut t = Tree::new(s, params, &HashEval).unwrap();
+        t.descent_run(&HashEval, 16, &mut |t| t.stats.iterations >= 400)
+            .unwrap();
+        let check = |t: &Tree| {
+            let (mut collapsed, mut checked) = (0, 0);
+            for n in 0..t.nodes.len() as u32 {
+                if t.kind(n) == TERMINAL {
+                    continue;
+                }
+                let made = t.created_state(n);
+                let want = HashEval.eval(&[made.view()]).unwrap()[0];
+                assert_eq!(t.nodes[n as usize].prior, want, "node {n}");
+                checked += 1;
+                if t.kind(n) == EXPANDED {
+                    let now = HashEval.eval(&[t.state_of(n).view()]).unwrap()[0];
+                    collapsed += usize::from(now != want);
+                }
+            }
+            (checked, collapsed)
+        };
+        let (checked, collapsed) = check(&t);
+        assert!(
+            collapsed > 0,
+            "no expansion collapsed a forced step ({checked} nodes)"
+        );
+        // Keep a few grandchildren's subtrees, and reroot at one of them.
+        let keep: Vec<u32> = t
+            .children(0)
+            .flat_map(|c| t.children(c).take(1).collect::<Vec<_>>())
+            .take(3)
+            .collect();
+        let (r, _) = t.retain(&keep);
+        check(&r);
+        check(&t.reroot(keep[0]));
+    }
+
     /// Descent reaches terminal nodes, keeps the power-mean invariant, and
     /// counts visits consistently: a descent entering a child entered its
     /// parent first, and in-flight counts return to zero.
@@ -1742,6 +1832,7 @@ mod tests {
                 pending: Vec::new(),
                 starts: Vec::new(),
                 next_start: 0,
+                created_roots: t.created_roots.clone(),
             };
             assert!(tt.recompute(n));
             assert!(
