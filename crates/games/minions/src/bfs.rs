@@ -447,9 +447,9 @@ impl Tree {
         for (&leaf, (s, out)) in leaves.iter().zip(work) {
             self.states[leaf as usize] = Some(s);
             match out.expect("built") {
-                Some((kids, vs)) => {
+                Some((chain, kids, vs)) => {
                     batch.views.extend(vs);
-                    batch.pend.push((leaf, kids));
+                    batch.pend.push((leaf, chain, kids));
                 }
                 None => {
                     self.nodes[leaf as usize].kind = DEAD;
@@ -464,7 +464,33 @@ impl Tree {
     /// order); the leaves become expanded.
     fn commit(&mut self, batch: Batch, vals: &[f32]) {
         let mut vi = 0;
-        for (leaf, kids) in batch.pend {
+        for (leaf, chain, kids) in batch.pend {
+            // The forced steps, one node each below the leaf, valued like it
+            // until the backup below fills them in from their children.
+            let prior = self.nodes[leaf as usize].prior;
+            let mut at = leaf;
+            let mut made = Vec::with_capacity(chain.len());
+            for (step, st) in chain {
+                let id = self.nodes.len() as u32;
+                self.nodes.push(Node {
+                    parent: at,
+                    first: 0,
+                    nch: 0,
+                    step,
+                    flip: false,
+                    kind: EXPANDED,
+                    visits: 0,
+                    value: prior,
+                    prior,
+                    comp: 0,
+                    resolved: false,
+                });
+                self.states.push(Some(st));
+                let a = &mut self.nodes[at as usize];
+                (a.first, a.nch, a.kind) = (id, 1, EXPANDED);
+                made.push(id);
+                at = id;
+            }
             let first = self.nodes.len() as u32;
             let nk = kids.len();
             for (step, flip, term, st) in kids {
@@ -477,7 +503,7 @@ impl Tree {
                     }
                 };
                 self.nodes.push(Node {
-                    parent: leaf,
+                    parent: at,
                     first: 0,
                     nch: 0,
                     step,
@@ -491,11 +517,16 @@ impl Tree {
                 });
                 self.states.push(Some(st));
             }
-            let nd = &mut self.nodes[leaf as usize];
+            let nd = &mut self.nodes[at as usize];
             nd.first = first;
             nd.nch = nk as u16;
             nd.kind = EXPANDED;
             self.stats.expansions += 1;
+            // Chain values bottom-up; the callers' backup takes it from the
+            // leaf up.
+            for &n in made.iter().rev() {
+                self.recompute(n);
+            }
         }
         debug_assert_eq!(vi, vals.len());
     }
@@ -736,7 +767,7 @@ impl Tree {
                             // In leaf order, as `finish` would collect them.
                             let mut views = Vec::new();
                             for (_, out) in work.iter_mut() {
-                                if let Some(Some((_, vs))) = out.as_mut() {
+                                if let Some(Some((_, _, vs))) = out.as_mut() {
                                     views.append(vs);
                                     // Freed here, on the thread whose malloc
                                     // arena holds it: from the main thread
@@ -1116,30 +1147,59 @@ fn backup_eps() -> f32 {
 /// A child built during expansion: (step, flip, terminal value + result, state).
 type Kid = (u8, bool, Option<(f32, i8)>, StepState);
 
-/// A leaf's state and, once built, its children and their views (`None`
-/// inside for a dead end).
-type Work = (StepState, Option<Option<(Vec<Kid>, Vec<View>)>>);
+/// A leaf's forced steps (each step and the state after it), the children of
+/// its first real choice, and their views.
+type Leaf = (Vec<(u8, StepState)>, Vec<Kid>, Vec<View>);
 
-/// One leaf's children and their views; `None` for a dead end.
-fn build_one(s: &mut StepState) -> Option<(Vec<Kid>, Vec<View>)> {
+/// A leaf's state and, once built, what [`build_one`] made of it (`None`
+/// inside for a dead end).
+type Work = (StepState, Option<Option<Leaf>>);
+
+/// One leaf's forced chain and the children of its first real choice; `None`
+/// for a dead end. Single-option steps within the turn become nodes of their
+/// own (so their positions can be recorded) but are never evaluated: their
+/// values come from below. A forced step that ends the turn or the game stays
+/// an ordinary, evaluated child. The leaf's own state is left as it is.
+fn build_one(s: &mut StepState) -> Option<Leaf> {
     let tp = Instant::now();
-    let opts = s.collapse_forced();
+    let mut chain: Vec<(u8, StepState)> = Vec::new();
+    let opts = loop {
+        let cur = match chain.last_mut() {
+            Some((_, st)) => st,
+            None => &mut *s,
+        };
+        let o = cur.options();
+        if o.len() != 1 {
+            break o;
+        }
+        let t = cur.child(o[0]);
+        if t.flipped != cur.flipped || t.is_terminal() {
+            break o;
+        }
+        cur.drop_options();
+        chain.push((o[0], t));
+    };
     crate::steps::prof::add(0, tp);
+    let e = match chain.last_mut() {
+        Some((_, st)) => st,
+        None => &mut *s,
+    };
     if opts.is_empty() {
         if std::env::var("STEPS_DEBUG_DEAD").is_ok()
             && DEAD_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8
         {
-            eprintln!("no-option leaf: {}", s.debug_dead());
+            eprintln!("no-option leaf: {}", e.debug_dead());
         }
+        s.drop_options();
         return None;
     }
     let mut kids = Vec::with_capacity(opts.len());
     let mut views = Vec::with_capacity(opts.len());
     for v in opts {
         let tp = Instant::now();
-        let c = s.child(v);
+        let c = e.child(v);
         crate::steps::prof::add(1, tp);
-        let flip = c.flipped != s.flipped;
+        let flip = c.flipped != e.flipped;
         if c.is_terminal() {
             let tv = (c.terminal_value(), c.terminal_outcome());
             kids.push((v, flip, Some(tv), c));
@@ -1150,8 +1210,8 @@ fn build_one(s: &mut StepState) -> Option<(Vec<Kid>, Vec<View>)> {
             kids.push((v, flip, None, c));
         }
     }
-    s.drop_options();
-    Some((kids, views))
+    e.drop_options();
+    Some((chain, kids, views))
 }
 
 /// Build every leaf in `work` on `threads` threads. Leaves are handed out one
@@ -1187,8 +1247,8 @@ fn build_all(work: &mut [Work], threads: usize) {
 /// Leaves whose children are built but not yet evaluated.
 struct Batch {
     leaves: Vec<u32>,
-    /// Live leaves and their children, in view order.
-    pend: Vec<(u32, Vec<Kid>)>,
+    /// Live leaves, their forced chains and their children, in view order.
+    pend: Vec<(u32, Vec<(u8, StepState)>, Vec<Kid>)>,
     views: Vec<View>,
 }
 
@@ -1634,31 +1694,46 @@ mod tests {
         let mut t = Tree::new(s, params, &HashEval).unwrap();
         t.descent_run(&HashEval, 16, &mut |t| t.stats.iterations >= 400)
             .unwrap();
+        // A forced step within a turn is a node that was never evaluated.
+        let forced = |t: &Tree, n: u32| {
+            let nd = &t.nodes[n as usize];
+            nd.parent != u32::MAX
+                && t.nodes[nd.parent as usize].nch == 1
+                && !nd.flip
+                && nd.kind != TERMINAL
+        };
+        let h = |v: View| HashEval.eval(&[v]).unwrap()[0];
         let check = |t: &Tree| {
-            let (mut collapsed, mut checked) = (0, 0);
+            let (mut chain, mut checked) = (0, 0);
             for n in 0..t.nodes.len() as u32 {
                 if t.kind(n) == TERMINAL {
                     continue;
                 }
-                let made = t.created_state(n);
-                let want = HashEval.eval(&[made.view()]).unwrap()[0];
-                assert_eq!(t.nodes[n as usize].prior, want, "node {n}");
-                checked += 1;
-                if t.kind(n) == EXPANDED {
-                    let now = HashEval.eval(&[t.state_of(n).view()]).unwrap()[0];
-                    collapsed += usize::from(now != want);
+                let made = h(t.created_state(n).view());
+                // Nothing is collapsed into a stored state any more.
+                assert_eq!(made, h(t.state_of(n).view()), "node {n} changed state");
+                if forced(t, n) {
+                    chain += 1;
+                    continue;
                 }
+                assert_eq!(t.nodes[n as usize].prior, made, "node {n}");
+                checked += 1;
             }
-            (checked, collapsed)
+            (checked, chain)
         };
-        let (checked, collapsed) = check(&t);
+        let (checked, chain) = check(&t);
         assert!(
-            collapsed > 0,
-            "no expansion collapsed a forced step ({checked} nodes)"
+            chain > 0,
+            "no forced step became a node ({checked} evaluated)"
         );
-        // Keep a few grandchildren's subtrees, and reroot at one of them.
+        // Keep a few grandchildren's subtrees below the root's forced chain,
+        // and reroot at one of them.
+        let mut top = 0;
+        while t.nodes[top as usize].nch == 1 {
+            top = t.nodes[top as usize].first;
+        }
         let keep: Vec<u32> = t
-            .children(0)
+            .children(top)
             .flat_map(|c| t.children(c).take(1).collect::<Vec<_>>())
             .take(3)
             .collect();
@@ -1756,9 +1831,13 @@ mod tests {
             t.descent_wave(&Material, 8).unwrap();
         }
         t.clear_descents();
-        // Two grandchildren-level roots in different subtrees, plus one
-        // inside the first's subtree (it must not become a root).
-        let kids: Vec<u32> = t.children(0).filter(|&c| t.kind(c) == EXPANDED).collect();
+        // Two roots in different subtrees, plus one inside the first's
+        // subtree (it must not become a root), below the root's forced chain.
+        let mut top = 0;
+        while t.nodes[top as usize].nch == 1 {
+            top = t.nodes[top as usize].first;
+        }
+        let kids: Vec<u32> = t.children(top).filter(|&c| t.kind(c) == EXPANDED).collect();
         assert!(kids.len() >= 2, "need two expanded children");
         let (a, b) = (kids[0], kids[1]);
         let inner = t.children(a).next().unwrap();

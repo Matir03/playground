@@ -16,8 +16,9 @@
 //! child is offered only if a relaxed attack-assignment bound (movement ignores
 //! blocking) still admits every declared kill; the realizer is the exact check.
 //!
-//! Steps with a single legal option are collapsed at expansion time
-//! ([`StepState::collapse_forced`]), never across a turn boundary.
+//! Steps with a single legal option within a turn become nodes of their own
+//! but are never evaluated (`bfs::build_one`); [`StepState::collapse_forced`]
+//! folds them instead, for older saved trees and the expansion benchmark.
 //!
 //! Everything runs in the mover's canonical frame (the mover is side 0).
 

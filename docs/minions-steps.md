@@ -101,8 +101,14 @@ turns where one kill must open a hex that a unit moves into before attacking
 retries with a sequential realizer (moves, one kill, repeat; each target
 tried first in turn).
 
-**Forced steps** (one option) collapse at expansion time, never across a
-turn boundary, so a node's mover never changes under it.
+**Forced steps** (one option) within a turn are nodes of their own with a
+single child, but are never evaluated: an expansion walks the forced chain
+and evaluates only the children of the first real choice, and the chain's
+values come from below (2026-10-02; before, the chain was folded into the
+expanded node's own state, so those positions could never be recorded and
+the node's stored state no longer matched the view its prior came from). A
+forced step that ends the turn or the game stays an ordinary, evaluated
+child.
 
 **Features** (`View`): the turn so far *projected* onto the board (fated
 enemies removed with their rebate/reinforcement, decided units at their

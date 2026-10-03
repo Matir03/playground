@@ -79,6 +79,11 @@ pub struct Meta {
     /// before 2026-10-02, which all used 2 except the hand-labelled minimax runs.
     #[serde(default)]
     pub power: Option<String>,
+    /// Forced steps are nodes of their own (from 2026-10-02); older trees
+    /// collapsed them into the expanded node's state, and replaying their
+    /// states needs the same collapse.
+    #[serde(default)]
+    pub forced_nodes: bool,
 }
 
 impl Meta {
@@ -160,6 +165,7 @@ impl TreeSaver {
                 } else {
                     "inf".into()
                 }),
+                forced_nodes: true,
             },
             gid: Vec::new(),
             next: 0,

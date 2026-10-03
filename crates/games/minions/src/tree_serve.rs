@@ -102,6 +102,14 @@ impl Snap {
     }
 }
 
+/// Trees saved before forced steps became nodes stored an expanded node's
+/// state with its forced steps already applied; replay those the same way.
+fn collapse_legacy(meta: &Meta, s: &mut StepState) {
+    if !meta.forced_nodes {
+        s.collapse_forced();
+    }
+}
+
 /// Each child's share in its parent's backed-up value, as `Tree::recompute`
 /// forms it: with a proven child (or `p = inf`) the best child of the
 /// deciding class carries it all; otherwise every live, unproven child is
@@ -262,22 +270,22 @@ impl Server {
                 let start = Minions::decode_state(&unhex(&meta.start)?)?;
                 let mut s = StepState::begin(&start, meta.salt);
                 for v in unhex(&root.path)? {
-                    s.collapse_forced();
+                    collapse_legacy(meta, &mut s);
                     s = s.child(v);
                 }
                 if snap.kind(a) == 1 {
-                    s.collapse_forced();
+                    collapse_legacy(meta, &mut s);
                 }
                 self.cache.lock().unwrap().states.insert(ck(a), s.clone());
                 s
             }
         };
         for &v in steps.iter().rev() {
-            s.collapse_forced();
+            collapse_legacy(meta, &mut s);
             s = s.child(v);
         }
         if snap.kind(i) == 1 {
-            s.collapse_forced();
+            collapse_legacy(meta, &mut s);
         }
         let mut c = self.cache.lock().unwrap();
         if c.states.len() > STATES_KEPT {
@@ -319,7 +327,9 @@ impl Server {
         let (first, nch) = (snap.first(i), snap.nch(i));
         // The replay is faithful if it offers exactly the saved children.
         let ok = snap.kind(i) != 1 || {
-            let mut opts = st.clone().collapse_forced();
+            let mut st = st.clone();
+            collapse_legacy(meta, &mut st);
+            let mut opts = st.options();
             let mut saved: Vec<u8> = (first..first + nch).map(|c| snap.step(c)).collect();
             opts.sort_unstable();
             saved.sort_unstable();
