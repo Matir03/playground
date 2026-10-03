@@ -76,6 +76,9 @@ pub struct Config {
     pub resample_expansions: u64,
     pub resample_heads: usize,
     pub resample_threads: usize,
+    /// Search the sampled positions with [`crate::two_tier`] (the budget is
+    /// still `resample_expansions` step expansions) instead of best-first.
+    pub resample_two_tier: Option<crate::two_tier::TwoTierParams>,
 }
 
 /// A sampled position waiting for its own search ([`Config::resample_expansions`]).
@@ -1122,6 +1125,9 @@ fn resample(
         threads: 1,
     };
     let next = std::sync::atomic::AtomicUsize::new(0);
+    // Two-tier totals: tier-1 descents, tier-2 descents, tier-2 repeats,
+    // widenings dropped, root turns, tier-1 nodes, evaluations.
+    let tt_stats: [AtomicU64; 7] = Default::default();
     let parts: Vec<anyhow::Result<Vec<(usize, Vec<u8>, u64)>>> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..cfg.resample_threads.max(1))
             .map(|_| {
@@ -1132,6 +1138,25 @@ fn resample(
                         let Some(p) = pending.get(i) else { break };
                         let (target, prior, exp) = match p.terminal {
                             Some(v) => (v, v, 0),
+                            None if cfg.resample_two_tier.is_some() => {
+                                let tt = cfg.resample_two_tier.clone().unwrap();
+                                let mut s =
+                                    crate::two_tier::TwoTier::new(p.state.clone(), tt, eval)?;
+                                s.run(eval, cfg.resample_expansions)?;
+                                let st = &s.stats;
+                                for (a, v) in tt_stats.iter().zip([
+                                    st.descents,
+                                    st.t2_descents,
+                                    st.t2_repeats,
+                                    st.widen_dropped,
+                                    s.nodes[0].children.len() as u64,
+                                    s.nodes.len() as u64,
+                                    st.evals,
+                                ]) {
+                                    a.fetch_add(v, Ordering::Relaxed);
+                                }
+                                (s.root_value(), s.nodes[0].prior, st.expansions)
+                            }
                             None => {
                                 let mut tree = Tree::new(p.state.clone(), params.clone(), eval)?;
                                 search_tree(&mut tree, eval, cfg.resample_expansions, 0.0)?;
@@ -1167,15 +1192,28 @@ fn resample(
     all.sort_unstable_by_key(|x| x.0);
     let exp: u64 = all.iter().map(|x| x.2).sum();
     let secs = t0.elapsed().as_secs_f64();
+    let how = match &cfg.resample_two_tier {
+        Some(tt) => format!("two-tier, c {} retries {}", tt.c_uct, tt.retries),
+        None => format!("best-first, {} heads", params.heads),
+    };
     println!(
-        "  resample: {} positions x {} expansions (best-first, {} heads, {} threads): {:.0}s, {:.0} expansions/s",
+        "  resample: {} positions x {} expansions ({how}, {} threads): {:.0}s, {:.0} expansions/s",
         pending.len(),
         cfg.resample_expansions,
-        params.heads,
         cfg.resample_threads,
         secs,
         exp as f64 / secs.max(1e-9)
     );
+    if cfg.resample_two_tier.is_some() {
+        let g: Vec<f64> = tt_stats
+            .iter()
+            .map(|a| a.load(Ordering::Relaxed) as f64 / pending.len().max(1) as f64)
+            .collect();
+        println!(
+            "  two-tier per position: tier-1 descents {:.1}, tier-2 descents {:.1} ({:.1} repeats), widenings dropped {:.2}, root turns {:.1}, tier-1 nodes {:.1}, evals {:.0}",
+            g[0], g[1], g[2], g[3], g[4], g[5], g[6]
+        );
+    }
     let mut recs = Vec::with_capacity(all.len() * REC_BYTES);
     let mut movers = Vec::with_capacity(all.len());
     for (i, rec, _) in all {
@@ -1231,6 +1269,29 @@ pub fn search_turn(
     }
 }
 
+/// One turn by [`crate::two_tier`] search: `expansions` step expansions from
+/// the turn's start, then the best turn found played.
+pub fn two_tier_turn(
+    real: &crate::game::MinionsState,
+    eval: &dyn Evaluator,
+    params: &crate::two_tier::TwoTierParams,
+    expansions: u64,
+    salt: u64,
+) -> anyhow::Result<SearchedTurn> {
+    let mut s = crate::two_tier::TwoTier::new(StepState::begin(real, salt), params.clone(), eval)?;
+    s.run(eval, expansions)?;
+    let b = s
+        .best_child()
+        .ok_or_else(|| anyhow::anyhow!("no turn found\n{}", real.render()))?;
+    let fin = s.end_state(b);
+    Ok(SearchedTurn {
+        next: fin.real_base(),
+        done: fin.done,
+        value: s.root_value(),
+        expansions: s.stats.expansions,
+    })
+}
+
 /// How one side plays its turns in a match.
 #[derive(Clone)]
 pub struct Player {
@@ -1239,6 +1300,9 @@ pub struct Player {
     /// many expansions per turn.
     pub expansions: u64,
     pub params: Params,
+    /// Search with [`crate::two_tier`] (budget `expansions`) instead of
+    /// best-first.
+    pub two_tier: Option<crate::two_tier::TwoTierParams>,
 }
 
 impl Player {
@@ -1249,6 +1313,8 @@ impl Player {
     ) -> anyhow::Result<crate::game::MinionsState> {
         if self.expansions == 0 {
             greedy_turn(real, self.eval.as_ref(), salt)
+        } else if let Some(tt) = &self.two_tier {
+            two_tier_turn(real, self.eval.as_ref(), tt, self.expansions, salt).map(|t| t.next)
         } else {
             search_turn(
                 real,

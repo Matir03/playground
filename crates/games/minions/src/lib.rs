@@ -33,6 +33,7 @@ pub mod tree_save;
 pub mod tree_serve;
 pub mod stepsp;
 pub mod turn;
+pub mod two_tier;
 pub mod units;
 
 pub use game::{Minions, MinionsMove, MinionsState};

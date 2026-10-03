@@ -30,10 +30,10 @@ pub trait Evaluator: Send + Sync {
 
 static DEAD_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-const LEAF: u8 = 0;
-const EXPANDED: u8 = 1;
-const TERMINAL: u8 = 2;
-const DEAD: u8 = 3;
+pub(crate) const LEAF: u8 = 0;
+pub(crate) const EXPANDED: u8 = 1;
+pub(crate) const TERMINAL: u8 = 2;
+pub(crate) const DEAD: u8 = 3;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Node {
@@ -173,6 +173,18 @@ impl Tree {
             starts: Vec::new(),
             next_start: 0,
         })
+    }
+
+    /// A tree whose root is `root` with its static value already known
+    /// (`value`, for its mover): nothing is evaluated.
+    pub fn with_root_value(root: StepState, params: Params, value: f32) -> Self {
+        struct Known(f32);
+        impl Evaluator for Known {
+            fn eval(&self, views: &[View]) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![self.0; views.len()])
+            }
+        }
+        Self::new(root, params, &Known(value)).expect("no evaluation fails")
     }
 
     /// Add another root (a forest: e.g. one per self-play game, each from its

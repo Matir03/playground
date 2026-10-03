@@ -617,6 +617,23 @@ enum Cmd {
         /// Game-pair threads.
         #[arg(long, default_value_t = 1)]
         threads: usize,
+        /// Seat A (and B with --two-tier-b) searches with `two_tier` instead
+        /// of best-first, on the same expansion budget.
+        #[arg(long)]
+        two_tier_a: bool,
+        #[arg(long)]
+        two_tier_b: bool,
+        /// Two-tier: UCT constant of the in-turn search.
+        #[arg(long, default_value_t = 0.1)]
+        t2_c: f32,
+        /// Two-tier: tier-2 descents that may end on known turns before a
+        /// node's widening is dropped.
+        #[arg(long, default_value_t = 20)]
+        t2_retries: u32,
+        /// Two-tier widening value: `current` (the newest turn's value now)
+        /// or `static` (its value when found).
+        #[arg(long, default_value = "current")]
+        t2_widen: String,
     },
     /// The step search (best-first) against the old sampled-AZ MCTS, standard
     /// openings with bidding. Old side defaults to the old ladder's eval
@@ -792,6 +809,20 @@ enum Cmd {
         /// Threads running those searches (0 = twice --expand-threads).
         #[arg(long, default_value_t = 0)]
         resample_threads: usize,
+        /// Those searches: best-first, or two-tier (`two_tier`).
+        #[arg(long, default_value = "best-first")]
+        resample_search: String,
+        /// Two-tier: UCT constant of the in-turn search.
+        #[arg(long, default_value_t = 0.1)]
+        t2_c: f32,
+        /// Two-tier: tier-2 descents that may end on known turns before a
+        /// node's widening is dropped.
+        #[arg(long, default_value_t = 20)]
+        t2_retries: u32,
+        /// Two-tier widening value: `current` (the newest turn's value now)
+        /// or `static` (its value when found).
+        #[arg(long, default_value = "current")]
+        t2_widen: String,
     },
 }
 
@@ -1293,20 +1324,23 @@ async fn main() -> anyhow::Result<()> {
             )?;
         }
         Cmd::NnueBench { active, reps } => minions_engine::nnue::bench_sweep(active, reps),
-        Cmd::StepsMatch { a, b, pairs, opening_max, opening_decay, ep, seed, expansions, expansions_b, power, power_b, heads, threads } => {
+        Cmd::StepsMatch { a, b, pairs, opening_max, opening_decay, ep, seed, expansions, expansions_b, power, power_b, heads, threads, two_tier_a, two_tier_b, t2_c, t2_retries, t2_widen } => {
             // A match evaluates one batch at a time per game thread, so one
             // runner (two sessions per net, not four) is enough: the session
             // builds were most of a short match's time and memory.
-            let player = |spec: &str, expansions: u64, power: f32| -> anyhow::Result<minions_engine::stepsp::Player> {
+            anyhow::ensure!(t2_widen == "current" || t2_widen == "static", "--t2-widen: current or static");
+            let tt = minions_engine::two_tier::TwoTierParams { c_uct: t2_c, retries: t2_retries, widen_current: t2_widen == "current" };
+            let player = |spec: &str, expansions: u64, power: f32, two: bool| -> anyhow::Result<minions_engine::stepsp::Player> {
                 let params = minions_engine::bfs::Params { heads, power, ..Default::default() };
-                Ok(minions_engine::stepsp::Player { eval: load_step_eval_runners(spec, &ep, 1)?, expansions, params })
+                let two_tier = two.then(|| tt.clone());
+                Ok(minions_engine::stepsp::Player { eval: load_step_eval_runners(spec, &ep, 1)?, expansions, params, two_tier })
             };
-            let pa = player(&a, expansions, power)?;
+            let pa = player(&a, expansions, power, two_tier_a)?;
             // `--b x,y,...`: a match against each in turn (seed + its index),
             // A loaded once and each B freed after its match.
             for (k, b) in b.split(',').enumerate() {
                 let t = std::time::Instant::now();
-                let res = player(b, expansions_b.unwrap_or(expansions), power_b.unwrap_or(power)).and_then(|pb| {
+                let res = player(b, expansions_b.unwrap_or(expansions), power_b.unwrap_or(power), two_tier_b).and_then(|pb| {
                     minions_engine::stepsp::play_match(&pa, &pb, pairs, opening_max, opening_decay, seed + k as u64, threads)
                 });
                 let (score, wdl) = match res {
@@ -1330,6 +1364,7 @@ async fn main() -> anyhow::Result<()> {
                 eval: load_step_eval(&a, &ep)?,
                 expansions,
                 params: minions_engine::bfs::Params { heads, ..Default::default() },
+                two_tier: None,
             };
             let (sampler, params) = minions_engine::eval::match_search(sims, candidates, t_steps, 2 * pairs, seed);
             let params = playground_core::sampled_mcts::SampledParams { resample_every, ..params };
@@ -1416,6 +1451,10 @@ async fn main() -> anyhow::Result<()> {
             resample_expansions,
             resample_heads,
             resample_threads,
+            resample_search,
+            t2_c,
+            t2_retries,
+            t2_widen,
         } => {
             use std::sync::Arc;
             anyhow::ensure!(search == "descent" || search == "bfs", "--search descent|bfs");
@@ -1467,6 +1506,11 @@ async fn main() -> anyhow::Result<()> {
                 resample_expansions,
                 resample_heads,
                 resample_threads: if resample_threads == 0 { 2 * expand_threads } else { resample_threads },
+                resample_two_tier: match resample_search.as_str() {
+                    "best-first" => None,
+                    "two-tier" => { anyhow::ensure!(t2_widen == "current" || t2_widen == "static", "--t2-widen: current or static"); Some(minions_engine::two_tier::TwoTierParams { c_uct: t2_c, retries: t2_retries, widen_current: t2_widen == "current" }) }
+                    o => anyhow::bail!("--resample-search: best-first or two-tier, not {o}"),
+                },
             };
             anyhow::ensure!(games == 1 || workers == 1 && expand_threads > 1, "--games needs --workers 1 and --expand-threads > 1");
             minions_engine::stepsp::run(cfg, eval, std::path::Path::new(&out))?;
