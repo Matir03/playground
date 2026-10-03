@@ -571,3 +571,76 @@ node counts) and in 80 s self-play trials with the cycle paused (SIGSTOP):
 - Profile after these (eager, thread-s over 60 s x 32 threads, nested):
   option generation 50% (exact 41%, fast realizer 8%), children 1%,
   feature views 0.5%; the remainder is evaluation wait and tree work.
+
+## Resample targets and two-tier search (gens 537-546, 2026-10-03) -- SHELVED
+
+Shelved on 2026-10-03 in favour of the turn-lattice design
+([minions-lattice.md](minions-lattice.md)). The cycle is stopped (`STOP` in
+`data/models/minions/steps`) after gen 546's self-play; gen 537 is the
+strongest net of the run. The code stays in and is off by default.
+
+**Resample regime (8f4c399).** Self-play trees only pick positions
+(`MOVE_SECS` 1). Each sampled position is queued, the queue is trimmed to
+`--target-records` at generation end, and each position then gets its own
+fresh search (`--resample-expansions`, best-first, 8 heads x 128 threads).
+Its root value is the target. `DATA_FROM=537` in `run_cycle.sh` keeps older
+data out of the window.
+
+| net | vs | score |
+|---|---|---|
+| gen 537 (372 steps on 400k resampled records, init gen 536) | gen 536 / gen 344 | **0.670 / 0.685** |
+| gen 538 | gen 537 | 0.405 |
+| gens 539-541 | gen 537 | 0.14-0.16 |
+| gen 542 | gen 537 / gen 344 | 0.325 / 0.46 |
+
+**Turn-phase bias in search targets.** prior − target by stage, positions
+from gen 536 (stage 0 = fates, 1 = moves, 2 = spawns, 3 = terminal):
+
+| target search | stage 0 | stage 2 |
+|---|---|---|
+| best-first p=2, 50 / 200 / 2000 expansions | −0.023 / −0.076 / −0.090 | +0.019 / +0.067 / +0.092 |
+| best-first p=1 at 200 | ≈ p=2 | ≈ p=2 |
+| best-first p=∞ at 200 | ~2x | ~2x |
+| two-tier, static widening, 1000 | −0.119 | +0.115 |
+| two-tier, current widening, 1000 / 500 | −0.137 / −0.124 | +0.112 / +0.099 |
+
+Every search tried disagrees with the static net the same way. It
+undervalues the mover at turn start and overvalues them at turn end. The gap
+grows with budget. A net that is ~0.016 consistent per step can still drift
+~0.24 over a turn.
+
+**Two-tier search (847c06d, `two_tier.rs`).** Tier 1 is Descent over turn
+boundaries with max backup and a widening pseudo-child. Each widening
+selection retries up to 20 times, then the widening child is dropped.
+`--t2-widen current` (default) uses the newest child's current q; `static`
+uses its value at discovery. Tier 2 is per-node MCTS over steps: UCT
+c = 0.1, the static counts as one return, mean backup, and turn ends are
+terminal. It runs at 55-75k expansions/s (1/3 of best-first) with ~4 evals
+per expansion. Budget 1000 gives 6.4 tier-1 descents, 3.8 root turns and
+16.5 ms/position at 128 threads. Flags:
+`--resample-search two-tier`, `--t2-c`, `--t2-retries`, `--t2-widen`;
+matches use `--two-tier-a/-b`.
+
+**Training experiments.** All start from gen 536 and play gen 537 over 100
+games at 2000 expansions (SE ~0.05).
+
+| run | data / targets | steps | vs gen 537 |
+|---|---|---|---|
+| E1 | gen 537+538 resampled data, best-first targets | 2227 | 0.080 |
+| E3 | same positions, targets = the net's own statics, `--keep-best 0` | 2227 | 0.280 (≈ gen 536) |
+| E4 3 epochs | 200k positions, two-tier 500 targets | 557 | **0.620 ± 0.049** |
+| E4 10 epochs | same | 1856 | 0.070 |
+
+Reading: the targets, not the narrow positions, sink a hard fit (E1 vs E3).
+A light fit of search targets helps, while a full fit collapses (E4 3 vs 10
+epochs, and gen 537 vs 539-541). This is consistent with a real turn-phase
+miscalibration that search amplifies. The full fit overshoots, and the eval
+search then double-counts it.
+
+**Open when shelved.**
+- A best-first control at a matched 557 steps was stopped before it
+  finished, so "two-tier beats best-first" is untested. Its script is
+  `e5.sh` in that session's scratchpad: best-first N=200, same recipe,
+  3 epochs, plus an E4 replication on seed 7802.
+- An outcome-based calibration check (static value vs game result by
+  stage) was proposed and never run.
