@@ -75,6 +75,19 @@ pub struct Meta {
     /// Why the batch ended: "games over", "enough records" or "stopped"
     /// (empty while it runs).
     pub ended: String,
+    /// The backup's power-mean exponent ("2", "inf"); absent in trees saved
+    /// before 2026-10-02, which all used 2 except the hand-labelled minimax runs.
+    #[serde(default)]
+    pub power: Option<String>,
+}
+
+impl Meta {
+    pub fn power(&self) -> f32 {
+        self.power
+            .as_deref()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(2.0)
+    }
 }
 
 /// The board a node shows: the real position at a game position, a turn's
@@ -127,6 +140,7 @@ impl TreeSaver {
         games: usize,
         start: &MinionsState,
         salt: u64,
+        power: f32,
     ) -> anyhow::Result<Self> {
         let dir = root.join(format!("b{batch:03}"));
         std::fs::create_dir_all(&dir)?;
@@ -141,6 +155,11 @@ impl TreeSaver {
                 rounds: Vec::new(),
                 distinct: 0,
                 ended: String::new(),
+                power: Some(if power.is_finite() {
+                    power.to_string()
+                } else {
+                    "inf".into()
+                }),
             },
             gid: Vec::new(),
             next: 0,

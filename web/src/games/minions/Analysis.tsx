@@ -7,7 +7,17 @@
 // a tree with 800 nodes nests deeply, and a flat list keeps the encoding cheap
 // and lets the panel expand lazily without holding the whole subtree in memory.
 
+import { createContext, useContext } from "react";
 import type { AnalyzeNode, AnalyzeEdge } from "../../gen/playground/engine/engine_pb";
+
+/** What the `prior` column holds: the energy head's prior by default; a view
+ *  without a policy (the step trees) can show something else there. */
+export interface PriorColumn {
+  header: string;
+  title: string;
+}
+const DEFAULT_PRIOR_COLUMN: PriorColumn = { header: "prior", title: "prior probability from the energy head" };
+const PriorColumnContext = createContext<PriorColumn>(DEFAULT_PRIOR_COLUMN);
 
 /** How a row is ranked. Visits is what the search believed; prior is what the
  *  net proposed before searching, and the disagreement between them is usually
@@ -132,6 +142,7 @@ function EdgeRow({
   /** This row's line is the one on the board. */
   onBoard: boolean;
 }) {
+  const priorColumn = useContext(PriorColumnContext);
   // The bar is the share of the visits PUCT chose, which is the policy
   // target's shape; forced visits would flatten it toward the floor.
   const chosenTotal = node.edges.reduce((s, e) => s + chosenVisits(e), 0);
@@ -208,7 +219,7 @@ function EdgeRow({
         {edge.manual ? "user" : edge.draws === 0 ? "fill" : edge.draws}
       </span>
 
-      <span title="prior probability from the energy head" style={{ color: "#9ab" }}>
+      <span title={priorColumn.title} style={{ color: "#9ab" }}>
         {pct(edge.prior)}
       </span>
 
@@ -312,6 +323,7 @@ export function AnalysisTree({
   onForce,
   maxDepth,
   shown,
+  priorColumn = DEFAULT_PRIOR_COLUMN,
 }: {
   nodes: AnalyzeNode[];
   chosen?: number;
@@ -332,6 +344,7 @@ export function AnalysisTree({
   maxDepth: number;
   /** The line currently on the board, so its row can be marked. */
   shown?: Uint8Array[];
+  priorColumn?: PriorColumn;
 }) {
   if (nodes.length === 0) return null;
 
@@ -384,6 +397,7 @@ export function AnalysisTree({
   walk(0, 0, [], []);
 
   return (
+    <PriorColumnContext.Provider value={priorColumn}>
     <div>
       <div
         style={{
@@ -402,7 +416,7 @@ export function AnalysisTree({
         <span title="visits PUCT chose">visits</span>
         <span title="visits an exploration floor forced">forced</span>
         <span title="sampler draws that produced this turn">draws</span>
-        <span>prior</span>
+        <span title={priorColumn.title}>{priorColumn.header}</span>
         <span>energy</span>
         <span title="the value head where the turn leads, before any search below it">net</span>
         <span title="the search's mean value over the turn's visits">search</span>
@@ -417,6 +431,7 @@ export function AnalysisTree({
         </div>
       )}
     </div>
+    </PriorColumnContext.Provider>
   );
 }
 

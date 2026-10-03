@@ -569,6 +569,7 @@ fn play_shared(
             cfg.games.max(1),
             &start,
             salt,
+            cfg.params.power,
         )?),
         None => None,
     };

@@ -97,6 +97,54 @@ impl Snap {
     fn flip(&self, i: u32) -> bool {
         self.b(i, 24) & 1 != 0
     }
+    fn comp(&self, i: u32) -> i8 {
+        self.b(i, 25) as i8
+    }
+}
+
+/// Each child's share in its parent's backed-up value, as `Tree::recompute`
+/// forms it: with a proven child (or `p = inf`) the best child of the
+/// deciding class carries it all; otherwise every live, unproven child is
+/// weighted `1 + descents` in the power mean. Dead children and ignored
+/// proven losses get 0.
+fn backup_weights(snap: &Snap, first: u32, nch: u32, p: f32) -> Vec<f32> {
+    let kids = first..first + nch;
+    let live = |c: &u32| snap.kind(*c) != 3;
+    let c_par = |c: u32| {
+        if snap.flip(c) {
+            -snap.comp(c)
+        } else {
+            snap.comp(c)
+        }
+    };
+    let q_par = |c: u32| {
+        if snap.flip(c) {
+            1.0 - snap.value(c)
+        } else {
+            snap.value(c)
+        }
+    };
+    let mut w = vec![0f32; nch as usize];
+    let Some(pick) = kids.clone().filter(live).map(c_par).max() else {
+        return w;
+    };
+    if pick != 0 || p.is_infinite() {
+        let best = kids
+            .clone()
+            .filter(|c| live(c) && c_par(*c) == pick)
+            .max_by(|&a, &b| q_par(a).total_cmp(&q_par(b)));
+        if let Some(b) = best {
+            w[(b - first) as usize] = 1.0;
+        }
+        return w;
+    }
+    let mut total = 0f32;
+    for c in kids.clone().filter(|c| live(c) && c_par(*c) == 0) {
+        w[(c - first) as usize] = 1.0 + snap.visits(c) as f32;
+        total += 1.0 + snap.visits(c) as f32;
+    }
+    w.iter_mut().for_each(|x| *x /= total.max(1.0));
+    w
 }
 
 #[derive(Default)]
@@ -277,9 +325,29 @@ impl Server {
             saved.sort_unstable();
             opts == saved
         };
+        let weights = backup_weights(snap, first, nch, meta.power());
         let mut edges = Vec::new();
         for c in first..first + nch {
+            // Dead children (an option whose lazily offered witness turned out
+            // impossible) are listed too, so a lone live child does not look
+            // forced and the parent's visits add up; they have no board.
             if snap.kind(c) == 3 {
+                edges.push(json!([
+                    format!("{}  ✕ impossible", st.step_label(snap.step(c))),
+                    snap.visits(c),
+                    Value::Null,
+                    to_pm(if snap.flip(c) {
+                        1.0 - snap.prior(c)
+                    } else {
+                        snap.prior(c)
+                    }),
+                    c,
+                    false,
+                    false,
+                    Value::Null,
+                    0.0,
+                    true,
+                ]));
                 continue;
             }
             let flip = snap.flip(c);
@@ -302,6 +370,8 @@ impl Server {
                 played.contains(&c) && played.contains(&i),
                 snap.kind(c) == 1,
                 board,
+                weights[(c - first) as usize],
+                false,
             ]));
         }
         Ok(json!({

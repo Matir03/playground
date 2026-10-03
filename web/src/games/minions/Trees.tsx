@@ -67,9 +67,10 @@ type Meta = MetaV2 | MetaV1;
 const isV2 = (m: Meta): m is MetaV2 => (m as MetaV2).version === 2;
 
 /** `[label, visits, value | null, static value, child, played, expandable,
- *  child board]`, values for the node's mover. Format 1 has only the first
- *  six, with `child` -1 past the view's cut. */
-type Edge = [string, number, number | null, number, number, boolean, boolean?, string?];
+ *  child board, backup weight, dead]`, values for the node's mover. Format 1
+ *  has only the first six, with `child` -1 past the view's cut; servers
+ *  before 2026-10-02 send neither the weight nor dead children. */
+type Edge = [string, number, number | null, number, number, boolean, boolean?, (string | null)?, number?, boolean?];
 
 interface SNode {
   /** The node's id: its index in the round's snapshot (format 2) or in the
@@ -171,8 +172,9 @@ function toAnalysis(s: Store): AnalyzeNode[] {
       edges: n.e.map((e, ei) =>
         create(AnalyzeEdgeSchema, {
           turn: edgeId(s.local.get(id)!, ei),
-          // Every option is enumerated and statically evaluated: no policy.
-          prior: 1 / live,
+          // No policy (every option is enumerated and evaluated): the column
+          // shows the child's share in the parent's backed-up value instead.
+          prior: e[8] ?? 1 / live,
           energy: 0,
           visits: e[1],
           value: e[2] ?? undefined,
@@ -535,6 +537,11 @@ export function Trees({ onBack }: { onBack: () => void }) {
                 }}
                 maxDepth={1024}
                 shown={line}
+                priorColumn={{
+                  header: "weight",
+                  title:
+                    "the child's share in this node's backed-up value: 1 + descents over the live, unproven siblings' total (p = 2); all of it on the best child of a proven class or under minimax; 0 for impossible options",
+                }}
               />
             </div>
           </div>
