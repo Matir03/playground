@@ -317,7 +317,11 @@ fn record_nodes(
     } else {
         cand.iter().map(|&id| weight(id)).sum::<f64>() / cand.len() as f64
     };
-    let eligible = cand.len() as u64;
+    // Forced steps are sampled like any node but do not count toward the
+    // generation's eligible-node target: they are a quarter of the nodes and
+    // over half of the visited ones (each inherits its parent's descents), so
+    // counting them would end self-play at about half the moves.
+    let eligible = cand.iter().filter(|&&id| !tree.is_forced(id)).count() as u64;
     let picked: Vec<u32> = cand
         .into_iter()
         .filter(|&id| frac >= 1.0 || rng.gen::<f64>() < frac * weight(id) / mean)

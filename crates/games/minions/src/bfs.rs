@@ -202,6 +202,17 @@ impl Tree {
         Ok(n)
     }
 
+    /// `n` is a forced step within a turn: the only child of its parent, never
+    /// evaluated (see `build_one`). A lone child that ends the turn or the
+    /// game is an ordinary evaluated one.
+    pub fn is_forced(&self, n: u32) -> bool {
+        let nd = &self.nodes[n as usize];
+        nd.parent != u32::MAX
+            && self.nodes[nd.parent as usize].nch == 1
+            && !nd.flip
+            && nd.kind != TERMINAL
+    }
+
     /// `n`'s state as it was created and statically evaluated (its `prior`):
     /// before its own expansion collapsed forced steps into it. The stored
     /// state is the collapsed one; the two have the same value but not the
@@ -1694,14 +1705,6 @@ mod tests {
         let mut t = Tree::new(s, params, &HashEval).unwrap();
         t.descent_run(&HashEval, 16, &mut |t| t.stats.iterations >= 400)
             .unwrap();
-        // A forced step within a turn is a node that was never evaluated.
-        let forced = |t: &Tree, n: u32| {
-            let nd = &t.nodes[n as usize];
-            nd.parent != u32::MAX
-                && t.nodes[nd.parent as usize].nch == 1
-                && !nd.flip
-                && nd.kind != TERMINAL
-        };
         let h = |v: View| HashEval.eval(&[v]).unwrap()[0];
         let check = |t: &Tree| {
             let (mut chain, mut checked) = (0, 0);
@@ -1712,7 +1715,7 @@ mod tests {
                 let made = h(t.created_state(n).view());
                 // Nothing is collapsed into a stored state any more.
                 assert_eq!(made, h(t.state_of(n).view()), "node {n} changed state");
-                if forced(t, n) {
+                if t.is_forced(n) {
                     chain += 1;
                     continue;
                 }
