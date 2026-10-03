@@ -781,6 +781,17 @@ enum Cmd {
         /// directory, for the web viewer (`tree_save`). Needs --games > 1.
         #[arg(long)]
         save_trees: Option<String>,
+        /// Give every sampled position its own best-first search of this many
+        /// expansions at the end of the generation (the eval procedure) and
+        /// record its root value instead of the self-play tree's (0 = off).
+        #[arg(long, default_value_t = 0)]
+        resample_expansions: u64,
+        /// Leaves per iteration of those searches.
+        #[arg(long, default_value_t = 8)]
+        resample_heads: usize,
+        /// Threads running those searches (0 = twice --expand-threads).
+        #[arg(long, default_value_t = 0)]
+        resample_threads: usize,
     },
 }
 
@@ -1402,6 +1413,9 @@ async fn main() -> anyhow::Result<()> {
             chunk_records,
             seed,
             save_trees,
+            resample_expansions,
+            resample_heads,
+            resample_threads,
         } => {
             use std::sync::Arc;
             anyhow::ensure!(search == "descent" || search == "bfs", "--search descent|bfs");
@@ -1450,6 +1464,9 @@ async fn main() -> anyhow::Result<()> {
                 seed,
                 games,
                 save_trees: save_trees.map(std::path::PathBuf::from),
+                resample_expansions,
+                resample_heads,
+                resample_threads: if resample_threads == 0 { 2 * expand_threads } else { resample_threads },
             };
             anyhow::ensure!(games == 1 || workers == 1 && expand_threads > 1, "--games needs --workers 1 and --expand-threads > 1");
             minions_engine::stepsp::run(cfg, eval, std::path::Path::new(&out))?;

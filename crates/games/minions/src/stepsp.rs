@@ -69,6 +69,20 @@ pub struct Config {
     pub games: usize,
     /// Save each shared tree here ([`crate::tree_save`]).
     pub save_trees: Option<PathBuf>,
+    /// Non-zero: the self-play trees only choose positions. Each sampled one
+    /// gets its own best-first search of this many expansions at the end of
+    /// the generation ([`resample`], the eval procedure), whose root value
+    /// is the record's target.
+    pub resample_expansions: u64,
+    pub resample_heads: usize,
+    pub resample_threads: usize,
+}
+
+/// A sampled position waiting for its own search ([`Config::resample_expansions`]).
+struct Pending {
+    state: StepState,
+    /// A terminal's value needs no search.
+    terminal: Option<f32>,
 }
 
 /// Shared-tree batches started, numbering the saved trees.
@@ -136,6 +150,8 @@ struct Writer {
     /// Keep every record in memory until [`Writer::finish_held`] (shared-tree
     /// self-play, which trims a generation to an exact count).
     hold: bool,
+    /// With resampling: the sampled positions, searched and encoded at the end.
+    pending: Option<Vec<Pending>>,
 }
 
 impl Writer {
@@ -326,6 +342,16 @@ fn record_nodes(
         .into_iter()
         .filter(|&id| frac >= 1.0 || rng.gen::<f64>() < frac * weight(id) / mean)
         .collect();
+    if let Some(pending) = w.pending.as_mut() {
+        for &id in &picked {
+            let nd = &tree.nodes[id as usize];
+            pending.push(Pending {
+                state: tree.created_state(id),
+                terminal: (nd.kind == 2).then_some(nd.value),
+            });
+        }
+        return Ok((picked.len() as u64, eligible));
+    }
     // Encoding (a state replay or copy, its view) in parallel over slices,
     // appended in order: the same bytes as one thread pushing each record.
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
@@ -792,6 +818,7 @@ pub fn run(cfg: Config, eval: Arc<dyn Evaluator>, out: &Path) -> anyhow::Result<
                 game: Vec::new(),
                 movers: Vec::new(),
                 hold: cfg.games > 1,
+                pending: (cfg.resample_expansions > 0).then(Vec::new),
             };
             while !stop.load(Ordering::Relaxed) {
                 if cfg.games > 1 {
@@ -802,6 +829,26 @@ pub fn run(cfg: Config, eval: Arc<dyn Evaluator>, out: &Path) -> anyhow::Result<
                 if cfg.games <= 1 && c.records.load(Ordering::Relaxed) >= cfg.target_records {
                     stop.store(true, Ordering::Relaxed);
                 }
+            }
+            if let Some(mut pending) = w.pending.take() {
+                // Trim to the generation's count first: only kept positions
+                // are searched.
+                if w.hold && pending.len() > cfg.target_records as usize {
+                    let mut idx = rand::seq::index::sample(
+                        &mut rng,
+                        pending.len(),
+                        cfg.target_records as usize,
+                    )
+                    .into_vec();
+                    idx.sort_unstable();
+                    let mut keep = vec![false; pending.len()];
+                    idx.iter().for_each(|&i| keep[i] = true);
+                    let mut k = keep.into_iter();
+                    pending.retain(|_| k.next().unwrap());
+                }
+                let (recs, movers) = resample(&cfg, eval.as_ref(), &pending)?;
+                w.push_encoded(&recs, &movers);
+                w.finish_game(0, 0)?;
             }
             if w.hold {
                 let n = w.finish_held(cfg.target_records as usize, &mut rng)?;
@@ -1026,6 +1073,118 @@ pub struct SearchedTurn {
     pub expansions: u64,
 }
 
+/// Best-first iterations on `tree` until `expansions` leaf expansions (or
+/// `secs` seconds if positive), the tree is solved, or the candidate pool
+/// starves (fewer than a quarter of the heads filled 8 times in a row).
+fn search_tree(
+    tree: &mut Tree,
+    eval: &dyn Evaluator,
+    expansions: u64,
+    secs: f64,
+) -> anyhow::Result<()> {
+    let t = Instant::now();
+    let mut starved = 0;
+    while !tree.is_solved() && tree.stats.expansions < expansions {
+        if secs > 0.0 && t.elapsed().as_secs_f64() > secs {
+            break;
+        }
+        let got = tree.iterate(eval)?;
+        if got == 0 {
+            break;
+        }
+        if got * 4 < tree.params.heads {
+            starved += 1;
+            if starved >= 8 {
+                break;
+            }
+        } else {
+            starved = 0;
+        }
+    }
+    Ok(())
+}
+
+/// The end-of-generation searches of [`Config::resample_expansions`]: every
+/// pending position gets a fresh tree searched like [`search_turn`] (best-first,
+/// `resample_heads` leaves per iteration) for `resample_expansions`
+/// expansions; its root value is the record's target and its static value the
+/// prior. Positions run on `resample_threads` threads, which share `eval`'s
+/// batching. Returns the records in the positions' order, with their movers.
+fn resample(
+    cfg: &Config,
+    eval: &dyn Evaluator,
+    pending: &[Pending],
+) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let t0 = Instant::now();
+    let params = Params {
+        heads: cfg.resample_heads.max(1),
+        power: cfg.params.power,
+        threads: 1,
+    };
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let parts: Vec<anyhow::Result<Vec<(usize, Vec<u8>, u64)>>> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..cfg.resample_threads.max(1))
+            .map(|_| {
+                sc.spawn(|| -> anyhow::Result<Vec<(usize, Vec<u8>, u64)>> {
+                    let mut out = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(p) = pending.get(i) else { break };
+                        let (target, prior, exp) = match p.terminal {
+                            Some(v) => (v, v, 0),
+                            None => {
+                                let mut tree = Tree::new(p.state.clone(), params.clone(), eval)?;
+                                search_tree(&mut tree, eval, cfg.resample_expansions, 0.0)?;
+                                (
+                                    tree.nodes[0].value,
+                                    tree.nodes[0].prior,
+                                    tree.stats.expansions,
+                                )
+                            }
+                        };
+                        let mut rec = Vec::with_capacity(REC_BYTES);
+                        encode_record(
+                            &p.state.view(),
+                            target,
+                            prior,
+                            exp.min(u64::from(u32::MAX)) as u32,
+                            &mut rec,
+                        );
+                        out.push((i, rec, exp));
+                    }
+                    Ok(out)
+                })
+            })
+            .collect();
+        hs.into_iter()
+            .map(|h| h.join().expect("resample thread"))
+            .collect()
+    });
+    let mut all = Vec::with_capacity(pending.len());
+    for p in parts {
+        all.extend(p?);
+    }
+    all.sort_unstable_by_key(|x| x.0);
+    let exp: u64 = all.iter().map(|x| x.2).sum();
+    let secs = t0.elapsed().as_secs_f64();
+    println!(
+        "  resample: {} positions x {} expansions (best-first, {} heads, {} threads): {:.0}s, {:.0} expansions/s",
+        pending.len(),
+        cfg.resample_expansions,
+        params.heads,
+        cfg.resample_threads,
+        secs,
+        exp as f64 / secs.max(1e-9)
+    );
+    let mut recs = Vec::with_capacity(all.len() * REC_BYTES);
+    let mut movers = Vec::with_capacity(all.len());
+    for (i, rec, _) in all {
+        recs.extend_from_slice(&rec);
+        movers.push(u8::from(pending[i].state.flipped));
+    }
+    Ok((recs, movers))
+}
+
 /// One turn by search: a fresh tree searched for `expansions` leaf
 /// expansions (or `secs` seconds if positive, or until the candidate pool
 /// starves), then the principal variation played to the end of the turn.
@@ -1037,26 +1196,8 @@ pub fn search_turn(
     secs: f64,
     salt: u64,
 ) -> anyhow::Result<SearchedTurn> {
-    let t = Instant::now();
     let mut tree = Tree::new(StepState::begin(real, salt), params.clone(), eval)?;
-    let mut starved = 0;
-    while !tree.is_solved() && tree.stats.expansions < expansions {
-        if secs > 0.0 && t.elapsed().as_secs_f64() > secs {
-            break;
-        }
-        let got = tree.iterate(eval)?;
-        if got == 0 {
-            break;
-        }
-        if got * 4 < params.heads {
-            starved += 1;
-            if starved >= 8 {
-                break;
-            }
-        } else {
-            starved = 0;
-        }
-    }
+    search_tree(&mut tree, eval, expansions, secs)?;
     let mut n = 0u32;
     loop {
         tree.ensure_expanded(n, eval)?;
