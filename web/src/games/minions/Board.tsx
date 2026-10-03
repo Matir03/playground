@@ -106,7 +106,7 @@ const GRAVEYARD_XY: [number, number][] = [
   [4, 1], [2, 5],
   [0, 3], [6, 3],
 ];
-const IS_GRAVEYARD = (() => {
+export const IS_GRAVEYARD = (() => {
   const m = new Array<boolean>(CELLS).fill(false);
   for (const [x, y] of GRAVEYARD_XY) m[cellIdx(x, y)] = true;
   return m;

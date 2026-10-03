@@ -31,7 +31,7 @@ import {
   AnalyzeNodeSchema,
   type AnalyzeNode,
 } from "../../gen/playground/engine/engine_pb";
-import { decode, px, py, HEX_POINTS, SVG_W, SVG_H, Piece, SIDE_FILL } from "./Board";
+import { decode, px, py, HEX_POINTS, SVG_W, SVG_H, Piece, SIDE_FILL, IS_GRAVEYARD } from "./Board";
 import { AnalysisTree, type SortKey } from "./Analysis";
 import { MoveList } from "./MoveList";
 import * as H from "./history";
@@ -262,7 +262,13 @@ export function Position({ state }: { state: GameState }) {
     <svg width={SVG_W} height={SVG_H} style={{ background: "#20242b", borderRadius: 8, flex: "0 0 auto" }}>
       {Array.from({ length: d.cells.length }, (_, i) => (
         <g key={i} transform={`translate(${px(i)},${py(i)})`}>
-          <polygon points={HEX_POINTS} fill="#2c313a" stroke="#454b55" strokeWidth={1} />
+          <polygon points={HEX_POINTS} fill={IS_GRAVEYARD[i] ? "#4a4438" : "#2c313a"} stroke="#454b55" strokeWidth={1} />
+          {/* Graveyards as on the game board: an inner ring that stays legible
+              under a piece, and the glyph when empty. */}
+          {IS_GRAVEYARD[i] && <polygon points={HEX_POINTS} transform="scale(0.8)" fill="none" stroke="#c8b06a" strokeWidth={1.5} />}
+          {IS_GRAVEYARD[i] && d.cells[i] === 0 && (
+            <text textAnchor="middle" dy="0.35em" fontSize={15} fill="#9a8f74">†</text>
+          )}
           {d.cells[i] !== 0 && <Piece cell={d.cells[i]} pstate={d.pstate[i]} />}
         </g>
       ))}
