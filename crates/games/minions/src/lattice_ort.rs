@@ -452,6 +452,83 @@ mod tests {
     /// net its trunk came from) on turn starts; expansions are finite and
     /// the same with a cached trunk as with one computed in the call, alone
     /// or batched.
+    /// Runner call cost by shape, interleaved as in self-play (synthetic
+    /// inputs, trunks given). `LATTICE_DIR` names the nets.
+    ///
+    /// Measured 2026-10-04 on gen-6 nets (res:64x6 trunk), with the cycle
+    /// running beside it: ~1.3-1.9 ms per graph call whatever the size up to
+    /// ~256 rows; the same shapes back to back, or each on its own session,
+    /// 0.8-1.2 ms -- a shape change costs ~0.6 ms. Padding to x2 size
+    /// buckets, one session each, lost that back on mid-size calls (250
+    /// tier-1 rows padded to 512: 2.5 ms vs 1.8 ms), so it was dropped.
+    /// The GPU clock does not matter here: holding P0 (1.3-1.9 GHz) instead
+    /// of P8 (315 MHz) left calls at ~5 ms in lattice-gen.
+    #[test]
+    #[ignore]
+    fn runner_call_cost() {
+        let Ok(dir) = std::env::var("LATTICE_DIR") else {
+            eprintln!("set LATTICE_DIR");
+            return;
+        };
+        let dir = Path::new(&dir);
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("lattice.json")).unwrap())
+                .unwrap();
+        let c = meta["c_trunk"].as_u64().unwrap() as usize;
+        let p1 = |b: usize| format!("ridx:{b}x{MAX_ACTIVE},rscal:{b}x{N_SCALARS}");
+        let p2 = |b: usize, t: usize| {
+            format!("h:{b}x{c}x7x7,nidx:{b}x{MAX_ACTIVE},nscal:{b}x{N_SCALARS},kid:{t}")
+        };
+        let build = |name: &str, min: String, opt: String, max: String| {
+            let p = dir.join(name);
+            let cache = p.with_extension("trt_cache").to_string_lossy().into_owned();
+            crate::ort_net::build_trt_profile(&p, true, &cache, &min, &opt, &max).unwrap()
+        };
+        let mut s1 = build("tier1.onnx", p1(1), p1(128), p1(MAX_ROWS));
+        let mut s2 = build(
+            "tier2.onnx",
+            p2(1, 1),
+            p2(1024, 32 * 1024),
+            p2(MAX_ROWS, MAX_TOTAL_KIDS),
+        );
+        let trunk: Trunk = vec![half::f16::from_f32(0.1); c * CELLS].into();
+        let batch = |n1: usize, n2: usize, k: usize| Batch {
+            ridx: vec![SPARSE_DIM as i32; n1 * MAX_ACTIVE],
+            rscal: vec![0.0; n1 * N_SCALARS],
+            n1,
+            trunk: (0..n2).map(|_| TrunkSrc::Given(trunk.clone())).collect(),
+            nidx: vec![SPARSE_DIM as i32; n2 * MAX_ACTIVE],
+            nscal: vec![0.0; n2 * N_SCALARS],
+            kids: (0..n2).map(|_| (0..k as i32).collect()).collect(),
+        };
+        let shapes: Vec<(usize, usize, usize)> = vec![
+            (0, 60, 27),
+            (0, 250, 27),
+            (0, 1000, 27),
+            (6, 0, 0),
+            (60, 0, 0),
+            (250, 0, 0),
+            (40, 300, 27),
+        ];
+        let mut times: Vec<Vec<f64>> = vec![Vec::new(); shapes.len()];
+        for round in 0..32 {
+            for (i, &(n1, n2, k)) in shapes.iter().enumerate() {
+                let t0 = std::time::Instant::now();
+                run_batch(&mut s1, &mut s2, c, batch(n1, n2, k)).unwrap();
+                if round >= 2 {
+                    times[i].push(t0.elapsed().as_secs_f64() * 1e3);
+                }
+            }
+        }
+        for (&(n1, n2, k), t) in shapes.iter().zip(&mut times) {
+            t.sort_by(|a, b| a.total_cmp(b));
+            eprintln!(
+                "tier1 rows {n1:4} tier2 rows {n2:4} kids/row {k:3}: {:6.2} ms",
+                t[t.len() / 2]
+            );
+        }
+    }
+
     /// Tier-1 search on random openings next to the greedy steps turn:
     /// root children's visits, search values and static values (all for the
     /// root's mover), and the greedy turn's static value.
