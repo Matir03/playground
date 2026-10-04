@@ -87,6 +87,10 @@ pub struct GenConfig {
     /// Also record every non-root tier-1 node with at least this many
     /// visits as a tier-1 value target (0 = the root only).
     pub t1_min_visits: u32,
+    /// Also record each tier-2 record's node, and each of its kids with at
+    /// least this many visits, as tier-1 value targets on their (partial
+    /// turn) views: the targets a bridge evaluator needs (0 = none).
+    pub view_min_visits: u32,
     /// Groups of games per worker taking turns, so that the worker advances
     /// one group while another's net call is in flight (1 = no overlap).
     pub pipeline: usize,
@@ -203,6 +207,8 @@ pub struct GenCounters {
     pub opening_turns: AtomicU64,
     /// Games started from the opening pool (the rest played theirs inline).
     pub pooled: AtomicU64,
+    /// Tier-1 records on partial-turn views (`view_min_visits`).
+    pub view_records: AtomicU64,
 }
 
 enum Task {
@@ -590,6 +596,7 @@ impl Worker<'_> {
                 }
                 for r in &walk.records {
                     encode_t2(&lat.start, r, &mut self.t2w)?;
+                    self.view_targets(r)?;
                 }
                 self.c
                     .t2_records
@@ -597,6 +604,47 @@ impl Worker<'_> {
                 Ok(Next::Replace(Vec::new()))
             }
         }
+    }
+
+    /// Partial-turn value targets from a tier-2 record (see
+    /// `GenConfig::view_min_visits`). Values are the turn mover's, as the
+    /// bridge reads them: a kid that starts the next turn is flipped.
+    fn view_targets(&mut self, r: &T2Record) -> Result<()> {
+        let min = self.cfg.view_min_visits;
+        if min == 0 {
+            return Ok(());
+        }
+        let mut rec = Vec::new();
+        let mut put = |w: &mut ChunkWriter, c: &StepState, v: f32, n: f32| -> Result<()> {
+            rec.clear();
+            crate::stepsp::encode_record(&c.view(), v, 0.0, n as u32, &mut rec);
+            w.buf.extend_from_slice(&rec);
+            w.added()
+        };
+        let mut k = 0;
+        if r.n >= min as f32 && !r.node.is_terminal() {
+            put(&mut self.t1w, &r.node, r.q, r.n)?;
+            k += 1;
+        }
+        for &(cell, slot, n, q) in &r.kids {
+            if n < min as f32 {
+                continue;
+            }
+            let c = r.node.with_next(cell).child_unchecked(slot);
+            if c.is_terminal() {
+                continue;
+            }
+            let v = if c.flipped != r.node.flipped {
+                1.0 - q
+            } else {
+                q
+            };
+            put(&mut self.t1w, &c, v, n)?;
+            k += 1;
+        }
+        self.c.t1_records.fetch_add(k, Relaxed);
+        self.c.view_records.fetch_add(k, Relaxed);
+        Ok(())
     }
 
     /// Record the searched turn, pick the next one, and hand the root's
@@ -1046,12 +1094,13 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
                 let ev = c.eval_ns.load(Relaxed) as f64;
                 let cpu = c.cpu_ns.load(Relaxed) as f64;
                 eprintln!(
-                    "  {el:.0}s: games {} ({} pooled) turns {} (+{} opening), t1 {} t2 {} ({:.0}/s), expansions {:.0}/s ({:.1} kids), values {:.0}/s, eval share {:.0}%, rounds {}",
+                    "  {el:.0}s: games {} ({} pooled) turns {} (+{} opening), t1 {} ({} views) t2 {} ({:.0}/s), expansions {:.0}/s ({:.1} kids), values {:.0}/s, eval share {:.0}%, rounds {}",
                     c.games.load(Relaxed),
                     c.pooled.load(Relaxed),
                     c.turns.load(Relaxed),
                     c.opening_turns.load(Relaxed),
                     c.t1_records.load(Relaxed),
+                    c.view_records.load(Relaxed),
                     t2r,
                     (t2r - last.3) as f64 / dt,
                     (ex - last.1) as f64 / dt,
