@@ -30,7 +30,7 @@ phase.
   resulting position, the turn is scored as a loss on the spot rather than
   by the net. This biases tier-2 values, which is fine because they are only
   compared with other tier-2 values.
-- **Spawns (default).** Each spawn cell's choices are "nothing" or an
+- **Spawns** (confirmed 2026-10-03). Each spawn cell's choices are "nothing" or an
   affordable unit. A cell with only "nothing" left is committed
   automatically. The node is a full turn once no undecided cell has a real
   option.
@@ -55,7 +55,7 @@ word operations.
 ## Tier 2: prior-based MCTS over the lattice
 
 - **Selection.** Starting at the root, take the child with the highest PUCT
-  score (default: the spec's "lowest" read as the best for the mover), and
+  score for the mover (the spec's "lowest" was a slip, confirmed), and
   expand along the way. The descent stops at a sink, i.e. a full turn.
   Every descent is a whole root-to-turn path: a descent, not a single
   expansion.
@@ -81,8 +81,10 @@ word operations.
     that completes P.
   - Cost is O(N) per selection step, times ≤ H credits per entry (more for
     expanded entries' child arrays), over a depth of O(H).
-- **PUCT prior (default).** p(h, c) / (#allowed hexes), so the priors sum
-  to 1 over all children.
+- **PUCT prior.** p(h, c) as is: each hex's children are a disjoint set
+  whose priors sum to 1 within it. The single PUCT comparison over all
+  children just picks a hex and its choice at once, and the hex-picking
+  procedure may change later (the user's call, 2026-10-03).
 
 ## Tier 1: AlphaZero-style MCTS over turns, with progressive widening
 
@@ -106,9 +108,10 @@ word operations.
 
 1. **Opening.** Play k turns from the start by expanding lattice nodes ply
    by ply and picking via the ordinal distribution over children ranked by
-   value. k is geometric and starts end-heavy: the spec's example is "20
-   turns mean from 30" (`MAX_TURNS` = 30). It loosens toward the start over
-   training (default: a curriculum knob on the mean, clipped to [0, 29]).
+   value. k = 30 - G with G geometric (mean 10 at first, so the mean start
+   is turn 20 of `MAX_TURNS` = 30): end-heavy, loosened toward the start
+   over training by raising G's mean (`--from-end-mean`). The user meant G
+   as the start turn itself but preferred this reading (2026-10-03).
 2. **Each turn: tier-1 search** with N1 ≈ 400 tier-1 visits. The root value
    afterwards is a **tier-1 value target**. The next turn is chosen from the
    children's visits with temperature + Dirichlet noise.

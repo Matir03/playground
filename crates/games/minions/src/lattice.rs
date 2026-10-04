@@ -810,19 +810,14 @@ impl Lattice {
         st
     }
 
-    /// PUCT over the live kids of expanded node `p`: the prior is the kid's
-    /// within its variable over the number of variables, so the priors sum
-    /// to 1 over all kids.
+    /// PUCT over the live kids of expanded node `p`. Each variable's kids
+    /// are their own set, with priors summing to 1 within it (not
+    /// normalized over all kids): one comparison over every kid just picks
+    /// a variable and its choice at once, and how the variable is picked
+    /// may change later.
     pub fn select(&mut self, p: u32, c_puct: f32) -> Option<usize> {
         let st = self.stats(p);
         let pn = &self.nodes[p as usize];
-        let vars = pn
-            .kids
-            .iter()
-            .filter(|k| !k.dead)
-            .fold(0u64, |m, k| m | 1 << k.var)
-            .count_ones()
-            .max(1);
         let sq = st.n.max(1.0).sqrt();
         let mut best = None;
         let mut best_u = f64::NEG_INFINITY;
@@ -832,7 +827,7 @@ impl Lattice {
             }
             let (n, w) = st.kids[i];
             let q = if n > 0.0 { w / n } else { f64::from(k.v) };
-            let prior = f64::from(k.logp).exp() / f64::from(vars);
+            let prior = f64::from(k.logp).exp();
             let u = q + f64::from(c_puct) * prior * sq / (1.0 + n);
             if u > best_u {
                 best_u = u;
