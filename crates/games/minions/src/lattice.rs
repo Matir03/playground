@@ -31,8 +31,8 @@ pub static PROF: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// Live lattices, nodes and kids (for memory accounting).
-pub static LIVE: [std::sync::atomic::AtomicI64; 3] =
-    [const { std::sync::atomic::AtomicI64::new(0) }; 3];
+pub static LIVE: [std::sync::atomic::AtomicI64; 4] =
+    [const { std::sync::atomic::AtomicI64::new(0) }; 4];
 
 pub static SCANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -383,6 +383,10 @@ impl Drop for Lattice {
             self.nodes.iter().map(|n| n.kids.len() as i64).sum(),
             Relaxed,
         );
+        LIVE[3].fetch_sub(
+            self.nodes.iter().map(|n| n.wit_ex.len() as i64).sum(),
+            Relaxed,
+        );
     }
 }
 
@@ -581,7 +585,13 @@ impl Lattice {
             .filter(|(_, (k, w))| *w != swapped(&own, stage, k.cell, k.choice))
             .map(|(i, (_, w))| (i as u16, *w))
             .collect();
-        node.kids = kids.into_iter().map(|x| x.0).collect();
+        LIVE[3].fetch_add(
+            node.wit_ex.len() as i64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // Not `into_iter().collect()`: that reuses the (Kid, TurnSpec)
+        // allocation in place, ~10x the bytes the kids need.
+        node.kids = kids.iter().map(|x| x.0).collect();
         Ok(!node.kids.is_empty())
     }
 
@@ -828,6 +838,19 @@ impl Lattice {
                 best_u = u;
                 best = Some(i);
             }
+        }
+        if best.is_none() && pn.kids.iter().any(|k| !k.dead) {
+            let live: Vec<_> = pn
+                .kids
+                .iter()
+                .zip(&st.kids)
+                .filter(|(k, _)| !k.dead)
+                .map(|(k, s)| (k.logp, k.v, s.0, s.1))
+                .collect();
+            panic!(
+                "no PUCT candidate at node {p} (n {} w {}): live kids (logp, v, n, w) {live:?}",
+                st.n, st.w
+            );
         }
         best
     }
@@ -1552,7 +1575,10 @@ pub(crate) mod tests {
     /// Under lazy witnesses some offered kids are refuted at their own
     /// expansion: descents still end on full turns and the statistics stay
     /// exact with dead nodes around.
+    /// Ignored: `LAZY_WITNESS` is process-wide, and the steps tests running
+    /// in parallel assume it off. Run alone: `cargo test lattice_lazy -- --ignored`.
     #[test]
+    #[ignore]
     fn lattice_lazy_witness() {
         crate::steps::LAZY_WITNESS.store(true, std::sync::atomic::Ordering::Relaxed);
         let mut dead = 0;

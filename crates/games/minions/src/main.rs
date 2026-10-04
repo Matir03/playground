@@ -773,8 +773,9 @@ enum Cmd {
         /// deferring the exact search to the child's expansion.
         #[arg(long)]
         no_lazy_witness: bool,
-        /// For a `lattice.onnx` net: execution provider and sessions.
-        #[arg(long, default_value = "cuda")]
+        /// For a `lattice.onnx` net: execution provider and sessions (the
+        /// CUDA EP computes this graph wrongly for some shapes; use trt).
+        #[arg(long, default_value = "trt")]
         lattice_ep: String,
         #[arg(long, default_value_t = 4)]
         lattice_sessions: usize,

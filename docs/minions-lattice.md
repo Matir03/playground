@@ -182,3 +182,72 @@ word operations.
    of tier-1/tier-2, record format. Measure and optimize throughput before
    using the data.
 6. **Learner and cycle.**
+
+## Implementation status (2026-10-03)
+
+Built (all CPU-side logic unit-tested against mock evaluators):
+
+| piece | where |
+|---|---|
+| lattice, tier-2 PUCT, lazy propagation (scan checked against brute force), walk | `lattice.rs` |
+| tier-1 PW MCTS, log-odds priors | `tier1.rs` |
+| generation driver (`lattice-gen`), t1 / t2 record writers | `latgen.rs` |
+| steps-net bridge evaluator (bootstrap: child values from child views, uniform priors) | `lattice.rs` `StepsBridge` |
+| `lattice.onnx` evaluator: one graph for both tiers, merging batch queue | `lattice_ort.rs` |
+| tier-2 learner + export (frozen tier-1 trunk from a steps `net.pt`) | `python/minions_lattice_learner.py` |
+
+Choices made while building:
+- Concurrency: each search keeps `--inflight` tier-1 visits in flight, and
+  each walk keeps the same number of descents. Tier 1 uses virtual loss on
+  the path and counts widenings in flight. In the lattice, the virtual loss
+  is a pending zero-value direct visit at the descent's current node, which
+  the lazy propagation charges to every node below it. One request per node
+  is in flight at a time (busy flags).
+- The search reuses the chosen child's lattice. The root's lattice goes to
+  that turn's walk.
+- `lattice.onnx` must run under TensorRT with one explicit shape profile.
+  The CUDA EP returned wrong values (NaN, or values that depended on the
+  rest of the batch) for some (rows, kids) shapes whose inputs were fine on
+  the CPU EP.
+- Witnesses are stored only where they differ from the node's own witness
+  with the child's choice swapped in (~4% of children).
+
+Bootstrap data: 15 min of `lattice-gen` with the gen-537 bridge gave 58.7k
+tier-2 records (20 kids/record). Tier-2 32x2 trained 8 epochs on it:
+- prior excess CE (vs the visit shares, minus their entropy): 0.271 → 0.097;
+- child-value BCE: 0.709 → 0.609;
+- node-value BCE: 0.691 → 0.601.
+
+Throughput (search only, `--from-end-mean 1000`, 16 workers x 8 games):
+
+| evaluator | in flight | expansions/s | turns/s | RSS |
+|---|---|---|---|---|
+| bridge, 8 x 16 games, 1 at a time | 1 | 36-47k | 4.2 | 10 GB |
+| bridge, 8 x 8 games | 8 | 47k | 6.3 | 7.6 GB |
+| lattice.onnx, direct sessions | 8 | 45-54k | 2.2-4 | 12 GB |
+| lattice.onnx, merging queue | 8 | 108k | 8.7 | 8.9 GB |
+| lattice.onnx, merging queue, dynamic batching (1024 rows / 1.5 ms) | 32 | 153k | 12.3 | 8.8 GB |
+
+Where the time goes now:
+- The single runner is ~85-90% busy inside `Session::run`. Per-call host
+  overhead dominates: 0.8 ms for 64 rows, 2.25 ms for 1024, roughly doubled
+  when the CPU is loaded, which is the laptop's shared power and core
+  budget.
+- More runners only slow each call. Bigger calls (more rows in flight) are
+  what helps.
+- Worker thread time: lattice prepare (children and witnesses) ~20%, stats
+  scans ~15%.
+
+Memory: about 4.3 GB is ORT/TensorRT. A live lattice node costs ~1.4 KB:
+the StepState is 880 B, and each child takes 16 B. A
+`Vec<(Kid, TurnSpec)>::into_iter().collect()` once kept ~10x the children's
+bytes (in-place collect reuses the allocation).
+
+Next, by expected payoff:
+1. Cache the tier-1 trunk per turn start and export tier 1 / tier 2 as two
+   graphs. Tier-2 rows recompute the 4-block trunk today, ~60% of their
+   GPU work.
+2. Cut per-node CPU: incremental children from the parent's options, a
+   cheaper stats scan, and shrinking the per-node StepState.
+3. Then the learner loop: tier-1 value from t1 records (the steps learner
+   reads them as is), tier-2 from t2, and a cycle.

@@ -500,6 +500,42 @@ fn env_flag(name: &str, def: bool) -> bool {
     }
 }
 
+/// A TensorRT session with one explicit optimization profile (`min`, `opt`,
+/// `max` in TensorRT's `name:dxd,...` form) instead of one engine per input
+/// shape: for graphs fed many shapes, like `lattice.onnx` (rows x children).
+pub(crate) fn build_trt_profile(
+    path: &Path,
+    fp16: bool,
+    cache_dir: &str,
+    min: &str,
+    opt: &str,
+    max: &str,
+) -> anyhow::Result<Session> {
+    std::fs::create_dir_all(cache_dir).ok();
+    let trt = TensorRT::default()
+        .with_device_id(0)
+        .with_fp16(fp16)
+        .with_engine_cache(true)
+        .with_engine_cache_path(cache_dir.to_string())
+        .with_profile_min_shapes(min)
+        .with_profile_opt_shapes(opt)
+        .with_profile_max_shapes(max)
+        .build();
+    let cuda = CUDA::default().with_device_id(0).build();
+    // One intra-op thread, not spinning: TensorRT runs the graph, and the
+    // default pool (a spinning thread per core) competes with the callers.
+    Session::builder()
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .with_intra_threads(1)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .with_intra_op_spinning(false)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .with_execution_providers([trt, cuda])
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .commit_from_file(path)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
 pub(crate) fn build(path: &Path, ep: &str, fp16: bool, cache_dir: &str) -> anyhow::Result<Session> {
     let cuda = || {
         CUDA::default()

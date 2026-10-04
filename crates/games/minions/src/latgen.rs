@@ -725,7 +725,7 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
                     .collect();
                 let tot = (ev + cpu).max(1.0);
                 eprintln!(
-                    "    thread time: prepare {:.0}% stats {:.0}% child {:.0}% bridge-views {:.0}%; {:.0} nodes per scan; live lattices {} nodes {} kids {}",
+                    "    thread time: prepare {:.0}% stats {:.0}% child {:.0}% bridge-views {:.0}%; {:.0} nodes per scan; live lattices {} nodes {} kids {} witness exceptions {}",
                     100.0 * pr[0] / tot,
                     100.0 * pr[1] / tot,
                     100.0 * pr[2] / tot,
@@ -734,7 +734,24 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
                     crate::lattice::LIVE[0].load(Relaxed),
                     crate::lattice::LIVE[1].load(Relaxed),
                     crate::lattice::LIVE[2].load(Relaxed),
+                    crate::lattice::LIVE[3].load(Relaxed),
                 );
+                let rp: Vec<f64> = crate::lattice_ort::RUN_PROF
+                    .iter()
+                    .map(|x| x.load(Relaxed) as f64)
+                    .collect();
+                if rp[1] > 0.0 {
+                    eprintln!(
+                        "    lattice runner (of wall): merge {:.0}% run {:.0}% split {:.0}%; padded kids {:.0}; {:.0} calls/s, {:.0} rows/call, {:.2} ms/call",
+                        100.0 * rp[0] / (el * 1e9),
+                        100.0 * rp[1] / (el * 1e9),
+                        100.0 * rp[2] / (el * 1e9),
+                        rp[3],
+                        rp[4] / el,
+                        rp[5] / rp[4].max(1.0),
+                        1e-6 * rp[1] / rp[4].max(1.0)
+                    );
+                }
                 last = (Instant::now(), ex, va, t2r);
             }
             if done {
