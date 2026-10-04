@@ -261,3 +261,39 @@ per-node StepState).
 
 Throughput is good enough to train on (~12 turns/s, ~220 tier-2 records/s);
 the next step is the cycle from random init.
+
+## Training cycle (from random init, started 2026-10-03 22:20)
+
+`data/models/minions/lattice/cycle.sh` (untracked, like the steps cycle),
+run detached with `GEN_FLAGS="--games 4"`:
+- gen 0: random tier 1 `res:64x6` and tier 2 `32x2`
+  (`minions_lattice_learner.py --export-only`; tier-2 priors start uniform).
+- Each generation: `lattice-gen` for 600 s with the newest finished nets.
+  The opening's from-end mean is 10 + 0.2 G, capped at 30.
+- LAG = 1: net G-1 trains beside generation G, which uses net G-2.
+- Joint training on the last 4 generations: 2 passes over the tier-2
+  records, plus 256 tier-1 records per step. The tier-2 losses train the
+  tier-1 trunk too, so it learns from far more than the ~12k tier-1
+  records a generation gives. Warm start from the previous generation.
+- Tier-1 targets: the root plus every tier-1 turn with at least 16 visits
+  (`--t1-min-visits`), about 11 per searched turn.
+- Eval every 5 generations: `steps-match` of the new nets against
+  generations g-5, g-10, g-20 and g-40, 4 pairs each (random openings,
+  seats swapped), 100 tier-1 visits a turn. A lattice net directory passed
+  to `steps-match` / `steps-vs-mcts` plays by tier-1 search; its tier-1 net
+  is also exported as a steps value net for bids.
+
+Random-init nets behave differently from the distilled ones. Uniform priors
+spread every descent, so each lattice holds about twice the nodes.
+`--games 8` reached 14.5 GB RSS in 3 minutes and was still growing.
+`--games 4` plateaus at 6.3 GB and is about 3x faster per generation.
+Gen 1 (random nets): 1010 searched turns, 26k tier-2 and 11.6k tier-1
+records in 600 s; GPU ~33% busy. Generation is CPU-bound
+(prepare 38%, stats scans 13%), and training takes seconds.
+
+The search is sound but proposal-bound. With the distilled tier 2 (`lt1`),
+lattice search lost 2-14 to gen-537 step-greedy at both 50 and 800 tier-1
+visits. `lattice_search_diag` shows why: the best root child's static
+value is 0.46/0.64/0.73/0.47 on four positions, vs 0.52/0.63/0.82/0.59 for
+the greedy turn. Tier-1 search ranks the turns it is given well, but PW
+gives it only sqrt(n) of them, all proposed by tier 2.
