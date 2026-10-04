@@ -301,8 +301,17 @@ impl Tier1 {
                     Need::Value(n) => return Ok(Need1::SinkValue { t: wt, n }),
                     Need::Wait => return Ok(Need1::Wait),
                     Need::Dead => bail!("tier-1 node {wt}'s lattice root is a dead end"),
-                    Need::Done { sink, value, fresh } => {
+                    Need::Done { sink, value, .. } => {
                         self.stats.t2_descents += 1;
+                        // New to this tier-1 node, not to its lattice: a
+                        // lattice adopted from the previous turn's search
+                        // already knows the sinks it reached there (with few
+                        // distinct turns, all of them -- and the root then
+                        // never got a child).
+                        let fresh = !self.nodes[wt as usize]
+                            .children
+                            .iter()
+                            .any(|&c| self.nodes[c as usize].sink == sink);
                         if fresh {
                             vis.widen = None;
                             self.nodes[wt as usize].widening -= 1;
@@ -555,6 +564,31 @@ mod tests {
 
     /// Several visits in flight, fed in rounds: the same invariants hold,
     /// and every virtual loss and widening count is gone at the end.
+    /// A search that adopts the lattice of the turn just played (as
+    /// `latgen` does) widens its root, and its children are distinct turns.
+    /// (Widening once asked the lattice whether a sink was new; an adopted
+    /// lattice's known sinks then never became children, and gen 27 of the
+    /// lattice cycle died on a position with few turns.)
+    #[test]
+    fn tier1_adopted_lattice() {
+        let s = StepState::begin(&MinionsState::with_bid(0), 5);
+        let mut t = Tier1::new(s, T1Params::default());
+        t.run(&HashLatticeEval, 200).unwrap();
+        let best = t.best_child().unwrap() as usize;
+        let lat = t.nodes[best]
+            .lattice
+            .take()
+            .expect("the best child was searched");
+        let mut t2 = Tier1::new(t.nodes[best].state.clone(), T1Params::default());
+        t2.nodes[0].lattice = Some(lat);
+        t2.run(&HashLatticeEval, 100).unwrap();
+        let kids = &t2.nodes[0].children;
+        assert!(!kids.is_empty());
+        let sinks: std::collections::HashSet<u32> =
+            kids.iter().map(|&c| t2.nodes[c as usize].sink).collect();
+        assert_eq!(sinks.len(), kids.len(), "two children are the same turn");
+    }
+
     #[test]
     fn tier1_inflight() {
         let s = StepState::begin(&MinionsState::with_bid(0), 9);
