@@ -76,6 +76,9 @@ pub struct GenConfig {
     /// If positive, G's median instead (overrides the mean): turn
     /// `MAX_TURNS - median` is the median start.
     pub from_end_median: f64,
+    /// If positive, overrides both: the start turn itself is geometric on
+    /// 0, 1, 2, ... (below `MAX_TURNS`) with this mean.
+    pub start_turn_mean: f64,
     pub secs: f64,
     /// Stop after this many tier-2 records (0 = no limit).
     pub target_t2: u64,
@@ -102,6 +105,30 @@ pub struct GenConfig {
     /// Refill mode: play openings until the pool holds this many, save it,
     /// and stop (no searches).
     pub refill_to: usize,
+}
+
+/// The continuation probability q of a geometric on 0..n (P(k) ∝ q^k)
+/// whose mean is `mean`, by bisection.
+fn truncated_geometric_q(mean: f64, n: u32) -> f64 {
+    let m = |q: f64| {
+        let (mut num, mut den, mut w) = (0.0, 0.0, 1.0);
+        for k in 0..n {
+            num += k as f64 * w;
+            den += w;
+            w *= q;
+        }
+        num / den
+    };
+    let (mut lo, mut hi) = (0.0, 1.0 - 1e-9);
+    for _ in 0..60 {
+        let mid = 0.5 * (lo + hi);
+        if m(mid) < mean {
+            lo = mid
+        } else {
+            hi = mid
+        }
+    }
+    0.5 * (lo + hi)
 }
 
 const POOL_MAGIC: &[u8; 4] = b"MOPN";
@@ -412,6 +439,19 @@ impl Worker<'_> {
         }
         let salt: u64 = self.rng.gen();
         let s = StepState::begin(&crate::game::MinionsState::with_bid(self.bid), salt);
+        if self.cfg.start_turn_mean > 0.0 {
+            let q = truncated_geometric_q(self.cfg.start_turn_mean, crate::game::MAX_TURNS.into());
+            let k = loop {
+                let mut k = 0u32;
+                while self.rng.gen::<f64>() < q {
+                    k += 1;
+                }
+                if k < u32::from(crate::game::MAX_TURNS) {
+                    break k;
+                }
+            };
+            return self.start(s, k);
+        }
         // P(G <= g) = 1 - (1 - p)^g: a median of m needs (1 - p)^m = 1/2.
         let p = if self.cfg.from_end_median > 0.0 {
             1.0 - 0.5f64.powf(1.0 / self.cfg.from_end_median.max(1.0))
@@ -423,6 +463,11 @@ impl Worker<'_> {
             g += 1;
         }
         let k = u32::from(crate::game::MAX_TURNS).saturating_sub(g);
+        self.start(s, k)
+    }
+
+    /// A game at the start position `s` after `k` opening turns.
+    fn start(&mut self, s: StepState, k: u32) -> Result<Task> {
         if k == 0 {
             if let Some(out) = self.collect.as_mut() {
                 out.push(s);

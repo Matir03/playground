@@ -779,6 +779,10 @@ enum Cmd {
         /// is the median start.
         #[arg(long, default_value_t = 0.0)]
         from_end_median: f64,
+        /// The start turn itself geometric on 0, 1, ... (below the cap) with
+        /// this mean, if positive (overrides both of the above).
+        #[arg(long, default_value_t = 0.0)]
+        start_turn_mean: f64,
         #[arg(long, default_value_t = 60.0)]
         secs: f64,
         #[arg(long, default_value_t = 0)]
@@ -1558,7 +1562,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::LatticeGen {
             out, onnx, ep, batcher, workers, games, n1, inflight, n2, c1, c2, pw_c, pw_alpha, retries,
-            temp1, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, secs,
+            temp1, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, start_turn_mean, secs,
             target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, pipeline, openings, open_workers, pool, refill_to,
         } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
@@ -1589,6 +1593,7 @@ async fn main() -> anyhow::Result<()> {
                 dir1_frac,
                 from_end_mean,
                 from_end_median,
+                start_turn_mean,
                 secs,
                 target_t2,
                 seed,
