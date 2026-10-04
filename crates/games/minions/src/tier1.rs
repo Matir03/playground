@@ -254,6 +254,7 @@ impl Tier1 {
                 match l.advance(cur, c2)? {
                     Need::Expand(n) => return Ok(Need1::Expand { t: wt, n }),
                     Need::Value(n) => return Ok(Need1::SinkValue { t: wt, n }),
+                    Need::Dead => bail!("tier-1 node {wt}'s lattice root is a dead end"),
                     Need::Done { sink, value, fresh } => {
                         self.stats.t2_descents += 1;
                         if fresh {

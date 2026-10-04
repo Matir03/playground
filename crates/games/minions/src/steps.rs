@@ -489,6 +489,11 @@ impl StepState {
         s
     }
 
+    /// The witness certifying this node's decisions so far.
+    pub(crate) fn witness(&self) -> &TurnSpec {
+        &self.witness
+    }
+
     /// The current variable's options and their witnesses (uncached).
     pub(crate) fn lattice_options(&self) -> (Vec<u8>, Vec<TurnSpec>) {
         self.compute_options()

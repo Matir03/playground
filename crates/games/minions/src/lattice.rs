@@ -24,6 +24,25 @@ use crate::map::NUM_CELLS;
 use crate::steps::{Stage, StepState};
 use crate::turn::{TurnSpec, TARGET_STAY};
 
+/// Time profile (ns) of the lattice's CPU work: prepare (children and
+/// witnesses), stats scans, child creation, the bridge's child views; and
+/// the touched nodes scanned.
+pub static PROF: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Live lattices, nodes and kids (for memory accounting).
+pub static LIVE: [std::sync::atomic::AtomicI64; 3] =
+    [const { std::sync::atomic::AtomicI64::new(0) }; 3];
+
+pub static SCANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn prof(i: usize, t0: std::time::Instant) {
+    PROF[i].fetch_add(
+        t0.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// Variables per turn the key can hold.
 pub const MAX_VARS: usize = 64;
 const PER_WORD: usize = 10;
@@ -109,6 +128,24 @@ pub trait LatticeEval: Send + Sync {
     fn expand(&self, reqs: &[ExpandReq]) -> Result<Vec<ExpandOut>>;
     /// Tier-1 values of turn starts, each for its own mover.
     fn value(&self, states: &[&StepState]) -> Result<Vec<f32>>;
+    /// Both kinds at once (one net call where the evaluator can).
+    fn both(
+        &self,
+        reqs: &[ExpandReq],
+        states: &[&StepState],
+    ) -> Result<(Vec<ExpandOut>, Vec<f32>)> {
+        let e = if reqs.is_empty() {
+            Vec::new()
+        } else {
+            self.expand(reqs)?
+        };
+        let v = if states.is_empty() {
+            Vec::new()
+        } else {
+            self.value(states)?
+        };
+        Ok((e, v))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,7 +179,9 @@ pub struct LNode {
     pub expanded: bool,
     /// Sorted by `(var, choice)`.
     pub kids: Vec<Kid>,
-    wits: Vec<TurnSpec>,
+    /// The kids whose witness is not this node's own with the kid's choice
+    /// swapped in (see [`swapped`]), by kid index.
+    wit_ex: Vec<(u16, TurnSpec)>,
     /// The live kids' direct visits from this node's expansion.
     kid_n: u32,
     kid_w: f64,
@@ -159,7 +198,29 @@ pub struct LNode {
     parents: Vec<(u32, u16)>,
 }
 
+/// `own` with the choice `v` for the variable on `cell` swapped in: the
+/// witness most options get (spawns leave witnesses alone).
+fn swapped(own: &TurnSpec, stage: Stage, cell: u8, v: u8) -> TurnSpec {
+    let mut w = *own;
+    match stage {
+        Stage::Fates => w.targets[cell as usize] = v,
+        Stage::Moves => w.moves[cell as usize] = v,
+        _ => {}
+    }
+    w
+}
+
 impl LNode {
+    fn kid_witness(&self, k: usize) -> TurnSpec {
+        match self.wit_ex.binary_search_by_key(&(k as u16), |x| x.0) {
+            Ok(i) => self.wit_ex[i].1,
+            Err(_) => {
+                let kid = &self.kids[k];
+                swapped(self.state.witness(), self.state.stage, kid.cell, kid.choice)
+            }
+        }
+    }
+
     fn new(key: Key, state: StepState, kind: Kind) -> Self {
         LNode {
             key,
@@ -168,7 +229,7 @@ impl LNode {
             prepared: false,
             expanded: false,
             kids: Vec::new(),
-            wits: Vec::new(),
+            wit_ex: Vec::new(),
             kid_n: 0,
             kid_w: 0.0,
             n: 0,
@@ -221,6 +282,8 @@ pub enum Need {
     Value(u32),
     /// The descent reached a sink. `fresh`: no descent had before.
     Done { sink: u32, value: f32, fresh: bool },
+    /// The node the descent started at turned out to be a dead end.
+    Dead,
 }
 
 /// Children statistics at a node, from [`Lattice::stats`].
@@ -245,7 +308,11 @@ pub struct Lattice {
     /// this value and has no lattice.
     pub terminal: Option<f32>,
     pub stats: LatticeStats,
-    slot: Vec<u16>,
+}
+
+thread_local! {
+    /// Kid index by `var * 64 + choice` during a stats scan.
+    static SLOT: std::cell::RefCell<Vec<u16>> = std::cell::RefCell::new(vec![u16::MAX; MAX_VARS * 64]);
 }
 
 fn var_index(var_of: &[u8; NUM_CELLS], n_fm: usize, s: &StepState, cell: u8) -> usize {
@@ -295,10 +362,23 @@ pub fn necro_kill(start: &StepState) -> std::result::Result<StepState, StepState
     Err(s.lattice_child(TARGET_STAY, spare.unwrap_or_default()))
 }
 
+impl Drop for Lattice {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        LIVE[0].fetch_sub(1, Relaxed);
+        LIVE[1].fetch_sub(self.nodes.len() as i64, Relaxed);
+        LIVE[2].fetch_sub(
+            self.nodes.iter().map(|n| n.kids.len() as i64).sum(),
+            Relaxed,
+        );
+    }
+}
+
 impl Lattice {
     /// The lattice of the turn starting at `start` (a fresh
     /// [`StepState::begin`]).
     pub fn new(start: StepState) -> Result<Self> {
+        LIVE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut l = Lattice {
             start: start.clone(),
             nodes: Vec::new(),
@@ -308,7 +388,6 @@ impl Lattice {
             n_fm: 0,
             terminal: None,
             stats: LatticeStats::default(),
-            slot: vec![u16::MAX; MAX_VARS * 64],
         };
         if start.is_terminal() {
             l.terminal = Some(start.terminal_value());
@@ -342,6 +421,7 @@ impl Lattice {
             l.sink_value(&mut node);
         }
         l.nodes.push(node);
+        LIVE[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         l.index.insert(Key::default(), 0);
         Ok(l)
     }
@@ -372,17 +452,24 @@ impl Lattice {
     }
 
     /// The node for the root plus kid `k` of `p`, created on first use.
-    fn child(&mut self, p: u32, k: usize) -> Result<u32> {
+    pub fn child(&mut self, p: u32, k: usize) -> Result<u32> {
         let kid = self.nodes[p as usize].kids[k];
         if kid.node != NONE {
             return Ok(kid.node);
         }
+        let t0 = std::time::Instant::now();
+        let r = self.make_child(p, k, kid);
+        prof(2, t0);
+        r
+    }
+
+    fn make_child(&mut self, p: u32, k: usize, kid: Kid) -> Result<u32> {
         let pn = &self.nodes[p as usize];
         let mut key = pn.key.with(kid.var as usize, kid.choice);
         let mut st = pn
             .state
             .with_next(kid.cell)
-            .lattice_child(kid.choice, pn.wits[k]);
+            .lattice_child(kid.choice, pn.kid_witness(k));
         // Nothing left to buy: the remaining spawn cells stay empty.
         while st.stage == Stage::Spawns && st.flipped == self.start.flipped {
             let (o, w) = st.lattice_options();
@@ -408,17 +495,31 @@ impl Lattice {
                 }
                 let id = self.nodes.len() as u32;
                 self.nodes.push(node);
+                LIVE[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.index.insert(key, id);
                 id
             }
         };
         self.nodes[id as usize].parents.push((p, k as u16));
         self.nodes[p as usize].kids[k].node = id;
+        if self.nodes[id as usize].kind == Kind::Dead {
+            // Reached another way and refuted already: this kid is dead too.
+            let mut stack = Vec::new();
+            self.drop_kid(p, k, &mut stack);
+            self.kill_all(stack)?;
+        }
         Ok(id)
     }
 
     /// List a node's children with their witnesses. False: none (dead).
     fn prepare(&mut self, n: u32) -> Result<bool> {
+        let t0 = std::time::Instant::now();
+        let r = self.prepare_inner(n);
+        prof(0, t0);
+        r
+    }
+
+    fn prepare_inner(&mut self, n: u32) -> Result<bool> {
         let (var_of, n_fm) = (self.var_of, self.n_fm);
         let node = &mut self.nodes[n as usize];
         node.prepared = true;
@@ -459,9 +560,32 @@ impl Lattice {
         }
         kids.sort_unstable_by_key(|(k, _)| (k.var, k.choice));
         let node = &mut self.nodes[n as usize];
-        node.wits = kids.iter().map(|x| x.1).collect();
+        LIVE[2].fetch_add(kids.len() as i64, std::sync::atomic::Ordering::Relaxed);
+        let own = *node.state.witness();
+        let stage = node.state.stage;
+        node.wit_ex = kids
+            .iter()
+            .enumerate()
+            .filter(|(_, (k, w))| *w != swapped(&own, stage, k.cell, k.choice))
+            .map(|(i, (_, w))| (i as u16, *w))
+            .collect();
         node.kids = kids.into_iter().map(|x| x.0).collect();
         Ok(!node.kids.is_empty())
+    }
+
+    /// Make sure node `n` is expanded: `Some(Expand)` if it needs the net,
+    /// `None` if it already is (or is not an inner node). A dead end is
+    /// marked dead and reported as an error-free `None`.
+    pub fn ensure_expanded(&mut self, n: u32) -> Result<Option<Need>> {
+        let node = &self.nodes[n as usize];
+        if node.kind != Kind::Inner || node.expanded {
+            return Ok(None);
+        }
+        if node.prepared || self.prepare(n)? {
+            return Ok(Some(Need::Expand(n)));
+        }
+        self.kill(n)?;
+        Ok(None)
     }
 
     /// The request to expand prepared node `n`.
@@ -526,7 +650,27 @@ impl Lattice {
 
     /// Mark `n` dead, and every parent all of whose kids are.
     fn kill(&mut self, n: u32) -> Result<()> {
-        let mut stack = vec![n];
+        self.kill_all(vec![n])
+    }
+
+    /// Mark kid `k` of `p` dead; `p` goes on `stack` once all its kids are.
+    fn drop_kid(&mut self, p: u32, k: usize, stack: &mut Vec<u32>) {
+        let pn = &mut self.nodes[p as usize];
+        let kid = &mut pn.kids[k];
+        if kid.dead {
+            return;
+        }
+        kid.dead = true;
+        if pn.expanded {
+            pn.kid_n -= 1;
+            pn.kid_w -= f64::from(kid.v);
+        }
+        if pn.kids.iter().all(|k| k.dead) {
+            stack.push(p);
+        }
+    }
+
+    fn kill_all(&mut self, mut stack: Vec<u32>) -> Result<()> {
         while let Some(x) = stack.pop() {
             if self.nodes[x as usize].kind == Kind::Dead {
                 continue;
@@ -537,19 +681,7 @@ impl Lattice {
             self.stats.dead += 1;
             self.nodes[x as usize].kind = Kind::Dead;
             for (p, k) in self.nodes[x as usize].parents.clone() {
-                let pn = &mut self.nodes[p as usize];
-                let kid = &mut pn.kids[k as usize];
-                if kid.dead {
-                    continue;
-                }
-                kid.dead = true;
-                if pn.expanded {
-                    pn.kid_n -= 1;
-                    pn.kid_w -= f64::from(kid.v);
-                }
-                if pn.kids.iter().all(|k| k.dead) {
-                    stack.push(p);
-                }
+                self.drop_kid(p, k as usize, &mut stack);
             }
         }
         Ok(())
@@ -563,13 +695,29 @@ impl Lattice {
     /// touched node's own visits, plus one per live kid of each expanded
     /// node (its expansion's visit to that child, at commitments X + kid).
     pub fn stats(&mut self, p: u32) -> Stats {
+        let t0 = std::time::Instant::now();
+        PROF[4].fetch_add(
+            self.touched.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        SCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let r = self.stats_inner(p);
+        prof(1, t0);
+        r
+    }
+
+    fn stats_inner(&mut self, p: u32) -> Stats {
+        SLOT.with(|slot| self.stats_with(p, &mut slot.borrow_mut()))
+    }
+
+    fn stats_with(&self, p: u32, slot_m: &mut [u16]) -> Stats {
         let pn = &self.nodes[p as usize];
         let pk = pn.key;
         let mut allowed = 0u64;
         for (i, k) in pn.kids.iter().enumerate() {
             if !k.dead {
                 allowed |= 1 << k.var;
-                self.slot[k.var as usize * 64 + k.choice as usize] = i as u16;
+                slot_m[k.var as usize * 64 + k.choice as usize] = i as u16;
             }
         }
         let mut st = Stats {
@@ -577,7 +725,7 @@ impl Lattice {
             w: 0.0,
             kids: vec![(0.0, 0.0); pn.kids.len()],
         };
-        let slot = &self.slot;
+        let slot = &*slot_m;
         let credit = |st: &mut Stats, x: &Key, mut extra: u64, cn: f64, cw: f64| {
             st.n += cn;
             st.w += cw;
@@ -625,8 +773,8 @@ impl Lattice {
                 }
             }
         }
-        for k in &self.nodes[p as usize].kids {
-            self.slot[k.var as usize * 64 + k.choice as usize] = u16::MAX;
+        for k in &pn.kids {
+            slot_m[k.var as usize * 64 + k.choice as usize] = u16::MAX;
         }
         st
     }
@@ -665,13 +813,13 @@ impl Lattice {
 
     /// Run descent `cur` until it needs the net or reaches a sink.
     pub fn advance(&mut self, cur: &mut Cursor, c_puct: f32) -> Result<Need> {
-        loop {
+        for _ in 0..1_000_000 {
             let n = cur.at;
             let node = &self.nodes[n as usize];
             match node.kind {
                 Kind::Dead => {
                     let Some((p, k)) = cur.path.pop() else {
-                        bail!("descent started at a dead node");
+                        return Ok(Need::Dead);
                     };
                     cur.lp -= f64::from(self.nodes[p as usize].kids[k as usize].logp);
                     cur.at = p;
@@ -709,6 +857,7 @@ impl Lattice {
                 },
             }
         }
+        bail!("lattice descent made no progress in 1e6 steps")
     }
 
     /// One whole descent from `cur`, calling `eval` for every expansion and
@@ -736,6 +885,7 @@ impl Lattice {
                     self.feed_value(n, v);
                 }
                 Need::Done { sink, value, fresh } => return Ok((sink, value, fresh)),
+                Need::Dead => bail!("descent started at a dead node"),
             }
         }
     }
@@ -745,6 +895,78 @@ impl Lattice {
     pub fn sink_logp(&self, n: u32) -> f64 {
         let s = &self.nodes[n as usize];
         s.lp_sum / f64::from(s.lp_n.max(1))
+    }
+}
+
+/// Bootstrap evaluator from a steps-mode value net: a child's value is the
+/// net's value of the child state, priors are uniform, and tier-1 values
+/// are the net's values of turn starts.
+pub struct StepsBridge {
+    pub eval: std::sync::Arc<dyn crate::bfs::Evaluator>,
+}
+
+impl LatticeEval for StepsBridge {
+    fn expand(&self, reqs: &[ExpandReq]) -> Result<Vec<ExpandOut>> {
+        Ok(self.both(reqs, &[])?.0)
+    }
+
+    fn value(&self, states: &[&StepState]) -> Result<Vec<f32>> {
+        Ok(self.both(&[], states)?.1)
+    }
+
+    fn both(
+        &self,
+        reqs: &[ExpandReq],
+        states: &[&StepState],
+    ) -> Result<(Vec<ExpandOut>, Vec<f32>)> {
+        let t0 = std::time::Instant::now();
+        let mut views = Vec::new();
+        let mut flip = Vec::new();
+        let mut term = Vec::new();
+        for r in reqs {
+            views.push(r.node.view());
+            flip.push(false);
+            term.push(None);
+            for &(cell, slot) in r.slots {
+                let c = r.node.with_next(cell).child_unchecked(slot);
+                flip.push(c.flipped != r.node.flipped);
+                term.push(c.is_terminal().then(|| c.terminal_value()));
+                views.push(c.view());
+            }
+        }
+        for s in states {
+            views.push(s.view());
+            flip.push(false);
+            term.push(s.is_terminal().then(|| s.terminal_value()));
+        }
+        prof(3, t0);
+        let vals = if views.is_empty() {
+            Vec::new()
+        } else {
+            self.eval.eval(&views)?
+        };
+        let v = |i: usize| {
+            let x = term[i].unwrap_or(vals[i]);
+            if flip[i] {
+                1.0 - x
+            } else {
+                x
+            }
+        };
+        let mut out = Vec::with_capacity(reqs.len());
+        let mut i = 0;
+        for r in reqs {
+            let value = v(i);
+            let values = (0..r.slots.len()).map(|j| v(i + 1 + j)).collect();
+            out.push(ExpandOut {
+                logits: vec![0.0; r.slots.len()],
+                values,
+                value,
+            });
+            i += 1 + r.slots.len();
+        }
+        let sv = (i..views.len()).map(v).collect();
+        Ok((out, sv))
     }
 }
 
@@ -878,6 +1100,10 @@ impl Lattice {
                     Need::Done { .. } => {
                         w.cur = None;
                         w.left -= 1;
+                    }
+                    Need::Dead => {
+                        w.done = true;
+                        return Ok(None);
                     }
                     need => return Ok(Some(need)),
                 }
@@ -1105,6 +1331,19 @@ pub(crate) mod tests {
         assert!(compared > 0, "no pair of orders compared");
     }
 
+    #[test]
+    #[ignore]
+    fn sizes() {
+        eprintln!(
+            "StepState {} MinionsState {} TurnSpec {} LNode {} Kid {}",
+            std::mem::size_of::<StepState>(),
+            std::mem::size_of::<crate::game::MinionsState>(),
+            std::mem::size_of::<TurnSpec>(),
+            std::mem::size_of::<LNode>(),
+            std::mem::size_of::<Kid>()
+        );
+    }
+
     /// Cost profile: kids per expansion and CPU time per expansion.
     #[test]
     #[ignore]
@@ -1206,7 +1445,7 @@ pub(crate) mod tests {
                             .unwrap()[0];
                         l.feed_value(n, v);
                     }
-                    Need::Done { .. } => unreachable!(),
+                    Need::Done { .. } | Need::Dead => unreachable!(),
                 }
             }
             assert_eq!(l.nodes[w.at as usize].kind, Kind::Sink);
@@ -1216,5 +1455,29 @@ pub(crate) mod tests {
                 assert!(r.n >= p.n2 as f32);
             }
         }
+    }
+
+    /// Under lazy witnesses some offered kids are refuted at their own
+    /// expansion: descents still end on full turns and the statistics stay
+    /// exact with dead nodes around.
+    #[test]
+    fn lattice_lazy_witness() {
+        crate::steps::LAZY_WITNESS.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut dead = 0;
+        for s in positions(8, 17) {
+            let mut l = Lattice::new(s).unwrap();
+            if l.terminal.is_some() {
+                continue;
+            }
+            for _ in 0..80 {
+                let (sink, _, _) = l
+                    .descend(&HashLatticeEval, Cursor::at(0, 0.0), 1.5)
+                    .unwrap();
+                assert_eq!(l.nodes[sink as usize].kind, Kind::Sink);
+            }
+            check_stats(&mut l);
+            dead += l.stats.dead;
+        }
+        eprintln!("dead nodes: {dead}");
     }
 }

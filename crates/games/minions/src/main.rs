@@ -714,6 +714,65 @@ enum Cmd {
         #[arg(long)]
         diag: Option<String>,
     },
+    /// Turn-lattice generation (docs/minions-lattice.md): tier-1 searches
+    /// every turn, tier-2 walks for the tier-2 net's records.
+    LatticeGen {
+        #[arg(long)]
+        out: String,
+        /// Bootstrap evaluator: a steps-mode value net (`value_sparse.onnx`).
+        #[arg(long)]
+        onnx: String,
+        #[arg(long, default_value = "trt")]
+        ep: String,
+        #[arg(long, default_value_t = 2)]
+        batcher: usize,
+        #[arg(long, default_value_t = 8)]
+        workers: usize,
+        /// Games per worker.
+        #[arg(long, default_value_t = 32)]
+        games: usize,
+        #[arg(long, default_value_t = 400)]
+        n1: u32,
+        #[arg(long, default_value_t = 20)]
+        n2: u32,
+        #[arg(long, default_value_t = 1.5)]
+        c1: f32,
+        #[arg(long, default_value_t = 1.5)]
+        c2: f32,
+        #[arg(long, default_value_t = 1.0)]
+        pw_c: f32,
+        #[arg(long, default_value_t = 0.5)]
+        pw_alpha: f32,
+        #[arg(long, default_value_t = 20)]
+        retries: u32,
+        #[arg(long, default_value_t = 1.0)]
+        temp1: f64,
+        #[arg(long, default_value_t = 0.3)]
+        dir1_alpha: f64,
+        #[arg(long, default_value_t = 0.25)]
+        dir1_frac: f64,
+        #[arg(long, default_value_t = 1.0)]
+        temp2: f64,
+        #[arg(long, default_value_t = 0.3)]
+        dir2_alpha: f64,
+        #[arg(long, default_value_t = 0.25)]
+        dir2_frac: f64,
+        /// Games start MAX_TURNS - G turns in, G geometric with this mean.
+        #[arg(long, default_value_t = 10.0)]
+        from_end_mean: f64,
+        #[arg(long, default_value_t = 60.0)]
+        secs: f64,
+        #[arg(long, default_value_t = 0)]
+        target_t2: u64,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Check every offered option's witness on the spot instead of
+        /// deferring the exact search to the child's expansion.
+        #[arg(long)]
+        no_lazy_witness: bool,
+        #[arg(long, default_value_t = 20000)]
+        chunk_records: usize,
+    },
     StepsSelfplay {
         /// Record output directory.
         #[arg(long)]
@@ -1418,6 +1477,38 @@ async fn main() -> anyhow::Result<()> {
                 Some(labels) => minions_engine::steps::exact_diag(corpus, std::path::Path::new(&labels))?,
                 None => minions_engine::steps::exact_bench(corpus, budget, limit, labels_out.as_deref().map(std::path::Path::new))?,
             }
+        }
+        Cmd::LatticeGen {
+            out, onnx, ep, batcher, workers, games, n1, n2, c1, c2, pw_c, pw_alpha, retries,
+            temp1, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, secs,
+            target_t2, seed, chunk_records, no_lazy_witness,
+        } => {
+            minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
+            let eval = load_step_eval_runners(&onnx, &ep, batcher)?;
+            let bridge = std::sync::Arc::new(minions_engine::lattice::StepsBridge { eval });
+            let cfg = minions_engine::latgen::GenConfig {
+                out: out.into(),
+                workers,
+                games,
+                n1,
+                t1: minions_engine::tier1::T1Params { c_puct: c1, pw_c, pw_alpha, retries, c2 },
+                walk: minions_engine::lattice::WalkParams {
+                    n2,
+                    c2,
+                    temp: temp2,
+                    dir_alpha: dir2_alpha,
+                    dir_frac: dir2_frac,
+                },
+                temp1,
+                dir1_alpha,
+                dir1_frac,
+                from_end_mean,
+                secs,
+                target_t2,
+                seed,
+                chunk_records,
+            };
+            minions_engine::latgen::generate(&cfg, bridge)?;
         }
         Cmd::StepsSelfplay {
             out,

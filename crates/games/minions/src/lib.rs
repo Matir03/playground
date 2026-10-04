@@ -18,6 +18,7 @@ pub(crate) mod combine;
 pub mod eval;
 pub mod game;
 pub mod genpos;
+pub mod latgen;
 pub mod lattice;
 pub mod map;
 pub mod net;
