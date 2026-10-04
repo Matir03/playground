@@ -36,6 +36,24 @@ pub static LIVE: [std::sync::atomic::AtomicI64; 4] =
 
 pub static SCANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Option-check cost breakdown while preparing nodes: per
+/// [`crate::steps::cand_log`] class, candidates and nanoseconds.
+pub static WIT_CLASS: [[std::sync::atomic::AtomicU64; 2]; crate::steps::cand_log::N] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; crate::steps::cand_log::N];
+
+/// Deferred witnesses resolved at preparation: found, dead, nanoseconds;
+/// nodes found dead by a nogood before any search, and deferred witnesses
+/// taken from the pool.
+pub static WIT_RESOLVE: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// What inheriting candidates from the creating parent would change, over
+/// nodes in the same stage as that parent: candidates the parent did not
+/// offer live (count, nanoseconds spent checking them again), and how many
+/// of those this node offers anyway (choices inheritance would drop).
+pub static WIT_INHERIT: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 fn prof(i: usize, t0: std::time::Instant) {
     PROF[i].fetch_add(
         t0.elapsed().as_nanos() as u64,
@@ -105,6 +123,38 @@ impl Key {
     pub fn includes(&self, o: &Key) -> bool {
         o.mask & !self.mask == 0 && !self.conflicts(o)
     }
+
+    /// With variable `v` (decided or not) set to `c`.
+    pub fn set(mut self, v: usize, c: u8) -> Key {
+        let sh = 6 * (v % PER_WORD);
+        self.mask |= 1 << v;
+        self.packed[v / PER_WORD] =
+            (self.packed[v / PER_WORD] & !(63 << sh)) | (u64::from(c) << sh);
+        self
+    }
+}
+
+/// Known witnesses kept per lattice (complete fates+moves declarations as
+/// keys), and known infeasible keys (`LATTICE_POOL`, `LATTICE_NOGOODS`: caps,
+/// 0 = off).
+fn pool_cap() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("LATTICE_POOL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2048)
+    })
+}
+
+fn nogood_cap() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("LATTICE_NOGOODS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4096)
+    })
 }
 
 /// A node to expand: the turn's start (whose tier-1 trunk the tier-2 net
@@ -335,6 +385,17 @@ pub struct Lattice {
     touched: Vec<u32>,
     var_of: [u8; NUM_CELLS],
     n_fm: usize,
+    /// Fate variables (the first `n_f`).
+    n_f: usize,
+    /// A complete declaration of the turn (the root's witness): what a
+    /// pool key's declaration is filled in from.
+    wit0: TurnSpec,
+    /// Known witnesses (keys over every fate and move variable) and their
+    /// hashes, to keep them distinct.
+    pool: Vec<Key>,
+    pool_seen: std::collections::HashSet<u64>,
+    /// Known infeasible commitment sets: every node including one is dead.
+    nogoods: Vec<Key>,
     /// The mover can kill the enemy necromancer: the turn is terminal with
     /// this value and has no lattice.
     pub terminal: Option<f32>,
@@ -423,6 +484,11 @@ impl Lattice {
             touched: Vec::new(),
             var_of: [u8::MAX; NUM_CELLS],
             n_fm: 0,
+            n_f: 0,
+            wit0: TurnSpec::default(),
+            pool: Vec::new(),
+            pool_seen: Default::default(),
+            nogoods: Vec::new(),
             terminal: None,
             stats: LatticeStats::default(),
             trunk: None,
@@ -450,6 +516,8 @@ impl Lattice {
             l.var_of[c as usize] = i as u8;
         }
         l.n_fm = fates.len() + friends.len();
+        l.n_f = fates.len();
+        l.wit0 = *root.witness();
         if l.n_fm >= MAX_VARS {
             bail!("{} fate and move variables", l.n_fm);
         }
@@ -462,6 +530,55 @@ impl Lattice {
         LIVE[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         l.index.insert(Key::default(), 0);
         Ok(l)
+    }
+
+    /// A complete declaration as a key over every fate and move variable.
+    fn witness_key(&self, w: &TurnSpec) -> Key {
+        let mut k = Key::default();
+        for (c, &v) in self.var_of.iter().enumerate() {
+            let v = v as usize;
+            if v < self.n_fm {
+                let ch = if v < self.n_f {
+                    w.targets[c]
+                } else {
+                    match w.moves[c] {
+                        crate::turn::NO_MOVE => 0,
+                        m => m,
+                    }
+                };
+                k = k.with(v, ch);
+            }
+        }
+        k
+    }
+
+    /// The declaration a pool key stands for.
+    fn key_witness(&self, k: &Key) -> TurnSpec {
+        let mut w = self.wit0;
+        for (c, &v) in self.var_of.iter().enumerate() {
+            let v = v as usize;
+            if v < self.n_f {
+                w.targets[c] = k.get(v);
+            } else if v < self.n_fm {
+                let m = k.get(v);
+                if !(m == 0 && w.moves[c] == crate::turn::NO_MOVE) {
+                    w.moves[c] = m;
+                }
+            }
+        }
+        w
+    }
+
+    fn pool_add(&mut self, k: Key) {
+        if self.pool.len() >= pool_cap() {
+            return;
+        }
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        k.hash(&mut h);
+        if self.pool_seen.insert(h.finish()) {
+            self.pool.push(k);
+        }
     }
 
     fn classify(&self, s: &StepState) -> Kind {
@@ -559,13 +676,66 @@ impl Lattice {
 
     fn prepare_inner(&mut self, n: u32) -> Result<bool> {
         let (var_of, n_fm) = (self.var_of, self.n_fm);
+        use std::sync::atomic::Ordering::Relaxed;
+        self.nodes[n as usize].prepared = true;
+        let xk = self.nodes[n as usize].key;
+        let fm = matches!(
+            self.nodes[n as usize].state.stage,
+            Stage::Fates | Stage::Moves
+        );
+        // What the lattice knows about this node's commitments: a nogood
+        // inside them kills it; one short of them by a single commitment
+        // refutes that choice; a known witness including them certifies it.
+        let mut refuted: Vec<(u8, u8)> = Vec::new();
+        let mut hits: Vec<Key> = Vec::new();
+        if fm {
+            for g in &self.nogoods {
+                let extra = g.mask & !xk.mask;
+                if extra.count_ones() <= 1 && !g.conflicts(&xk) {
+                    if extra == 0 {
+                        WIT_RESOLVE[3].fetch_add(1, Relaxed);
+                        return Ok(false);
+                    }
+                    let v = extra.trailing_zeros() as usize;
+                    refuted.push((v as u8, g.get(v)));
+                }
+            }
+            hits = self
+                .pool
+                .iter()
+                .filter(|w| w.includes(&xk))
+                .copied()
+                .collect();
+        }
+        let pool_wit = hits.first().map(|w| self.key_witness(w));
         let node = &mut self.nodes[n as usize];
-        node.prepared = true;
-        if !node.state.resolve_pending() {
+        let t_res = std::time::Instant::now();
+        let was_pending = !node.state.resolve_pending_is_noop();
+        if was_pending {
+            if let Some(w) = pool_wit {
+                node.state.set_witness(w);
+                WIT_RESOLVE[4].fetch_add(1, Relaxed);
+            }
+        }
+        let was_pending = !node.state.resolve_pending_is_noop();
+        let ok = node.state.resolve_pending();
+        if was_pending {
+            WIT_RESOLVE[usize::from(!ok)].fetch_add(1, Relaxed);
+            WIT_RESOLVE[2].fetch_add(t_res.elapsed().as_nanos() as u64, Relaxed);
+        }
+        if !ok {
             return Ok(false);
         }
+        // The creating parent, when it decides the same stage's variables.
+        let parent = self.nodes[n as usize]
+            .parents
+            .first()
+            .map(|&(p, _)| p)
+            .filter(|&p| self.nodes[p as usize].state.stage == self.nodes[n as usize].state.stage);
+        let node = &self.nodes[n as usize];
         let st = &node.state;
         let mut kids: Vec<(Kid, TurnSpec)> = Vec::new();
+        let mut new_nogoods: Vec<Key> = Vec::new();
         let kid = |var: usize, choice: u8, cell: u8| Kid {
             var: var as u8,
             choice,
@@ -577,10 +747,55 @@ impl Lattice {
         };
         match st.stage {
             Stage::Fates | Stage::Moves => {
+                crate::steps::cand_log::on(true);
+                let mut cls = [[0u64; 2]; crate::steps::cand_log::N];
+                let mut inh = [0u64; 3];
                 for &c in st.undecided() {
-                    let (o, w) = st.with_next(c).lattice_options();
                     let v = var_of[c as usize] as usize;
+                    let oracle = |choice: u8| -> crate::steps::Known {
+                        if refuted.contains(&(v as u8, choice)) {
+                            crate::steps::Known::Refuted
+                        } else if let Some(w) = hits.iter().find(|w| w.get(v) == choice) {
+                            crate::steps::Known::Witness(self.key_witness(w))
+                        } else {
+                            crate::steps::Known::Nothing
+                        }
+                    };
+                    let (o, w) = st.with_next(c).lattice_options_with(&oracle);
+                    let log = crate::steps::cand_log::take();
+                    for &(choice, class, _) in &log {
+                        use crate::steps::cand_log::{EXACT_NO, RELAXED};
+                        if class == RELAXED || class == EXACT_NO {
+                            new_nogoods.push(xk.with(v, choice));
+                        }
+                    }
+                    let pk: Option<&[Kid]> = parent.map(|p| {
+                        let ks = &self.nodes[p as usize].kids;
+                        let a = ks.partition_point(|k| (k.var as usize) < v);
+                        let b = ks.partition_point(|k| (k.var as usize) <= v);
+                        &ks[a..b]
+                    });
+                    for &(choice, class, ns) in &log {
+                        cls[class as usize][0] += 1;
+                        cls[class as usize][1] += u64::from(ns);
+                        if let Some(pk) = pk {
+                            let live = pk.iter().any(|k| k.choice == choice && !k.dead);
+                            if !live {
+                                inh[0] += 1;
+                                inh[1] += u64::from(ns);
+                                inh[2] += u64::from(crate::steps::cand_log::offers(class));
+                            }
+                        }
+                    }
                     kids.extend(o.into_iter().zip(w).map(|(x, w)| (kid(v, x, c), w)));
+                }
+                crate::steps::cand_log::on(false);
+                for (a, b) in WIT_CLASS.iter().zip(cls) {
+                    a[0].fetch_add(b[0], Relaxed);
+                    a[1].fetch_add(b[1], Relaxed);
+                }
+                for (a, b) in WIT_INHERIT.iter().zip(inh) {
+                    a.fetch_add(b, Relaxed);
                 }
             }
             Stage::Spawns => {
@@ -614,7 +829,34 @@ impl Lattice {
         // Not `into_iter().collect()`: that reuses the (Kid, TurnSpec)
         // allocation in place, ~10x the bytes the kids need.
         node.kids = kids.iter().map(|x| x.0).collect();
-        Ok(!node.kids.is_empty())
+        let alive = !node.kids.is_empty();
+        if fm {
+            let cap = nogood_cap();
+            for g in new_nogoods {
+                if self.nogoods.len() < cap {
+                    self.nogoods.push(g);
+                }
+            }
+            // Every verified witness here joins the pool: the node's own, and
+            // its kids' (a kid's is the own one with its choice swapped in,
+            // unless listed as an exception).
+            if pool_cap() > 0 && !crate::steps::witness_is_pending(&own) {
+                let ok = self.witness_key(&own);
+                self.pool_add(ok);
+                for (k, w) in &kids {
+                    if crate::steps::witness_is_pending(w) {
+                        continue;
+                    }
+                    let key = if *w == swapped(&own, stage, k.cell, k.choice) {
+                        ok.set(k.var as usize, k.choice)
+                    } else {
+                        self.witness_key(w)
+                    };
+                    self.pool_add(key);
+                }
+            }
+        }
+        Ok(alive)
     }
 
     /// Make sure node `n` is expanded: `Some(Expand)` if it needs the net,
@@ -737,6 +979,14 @@ impl Lattice {
                 bail!("the lattice's root is a dead end");
             }
             self.stats.dead += 1;
+            let nd = &self.nodes[x as usize];
+            // No completion: every node including these commitments is dead.
+            if nd.kind == Kind::Inner
+                && matches!(nd.state.stage, Stage::Fates | Stage::Moves)
+                && self.nogoods.len() < nogood_cap()
+            {
+                self.nogoods.push(nd.key);
+            }
             self.nodes[x as usize].kind = Kind::Dead;
             for (p, k) in self.nodes[x as usize].parents.clone() {
                 self.drop_kid(p, k as usize, &mut stack);
@@ -1511,6 +1761,67 @@ pub(crate) mod tests {
 
     /// Descents end on full turns, the lazy statistics equal the brute-force
     /// sums, sinks are distinct, and the search spreads over several turns.
+    /// The pool and the nogoods change no answer: every offered kid's
+    /// witness includes the kid's commitments and realizes, and every
+    /// choice the plain checks certify with a witness is still offered.
+    #[test]
+    fn pool_and_nogoods_sound() {
+        let (mut witnesses, mut certified) = (0, 0);
+        for s in positions(8, 3).into_iter().chain(positions(8, 17)) {
+            let mut l = Lattice::new(s).unwrap();
+            if l.terminal.is_some() {
+                continue;
+            }
+            for _ in 0..80 {
+                l.descend(&HashLatticeEval, Cursor::at(0, 0.0), 1.0)
+                    .unwrap();
+            }
+            for nd in &l.nodes {
+                if !nd.prepared
+                    || nd.kind != Kind::Inner
+                    || !matches!(nd.state.stage, Stage::Fates | Stage::Moves)
+                {
+                    continue;
+                }
+                for (i, k) in nd.kids.iter().enumerate() {
+                    let w = nd.kid_witness(i);
+                    if crate::steps::witness_is_pending(&w) {
+                        continue;
+                    }
+                    let kk = nd.key.with(k.var as usize, k.choice);
+                    assert!(
+                        l.witness_key(&w).includes(&kk),
+                        "a witness misses its kid's commitments"
+                    );
+                    assert!(
+                        crate::steps::attack_part(&nd.state.base, &w).is_some(),
+                        "a witness does not realize"
+                    );
+                    witnesses += 1;
+                }
+                for &c in nd.state.undecided() {
+                    let v = l.var_of[c as usize] as usize;
+                    let (o, ws) = nd.state.with_next(c).lattice_options();
+                    for (&x, w) in o.iter().zip(&ws) {
+                        if crate::steps::witness_is_pending(w) {
+                            continue;
+                        }
+                        assert!(
+                            nd.kids.iter().any(|k| k.var as usize == v && k.choice == x),
+                            "a certified choice (var {v}, choice {x}) is not offered"
+                        );
+                        certified += 1;
+                    }
+                }
+            }
+            assert!(l.pool.len() > 1, "the pool stayed empty");
+        }
+        assert!(
+            witnesses > 100 && certified > 100,
+            "{witnesses} witnesses, {certified} certified"
+        );
+    }
+
     #[test]
     fn lattice_descents() {
         let mut spawn_nodes = 0;

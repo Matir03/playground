@@ -763,6 +763,40 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
                     crate::lattice::LIVE[2].load(Relaxed),
                     crate::lattice::LIVE[3].load(Relaxed),
                 );
+                {
+                    use crate::lattice::{WIT_CLASS, WIT_INHERIT, WIT_RESOLVE};
+                    use crate::steps::cand_log::NAMES;
+                    let cls: Vec<(u64, u64)> = WIT_CLASS
+                        .iter()
+                        .map(|x| (x[0].load(Relaxed), x[1].load(Relaxed)))
+                        .collect();
+                    let ns_all: u64 = cls.iter().map(|x| x.1).sum();
+                    let n_all: u64 = cls.iter().map(|x| x.0).sum();
+                    let mut line = String::new();
+                    for (name, (n, ns)) in NAMES.iter().zip(&cls) {
+                        if *n > 0 {
+                            line += &format!(
+                                " {name} {:.0}%/{:.0}%t",
+                                100.0 * *n as f64 / n_all.max(1) as f64,
+                                100.0 * *ns as f64 / ns_all.max(1) as f64
+                            );
+                        }
+                    }
+                    let r: Vec<u64> = WIT_RESOLVE.iter().map(|x| x.load(Relaxed)).collect();
+                    let ih: Vec<u64> = WIT_INHERIT.iter().map(|x| x.load(Relaxed)).collect();
+                    eprintln!(
+                        "    witnesses: {:.0}% of thread time in option checks, {:.0}% in resolutions ({} found, {} dead, {} from the pool; {} nodes refuted by nogoods); candidates (share of count / of check time):{line}; not live at the parent: {:.0}% of candidates, {:.0}% of check time, {} of them offered here",
+                        100.0 * ns_all as f64 / tot,
+                        100.0 * r[2] as f64 / tot,
+                        r[0],
+                        r[1],
+                        r[4],
+                        r[3],
+                        100.0 * ih[0] as f64 / n_all.max(1) as f64,
+                        100.0 * ih[1] as f64 / ns_all.max(1) as f64,
+                        ih[2]
+                    );
+                }
                 let rp: Vec<f64> = crate::lattice_ort::RUN_PROF
                     .iter()
                     .map(|x| x.load(Relaxed) as f64)

@@ -47,6 +47,19 @@ pub enum Stage {
     Terminal,
 }
 
+/// What the lattice already knows about deciding the current variable one
+/// way (see [`StepState::lattice_options_with`]).
+pub(crate) enum Known {
+    Nothing,
+    /// A subset of the decisions with it is infeasible.
+    Refuted,
+    /// A complete declaration extending the decisions with it realizes.
+    Witness(TurnSpec),
+}
+
+/// The lattice's knowledge per choice of the current variable.
+pub(crate) type Oracle<'a> = &'a dyn Fn(u8) -> Known;
+
 /// One turn under construction.
 #[derive(Clone, Debug)]
 pub struct StepState {
@@ -430,6 +443,10 @@ impl StepState {
     }
 
     fn compute_options(&self) -> (Vec<u8>, Vec<TurnSpec>) {
+        self.compute_options_with(None)
+    }
+
+    fn compute_options_with(&self, oracle: Option<Oracle>) -> (Vec<u8>, Vec<TurnSpec>) {
         // A lazily offered option's witness is found here, when the node is
         // first expanded; none means the node is a dead end.
         let resolved;
@@ -446,8 +463,8 @@ impl StepState {
         };
         match self.stage {
             Stage::Terminal => (Vec::new(), Vec::new()),
-            Stage::Fates => self.fate_options(wit),
-            Stage::Moves => self.move_options(wit),
+            Stage::Fates => self.fate_options(wit, oracle),
+            Stage::Moves => self.move_options(wit, oracle),
             Stage::Spawns => {
                 let o = self.spawn_options();
                 let w = vec![*wit; o.len()];
@@ -499,9 +516,26 @@ impl StepState {
         self.compute_options()
     }
 
+    /// [`Self::lattice_options`], asking `oracle` before checking each
+    /// choice that the cheap filters let through.
+    pub(crate) fn lattice_options_with(&self, oracle: Oracle) -> (Vec<u8>, Vec<TurnSpec>) {
+        self.compute_options_with(Some(oracle))
+    }
+
     /// The child deciding the current variable as `v`, certified by `w`.
     pub(crate) fn lattice_child(&self, v: u8, w: TurnSpec) -> StepState {
         self.child_with(v, w)
+    }
+
+    /// Take `w` (a known completion of the decisions so far) as this node's
+    /// witness, in place of a deferred search.
+    pub(crate) fn set_witness(&mut self, w: TurnSpec) {
+        self.witness = w;
+    }
+
+    /// Whether [`Self::resolve_pending`] has nothing to do.
+    pub(crate) fn resolve_pending_is_noop(&self) -> bool {
+        !is_pending(&self.witness)
     }
 
     /// Run the exact search a lazily offered option deferred to this node.
@@ -734,7 +768,7 @@ impl StepState {
 
     // ── Fates ────────────────────────────────────────────────────────────────
 
-    fn fate_options(&self, wit: &TurnSpec) -> (Vec<u8>, Vec<TurnSpec>) {
+    fn fate_options(&self, wit: &TurnSpec, oracle: Option<Oracle>) -> (Vec<u8>, Vec<TurnSpec>) {
         let e = self.enemies[self.idx];
         let (_, t) = self.base.piece_at(e).expect("enemy");
         // The current witness's own fate for `e` is always completable (the
@@ -742,9 +776,24 @@ impl StepState {
         // may kill an undecided enemy to open a path.
         let own = wit.targets[e as usize];
         let (mut out, mut ws) = (vec![own], vec![*wit]);
+        cand_log::add(own, cand_log::OWN, std::time::Instant::now());
         for v in [TARGET_STAY, TARGET_KILL, TARGET_UNSUMMON] {
+            let tc = std::time::Instant::now();
             if v == own || v == TARGET_UNSUMMON && t.stats().persistent {
                 continue;
+            }
+            match oracle.map_or(Known::Nothing, |f| f(v)) {
+                Known::Refuted => {
+                    cand_log::add(v, cand_log::NOGOOD, tc);
+                    continue;
+                }
+                Known::Witness(w) => {
+                    out.push(v);
+                    ws.push(w);
+                    cand_log::add(v, cand_log::POOL, tc);
+                    continue;
+                }
+                Known::Nothing => {}
             }
             let mut spec = self.spec;
             spec.targets[e as usize] = v;
@@ -753,6 +802,7 @@ impl StepState {
             if known_realizable(&self.base, &cand) {
                 out.push(v);
                 ws.push(cand);
+                cand_log::add(v, cand_log::FAST, tc);
                 continue;
             }
             // With the unfated enemies treated as removable the relaxation is
@@ -764,12 +814,14 @@ impl StepState {
                 .iter()
                 .fold(0, |b, &x| b | bit(x));
             if !relaxed_feasible(&self.base, &spec, &[], open) {
+                cand_log::add(v, cand_log::RELAXED, tc);
                 continue; // necessary even with the unfated enemies removable
             }
             if relaxed_feasible(&self.base, &spec, &[], 0) {
                 if let Some(w) = build_witness(&self.base, &spec, &[]) {
                     out.push(v);
                     ws.push(w);
+                    cand_log::add(v, cand_log::BUILT, tc);
                     continue;
                 }
             }
@@ -778,6 +830,7 @@ impl StepState {
             if lazy_witness() && !t.stats().necromancer {
                 out.push(v);
                 ws.push(pending(spec));
+                cand_log::add(v, cand_log::PENDING, tc);
                 continue;
             }
             let fated = self.enemies[..=self.idx].iter().fold(0, |b, &x| b | bit(x));
@@ -787,6 +840,9 @@ impl StepState {
             if let Exact::Found(w, _) = r {
                 out.push(v);
                 ws.push(w);
+                cand_log::add(v, cand_log::EXACT_OK, tc);
+            } else {
+                cand_log::add(v, cand_log::EXACT_NO, tc);
             }
         }
         (out, ws)
@@ -794,7 +850,7 @@ impl StepState {
 
     // ── Moves ────────────────────────────────────────────────────────────────
 
-    fn move_options(&self, wit: &TurnSpec) -> (Vec<u8>, Vec<TurnSpec>) {
+    fn move_options(&self, wit: &TurnSpec, oracle: Option<Oracle>) -> (Vec<u8>, Vec<TurnSpec>) {
         let c = self.friends[self.idx];
         let (_, u) = self.base.piece_at(c).expect("friend");
         let st = u.stats();
@@ -832,6 +888,7 @@ impl StepState {
             k => k,
         };
         for k in 0..N_OFFSETS as u8 {
+            let tc = std::time::Instant::now();
             let d = MOVE_DEST[c as usize][k as usize];
             if d == NO_CELL {
                 continue;
@@ -841,6 +898,7 @@ impl StepState {
             if k == wk {
                 out.push(k);
                 ws.push(*wit);
+                cand_log::add(k, cand_log::OWN, tc);
                 continue;
             }
             if !has(reach, d) {
@@ -848,10 +906,25 @@ impl StepState {
             }
             if k == 0 {
                 if has(self.claimed, c) {
+                    cand_log::add(k, cand_log::CHEAP, tc);
                     continue; // someone is moving onto this unit's origin
                 }
             } else if has(blocked, d) || self.closes_cycle(c, d) {
+                cand_log::add(k, cand_log::CHEAP, tc);
                 continue;
+            }
+            match oracle.map_or(Known::Nothing, |f| f(k)) {
+                Known::Refuted => {
+                    cand_log::add(k, cand_log::NOGOOD, tc);
+                    continue;
+                }
+                Known::Witness(w) => {
+                    out.push(k);
+                    ws.push(w);
+                    cand_log::add(k, cand_log::POOL, tc);
+                    continue;
+                }
+                Known::Nothing => {}
             }
             let mut spec = self.spec;
             spec.moves[c as usize] = k;
@@ -859,6 +932,9 @@ impl StepState {
                 if attack_part(&self.base, &spec).is_some() {
                     out.push(k);
                     ws.push(spec);
+                    cand_log::add(k, cand_log::LAST_OK, tc);
+                } else {
+                    cand_log::add(k, cand_log::LAST_NO, tc);
                 }
                 continue;
             }
@@ -868,6 +944,7 @@ impl StepState {
             if known_realizable(&self.base, &cand) {
                 out.push(k);
                 ws.push(cand);
+                cand_log::add(k, cand_log::FAST, tc);
                 continue;
             }
             let mut dec = decided.clone();
@@ -876,6 +953,7 @@ impl StepState {
             // the relaxation's "undecided enemies stay" is vacuous.
             // (`witness_drop_rate` checks it.)
             if !relaxed_feasible(&self.base, &spec, &dec, 0) {
+                cand_log::add(k, cand_log::RELAXED, tc);
                 continue;
             }
             // Not necessary (it routes evacuating units on vertex-disjoint
@@ -885,12 +963,14 @@ impl StepState {
                 if let Some(w) = build_witness(&self.base, &spec, &dec) {
                     out.push(k);
                     ws.push(w);
+                    cand_log::add(k, cand_log::BUILT, tc);
                     continue;
                 }
             }
             if lazy_witness() {
                 out.push(k);
                 ws.push(pending(spec));
+                cand_log::add(k, cand_log::PENDING, tc);
                 continue;
             }
             let decided_bb = dec.iter().fold(0, |b, &x| b | bit(x));
@@ -901,6 +981,9 @@ impl StepState {
             if let Exact::Found(w, _) = r {
                 out.push(k);
                 ws.push(w);
+                cand_log::add(k, cand_log::EXACT_OK, tc);
+            } else {
+                cand_log::add(k, cand_log::EXACT_NO, tc);
             }
         }
         (out, ws)
@@ -1717,6 +1800,11 @@ fn is_pending(w: &TurnSpec) -> bool {
     w.spawns[0] == PENDING_MARK
 }
 
+/// Whether a witness is a deferred search rather than a declaration.
+pub(crate) fn witness_is_pending(w: &TurnSpec) -> bool {
+    is_pending(w)
+}
+
 /// Per-thread timers for the self-play profile (flushed per move).
 pub mod prof {
     use std::cell::Cell;
@@ -1750,6 +1838,67 @@ pub mod prof {
         for (t, x) in TOTAL.iter().zip(v) {
             t.fetch_add(x, Ordering::Relaxed);
         }
+    }
+}
+
+/// Per-candidate outcomes of the option checks, logged while a lattice
+/// prepares a node (`cand_log::on`), for `lattice.rs`'s cost breakdown.
+pub mod cand_log {
+    use std::cell::{Cell, RefCell};
+
+    /// Rejected by the cheap filters (reach, claims, cycles).
+    pub const CHEAP: u8 = 0;
+    /// The current witness's own choice.
+    pub const OWN: u8 = 1;
+    /// The witness with the choice swapped in realizes (fast realizer / cache).
+    pub const FAST: u8 = 2;
+    /// Rejected by the relaxed bound.
+    pub const RELAXED: u8 = 3;
+    /// Certified by the constructor.
+    pub const BUILT: u8 = 4;
+    /// Offered with the exact search deferred.
+    pub const PENDING: u8 = 5;
+    /// The exact search on the spot: found, or not.
+    pub const EXACT_OK: u8 = 6;
+    pub const EXACT_NO: u8 = 7;
+    /// The stage's last variable: the complete declaration realizes, or not.
+    pub const LAST_OK: u8 = 8;
+    pub const LAST_NO: u8 = 9;
+    /// Certified by a known witness of the lattice (its pool).
+    pub const POOL: u8 = 10;
+    /// Refuted by a known infeasible subset (the lattice's nogoods).
+    pub const NOGOOD: u8 = 11;
+    pub const N: usize = 12;
+    pub const NAMES: [&str; N] = [
+        "cheap", "own", "fast", "relaxed", "built", "pending", "exact+", "exact-", "last+", "last-",
+        "pool", "nogood",
+    ];
+    /// Classes that offer the choice.
+    pub fn offers(c: u8) -> bool {
+        matches!(c, OWN | FAST | BUILT | PENDING | EXACT_OK | LAST_OK | POOL)
+    }
+
+    thread_local! {
+        static ON: Cell<bool> = const { Cell::new(false) };
+        static LOG: RefCell<Vec<(u8, u8, u32)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub fn on(v: bool) {
+        ON.with(|o| o.set(v));
+        LOG.with(|l| l.borrow_mut().clear());
+    }
+
+    #[inline]
+    pub fn add(choice: u8, class: u8, t0: std::time::Instant) {
+        if ON.with(|o| o.get()) {
+            let ns = t0.elapsed().as_nanos().min(u32::MAX as u128) as u32;
+            LOG.with(|l| l.borrow_mut().push((choice, class, ns)));
+        }
+    }
+
+    /// The entries logged since the last take: (choice, class, ns).
+    pub fn take() -> Vec<(u8, u8, u32)> {
+        LOG.with(|l| std::mem::take(&mut *l.borrow_mut()))
     }
 }
 
@@ -3774,8 +3923,8 @@ mod tests {
                                     false_offer += 1;
                                     if false_offer <= 6 {
                                         let (o, ws) = match s.stage {
-                                            Stage::Fates => s.fate_options(&s.witness),
-                                            _ => s.move_options(&s.witness),
+                                            Stage::Fates => s.fate_options(&s.witness, None),
+                                            _ => s.move_options(&s.witness, None),
                                         };
                                         let w = ws[o.iter().position(|&x| x == v).unwrap()];
                                         let mut sp = w;
