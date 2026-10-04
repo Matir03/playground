@@ -62,6 +62,8 @@ pub struct GenConfig {
     pub games: usize,
     /// Tier-1 visits per turn.
     pub n1: u32,
+    /// Tier-1 visits in flight per search.
+    pub inflight1: usize,
     pub t1: T1Params,
     pub walk: WalkParams,
     /// The next turn: tempered root visits plus Dirichlet noise.
@@ -94,9 +96,21 @@ pub struct GenCounters {
 }
 
 enum Task {
-    Opening { lat: Lattice, at: u32, left: u32 },
-    Search { t1: Tier1, left: u32, vis: Visit },
-    Walk { lat: Lattice, walk: Walk },
+    Opening {
+        lat: Lattice,
+        at: u32,
+        left: u32,
+    },
+    /// `started` of `n1` visits begun; `vis` those in flight.
+    Search {
+        t1: Tier1,
+        started: u32,
+        vis: Vec<Visit>,
+    },
+    Walk {
+        lat: Lattice,
+        walk: Walk,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -110,7 +124,9 @@ enum Req {
 }
 
 enum Next {
-    Wait(Req),
+    /// Requests to evaluate this round (possibly none: everything in flight
+    /// waits on requests already queued).
+    Wait(Vec<Req>),
     /// The task is finished; run these instead.
     Replace(Vec<Task>),
 }
@@ -322,11 +338,10 @@ impl Worker<'_> {
     fn search(&self, s: StepState, lat: Option<Lattice>) -> Task {
         let mut t1 = Tier1::new(s, self.cfg.t1.clone());
         t1.nodes[0].lattice = lat;
-        let vis = t1.visit();
         Task::Search {
             t1,
-            left: self.cfg.n1,
-            vis,
+            started: 0,
+            vis: Vec::new(),
         }
     }
 
@@ -354,7 +369,7 @@ impl Worker<'_> {
                     Kind::Dead => *at = 0,
                     Kind::Inner => {
                         if let Some(Need::Expand(e)) = lat.ensure_expanded(n)? {
-                            return Ok(Next::Wait(Req::Expand { t1: NONE, n: e }));
+                            return Ok(Next::Wait(vec![Req::Expand { t1: NONE, n: e }]));
                         }
                         let nd = &lat.nodes[n as usize];
                         if nd.kind != Kind::Inner {
@@ -373,39 +388,62 @@ impl Worker<'_> {
                     }
                 }
             },
-            Task::Search { t1, left, vis } => loop {
-                if *left == 0 || t1.nodes[0].terminal.is_some() {
-                    return self.finish_turn(t1);
-                }
-                match t1.advance(vis)? {
-                    Need1::Expand { t, n } => return Ok(Next::Wait(Req::Expand { t1: t, n })),
-                    Need1::SinkValue { t, n } => return Ok(Next::Wait(Req::T1Value { t1: t, n })),
-                    Need1::NodeValue { t } => {
-                        return Ok(Next::Wait(Req::T1Value { t1: t, n: NONE }))
+            Task::Search { t1, started, vis } => {
+                // Visits that already handed in a request wait on it (the
+                // node is busy) when advanced again, so passes repeat until
+                // none finishes and every request is collected once.
+                let mut reqs = Vec::new();
+                loop {
+                    if t1.nodes[0].terminal.is_some() || (*started >= self.cfg.n1 && vis.is_empty())
+                    {
+                        return self.finish_turn(t1);
                     }
-                    Need1::Done => {
-                        *left -= 1;
-                        *vis = t1.visit();
+                    while *started < self.cfg.n1 && vis.len() < self.cfg.inflight1.max(1) {
+                        vis.push(t1.visit());
+                        *started += 1;
                     }
-                }
-            },
-            Task::Walk { lat, walk } => {
-                match lat.advance_walk(walk, &self.cfg.walk, &mut self.rng)? {
-                    Some(Need::Expand(n)) => Ok(Next::Wait(Req::Expand { t1: NONE, n })),
-                    Some(Need::Value(n)) => Ok(Next::Wait(Req::LatValue { n })),
-                    Some(Need::Done { .. } | Need::Dead) => {
-                        unreachable!("walks consume their descents")
-                    }
-                    None => {
-                        for r in &walk.records {
-                            encode_t2(&lat.start, r, &mut self.t2w)?;
+                    let mut progressed = false;
+                    let mut i = 0;
+                    while i < vis.len() {
+                        match t1.advance(&mut vis[i])? {
+                            Need1::Expand { t, n } => reqs.push(Req::Expand { t1: t, n }),
+                            Need1::SinkValue { t, n } => reqs.push(Req::T1Value { t1: t, n }),
+                            Need1::NodeValue { t } => reqs.push(Req::T1Value { t1: t, n: NONE }),
+                            Need1::Wait => {}
+                            Need1::Done => {
+                                vis.swap_remove(i);
+                                progressed = true;
+                                continue;
+                            }
                         }
-                        self.c
-                            .t2_records
-                            .fetch_add(walk.records.len() as u64, Relaxed);
-                        Ok(Next::Replace(Vec::new()))
+                        i += 1;
+                    }
+                    if !progressed {
+                        return Ok(Next::Wait(reqs));
                     }
                 }
+            }
+            Task::Walk { lat, walk } => {
+                let mut needs = Vec::new();
+                if !lat.advance_walk(walk, &self.cfg.walk, &mut self.rng, &mut needs)? {
+                    return Ok(Next::Wait(
+                        needs
+                            .into_iter()
+                            .map(|n| match n {
+                                Need::Expand(n) => Req::Expand { t1: NONE, n },
+                                Need::Value(n) => Req::LatValue { n },
+                                _ => unreachable!("walks only hand out requests"),
+                            })
+                            .collect(),
+                    ));
+                }
+                for r in &walk.records {
+                    encode_t2(&lat.start, r, &mut self.t2w)?;
+                }
+                self.c
+                    .t2_records
+                    .fetch_add(walk.records.len() as u64, Relaxed);
+                Ok(Next::Replace(Vec::new()))
             }
         }
     }
@@ -472,7 +510,7 @@ impl Worker<'_> {
             while i < tasks.len() {
                 match self.advance(&mut tasks[i])? {
                     Next::Wait(r) => {
-                        reqs.push((i, r));
+                        reqs.extend(r.into_iter().map(|r| (i, r)));
                         i += 1;
                     }
                     Next::Replace(v) => {

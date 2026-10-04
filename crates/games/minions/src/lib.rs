@@ -20,6 +20,7 @@ pub mod game;
 pub mod genpos;
 pub mod latgen;
 pub mod lattice;
+pub mod lattice_ort;
 pub mod map;
 pub mod net;
 pub mod net_seat;

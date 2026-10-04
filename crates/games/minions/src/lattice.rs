@@ -177,6 +177,10 @@ pub struct LNode {
     pub kind: Kind,
     pub prepared: bool,
     pub expanded: bool,
+    /// A net request for this node (expansion or sink value) is in flight.
+    pub busy: bool,
+    /// Listed in the lattice's touched nodes.
+    ever: bool,
     /// Sorted by `(var, choice)`.
     pub kids: Vec<Kid>,
     /// The kids whose witness is not this node's own with the kid's choice
@@ -228,6 +232,8 @@ impl LNode {
             kind,
             prepared: false,
             expanded: false,
+            busy: false,
+            ever: false,
             kids: Vec::new(),
             wit_ex: Vec::new(),
             kid_n: 0,
@@ -263,6 +269,8 @@ pub struct Cursor {
     pub at: u32,
     pub path: Vec<(u32, u16)>,
     pub lp: f64,
+    /// The node holding this descent's virtual loss (`NONE`: none yet).
+    vl: u32,
 }
 
 impl Cursor {
@@ -271,6 +279,7 @@ impl Cursor {
             at: node,
             path: Vec::new(),
             lp,
+            vl: NONE,
         }
     }
 }
@@ -284,6 +293,9 @@ pub enum Need {
     Done { sink: u32, value: f32, fresh: bool },
     /// The node the descent started at turned out to be a dead end.
     Dead,
+    /// Another descent's request for this node is in flight: try again
+    /// after it is fed.
+    Wait,
 }
 
 /// Children statistics at a node, from [`Lattice::stats`].
@@ -599,7 +611,11 @@ impl Lattice {
 
     pub fn feed_expand(&mut self, n: u32, out: &ExpandOut) {
         let node = &mut self.nodes[n as usize];
-        debug_assert!(node.prepared && !node.expanded);
+        node.busy = false;
+        if node.expanded || node.kind != Kind::Inner {
+            return;
+        }
+        debug_assert!(node.prepared);
         debug_assert_eq!(out.logits.len(), node.kids.len());
         // Log-softmax within each variable's offered choices.
         let mut i = 0;
@@ -636,12 +652,17 @@ impl Lattice {
     pub fn feed_value(&mut self, n: u32, v: f32) {
         let s = &self.nodes[n as usize].state;
         let v = for_root(&self.start, s, v);
-        self.nodes[n as usize].value = Some(v);
+        let node = &mut self.nodes[n as usize];
+        node.busy = false;
+        if node.value.is_none() {
+            node.value = Some(v);
+        }
     }
 
     fn visit(&mut self, n: u32, v: f32) {
         let node = &mut self.nodes[n as usize];
-        if node.n == 0 {
+        if !node.ever {
+            node.ever = true;
             self.touched.push(n);
         }
         node.n += 1;
@@ -815,10 +836,16 @@ impl Lattice {
     pub fn advance(&mut self, cur: &mut Cursor, c_puct: f32) -> Result<Need> {
         for _ in 0..1_000_000 {
             let n = cur.at;
+            // Virtual loss: a pending zero-value visit where the descent is,
+            // which counts against every node below it as well.
+            if cur.vl != n {
+                self.move_vl(cur, n);
+            }
             let node = &self.nodes[n as usize];
             match node.kind {
                 Kind::Dead => {
                     let Some((p, k)) = cur.path.pop() else {
+                        self.move_vl(cur, NONE);
                         return Ok(Need::Dead);
                     };
                     cur.lp -= f64::from(self.nodes[p as usize].kids[k as usize].logp);
@@ -826,8 +853,13 @@ impl Lattice {
                 }
                 Kind::Sink => {
                     let Some(v) = node.value else {
+                        if node.busy {
+                            return Ok(Need::Wait);
+                        }
+                        self.nodes[n as usize].busy = true;
                         return Ok(Need::Value(n));
                     };
+                    self.move_vl(cur, NONE);
                     self.visit(n, v);
                     let node = &mut self.nodes[n as usize];
                     let fresh = node.lp_n == 0;
@@ -841,7 +873,11 @@ impl Lattice {
                     });
                 }
                 Kind::Inner if !node.expanded => {
+                    if node.busy {
+                        return Ok(Need::Wait);
+                    }
                     if node.prepared || self.prepare(n)? {
+                        self.nodes[n as usize].busy = true;
                         return Ok(Need::Expand(n));
                     }
                     self.kill(n)?;
@@ -858,6 +894,22 @@ impl Lattice {
             }
         }
         bail!("lattice descent made no progress in 1e6 steps")
+    }
+
+    /// Move `cur`'s virtual loss to node `to` (`NONE`: drop it).
+    fn move_vl(&mut self, cur: &mut Cursor, to: u32) {
+        if cur.vl != NONE {
+            self.nodes[cur.vl as usize].n -= 1;
+        }
+        if to != NONE {
+            let node = &mut self.nodes[to as usize];
+            if !node.ever {
+                node.ever = true;
+                self.touched.push(to);
+            }
+            node.n += 1;
+        }
+        cur.vl = to;
     }
 
     /// One whole descent from `cur`, calling `eval` for every expansion and
@@ -886,6 +938,7 @@ impl Lattice {
                 }
                 Need::Done { sink, value, fresh } => return Ok((sink, value, fresh)),
                 Need::Dead => bail!("descent started at a dead node"),
+                Need::Wait => bail!("a lone descent waited on itself"),
             }
         }
     }
@@ -1038,6 +1091,8 @@ pub struct WalkParams {
     pub temp: f64,
     pub dir_alpha: f64,
     pub dir_frac: f64,
+    /// Descents in flight at a time.
+    pub inflight: usize,
 }
 
 impl Default for WalkParams {
@@ -1048,6 +1103,7 @@ impl Default for WalkParams {
             temp: 1.0,
             dir_alpha: 0.3,
             dir_frac: 0.25,
+            inflight: 1,
         }
     }
 }
@@ -1059,19 +1115,21 @@ impl Default for WalkParams {
 pub struct Walk {
     pub at: u32,
     lp: f64,
-    left: u32,
-    cur: Option<Cursor>,
+    started: u32,
+    finished: u32,
+    curs: Vec<Cursor>,
     pub records: Vec<T2Record>,
     pub done: bool,
 }
 
 impl Walk {
-    pub fn new(p: &WalkParams) -> Self {
+    pub fn new(_p: &WalkParams) -> Self {
         Walk {
             at: 0,
             lp: 0.0,
-            left: p.n2,
-            cur: None,
+            started: 0,
+            finished: 0,
+            curs: Vec::new(),
             records: Vec::new(),
             done: false,
         }
@@ -1079,33 +1137,54 @@ impl Walk {
 }
 
 impl Lattice {
-    /// Run walk `w` until it needs the net (`Some`) or ends (`None`).
+    /// Run walk `w` until every descent in flight (up to `p.inflight` at a
+    /// time) waits on the net; their requests go to `out`. True once the walk
+    /// is over.
     pub fn advance_walk(
         &mut self,
         w: &mut Walk,
         p: &WalkParams,
         rng: &mut impl rand::Rng,
-    ) -> Result<Option<Need>> {
+        out: &mut Vec<Need>,
+    ) -> Result<bool> {
         loop {
             if w.done {
-                return Ok(None);
+                return Ok(true);
             }
             if self.nodes[w.at as usize].kind != Kind::Inner {
                 w.done = true;
-                return Ok(None);
+                return Ok(true);
             }
-            if w.left > 0 {
-                let cur = w.cur.get_or_insert_with(|| Cursor::at(w.at, w.lp));
-                match self.advance(cur, p.c2)? {
-                    Need::Done { .. } => {
-                        w.cur = None;
-                        w.left -= 1;
+            if w.finished < p.n2 {
+                while w.started < p.n2 && w.curs.len() < p.inflight.max(1) {
+                    w.curs.push(Cursor::at(w.at, w.lp));
+                    w.started += 1;
+                }
+                let mut progressed = false;
+                let mut i = 0;
+                while i < w.curs.len() {
+                    match self.advance(&mut w.curs[i], p.c2)? {
+                        Need::Done { .. } => {
+                            w.curs.swap_remove(i);
+                            w.finished += 1;
+                            progressed = true;
+                        }
+                        Need::Dead => {
+                            for mut c in std::mem::take(&mut w.curs) {
+                                self.move_vl(&mut c, NONE);
+                            }
+                            w.done = true;
+                            return Ok(true);
+                        }
+                        Need::Wait => i += 1,
+                        need => {
+                            out.push(need);
+                            i += 1;
+                        }
                     }
-                    Need::Dead => {
-                        w.done = true;
-                        return Ok(None);
-                    }
-                    need => return Ok(Some(need)),
+                }
+                if !progressed {
+                    return Ok(false);
                 }
                 continue;
             }
@@ -1134,7 +1213,8 @@ impl Lattice {
             let k = idx[noisy_pick(&wts, p.temp, p.dir_alpha, p.dir_frac, rng)];
             w.lp += f64::from(nd.kids[k].logp);
             w.at = self.child(at, k)?;
-            w.left = p.n2;
+            w.started = 0;
+            w.finished = 0;
         }
     }
 }
@@ -1416,43 +1496,55 @@ pub(crate) mod tests {
     #[test]
     fn walk_locks_down_to_a_turn() {
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(9);
-        let p = WalkParams::default();
-        for s in positions(5, 21) {
-            let mut l = Lattice::new(s).unwrap();
-            if l.terminal.is_some() {
-                continue;
-            }
-            for _ in 0..10 {
-                l.descend(&HashLatticeEval, Cursor::at(0, 0.0), 1.5)
-                    .unwrap();
-            }
-            let mut w = Walk::new(&p);
-            while let Some(need) = l.advance_walk(&mut w, &p, &mut rng).unwrap() {
-                match need {
-                    Need::Expand(n) => {
-                        let (slots, node) = l.request(n);
-                        let req = ExpandReq {
-                            root: &l.start,
-                            node,
-                            slots: &slots,
-                        };
-                        let out = HashLatticeEval.expand(&[req]).unwrap().pop().unwrap();
-                        l.feed_expand(n, &out);
-                    }
-                    Need::Value(n) => {
-                        let v = HashLatticeEval
-                            .value(&[&l.nodes[n as usize].state])
-                            .unwrap()[0];
-                        l.feed_value(n, v);
-                    }
-                    Need::Done { .. } | Need::Dead => unreachable!(),
+        for inflight in [1, 4] {
+            let p = WalkParams {
+                inflight,
+                ..WalkParams::default()
+            };
+            for s in positions(5, 21) {
+                let mut l = Lattice::new(s).unwrap();
+                if l.terminal.is_some() {
+                    continue;
                 }
-            }
-            assert_eq!(l.nodes[w.at as usize].kind, Kind::Sink);
-            assert!(!w.records.is_empty());
-            for r in &w.records {
-                assert!(r.kids.iter().all(|k| k.2 >= 1.0));
-                assert!(r.n >= p.n2 as f32);
+                for _ in 0..10 {
+                    l.descend(&HashLatticeEval, Cursor::at(0, 0.0), 1.5)
+                        .unwrap();
+                }
+                let mut w = Walk::new(&p);
+                let mut needs = Vec::new();
+                while !l.advance_walk(&mut w, &p, &mut rng, &mut needs).unwrap() {
+                    for need in needs.drain(..) {
+                        match need {
+                            Need::Expand(n) => {
+                                let (slots, node) = l.request(n);
+                                let req = ExpandReq {
+                                    root: &l.start,
+                                    node,
+                                    slots: &slots,
+                                };
+                                let out = HashLatticeEval.expand(&[req]).unwrap().pop().unwrap();
+                                l.feed_expand(n, &out);
+                            }
+                            Need::Value(n) => {
+                                let v = HashLatticeEval
+                                    .value(&[&l.nodes[n as usize].state])
+                                    .unwrap()[0];
+                                l.feed_value(n, v);
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                assert_eq!(l.nodes[w.at as usize].kind, Kind::Sink);
+                assert!(!w.records.is_empty());
+                for r in &w.records {
+                    assert!(r.kids.iter().all(|k| k.2 >= 1.0));
+                    assert!(r.n >= p.n2 as f32);
+                }
+                // No virtual loss left behind.
+                let direct: u32 = l.nodes.iter().map(|n| n.n).sum();
+                let real = l.stats.expansions as u32 + l.stats.descents as u32;
+                assert_eq!(direct, real, "virtual visits left over");
             }
         }
     }

@@ -55,6 +55,8 @@ pub struct T1Node {
     pub w: f64,
     pub children: Vec<u32>,
     pub widen_done: bool,
+    /// Widenings in flight.
+    widening: u32,
 }
 
 impl T1Node {
@@ -94,6 +96,8 @@ pub enum Need1 {
     NodeValue {
         t: u32,
     },
+    /// Waiting on another visit's request in flight.
+    Wait,
     Done,
 }
 
@@ -101,6 +105,8 @@ pub struct Tier1 {
     pub nodes: Vec<T1Node>,
     pub params: T1Params,
     pub stats: T1Stats,
+    /// The root's value request is in flight.
+    root_pending: bool,
 }
 
 impl Tier1 {
@@ -118,9 +124,11 @@ impl Tier1 {
                 w: 0.0,
                 children: Vec::new(),
                 widen_done: false,
+                widening: 0,
             }],
             params,
             stats: T1Stats::default(),
+            root_pending: false,
         }
     }
 
@@ -136,6 +144,7 @@ impl Tier1 {
     }
 
     pub fn feed_node_value(&mut self, t: u32, v: f32) {
+        self.root_pending = false;
         let nd = &mut self.nodes[t as usize];
         nd.n += 1;
         nd.w += f64::from(v);
@@ -206,7 +215,26 @@ impl Tier1 {
         let nd = &self.nodes[t as usize];
         let p = &self.params;
         let k = (f64::from(p.pw_c) * f64::from(nd.n.max(1)).powf(f64::from(p.pw_alpha))).ceil();
-        !nd.widen_done && (nd.children.len() as f64) < k
+        !nd.widen_done && ((nd.children.len() + nd.widening as usize) as f64) < k
+    }
+
+    /// Visits in flight weigh on their path: each node below the root
+    /// counts a pending visit worth a win to its own mover (a loss to the
+    /// parent choosing it).
+    fn virtual_loss(&mut self, t: u32, sign: f64) {
+        let nd = &mut self.nodes[t as usize];
+        if sign > 0.0 {
+            nd.n += 1;
+        } else {
+            nd.n -= 1;
+        }
+        nd.w += sign;
+    }
+
+    fn end_visit(&mut self, vis: &Visit) {
+        for &t in &vis.path[1..] {
+            self.virtual_loss(t, -1.0);
+        }
     }
 
     /// A new child of `t` for its lattice's sink `sink`, worth `value` to
@@ -226,12 +254,15 @@ impl Tier1 {
             w: f64::from(v),
             children: Vec::new(),
             widen_done: false,
+            widening: 0,
         });
         self.nodes[t as usize].children.push(id);
         id
     }
 
-    /// Run visit `vis` until it needs the net or is done.
+    /// Run visit `vis` until it needs the net, waits on another visit's
+    /// request, or is done. Visits may run concurrently (virtual loss keeps
+    /// them apart).
     pub fn advance(&mut self, vis: &mut Visit) -> Result<Need1> {
         if self.nodes[0].lattice.is_none() {
             let l = Lattice::new(self.nodes[0].state.clone())?;
@@ -244,6 +275,10 @@ impl Tier1 {
             root.lattice = Some(l);
         }
         if self.nodes[0].n == 0 {
+            if self.root_pending {
+                return Ok(Need1::Wait);
+            }
+            self.root_pending = true;
             return Ok(Need1::NodeValue { t: 0 });
         }
         loop {
@@ -254,12 +289,15 @@ impl Tier1 {
                 match l.advance(cur, c2)? {
                     Need::Expand(n) => return Ok(Need1::Expand { t: wt, n }),
                     Need::Value(n) => return Ok(Need1::SinkValue { t: wt, n }),
+                    Need::Wait => return Ok(Need1::Wait),
                     Need::Dead => bail!("tier-1 node {wt}'s lattice root is a dead end"),
                     Need::Done { sink, value, fresh } => {
                         self.stats.t2_descents += 1;
                         if fresh {
                             vis.widen = None;
+                            self.nodes[wt as usize].widening -= 1;
                             self.add_child(wt, sink, value);
+                            self.end_visit(vis);
                             let p = vis.path.clone();
                             self.backup(&p, f64::from(value));
                             self.stats.visits += 1;
@@ -272,14 +310,19 @@ impl Tier1 {
                             continue;
                         }
                         vis.widen = None;
-                        self.nodes[wt as usize].widen_done = true;
-                        self.stats.widen_dropped += 1;
+                        let nd = &mut self.nodes[wt as usize];
+                        nd.widening -= 1;
+                        if !nd.widen_done {
+                            nd.widen_done = true;
+                            self.stats.widen_dropped += 1;
+                        }
                     }
                 }
             }
             let t = *vis.path.last().expect("path");
             let nd = &self.nodes[t as usize];
             if let Some(v) = nd.terminal {
+                self.end_visit(vis);
                 let p = vis.path.clone();
                 self.backup(&p, f64::from(v));
                 self.stats.visits += 1;
@@ -296,11 +339,17 @@ impl Tier1 {
             }
             if self.wants_widen(t) {
                 self.stats.widenings += 1;
+                self.nodes[t as usize].widening += 1;
                 vis.widen = Some((t, Cursor::at(0, 0.0), 0));
                 continue;
             }
             match self.select(t) {
-                Some(c) => vis.path.push(c),
+                Some(c) => {
+                    self.virtual_loss(c, 1.0);
+                    vis.path.push(c);
+                }
+                // Its first turns are still being found by other visits.
+                None if self.nodes[t as usize].widening > 0 => return Ok(Need1::Wait),
                 None => bail!("tier-1 node {t} has no children and stopped widening"),
             }
         }
@@ -332,6 +381,7 @@ impl Tier1 {
                         self.feed_node_value(t, v);
                     }
                     Need1::Done => break,
+                    Need1::Wait => bail!("a lone visit waited on itself"),
                 }
             }
             if self.nodes[0].terminal.is_some() {
@@ -385,8 +435,91 @@ mod tests {
                 assert!(st.is_terminal() || st.flipped != p.state.flipped);
             }
         }
+        assert!(t.nodes.iter().all(|n| n.widening == 0));
         let pri = t.priors(0);
         assert!((pri.iter().sum::<f64>() - 1.0).abs() < 1e-9);
         eprintln!("{:?} root q {:.3}", t.stats, t.root_value());
+    }
+
+    /// Several visits in flight, fed in rounds: the same invariants hold,
+    /// and every virtual loss and widening count is gone at the end.
+    #[test]
+    fn tier1_inflight() {
+        let s = StepState::begin(&MinionsState::with_bid(0), 9);
+        let mut t = Tier1::new(s, T1Params::default());
+        let (total, k) = (160u32, 8usize);
+        let mut started = 0;
+        let mut vis: Vec<Visit> = Vec::new();
+        let mut rounds = 0;
+        loop {
+            while started < total && vis.len() < k {
+                vis.push(t.visit());
+                started += 1;
+            }
+            if vis.is_empty() {
+                break;
+            }
+            rounds += 1;
+            let mut needs = Vec::new();
+            let mut i = 0;
+            while i < vis.len() {
+                match t.advance(&mut vis[i]).unwrap() {
+                    Need1::Done => {
+                        vis.swap_remove(i);
+                        continue;
+                    }
+                    Need1::Wait => {}
+                    n => needs.push(n),
+                }
+                i += 1;
+            }
+            for n in needs {
+                match n {
+                    Need1::Expand { t: tt, n } => {
+                        let l = t.lattice(tt);
+                        let (slots, node) = l.request(n);
+                        let req = ExpandReq {
+                            root: &l.start,
+                            node,
+                            slots: &slots,
+                        };
+                        let out = HashLatticeEval.expand(&[req]).unwrap().pop().unwrap();
+                        t.feed_expand(tt, n, &out);
+                    }
+                    Need1::SinkValue { t: tt, n } => {
+                        let v = HashLatticeEval
+                            .value(&[&t.lattice(tt).nodes[n as usize].state])
+                            .unwrap()[0];
+                        t.feed_sink_value(tt, n, v);
+                    }
+                    Need1::NodeValue { t: tt } => {
+                        let v = HashLatticeEval
+                            .value(&[&t.nodes[tt as usize].state])
+                            .unwrap()[0];
+                        t.feed_node_value(tt, v);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        assert_eq!(t.stats.visits, u64::from(total));
+        assert_eq!(t.nodes[0].n, total + 1);
+        for (i, nd) in t.nodes.iter().enumerate() {
+            assert_eq!(nd.widening, 0, "node {i}");
+            if nd.terminal.is_none() {
+                let kids: u32 = nd.children.iter().map(|&c| t.nodes[c as usize].n).sum();
+                assert_eq!(nd.n, 1 + kids, "node {i}");
+            }
+            assert!((0.0..=1.0).contains(&nd.q()), "node {i} q {}", nd.q());
+            if let Some(l) = nd.lattice.as_ref() {
+                let direct: u32 = l.nodes.iter().map(|n| n.n).sum();
+                assert_eq!(
+                    direct as u64,
+                    l.stats.expansions + l.stats.descents,
+                    "node {i}: virtual visits left"
+                );
+            }
+        }
+        eprintln!("{rounds} rounds for {total} visits, {:?}", t.stats);
     }
 }

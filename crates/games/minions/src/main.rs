@@ -733,6 +733,9 @@ enum Cmd {
         games: usize,
         #[arg(long, default_value_t = 400)]
         n1: u32,
+        /// Tier-1 visits and tier-2 walk descents in flight per game.
+        #[arg(long, default_value_t = 8)]
+        inflight: usize,
         #[arg(long, default_value_t = 20)]
         n2: u32,
         #[arg(long, default_value_t = 1.5)]
@@ -770,6 +773,11 @@ enum Cmd {
         /// deferring the exact search to the child's expansion.
         #[arg(long)]
         no_lazy_witness: bool,
+        /// For a `lattice.onnx` net: execution provider and sessions.
+        #[arg(long, default_value = "cuda")]
+        lattice_ep: String,
+        #[arg(long, default_value_t = 4)]
+        lattice_sessions: usize,
         #[arg(long, default_value_t = 20000)]
         chunk_records: usize,
     },
@@ -1479,18 +1487,26 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::LatticeGen {
-            out, onnx, ep, batcher, workers, games, n1, n2, c1, c2, pw_c, pw_alpha, retries,
+            out, onnx, ep, batcher, workers, games, n1, inflight, n2, c1, c2, pw_c, pw_alpha, retries,
             temp1, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, secs,
-            target_t2, seed, chunk_records, no_lazy_witness,
+            target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions,
         } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
-            let eval = load_step_eval_runners(&onnx, &ep, batcher)?;
-            let bridge = std::sync::Arc::new(minions_engine::lattice::StepsBridge { eval });
+            // `lattice.onnx` is the lattice nets; anything else a steps value net behind the bridge.
+            let bridge: std::sync::Arc<dyn minions_engine::lattice::LatticeEval> = if onnx.ends_with("lattice.onnx") {
+                let p = std::path::Path::new(&onnx);
+                let cache = p.with_extension("trt_cache").to_string_lossy().into_owned();
+                std::sync::Arc::new(minions_engine::lattice_ort::OrtLatticeEval::load(p, &lattice_ep, true, &cache, lattice_sessions)?)
+            } else {
+                let eval = load_step_eval_runners(&onnx, &ep, batcher)?;
+                std::sync::Arc::new(minions_engine::lattice::StepsBridge { eval })
+            };
             let cfg = minions_engine::latgen::GenConfig {
                 out: out.into(),
                 workers,
                 games,
                 n1,
+                inflight1: inflight,
                 t1: minions_engine::tier1::T1Params { c_puct: c1, pw_c, pw_alpha, retries, c2 },
                 walk: minions_engine::lattice::WalkParams {
                     n2,
@@ -1498,6 +1514,7 @@ async fn main() -> anyhow::Result<()> {
                     temp: temp2,
                     dir_alpha: dir2_alpha,
                     dir_frac: dir2_frac,
+                    inflight,
                 },
                 temp1,
                 dir1_alpha,
