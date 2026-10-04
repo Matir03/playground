@@ -73,6 +73,9 @@ pub struct GenConfig {
     /// Games start `MAX_TURNS - G` turns in, G geometric on 1, 2, ... with
     /// this mean (the opening is played ply by ply from the net's values).
     pub from_end_mean: f64,
+    /// If positive, G's median instead (overrides the mean): turn
+    /// `MAX_TURNS - median` is the median start.
+    pub from_end_median: f64,
     pub secs: f64,
     /// Stop after this many tier-2 records (0 = no limit).
     pub target_t2: u64,
@@ -81,6 +84,9 @@ pub struct GenConfig {
     /// Also record every non-root tier-1 node with at least this many
     /// visits as a tier-1 value target (0 = the root only).
     pub t1_min_visits: u32,
+    /// Groups of games per worker taking turns, so that the worker advances
+    /// one group while another's net call is in flight (1 = no overlap).
+    pub pipeline: usize,
 }
 
 #[derive(Default)]
@@ -322,7 +328,12 @@ impl Worker<'_> {
         self.c.games.fetch_add(1, Relaxed);
         let salt: u64 = self.rng.gen();
         let s = StepState::begin(&crate::game::MinionsState::with_bid(self.bid), salt);
-        let p = 1.0 / self.cfg.from_end_mean.max(1.0);
+        // P(G <= g) = 1 - (1 - p)^g: a median of m needs (1 - p)^m = 1/2.
+        let p = if self.cfg.from_end_median > 0.0 {
+            1.0 - 0.5f64.powf(1.0 / self.cfg.from_end_median.max(1.0))
+        } else {
+            1.0 / self.cfg.from_end_mean.max(1.0)
+        };
         let mut g = 1u32;
         while g < 1000 && self.rng.gen::<f64>() >= p {
             g += 1;
@@ -525,114 +536,162 @@ impl Worker<'_> {
     }
 
     fn run(&mut self, eval: &dyn LatticeEval, stop: &AtomicBool) -> Result<()> {
-        let mut tasks: Vec<Task> = Vec::new();
-        for _ in 0..self.cfg.games {
-            tasks.push(self.new_game()?);
+        // The games in groups that take turns: while one group's net call is
+        // in flight, the worker advances the next group.
+        let n = self.cfg.pipeline.max(1);
+        let mut groups: Vec<Group> = (0..n).map(|_| Group::default()).collect();
+        for i in 0..self.cfg.games {
+            groups[i % n].tasks.push(self.new_game()?);
         }
+        let mut g = 0;
         while !stop.load(Relaxed) {
-            let t0 = Instant::now();
-            let mut reqs: Vec<(usize, Req)> = Vec::with_capacity(tasks.len());
-            let mut i = 0;
-            while i < tasks.len() {
-                match self.advance(&mut tasks[i])? {
-                    Next::Wait(r) => {
-                        reqs.extend(r.into_iter().map(|r| (i, r)));
-                        i += 1;
-                    }
-                    Next::Replace(v) => {
-                        // Queued requests are all for tasks before `i`; the
-                        // one moved into `i` and the new ones come next.
-                        tasks.swap_remove(i);
-                        tasks.extend(v);
-                    }
-                }
+            let grp = &mut groups[g];
+            if let Some(f) = grp.inflight.take() {
+                self.feed(&mut grp.tasks, f)?;
             }
-            // Expansions and values, each one batched call.
-            let mut slots: Vec<Vec<(u8, u8)>> = Vec::new();
-            let mut ex_idx = Vec::new();
-            let mut val_idx = Vec::new();
-            for (k, &(ti, r)) in reqs.iter().enumerate() {
-                match r {
-                    Req::Expand { t1, n } => {
-                        let l = lat_of(&tasks[ti], t1);
-                        slots.push(l.request(n).0);
-                        ex_idx.push(k);
-                    }
-                    _ => val_idx.push(k),
-                }
+            grp.inflight = Some(self.submit_round(&mut grp.tasks, eval)?);
+            g = (g + 1) % n;
+        }
+        for grp in &mut groups {
+            if let Some(f) = grp.inflight.take() {
+                f.pending.wait()?;
             }
-            let mut ex_reqs = Vec::with_capacity(ex_idx.len());
-            for (j, &k) in ex_idx.iter().enumerate() {
-                let (ti, Req::Expand { t1, n }) = reqs[k] else {
-                    unreachable!()
-                };
-                let l = lat_of(&tasks[ti], t1);
-                ex_reqs.push(ExpandReq {
-                    root: &l.start,
-                    node: &l.nodes[n as usize].state,
-                    slots: &slots[j],
-                    trunk: l.trunk.clone(),
-                });
-            }
-            let mut states: Vec<&StepState> = Vec::with_capacity(val_idx.len());
-            for &k in &val_idx {
-                let (ti, r) = reqs[k];
-                let s = match (r, &tasks[ti]) {
-                    (Req::T1Value { t1, n }, Task::Search { t1: s, .. }) => {
-                        if n == NONE {
-                            &s.nodes[t1 as usize].state
-                        } else {
-                            &s.lattice(t1).nodes[n as usize].state
-                        }
-                    }
-                    (Req::LatValue { n }, Task::Walk { lat, .. }) => &lat.nodes[n as usize].state,
-                    _ => unreachable!("request and task disagree"),
-                };
-                states.push(s);
-            }
-            let t1 = Instant::now();
-            let (outs, vals) = eval.both(&ex_reqs, &states)?;
-            let t2 = Instant::now();
-            let kids: usize = slots.iter().map(|s| s.len()).sum();
-            drop(ex_reqs);
-            drop(states);
-            for (j, &k) in ex_idx.iter().enumerate() {
-                let (ti, Req::Expand { t1, n }) = reqs[k] else {
-                    unreachable!()
-                };
-                match &mut tasks[ti] {
-                    Task::Search { t1: s, .. } => s.feed_expand(t1, n, &outs[j]),
-                    Task::Opening { lat, .. } | Task::Walk { lat, .. } => {
-                        lat.feed_expand(n, &outs[j])
-                    }
-                }
-            }
-            for (j, &k) in val_idx.iter().enumerate() {
-                let (ti, r) = reqs[k];
-                match (r, &mut tasks[ti]) {
-                    (Req::T1Value { t1, n }, Task::Search { t1: s, .. }) => {
-                        if n == NONE {
-                            s.feed_node_value(t1, &vals[j]);
-                        } else {
-                            s.feed_sink_value(t1, n, &vals[j]);
-                        }
-                    }
-                    (Req::LatValue { n }, Task::Walk { lat, .. }) => lat.feed_value(n, &vals[j]),
-                    _ => unreachable!(),
-                }
-            }
-            let c = self.c;
-            c.rounds.fetch_add(1, Relaxed);
-            c.expansions.fetch_add(ex_idx.len() as u64, Relaxed);
-            c.kids.fetch_add(kids as u64, Relaxed);
-            c.values.fetch_add(val_idx.len() as u64, Relaxed);
-            c.eval_ns.fetch_add((t2 - t1).as_nanos() as u64, Relaxed);
-            c.cpu_ns
-                .fetch_add(((t1 - t0) + t2.elapsed()).as_nanos() as u64, Relaxed);
         }
         self.t1w.flush()?;
         self.t2w.flush()
     }
+
+    /// Advance `tasks` until each waits on the net, and submit their
+    /// requests as one call.
+    fn submit_round(&mut self, tasks: &mut Vec<Task>, eval: &dyn LatticeEval) -> Result<InFlight> {
+        let t0 = Instant::now();
+        let mut reqs: Vec<(usize, Req)> = Vec::with_capacity(tasks.len());
+        let mut i = 0;
+        while i < tasks.len() {
+            match self.advance(&mut tasks[i])? {
+                Next::Wait(r) => {
+                    reqs.extend(r.into_iter().map(|r| (i, r)));
+                    i += 1;
+                }
+                Next::Replace(v) => {
+                    // Queued requests are all for tasks before `i`; the
+                    // one moved into `i` and the new ones come next.
+                    tasks.swap_remove(i);
+                    tasks.extend(v);
+                }
+            }
+        }
+        // Expansions and values, one call.
+        let mut slots: Vec<Vec<(u8, u8)>> = Vec::new();
+        let mut ex_idx = Vec::new();
+        let mut val_idx = Vec::new();
+        for (k, &(ti, r)) in reqs.iter().enumerate() {
+            match r {
+                Req::Expand { t1, n } => {
+                    let l = lat_of(&tasks[ti], t1);
+                    slots.push(l.request(n).0);
+                    ex_idx.push(k);
+                }
+                _ => val_idx.push(k),
+            }
+        }
+        let mut ex_reqs = Vec::with_capacity(ex_idx.len());
+        for (j, &k) in ex_idx.iter().enumerate() {
+            let (ti, Req::Expand { t1, n }) = reqs[k] else {
+                unreachable!()
+            };
+            let l = lat_of(&tasks[ti], t1);
+            ex_reqs.push(ExpandReq {
+                root: &l.start,
+                node: &l.nodes[n as usize].state,
+                slots: &slots[j],
+                trunk: l.trunk.clone(),
+            });
+        }
+        let mut states: Vec<&StepState> = Vec::with_capacity(val_idx.len());
+        for &k in &val_idx {
+            let (ti, r) = reqs[k];
+            let s = match (r, &tasks[ti]) {
+                (Req::T1Value { t1, n }, Task::Search { t1: s, .. }) => {
+                    if n == NONE {
+                        &s.nodes[t1 as usize].state
+                    } else {
+                        &s.lattice(t1).nodes[n as usize].state
+                    }
+                }
+                (Req::LatValue { n }, Task::Walk { lat, .. }) => &lat.nodes[n as usize].state,
+                _ => unreachable!("request and task disagree"),
+            };
+            states.push(s);
+        }
+        let pending = eval.submit(&ex_reqs, &states)?;
+        let kids = slots.iter().map(|s| s.len()).sum();
+        self.c
+            .cpu_ns
+            .fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+        Ok(InFlight {
+            pending,
+            reqs,
+            ex_idx,
+            val_idx,
+            kids,
+        })
+    }
+
+    /// Wait for a submitted call and hand its results to the tasks.
+    fn feed(&mut self, tasks: &mut [Task], f: InFlight) -> Result<()> {
+        let t1 = Instant::now();
+        let (outs, vals) = f.pending.wait()?;
+        let t2 = Instant::now();
+        let reqs = &f.reqs;
+        for (j, &k) in f.ex_idx.iter().enumerate() {
+            let (ti, Req::Expand { t1, n }) = reqs[k] else {
+                unreachable!()
+            };
+            match &mut tasks[ti] {
+                Task::Search { t1: s, .. } => s.feed_expand(t1, n, &outs[j]),
+                Task::Opening { lat, .. } | Task::Walk { lat, .. } => lat.feed_expand(n, &outs[j]),
+            }
+        }
+        for (j, &k) in f.val_idx.iter().enumerate() {
+            let (ti, r) = reqs[k];
+            match (r, &mut tasks[ti]) {
+                (Req::T1Value { t1, n }, Task::Search { t1: s, .. }) => {
+                    if n == NONE {
+                        s.feed_node_value(t1, &vals[j]);
+                    } else {
+                        s.feed_sink_value(t1, n, &vals[j]);
+                    }
+                }
+                (Req::LatValue { n }, Task::Walk { lat, .. }) => lat.feed_value(n, &vals[j]),
+                _ => unreachable!(),
+            }
+        }
+        let c = self.c;
+        c.rounds.fetch_add(1, Relaxed);
+        c.expansions.fetch_add(f.ex_idx.len() as u64, Relaxed);
+        c.kids.fetch_add(f.kids as u64, Relaxed);
+        c.values.fetch_add(f.val_idx.len() as u64, Relaxed);
+        c.eval_ns.fetch_add((t2 - t1).as_nanos() as u64, Relaxed);
+        c.cpu_ns.fetch_add(t2.elapsed().as_nanos() as u64, Relaxed);
+        Ok(())
+    }
+}
+
+/// A worker's share of games that submit their net calls together.
+#[derive(Default)]
+struct Group {
+    tasks: Vec<Task>,
+    inflight: Option<InFlight>,
+}
+
+/// A submitted round: the call, and which task asked for each result.
+struct InFlight {
+    pending: crate::lattice::Pending,
+    reqs: Vec<(usize, Req)>,
+    ex_idx: Vec<usize>,
+    val_idx: Vec<usize>,
+    kids: usize,
 }
 
 /// The bid at which the tier-1 values rate the opening even (as
@@ -803,10 +862,12 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
                     .collect();
                 if rp[1] > 0.0 {
                     eprintln!(
-                        "    lattice runner (of wall): merge {:.0}% run {:.0}% (tier 1 {:.0}%) split {:.0}%; {:.0} calls/s, {:.0} rows/call, {:.2} ms/call",
+                        "    lattice runner (of wall): merge {:.0}% run {:.0}% (tier 1 {:.0}%, tier-2 inputs {:.0}%, tier-2 session {:.0}%) split {:.0}%; {:.0} calls/s, {:.0} rows/call, {:.2} ms/call",
                         100.0 * rp[0] / (el * 1e9),
                         100.0 * rp[1] / (el * 1e9),
                         100.0 * rp[3] / (el * 1e9),
+                        100.0 * rp[6] / (el * 1e9),
+                        100.0 * rp[7] / (el * 1e9),
                         100.0 * rp[2] / (el * 1e9),
                         rp[4] / el,
                         rp[5] / rp[4].max(1.0),

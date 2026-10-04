@@ -23,7 +23,7 @@ use half::f16;
 use ort::session::Session;
 
 use crate::latgen::t2_view;
-use crate::lattice::{ExpandOut, ExpandReq, LatticeEval, Trunk, ValueOut};
+use crate::lattice::{ExpandOut, ExpandReq, LatticeEval, Pending, Trunk, ValueOut};
 use crate::steps::{StepState, View, MAX_ACTIVE, N_SCALARS, SPARSE_DIM};
 
 pub const SLOTS: usize = 37;
@@ -36,8 +36,9 @@ const CELLS: usize = crate::map::NUM_CELLS;
 
 /// Runner profile (ns, of all runners): merging rows, inside the two
 /// `Session::run`s, splitting the outputs; the tier-1 part of the runs;
-/// calls; rows.
-pub static RUN_PROF: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// calls; rows; the tier-2 inputs' assembly (kid indices, trunks) and
+/// the tier-2 `Session::run` alone.
+pub static RUN_PROF: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 fn push_view(v: &View, idx: &mut Vec<i32>, scal: &mut Vec<f32>) {
     let mut act = Vec::with_capacity(MAX_ACTIVE);
@@ -158,6 +159,7 @@ fn run_batch(s1: &mut Session, s2: &mut Session, c: usize, b: Batch) -> Result<O
     RUN_PROF[3].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
     let n2 = b.kids.len();
     if n2 > 0 {
+        let t_prep = std::time::Instant::now();
         // Children flattened over the batch: row * 49*37 + cell * 37 + slot.
         let per_row = (CELLS * SLOTS) as i32;
         let kid: Vec<i32> = b
@@ -181,6 +183,8 @@ fn run_batch(s1: &mut Session, s2: &mut Session, c: usize, b: Batch) -> Result<O
             }
         }
         let (n, a, sc) = (n2 as i64, MAX_ACTIVE as i64, N_SCALARS as i64);
+        RUN_PROF[6].fetch_add(t_prep.elapsed().as_nanos() as u64, Relaxed);
+        let t_run = std::time::Instant::now();
         let outs = s2
             .run(ort::inputs![
                 "h" => Tensor::from_array((vec![n, c as i64, 7, 7], h)).map_err(e)?,
@@ -189,6 +193,7 @@ fn run_batch(s1: &mut Session, s2: &mut Session, c: usize, b: Batch) -> Result<O
                 "kid" => Tensor::from_array((vec![t as i64], kid)).map_err(e)?,
             ])
             .map_err(e)?;
+        RUN_PROF[7].fetch_add(t_run.elapsed().as_nanos() as u64, Relaxed);
         let get = |name: &str| -> Result<Vec<f32>> {
             let (_, v) = outs[name].try_extract_tensor::<f32>().map_err(e)?;
             Ok(v.to_vec())
@@ -355,15 +360,15 @@ impl OrtLatticeEval {
         Ok(OrtLatticeEval { queue, runners: hs })
     }
 
-    fn run(&self, batch: Batch) -> Result<Outs> {
+    /// Queue `batch` for a runner; its results arrive on the receiver.
+    fn enqueue(&self, batch: Batch) -> std::sync::mpsc::Receiver<Result<Outs>> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         {
             let mut g = self.queue.q.lock().unwrap_or_else(|p| p.into_inner());
             g.push_back(Job { batch, tx });
         }
         self.queue.cv.notify_all();
-        rx.recv()
-            .map_err(|_| anyhow::anyhow!("lattice runner gone"))?
+        rx
     }
 }
 
@@ -373,6 +378,10 @@ impl LatticeEval for OrtLatticeEval {
         reqs: &[ExpandReq],
         states: &[&StepState],
     ) -> Result<(Vec<ExpandOut>, Vec<ValueOut>)> {
+        self.submit(reqs, states)?.wait()
+    }
+
+    fn submit(&self, reqs: &[ExpandReq], states: &[&StepState]) -> Result<Pending> {
         let mut b = Batch::default();
         // Tier-1 rows: the values asked for, then each turn start an
         // expansion needs a trunk for (once per turn start).
@@ -412,14 +421,34 @@ impl LatticeEval for OrtLatticeEval {
                     .collect(),
             );
         }
-        let o = if b.rows() == 0 {
-            Outs::default()
-        } else {
-            self.run(b)?
-        };
+        let rx = (b.rows() > 0).then(|| self.enqueue(b));
+        let n_reqs = reqs.len();
+        let terminal: Vec<f32> = states.iter().map(|s| s.terminal_value()).collect();
+        Ok(Pending::new(move || {
+            let o = match rx {
+                Some(rx) => rx
+                    .recv()
+                    .map_err(|_| anyhow::anyhow!("lattice runner gone"))??,
+                None => Outs::default(),
+            };
+            Ok(unpack(o, n_reqs, &computed, &terminal, &live))
+        }))
+    }
+}
+
+/// A call's outputs as per-request results.
+fn unpack(
+    o: Outs,
+    n_reqs: usize,
+    computed: &[Option<usize>],
+    terminal: &[f32],
+    live: &[usize],
+) -> (Vec<ExpandOut>, Vec<ValueOut>) {
+    {
+        let reqs_len = n_reqs;
         let mut lg = o.logit.into_iter();
         let mut va = o.value.into_iter();
-        let out = (0..reqs.len())
+        let out = (0..reqs_len)
             .map(|i| ExpandOut {
                 logits: lg.next().expect("row"),
                 values: va.next().expect("row"),
@@ -427,12 +456,9 @@ impl LatticeEval for OrtLatticeEval {
                 trunk: computed[i].map(|r| o.h[r].clone()),
             })
             .collect();
-        let mut vals: Vec<ValueOut> = states
+        let mut vals: Vec<ValueOut> = terminal
             .iter()
-            .map(|s| ValueOut {
-                v: s.terminal_value(),
-                trunk: None,
-            })
+            .map(|&v| ValueOut { v, trunk: None })
             .collect();
         for (j, &i) in live.iter().enumerate() {
             vals[i] = ValueOut {
@@ -440,7 +466,7 @@ impl LatticeEval for OrtLatticeEval {
                 trunk: Some(o.h[j].clone()),
             };
         }
-        Ok((out, vals))
+        (out, vals)
     }
 }
 

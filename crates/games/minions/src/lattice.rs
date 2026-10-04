@@ -190,6 +190,26 @@ pub struct ExpandOut {
     pub trunk: Option<Trunk>,
 }
 
+/// The results of a submitted net call, to collect later.
+pub struct Pending(Box<dyn FnOnce() -> Result<(Vec<ExpandOut>, Vec<ValueOut>)> + Send>);
+
+impl Pending {
+    pub fn ready(r: Result<(Vec<ExpandOut>, Vec<ValueOut>)>) -> Self {
+        Pending(Box::new(move || r))
+    }
+
+    pub fn new(
+        f: impl FnOnce() -> Result<(Vec<ExpandOut>, Vec<ValueOut>)> + Send + 'static,
+    ) -> Self {
+        Pending(Box::new(f))
+    }
+
+    /// Block until the results are in.
+    pub fn wait(self) -> Result<(Vec<ExpandOut>, Vec<ValueOut>)> {
+        (self.0)()
+    }
+}
+
 pub trait LatticeEval: Send + Sync {
     /// Expansions and tier-1 values in one go (one net call where the
     /// evaluator can).
@@ -198,6 +218,13 @@ pub trait LatticeEval: Send + Sync {
         reqs: &[ExpandReq],
         states: &[&StepState],
     ) -> Result<(Vec<ExpandOut>, Vec<ValueOut>)>;
+
+    /// [`Self::both`] without waiting: the requests are read now, and the
+    /// caller collects the results with [`Pending::wait`] (synchronous unless
+    /// the evaluator overrides it).
+    fn submit(&self, reqs: &[ExpandReq], states: &[&StepState]) -> Result<Pending> {
+        Ok(Pending::ready(self.both(reqs, states)))
+    }
 
     fn expand(&self, reqs: &[ExpandReq]) -> Result<Vec<ExpandOut>> {
         Ok(self.both(reqs, &[])?.0)
