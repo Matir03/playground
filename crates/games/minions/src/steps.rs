@@ -456,6 +456,83 @@ impl StepState {
         }
     }
 
+    // ── Lattice hooks (`lattice.rs`) ────────────────────────────────────────
+    //
+    // The lattice decides the current stage's variables in any order: the
+    // decided ones are always the prefix `[..idx]` of the stage's list, and
+    // every feasibility check reads the decided set, not the order.
+
+    /// The current stage's undecided variables (cells).
+    pub(crate) fn undecided(&self) -> &[u8] {
+        match self.stage {
+            Stage::Fates => &self.enemies[self.idx..],
+            Stage::Moves => &self.friends[self.idx..],
+            Stage::Spawns => &self.spawn_cells[self.idx..],
+            Stage::Terminal => &[],
+        }
+    }
+
+    /// This state with undecided variable `h` moved to the current slot, so
+    /// that [`Self::lattice_options`] and [`Self::lattice_child`] decide it.
+    pub(crate) fn with_next(&self, h: u8) -> StepState {
+        let mut s = self.bare_clone();
+        let i = s.idx;
+        let list = match s.stage {
+            Stage::Fates => &mut s.enemies,
+            Stage::Moves => &mut s.friends,
+            Stage::Spawns => &mut s.spawn_cells,
+            Stage::Terminal => return s,
+        };
+        if let Some(j) = list[i..].iter().position(|&x| x == h) {
+            list.swap(i, i + j);
+        }
+        s
+    }
+
+    /// The current variable's options and their witnesses (uncached).
+    pub(crate) fn lattice_options(&self) -> (Vec<u8>, Vec<TurnSpec>) {
+        self.compute_options()
+    }
+
+    /// The child deciding the current variable as `v`, certified by `w`.
+    pub(crate) fn lattice_child(&self, v: u8, w: TurnSpec) -> StepState {
+        self.child_with(v, w)
+    }
+
+    /// Run the exact search a lazily offered option deferred to this node.
+    /// False: the decisions so far cannot be completed (a dead end).
+    pub(crate) fn resolve_pending(&mut self) -> bool {
+        if !is_pending(&self.witness) {
+            return true;
+        }
+        match self.resolve_witness() {
+            Some(w) => {
+                self.witness = w;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn bare_clone(&self) -> StepState {
+        StepState {
+            base: self.base.clone(),
+            flipped: self.flipped,
+            spec: self.spec,
+            done: self.done,
+            enemies: self.enemies.clone(),
+            friends: self.friends.clone(),
+            spawn_cells: self.spawn_cells.clone(),
+            stage: self.stage,
+            idx: self.idx,
+            claimed: self.claimed,
+            post: self.post.clone(),
+            salt: self.salt,
+            opts: None,
+            witness: self.witness,
+        }
+    }
+
     /// The exact search for this node's decisions so far (the query its
     /// parent deferred under [`LAZY_WITNESS`]).
     fn resolve_witness(&self) -> Option<TurnSpec> {
