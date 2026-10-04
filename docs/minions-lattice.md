@@ -230,6 +230,7 @@ Throughput (search only, `--from-end-mean 1000`, 16 workers x 8 games):
 | lattice.onnx, direct sessions | 8 | 45-54k | 2.2-4 | 12 GB |
 | lattice.onnx, merging queue | 8 | 108k | 8.7 | 8.9 GB |
 | lattice.onnx, merging queue, dynamic batching (1024 rows / 1.5 ms) | 32 | 153k | 12.3 | 8.8 GB |
+| tier1.onnx + tier2.onnx, cached trunk, flat kid index | 32 | 110-150k | 12.6 | 9.1 GB |
 
 Where the time goes now:
 - The single runner is ~85-90% busy inside `Session::run`. Per-call host
@@ -246,11 +247,17 @@ the StepState is 880 B, and each child takes 16 B. A
 `Vec<(Kid, TurnSpec)>::into_iter().collect()` once kept ~10x the children's
 bytes (in-place collect reuses the allocation).
 
-Next, by expected payoff:
-1. Cache the tier-1 trunk per turn start and export tier 1 / tier 2 as two
-   graphs. Tier-2 rows recompute the 4-block trunk today, ~60% of their
-   GPU work.
-2. Cut per-node CPU: incremental children from the parent's options, a
-   cheaper stats scan, and shrinking the per-node StepState.
-3. Then the learner loop: tier-1 value from t1 records (the steps learner
-   reads them as is), tier-2 from t2, and a cycle.
+Two graphs (tier1.onnx: board → value + f16 trunk image; tier2.onnx: trunk
++ partial-commit channels + a flat kid index `row*1813 + cell*37 + slot`)
+with the trunk cached per lattice root were roughly neutral: tier 1 is 21%
+of runner time, and the 3.1 KB/row fp16 trunk upload costs about what the
+recomputation saved. The runner is still ~85% inside `Session::run` at
+~110 calls/s, ~1460 rows/call, 7.4 ms/call. The bottleneck is per-row host
+and transfer overhead, not GPU compute (GPU 16-40% busy).
+
+Untried: int16 indices, a narrower trunk slice for tier 2, cheaper
+per-node CPU (incremental children, a cheaper stats scan, a smaller
+per-node StepState).
+
+Throughput is good enough to train on (~12 turns/s, ~220 tier-2 records/s);
+the next step is the cycle from random init.

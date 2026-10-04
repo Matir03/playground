@@ -14,7 +14,7 @@
 
 use anyhow::{bail, Result};
 
-use crate::lattice::{Cursor, ExpandReq, Lattice, LatticeEval, Need, NONE};
+use crate::lattice::{Cursor, ExpandReq, Lattice, LatticeEval, Need, ValueOut, NONE};
 use crate::steps::StepState;
 
 #[derive(Clone, Debug)]
@@ -57,6 +57,9 @@ pub struct T1Node {
     pub widen_done: bool,
     /// Widenings in flight.
     widening: u32,
+    /// The trunk image of this turn start (from its sink's value), handed
+    /// to its lattice when that is made.
+    trunk: Option<crate::lattice::Trunk>,
 }
 
 impl T1Node {
@@ -125,6 +128,7 @@ impl Tier1 {
                 children: Vec::new(),
                 widen_done: false,
                 widening: 0,
+                trunk: None,
             }],
             params,
             stats: T1Stats::default(),
@@ -143,19 +147,24 @@ impl Tier1 {
         }
     }
 
-    pub fn feed_node_value(&mut self, t: u32, v: f32) {
+    pub fn feed_node_value(&mut self, t: u32, out: &ValueOut) {
         self.root_pending = false;
         let nd = &mut self.nodes[t as usize];
         nd.n += 1;
-        nd.w += f64::from(v);
+        nd.w += f64::from(out.v);
+        if let Some(l) = nd.lattice.as_mut() {
+            if l.trunk.is_none() {
+                l.trunk.clone_from(&out.trunk);
+            }
+        }
     }
 
     pub fn feed_expand(&mut self, t: u32, n: u32, out: &crate::lattice::ExpandOut) {
         self.lattice_mut(t).feed_expand(n, out);
     }
 
-    pub fn feed_sink_value(&mut self, t: u32, n: u32, v: f32) {
-        self.lattice_mut(t).feed_value(n, v);
+    pub fn feed_sink_value(&mut self, t: u32, n: u32, out: &ValueOut) {
+        self.lattice_mut(t).feed_value(n, out);
     }
 
     pub fn lattice(&self, t: u32) -> &Lattice {
@@ -255,6 +264,7 @@ impl Tier1 {
             children: Vec::new(),
             widen_done: false,
             widening: 0,
+            trunk: sn.trunk.clone(),
         });
         self.nodes[t as usize].children.push(id);
         id
@@ -329,12 +339,13 @@ impl Tier1 {
                 return Ok(Need1::Done);
             }
             if nd.lattice.is_none() {
-                let l = Lattice::new(nd.state.clone())?;
+                let mut l = Lattice::new(nd.state.clone())?;
                 if l.terminal.is_some() {
                     // The parent's lattice scores such turns itself, so a
                     // child is never a necromancer kill it missed.
                     bail!("tier-1 node {t} turned out terminal");
                 }
+                l.trunk = self.nodes[t as usize].trunk.take();
                 self.nodes[t as usize].lattice = Some(l);
             }
             if self.wants_widen(t) {
@@ -368,17 +379,18 @@ impl Tier1 {
                             root: &l.start,
                             node,
                             slots: &slots,
+                            trunk: l.trunk.clone(),
                         };
                         let out = eval.expand(&[req])?.pop().expect("one output");
                         self.feed_expand(t, n, &out);
                     }
                     Need1::SinkValue { t, n } => {
-                        let v = eval.value(&[&self.lattice(t).nodes[n as usize].state])?[0];
-                        self.feed_sink_value(t, n, v);
+                        let o = eval.value1(&self.lattice(t).nodes[n as usize].state)?;
+                        self.feed_sink_value(t, n, &o);
                     }
                     Need1::NodeValue { t } => {
-                        let v = eval.value(&[&self.nodes[t as usize].state])?[0];
-                        self.feed_node_value(t, v);
+                        let o = eval.value1(&self.nodes[t as usize].state)?;
+                        self.feed_node_value(t, &o);
                     }
                     Need1::Done => break,
                     Need1::Wait => bail!("a lone visit waited on itself"),
@@ -482,21 +494,20 @@ mod tests {
                             root: &l.start,
                             node,
                             slots: &slots,
+                            trunk: None,
                         };
                         let out = HashLatticeEval.expand(&[req]).unwrap().pop().unwrap();
                         t.feed_expand(tt, n, &out);
                     }
                     Need1::SinkValue { t: tt, n } => {
-                        let v = HashLatticeEval
-                            .value(&[&t.lattice(tt).nodes[n as usize].state])
-                            .unwrap()[0];
-                        t.feed_sink_value(tt, n, v);
+                        let o = HashLatticeEval
+                            .value1(&t.lattice(tt).nodes[n as usize].state)
+                            .unwrap();
+                        t.feed_sink_value(tt, n, &o);
                     }
                     Need1::NodeValue { t: tt } => {
-                        let v = HashLatticeEval
-                            .value(&[&t.nodes[tt as usize].state])
-                            .unwrap()[0];
-                        t.feed_node_value(tt, v);
+                        let o = HashLatticeEval.value1(&t.nodes[tt as usize].state).unwrap();
+                        t.feed_node_value(tt, &o);
                     }
                     _ => unreachable!(),
                 }

@@ -719,7 +719,8 @@ enum Cmd {
     LatticeGen {
         #[arg(long)]
         out: String,
-        /// Bootstrap evaluator: a steps-mode value net (`value_sparse.onnx`).
+        /// A lattice net directory (tier1.onnx, tier2.onnx, lattice.json), or
+        /// a steps-mode value net (`value_sparse.onnx`) behind the bridge.
         #[arg(long)]
         onnx: String,
         #[arg(long, default_value = "trt")]
@@ -773,11 +774,11 @@ enum Cmd {
         /// deferring the exact search to the child's expansion.
         #[arg(long)]
         no_lazy_witness: bool,
-        /// For a `lattice.onnx` net: execution provider and sessions (the
-        /// CUDA EP computes this graph wrongly for some shapes; use trt).
+        /// For lattice nets: execution provider and runners (the CUDA EP
+        /// computed the one-graph export wrongly for some shapes; use trt).
         #[arg(long, default_value = "trt")]
         lattice_ep: String,
-        #[arg(long, default_value_t = 4)]
+        #[arg(long, default_value_t = 1)]
         lattice_sessions: usize,
         #[arg(long, default_value_t = 20000)]
         chunk_records: usize,
@@ -1493,11 +1494,9 @@ async fn main() -> anyhow::Result<()> {
             target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions,
         } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
-            // `lattice.onnx` is the lattice nets; anything else a steps value net behind the bridge.
-            let bridge: std::sync::Arc<dyn minions_engine::lattice::LatticeEval> = if onnx.ends_with("lattice.onnx") {
-                let p = std::path::Path::new(&onnx);
-                let cache = p.with_extension("trt_cache").to_string_lossy().into_owned();
-                std::sync::Arc::new(minions_engine::lattice_ort::OrtLatticeEval::load(p, &lattice_ep, true, &cache, lattice_sessions)?)
+            // A directory is the lattice nets (tier1/tier2.onnx); a file a steps value net behind the bridge.
+            let bridge: std::sync::Arc<dyn minions_engine::lattice::LatticeEval> = if std::path::Path::new(&onnx).is_dir() {
+                std::sync::Arc::new(minions_engine::lattice_ort::OrtLatticeEval::load(std::path::Path::new(&onnx), &lattice_ep, true, lattice_sessions)?)
             } else {
                 let eval = load_step_eval_runners(&onnx, &ep, batcher)?;
                 std::sync::Arc::new(minions_engine::lattice::StepsBridge { eval })

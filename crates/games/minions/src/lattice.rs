@@ -114,6 +114,20 @@ pub struct ExpandReq<'a> {
     pub root: &'a StepState,
     pub node: &'a StepState,
     pub slots: &'a [(u8, u8)],
+    /// The turn start's tier-1 trunk image if known (else the evaluator
+    /// computes it and returns it in [`ExpandOut::trunk`]).
+    pub trunk: Option<Trunk>,
+}
+
+/// A turn start's tier-1 trunk image (fp16, C x 7 x 7), computed once per
+/// turn start and reused by every tier-2 call in its lattice.
+pub type Trunk = std::sync::Arc<[half::f16]>;
+
+/// A tier-1 value for the state's mover, and the trunk image it came with.
+#[derive(Clone)]
+pub struct ValueOut {
+    pub v: f32,
+    pub trunk: Option<Trunk>,
 }
 
 /// Per child (parallel to the request's slots) a prior logit and a value,
@@ -122,29 +136,31 @@ pub struct ExpandOut {
     pub logits: Vec<f32>,
     pub values: Vec<f32>,
     pub value: f32,
+    /// The turn start's trunk image, when the request had none.
+    pub trunk: Option<Trunk>,
 }
 
 pub trait LatticeEval: Send + Sync {
-    fn expand(&self, reqs: &[ExpandReq]) -> Result<Vec<ExpandOut>>;
-    /// Tier-1 values of turn starts, each for its own mover.
-    fn value(&self, states: &[&StepState]) -> Result<Vec<f32>>;
-    /// Both kinds at once (one net call where the evaluator can).
+    /// Expansions and tier-1 values in one go (one net call where the
+    /// evaluator can).
     fn both(
         &self,
         reqs: &[ExpandReq],
         states: &[&StepState],
-    ) -> Result<(Vec<ExpandOut>, Vec<f32>)> {
-        let e = if reqs.is_empty() {
-            Vec::new()
-        } else {
-            self.expand(reqs)?
-        };
-        let v = if states.is_empty() {
-            Vec::new()
-        } else {
-            self.value(states)?
-        };
-        Ok((e, v))
+    ) -> Result<(Vec<ExpandOut>, Vec<ValueOut>)>;
+
+    fn expand(&self, reqs: &[ExpandReq]) -> Result<Vec<ExpandOut>> {
+        Ok(self.both(reqs, &[])?.0)
+    }
+
+    /// Tier-1 values of turn starts, each for its own mover.
+    fn value(&self, states: &[&StepState]) -> Result<Vec<f32>> {
+        Ok(self.both(&[], states)?.1.into_iter().map(|o| o.v).collect())
+    }
+
+    /// One tier-1 value with its trunk.
+    fn value1(&self, s: &StepState) -> Result<ValueOut> {
+        Ok(self.both(&[], &[s])?.1.pop().expect("one value"))
     }
 }
 
@@ -200,6 +216,8 @@ pub struct LNode {
     pub lp_sum: f64,
     pub lp_n: u32,
     parents: Vec<(u32, u16)>,
+    /// A sink's trunk image (from its tier-1 value), for its own lattice.
+    pub trunk: Option<Trunk>,
 }
 
 /// `own` with the choice `v` for the variable on `cell` swapped in: the
@@ -245,6 +263,7 @@ impl LNode {
             lp_sum: 0.0,
             lp_n: 0,
             parents: Vec::new(),
+            trunk: None,
         }
     }
 
@@ -320,6 +339,8 @@ pub struct Lattice {
     /// this value and has no lattice.
     pub terminal: Option<f32>,
     pub stats: LatticeStats,
+    /// The turn start's tier-1 trunk image, once known.
+    pub trunk: Option<Trunk>,
 }
 
 thread_local! {
@@ -404,6 +425,7 @@ impl Lattice {
             n_fm: 0,
             terminal: None,
             stats: LatticeStats::default(),
+            trunk: None,
         };
         if start.is_terminal() {
             l.terminal = Some(start.terminal_value());
@@ -620,6 +642,9 @@ impl Lattice {
     }
 
     pub fn feed_expand(&mut self, n: u32, out: &ExpandOut) {
+        if self.trunk.is_none() {
+            self.trunk.clone_from(&out.trunk);
+        }
         let node = &mut self.nodes[n as usize];
         node.busy = false;
         if node.expanded || node.kind != Kind::Inner {
@@ -658,8 +683,10 @@ impl Lattice {
         self.visit(n, out.value);
     }
 
-    /// Record sink `n`'s value (`v` for the sink's own mover).
-    pub fn feed_value(&mut self, n: u32, v: f32) {
+    /// Record sink `n`'s value (`v` for the sink's own mover) and trunk.
+    pub fn feed_value(&mut self, n: u32, out: &ValueOut) {
+        let v = out.v;
+        self.nodes[n as usize].trunk.clone_from(&out.trunk);
         let s = &self.nodes[n as usize].state;
         let v = for_root(&self.start, s, v);
         let node = &mut self.nodes[n as usize];
@@ -946,13 +973,18 @@ impl Lattice {
                         root: &self.start,
                         node,
                         slots: &slots,
+                        trunk: self.trunk.clone(),
                     };
                     let out = eval.expand(&[req])?.pop().expect("one output");
                     self.feed_expand(n, &out);
                 }
                 Need::Value(n) => {
-                    let v = eval.value(&[&self.nodes[n as usize].state])?[0];
-                    self.feed_value(n, v);
+                    let o = eval
+                        .both(&[], &[&self.nodes[n as usize].state])?
+                        .1
+                        .pop()
+                        .expect("one value");
+                    self.feed_value(n, &o);
                 }
                 Need::Done { sink, value, fresh } => return Ok((sink, value, fresh)),
                 Need::Dead => bail!("descent started at a dead node"),
@@ -977,19 +1009,11 @@ pub struct StepsBridge {
 }
 
 impl LatticeEval for StepsBridge {
-    fn expand(&self, reqs: &[ExpandReq]) -> Result<Vec<ExpandOut>> {
-        Ok(self.both(reqs, &[])?.0)
-    }
-
-    fn value(&self, states: &[&StepState]) -> Result<Vec<f32>> {
-        Ok(self.both(&[], states)?.1)
-    }
-
     fn both(
         &self,
         reqs: &[ExpandReq],
         states: &[&StepState],
-    ) -> Result<(Vec<ExpandOut>, Vec<f32>)> {
+    ) -> Result<(Vec<ExpandOut>, Vec<ValueOut>)> {
         let t0 = std::time::Instant::now();
         let mut views = Vec::new();
         let mut flip = Vec::new();
@@ -1033,10 +1057,16 @@ impl LatticeEval for StepsBridge {
                 logits: vec![0.0; r.slots.len()],
                 values,
                 value,
+                trunk: None,
             });
             i += 1 + r.slots.len();
         }
-        let sv = (i..views.len()).map(v).collect();
+        let sv = (i..views.len())
+            .map(|j| ValueOut {
+                v: v(j),
+                trunk: None,
+            })
+            .collect();
         Ok((out, sv))
     }
 }
@@ -1261,8 +1291,12 @@ pub(crate) mod tests {
     }
 
     impl LatticeEval for HashLatticeEval {
-        fn expand(&self, reqs: &[ExpandReq]) -> Result<Vec<ExpandOut>> {
-            Ok(reqs
+        fn both(
+            &self,
+            reqs: &[ExpandReq],
+            states: &[&StepState],
+        ) -> Result<(Vec<ExpandOut>, Vec<ValueOut>)> {
+            let e = reqs
                 .iter()
                 .map(|r| {
                     let base = h(&r.node.view(), 0);
@@ -1273,13 +1307,18 @@ pub(crate) mod tests {
                         logits: r.slots.iter().map(|s| 4.0 * f(s, 0x9E37_79B9)).collect(),
                         values: r.slots.iter().map(|s| f(s, 0x85EB_CA6B)).collect(),
                         value: unit(base),
+                        trunk: None,
                     }
                 })
-                .collect())
-        }
-
-        fn value(&self, states: &[&StepState]) -> Result<Vec<f32>> {
-            Ok(states.iter().map(|s| unit(h(&s.view(), 1))).collect())
+                .collect();
+            let v = states
+                .iter()
+                .map(|s| ValueOut {
+                    v: unit(h(&s.view(), 1)),
+                    trunk: None,
+                })
+                .collect();
+            Ok((e, v))
         }
     }
 
@@ -1539,15 +1578,19 @@ pub(crate) mod tests {
                                     root: &l.start,
                                     node,
                                     slots: &slots,
+                                    trunk: None,
                                 };
                                 let out = HashLatticeEval.expand(&[req]).unwrap().pop().unwrap();
                                 l.feed_expand(n, &out);
                             }
                             Need::Value(n) => {
-                                let v = HashLatticeEval
-                                    .value(&[&l.nodes[n as usize].state])
-                                    .unwrap()[0];
-                                l.feed_value(n, v);
+                                let o = HashLatticeEval
+                                    .both(&[], &[&l.nodes[n as usize].state])
+                                    .unwrap()
+                                    .1
+                                    .pop()
+                                    .unwrap();
+                                l.feed_value(n, &o);
                             }
                             _ => unreachable!(),
                         }

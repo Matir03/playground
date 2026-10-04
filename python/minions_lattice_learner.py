@@ -18,15 +18,13 @@ Training (`--data`: `lattice-gen` output dirs, reading `t2/`):
   node    BCE of the node value against the node's mean value
 The tier-1 trunk is frozen (taken from `--t1`, a steps net.pt).
 
-Export (`--out`): `lattice.onnx`, one graph for both tiers' requests:
-  inputs  ridx [B,96] int32, rscal [B,16]      the turn start (tier-1 input)
-          nidx [B,96] int32, nscal [B,16]      the lattice node
-          kid  [B,K] int32                     cell * 37 + slot per child
-  outputs v1 [B]       tier-1 value of the turn start
-          logit [B,K]  prior logits of the children
-          value [B,K]  values of the children (probabilities)
-          v2 [B]       value of the node
-Rows sharing a turn start recompute its trunk (no cache yet).
+Export (`--out`), two graphs so the trunk runs once per turn start:
+  tier1.onnx  ridx [B,96] int32, rscal [B,16] (the turn start)
+              -> v1 [B] tier-1 value, h [B,C,7,7] fp16 trunk image
+  tier2.onnx  h [B,C,7,7] fp16, nidx [B,96] int32, nscal [B,16] (the node),
+              kid [T] int32 (row * 49*37 + cell * 37 + slot, all rows' children)
+              -> logit [T] prior logits, value [T] child values, v2 [B]
+  lattice.json  {"c_trunk": C}
 """
 
 import argparse
@@ -153,57 +151,76 @@ class T2Net(nn.Module):
         return logit, vlog, v
 
 
-class Export(nn.Module):
-    def __init__(self, trunk, t2):
+def dense_x(idx, scal):
+    b = idx.shape[0]
+    ones = torch.ones(b, MAX_ACTIVE, device=scal.device, dtype=scal.dtype)
+    x = torch.zeros(b, SPARSE_DIM + 1, device=scal.device, dtype=scal.dtype)
+    x = x.scatter(1, idx.long(), ones)[:, :SPARSE_DIM]
+    return torch.cat([x, scal], 1)
+
+
+class Tier1Export(nn.Module):
+    def __init__(self, trunk):
         super().__init__()
         self.trunk = trunk
+
+    def forward(self, ridx, rscal):
+        h, v1 = self.trunk(dense_x(ridx, rscal))
+        return torch.sigmoid(v1), h.half()
+
+
+class Tier2Export(nn.Module):
+    def __init__(self, t2):
+        super().__init__()
         self.t2 = t2
 
-    def forward(self, ridx, rscal, nidx, nscal, kid):
-        def dense_x(idx, scal):
-            b = idx.shape[0]
-            ones = torch.ones(b, MAX_ACTIVE, device=scal.device, dtype=scal.dtype)
-            x = torch.zeros(b, SPARSE_DIM + 1, device=scal.device, dtype=scal.dtype)
-            x = x.scatter(1, idx.long(), ones)[:, :SPARSE_DIM]
-            return torch.cat([x, scal], 1)
-
-        h, v1 = self.trunk(dense_x(ridx, rscal))
-        logit, vlog, v2 = self.t2(h, dense_x(nidx, nscal))
+    def forward(self, h, nidx, nscal, kid):
+        # kid: flat [T] indices row * 49*37 + cell * 37 + slot (no padding).
+        logit, vlog, v2 = self.t2(h.float(), dense_x(nidx, nscal))
         k = kid.long()
-        return (
-            torch.sigmoid(v1),
-            logit.gather(1, k),
-            torch.sigmoid(vlog.gather(1, k)),
-            torch.sigmoid(v2),
-        )
+        return logit.reshape(-1).gather(0, k), torch.sigmoid(vlog.reshape(-1).gather(0, k)), torch.sigmoid(v2)
 
 
 def export_onnx(trunk, t2, out, dev):
+    """`tier1.onnx` (turn start -> value, fp16 trunk image), `tier2.onnx`
+    (trunk image + node + children -> children's logits and values, node
+    value) and `lattice.json` (the trunk's width)."""
     trunk.eval()
     t2.eval()
     b, k = 64, 24
+    c = trunk.net.stem[0].out_channels
     pad = torch.full((b, MAX_ACTIVE), SPARSE_DIM, dtype=torch.int32, device=dev)
     sc = torch.zeros(b, N_SCALARS, device=dev)
     torch.onnx.export(
-        Export(trunk, t2).to(dev).eval(),
-        (pad, sc, pad.clone(), sc.clone(), torch.zeros(b, k, dtype=torch.int32, device=dev)),
-        os.path.join(out, "lattice.onnx"),
-        input_names=["ridx", "rscal", "nidx", "nscal", "kid"],
-        output_names=["v1", "logit", "value", "v2"],
+        Tier1Export(trunk).to(dev).eval(),
+        (pad, sc),
+        os.path.join(out, "tier1.onnx"),
+        input_names=["ridx", "rscal"],
+        output_names=["v1", "h"],
+        dynamic_axes={"ridx": {0: "b"}, "rscal": {0: "b"}, "v1": {0: "b"}, "h": {0: "b"}},
+        opset_version=17,
+        dynamo=False,
+    )
+    torch.onnx.export(
+        Tier2Export(t2).to(dev).eval(),
+        (torch.zeros(b, c, N, N, dtype=torch.float16, device=dev), pad.clone(), sc.clone(), torch.zeros(b * k, dtype=torch.int32, device=dev)),
+        os.path.join(out, "tier2.onnx"),
+        input_names=["h", "nidx", "nscal", "kid"],
+        output_names=["logit", "value", "v2"],
         dynamic_axes={
-            "ridx": {0: "b"},
-            "rscal": {0: "b"},
+            "h": {0: "b"},
             "nidx": {0: "b"},
             "nscal": {0: "b"},
-            "kid": {0: "b", 1: "k"},
-            "v1": {0: "b"},
-            "logit": {0: "b", 1: "k"},
-            "value": {0: "b", 1: "k"},
+            "kid": {0: "t"},
+            "logit": {0: "t"},
+            "value": {0: "t"},
             "v2": {0: "b"},
         },
         opset_version=17,
         dynamo=False,
     )
+    with open(os.path.join(out, "lattice.json"), "w") as f:
+        json.dump({"c_trunk": c}, f)
 
 
 def group_log_softmax(logit, group, n_groups):

@@ -545,6 +545,7 @@ impl Worker<'_> {
                     root: &l.start,
                     node: &l.nodes[n as usize].state,
                     slots: &slots[j],
+                    trunk: l.trunk.clone(),
                 });
             }
             let mut states: Vec<&StepState> = Vec::with_capacity(val_idx.len());
@@ -585,12 +586,12 @@ impl Worker<'_> {
                 match (r, &mut tasks[ti]) {
                     (Req::T1Value { t1, n }, Task::Search { t1: s, .. }) => {
                         if n == NONE {
-                            s.feed_node_value(t1, vals[j]);
+                            s.feed_node_value(t1, &vals[j]);
                         } else {
-                            s.feed_sink_value(t1, n, vals[j]);
+                            s.feed_sink_value(t1, n, &vals[j]);
                         }
                     }
-                    (Req::LatValue { n }, Task::Walk { lat, .. }) => lat.feed_value(n, vals[j]),
+                    (Req::LatValue { n }, Task::Walk { lat, .. }) => lat.feed_value(n, &vals[j]),
                     _ => unreachable!(),
                 }
             }
@@ -742,11 +743,11 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
                     .collect();
                 if rp[1] > 0.0 {
                     eprintln!(
-                        "    lattice runner (of wall): merge {:.0}% run {:.0}% split {:.0}%; padded kids {:.0}; {:.0} calls/s, {:.0} rows/call, {:.2} ms/call",
+                        "    lattice runner (of wall): merge {:.0}% run {:.0}% (tier 1 {:.0}%) split {:.0}%; {:.0} calls/s, {:.0} rows/call, {:.2} ms/call",
                         100.0 * rp[0] / (el * 1e9),
                         100.0 * rp[1] / (el * 1e9),
+                        100.0 * rp[3] / (el * 1e9),
                         100.0 * rp[2] / (el * 1e9),
-                        rp[3],
                         rp[4] / el,
                         rp[5] / rp[4].max(1.0),
                         1e-6 * rp[1] / rp[4].max(1.0)
