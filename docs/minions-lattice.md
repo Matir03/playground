@@ -283,6 +283,26 @@ run detached with `GEN_FLAGS="--games 4"`:
   to `steps-match` / `steps-vs-mcts` plays by tier-1 search; its tier-1 net
   is also exported as a steps value net for bids.
 
+Openings (from gen 74). An opening ply is a single net row, but it waits
+on its own expansion: played inline, each opening turn held a search slot
+for ~20 sequential calls (about 20% of slot time at a median start of 22).
+Openings are now played apart from the searches, in large batches across
+all hardware threads, into a saved pool (`openings.bin`;
+`lattice-gen --pool F --refill-to N`). Generations take openings oldest
+first and write the rest back. The cycle refills to max(4096, 10 x the last
+generation's games) whenever the pool falls under half, with that
+generation's net and median, so openings can be a few generations stale.
+A refill of 4726 took 63 s, plus ~55 s of startup.
+
+The end-heavy curriculum has a cost (2026-10-04). At the cap, net worth
+decides the game, so a unit bought in the last few turns earns nothing
+back and can only be lost. Not spawning is right there, and gen 70's
+spawn visits went 72% to "nothing". In full games from random openings,
+gen 70 lost 1-31 to the heuristic greedy bot (`steps-match --b greedy`)
+at both 100 and 400 tier-1 visits, while gen-vs-gen matches kept showing
+progress. The player is not at fault: the lattice search on gen 537's
+value net (`--a bridge:<value_sparse.onnx>`) beat greedy 13-3.
+
 Random-init nets behave differently from the distilled ones. Uniform priors
 spread every descent, so each lattice holds about twice the nodes.
 `--games 8` reached 14.5 GB RSS in 3 minutes and was still growing.
