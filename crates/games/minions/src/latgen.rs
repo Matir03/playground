@@ -38,7 +38,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -87,6 +87,78 @@ pub struct GenConfig {
     /// Groups of games per worker taking turns, so that the worker advances
     /// one group while another's net call is in flight (1 = no overlap).
     pub pipeline: usize,
+    /// Openings played up front, in a phase of their own, before the search
+    /// workers start: all at once across `open_workers` threads, so their
+    /// net calls batch (an opening ply is one row; played inline, an opening
+    /// held a game slot for ~20 sequential calls a turn). Searches start
+    /// from this pool and play their openings inline only once it is empty.
+    pub openings: usize,
+    pub open_workers: usize,
+    /// A saved opening pool: searches start from it (oldest first) and the
+    /// rest is written back at the end, so openings are played in large,
+    /// infrequent batches (and may be a few generations stale). With a pool,
+    /// `openings` is ignored.
+    pub pool: Option<PathBuf>,
+    /// Refill mode: play openings until the pool holds this many, save it,
+    /// and stop (no searches).
+    pub refill_to: usize,
+}
+
+const POOL_MAGIC: &[u8; 4] = b"MOPN";
+
+/// The pool file: magic, record size, then each opening's real position
+/// (`Game::encode_state`), oldest first. Read back with fresh salts.
+fn load_pool(path: &Path) -> Result<Vec<StepState>> {
+    use playground_core::Game;
+    let b = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    anyhow::ensure!(
+        b.len() >= 8 && &b[..4] == POOL_MAGIC,
+        "{}: not an opening pool",
+        path.display()
+    );
+    let rec = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
+    if b.len() == 8 {
+        return Ok(Vec::new());
+    }
+    anyhow::ensure!(
+        rec > 0 && (b.len() - 8) % rec == 0,
+        "{}: truncated",
+        path.display()
+    );
+    let salt = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let mut out = Vec::with_capacity((b.len() - 8) / rec);
+    for (i, r) in b[8..].chunks(rec).enumerate() {
+        let real = crate::game::Minions::decode_state(r)?;
+        out.push(StepState::begin(
+            &real,
+            salt ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        ));
+    }
+    Ok(out)
+}
+
+/// Write `pool` (oldest first), atomically.
+fn save_pool(path: &Path, pool: &[StepState]) -> Result<()> {
+    use playground_core::Game;
+    let recs: Vec<Vec<u8>> = pool
+        .iter()
+        .map(|s| crate::game::Minions::encode_state(&s.real_base()))
+        .collect();
+    let mut b = POOL_MAGIC.to_vec();
+    b.extend_from_slice(&(recs.first().map_or(0, |r| r.len()) as u32).to_le_bytes());
+    for r in &recs {
+        b.extend_from_slice(r);
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &b)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 #[derive(Default)]
@@ -102,6 +174,8 @@ pub struct GenCounters {
     pub eval_ns: AtomicU64,
     pub cpu_ns: AtomicU64,
     pub opening_turns: AtomicU64,
+    /// Games started from the opening pool (the rest played theirs inline).
+    pub pooled: AtomicU64,
 }
 
 enum Task {
@@ -321,11 +395,21 @@ struct Worker<'a> {
     bid: i16,
     t1w: ChunkWriter,
     t2w: ChunkWriter,
+    /// The opening phase: finished openings go here, not into searches.
+    collect: Option<Vec<StepState>>,
+    /// The search phase: games start from these.
+    pool: Option<&'a Mutex<Vec<StepState>>>,
 }
 
 impl Worker<'_> {
     fn new_game(&mut self) -> Result<Task> {
-        self.c.games.fetch_add(1, Relaxed);
+        if self.collect.is_none() {
+            self.c.games.fetch_add(1, Relaxed);
+            if let Some(s) = self.pool.and_then(|p| p.lock().unwrap().pop()) {
+                self.c.pooled.fetch_add(1, Relaxed);
+                return Ok(self.search(s, None));
+            }
+        }
         let salt: u64 = self.rng.gen();
         let s = StepState::begin(&crate::game::MinionsState::with_bid(self.bid), salt);
         // P(G <= g) = 1 - (1 - p)^g: a median of m needs (1 - p)^m = 1/2.
@@ -340,6 +424,10 @@ impl Worker<'_> {
         }
         let k = u32::from(crate::game::MAX_TURNS).saturating_sub(g);
         if k == 0 {
+            if let Some(out) = self.collect.as_mut() {
+                out.push(s);
+                return self.new_game();
+            }
             return Ok(self.search(s, None));
         }
         Ok(Task::Opening {
@@ -375,6 +463,10 @@ impl Worker<'_> {
                         }
                         *left -= 1;
                         if *left == 0 {
+                            if let Some(out) = self.collect.as_mut() {
+                                out.push(s);
+                                return Ok(Next::Replace(Vec::new()));
+                            }
                             return Ok(Next::Replace(vec![self.search(s, None)]));
                         }
                         *lat = Lattice::new(s)?;
@@ -533,6 +625,32 @@ impl Worker<'_> {
             out.push(self.search(s, lat));
         }
         Ok(Next::Replace(out))
+    }
+
+    /// Play `n` openings at once (a game that ends inside its opening is
+    /// replaced) and return their final positions.
+    fn open_phase(&mut self, eval: &dyn LatticeEval, n: usize) -> Result<Vec<StepState>> {
+        self.collect = Some(Vec::with_capacity(n));
+        let p = self.cfg.pipeline.max(1);
+        let mut groups: Vec<Group> = (0..p).map(|_| Group::default()).collect();
+        for i in 0..n {
+            groups[i % p].tasks.push(self.new_game()?);
+        }
+        let mut g = 0;
+        while groups
+            .iter()
+            .any(|x| !x.tasks.is_empty() || x.inflight.is_some())
+        {
+            let grp = &mut groups[g];
+            if let Some(f) = grp.inflight.take() {
+                self.feed(&mut grp.tasks, f)?;
+            }
+            if !grp.tasks.is_empty() {
+                grp.inflight = Some(self.submit_round(&mut grp.tasks, eval)?);
+            }
+            g = (g + 1) % p;
+        }
+        Ok(self.collect.take().unwrap_or_default())
     }
 
     fn run(&mut self, eval: &dyn LatticeEval, stop: &AtomicBool) -> Result<()> {
@@ -720,6 +838,46 @@ pub fn lattice_bid(eval: &dyn LatticeEval) -> Result<i16> {
     Ok(lo)
 }
 
+fn make_worker<'a>(
+    cfg: &'a GenConfig,
+    bid: i16,
+    w: usize,
+    t1_dir: &Path,
+    t2_dir: &Path,
+    c: &'a GenCounters,
+) -> Worker<'a> {
+    Worker {
+        cfg,
+        c,
+        rng: rand_chacha::ChaCha8Rng::seed_from_u64(
+            cfg.seed ^ (w as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        ),
+        bid,
+        t1w: ChunkWriter::new(
+            t1_dir.to_path_buf(),
+            w,
+            b"MSTP",
+            crate::stepsp::VERSION,
+            crate::stepsp::REC_BYTES,
+            cfg.chunk_records,
+        ),
+        t2w: {
+            let mut x = ChunkWriter::new(
+                t2_dir.to_path_buf(),
+                w,
+                b"MLT2",
+                T2_VERSION,
+                T2_REC_BYTES,
+                cfg.chunk_records,
+            );
+            x.side = Some((b"MLTK", Vec::new(), T2_KID_BYTES));
+            x
+        },
+        collect: None,
+        pool: None,
+    }
+}
+
 pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
     let t1_dir = cfg.out.join("t1");
     let t2_dir = cfg.out.join("t2");
@@ -731,6 +889,83 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
         cfg.workers, cfg.games, cfg.n1, cfg.walk.n2
     );
     let c = Arc::new(GenCounters::default());
+    // The opening phase. Its workers write no records; their seeds (and
+    // writer tags) follow the search workers'.
+    let loaded = match &cfg.pool {
+        Some(p) => load_pool(p)?,
+        None => Vec::new(),
+    };
+    let n_open = if cfg.refill_to > 0 {
+        cfg.refill_to.saturating_sub(loaded.len())
+    } else if cfg.pool.is_some() {
+        0
+    } else {
+        cfg.openings
+    };
+    if cfg.pool.is_some() {
+        eprintln!("  opening pool: {} loaded", loaded.len());
+    }
+    let pool = Mutex::new(Vec::new());
+    if n_open > 0 {
+        let t = Instant::now();
+        let ow = cfg.open_workers.max(1);
+        let res: Vec<Result<Vec<StepState>>> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..ow)
+                .map(|w| {
+                    let (c, eval) = (c.clone(), eval.clone());
+                    let (t1_dir, t2_dir) = (t1_dir.clone(), t2_dir.clone());
+                    let n = n_open / ow + usize::from(w < n_open % ow);
+                    sc.spawn(move || {
+                        let mut wk = make_worker(cfg, bid, cfg.workers + w, &t1_dir, &t2_dir, &c);
+                        wk.open_phase(eval.as_ref(), n)
+                    })
+                })
+                .collect();
+            hs.into_iter()
+                .map(|h| h.join().expect("opening worker"))
+                .collect()
+        });
+        let mut p = pool.lock().unwrap();
+        for r in res {
+            p.extend(r?);
+        }
+        eprintln!(
+            "  openings: {} in {:.1}s ({} turns, {} rounds, {} expansions) on {ow} threads",
+            p.len(),
+            t.elapsed().as_secs_f64(),
+            c.opening_turns.load(Relaxed),
+            c.rounds.load(Relaxed),
+            c.expansions.load(Relaxed),
+        );
+        for x in [
+            &c.rounds,
+            &c.expansions,
+            &c.kids,
+            &c.values,
+            &c.eval_ns,
+            &c.cpu_ns,
+        ] {
+            x.store(0, Relaxed);
+        }
+    }
+    // Searches pop from the end, so the vector is newest first: fresh
+    // openings, then the loaded ones reversed (the oldest pops first).
+    {
+        let mut p = pool.lock().unwrap();
+        p.extend(loaded.into_iter().rev());
+    }
+    let save = |p: &[StepState]| -> Result<()> {
+        if let Some(path) = &cfg.pool {
+            let v: Vec<StepState> = p.iter().rev().cloned().collect();
+            save_pool(path, &v)?;
+            eprintln!("  opening pool: {} saved", v.len());
+        }
+        Ok(())
+    };
+    if cfg.refill_to > 0 {
+        return save(&pool.lock().unwrap());
+    }
+    let pool = &pool;
     let stop = Arc::new(AtomicBool::new(false));
     let t0 = Instant::now();
     let res: Vec<Result<()>> = std::thread::scope(|sc| {
@@ -739,34 +974,8 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
                 let (c, stop, eval) = (c.clone(), stop.clone(), eval.clone());
                 let (t1_dir, t2_dir) = (t1_dir.clone(), t2_dir.clone());
                 sc.spawn(move || {
-                    let mut wk = Worker {
-                        cfg,
-                        c: &c,
-                        rng: rand_chacha::ChaCha8Rng::seed_from_u64(
-                            cfg.seed ^ (w as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
-                        ),
-                        bid,
-                        t1w: ChunkWriter::new(
-                            t1_dir,
-                            w,
-                            b"MSTP",
-                            crate::stepsp::VERSION,
-                            crate::stepsp::REC_BYTES,
-                            cfg.chunk_records,
-                        ),
-                        t2w: {
-                            let mut x = ChunkWriter::new(
-                                t2_dir,
-                                w,
-                                b"MLT2",
-                                T2_VERSION,
-                                T2_REC_BYTES,
-                                cfg.chunk_records,
-                            );
-                            x.side = Some((b"MLTK", Vec::new(), T2_KID_BYTES));
-                            x
-                        },
-                    };
+                    let mut wk = make_worker(cfg, bid, w, &t1_dir, &t2_dir, &c);
+                    wk.pool = Some(pool);
                     let r = wk.run(eval.as_ref(), &stop);
                     if r.is_err() {
                         stop.store(true, Relaxed);
@@ -792,8 +1001,9 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
                 let ev = c.eval_ns.load(Relaxed) as f64;
                 let cpu = c.cpu_ns.load(Relaxed) as f64;
                 eprintln!(
-                    "  {el:.0}s: games {} turns {} (+{} opening), t1 {} t2 {} ({:.0}/s), expansions {:.0}/s ({:.1} kids), values {:.0}/s, eval share {:.0}%, rounds {}",
+                    "  {el:.0}s: games {} ({} pooled) turns {} (+{} opening), t1 {} t2 {} ({:.0}/s), expansions {:.0}/s ({:.1} kids), values {:.0}/s, eval share {:.0}%, rounds {}",
                     c.games.load(Relaxed),
+                    c.pooled.load(Relaxed),
                     c.turns.load(Relaxed),
                     c.opening_turns.load(Relaxed),
                     c.t1_records.load(Relaxed),
@@ -887,5 +1097,6 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
     for r in res {
         r?;
     }
-    Ok(())
+    let left = std::mem::take(&mut *pool.lock().unwrap());
+    save(&left)
 }

@@ -1305,6 +1305,9 @@ pub struct Player {
     pub two_tier: Option<crate::two_tier::TwoTierParams>,
     /// Play by turn-lattice tier-1 search instead (`eval` then only bids).
     pub lattice: Option<LatticePlay>,
+    /// Play the heuristic greedy solver ([`crate::solver::greedy_move`], one
+    /// atomic move at a time) instead (`eval` then only bids).
+    pub solver: bool,
 }
 
 /// A turn-lattice player: `n1` tier-1 visits, `inflight` at a time, then
@@ -1344,7 +1347,15 @@ impl Player {
         real: &crate::game::MinionsState,
         salt: u64,
     ) -> anyhow::Result<crate::game::MinionsState> {
-        if let Some(lp) = &self.lattice {
+        if self.solver {
+            use playground_core::Game;
+            let mut s = real.clone();
+            while !crate::game::Minions::outcome(&s).is_terminal() && s.side == real.side {
+                let mv = crate::solver::greedy_move(&s).best_move;
+                s = crate::game::Minions::apply(&s, &mv);
+            }
+            Ok(s)
+        } else if let Some(lp) = &self.lattice {
             lattice_turn(real, lp, salt)
         } else if self.expansions == 0 {
             greedy_turn(real, self.eval.as_ref(), salt)

@@ -805,6 +805,20 @@ enum Cmd {
         /// group while another's net call is in flight (1 = no overlap).
         #[arg(long, default_value_t = 2)]
         pipeline: usize,
+        /// Openings played up front, all at once (batched), before the
+        /// searches start; searches play theirs inline once these run out.
+        #[arg(long, default_value_t = 768)]
+        openings: usize,
+        /// Threads for the opening phase (0 = all hardware threads).
+        #[arg(long, default_value_t = 0)]
+        open_workers: usize,
+        /// A saved opening pool: games start from it (oldest first), the
+        /// rest is written back, and `--openings` is ignored.
+        #[arg(long)]
+        pool: Option<std::path::PathBuf>,
+        /// Refill the pool to this many openings and stop (no searches).
+        #[arg(long, default_value_t = 0)]
+        refill_to: usize,
     },
     StepsSelfplay {
         /// Record output directory.
@@ -922,6 +936,14 @@ enum Cmd {
 /// its tier-1 net as a steps value net (for bids) and the lattice player.
 /// Anything else is a steps spec, passed through.
 fn lattice_play(spec: &str, n1: u32, inflight: usize) -> anyhow::Result<(String, Option<minions_engine::stepsp::LatticePlay>)> {
+    // `bridge:<steps net>`: the lattice search on a steps value net (tier-1
+    // values, tier-2 child values on partial turns, uniform priors).
+    if let Some(net) = spec.strip_prefix("bridge:") {
+        let eval: std::sync::Arc<dyn minions_engine::lattice::LatticeEval> =
+            std::sync::Arc::new(minions_engine::lattice::StepsBridge { eval: load_step_eval_runners(net, "trt", 1)? });
+        let play = minions_engine::stepsp::LatticePlay { eval, n1, inflight, params: Default::default() };
+        return Ok((net.to_string(), Some(play)));
+    }
     let dir = std::path::Path::new(spec);
     if !dir.join("tier1.onnx").is_file() {
         return Ok((spec.to_string(), None));
@@ -1439,14 +1461,20 @@ async fn main() -> anyhow::Result<()> {
                 let params = minions_engine::bfs::Params { heads, power, ..Default::default() };
                 let two_tier = two.then(|| tt.clone());
                 let (spec, lattice) = lattice_play(spec, n1, lattice_inflight)?;
-                Ok(minions_engine::stepsp::Player { eval: load_step_eval_runners(&spec, &ep, 1)?, expansions, params, two_tier, lattice })
+                Ok(minions_engine::stepsp::Player { eval: load_step_eval_runners(&spec, &ep, 1)?, expansions, params, two_tier, lattice, solver: false })
             };
             let pa = player(&a, expansions, power, two_tier_a)?;
             // `--b x,y,...`: a match against each in turn (seed + its index),
             // A loaded once and each B freed after its match.
             for (k, b) in b.split(',').enumerate() {
                 let t = std::time::Instant::now();
-                let res = player(b, expansions_b.unwrap_or(expansions), power_b.unwrap_or(power), two_tier_b).and_then(|pb| {
+                // `greedy`: the heuristic solver (A's net only for bids).
+                let pb = if b == "greedy" {
+                    Ok(minions_engine::stepsp::Player { solver: true, lattice: None, two_tier: None, expansions: 0, ..pa.clone() })
+                } else {
+                    player(b, expansions_b.unwrap_or(expansions), power_b.unwrap_or(power), two_tier_b)
+                };
+                let res = pb.and_then(|pb| {
                     minions_engine::stepsp::play_match(&pa, &pb, pairs, opening_max, opening_decay, seed + k as u64, threads)
                 });
                 let (score, wdl) = match res {
@@ -1473,6 +1501,7 @@ async fn main() -> anyhow::Result<()> {
                 params: minions_engine::bfs::Params { heads, ..Default::default() },
                 two_tier: None,
                 lattice,
+                solver: false,
             };
             let (sampler, params) = minions_engine::eval::match_search(sims, candidates, t_steps, 2 * pairs, seed);
             let params = playground_core::sampled_mcts::SampledParams { resample_every, ..params };
@@ -1530,7 +1559,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::LatticeGen {
             out, onnx, ep, batcher, workers, games, n1, inflight, n2, c1, c2, pw_c, pw_alpha, retries,
             temp1, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, secs,
-            target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, pipeline,
+            target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, pipeline, openings, open_workers, pool, refill_to,
         } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
             // A directory is the lattice nets (tier1/tier2.onnx); a file a steps value net behind the bridge.
@@ -1566,6 +1595,10 @@ async fn main() -> anyhow::Result<()> {
                 chunk_records,
                 t1_min_visits,
                 pipeline,
+                openings,
+                pool,
+                refill_to,
+                open_workers: if open_workers > 0 { open_workers } else { std::thread::available_parallelism().map_or(8, |n| n.get()) },
             };
             minions_engine::latgen::generate(&cfg, bridge)?;
         }
