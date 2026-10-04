@@ -78,6 +78,9 @@ pub struct GenConfig {
     pub target_t2: u64,
     pub seed: u64,
     pub chunk_records: usize,
+    /// Also record every non-root tier-1 node with at least this many
+    /// visits as a tier-1 value target (0 = the root only).
+    pub t1_min_visits: u32,
 }
 
 #[derive(Default)]
@@ -468,6 +471,29 @@ impl Worker<'_> {
         self.t1w.buf.extend_from_slice(&rec);
         self.t1w.added()?;
         self.c.t1_records.fetch_add(1, Relaxed);
+        // Interior turns searched deeply enough are value targets too: each
+        // turn's tree is fresh, so they repeat nothing.
+        if self.cfg.t1_min_visits > 0 {
+            for node in &t1.nodes[1..] {
+                if node.n < self.cfg.t1_min_visits
+                    || node.terminal.is_some()
+                    || node.state.is_terminal()
+                {
+                    continue;
+                }
+                rec.clear();
+                crate::stepsp::encode_record(
+                    &node.state.view(),
+                    node.q() as f32,
+                    0.0,
+                    node.n,
+                    &mut rec,
+                );
+                self.t1w.buf.extend_from_slice(&rec);
+                self.t1w.added()?;
+                self.c.t1_records.fetch_add(1, Relaxed);
+            }
+        }
         let visits: Vec<f64> = root
             .children
             .iter()

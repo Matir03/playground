@@ -452,6 +452,68 @@ mod tests {
     /// net its trunk came from) on turn starts; expansions are finite and
     /// the same with a cached trunk as with one computed in the call, alone
     /// or batched.
+    /// Tier-1 search on random openings next to the greedy steps turn:
+    /// root children's visits, search values and static values (all for the
+    /// root's mover), and the greedy turn's static value.
+    #[test]
+    #[ignore]
+    fn lattice_search_diag() {
+        let (Ok(lat), Ok(steps)) = (std::env::var("LATTICE_DIR"), std::env::var("STEPS_ONNX"))
+        else {
+            eprintln!("set LATTICE_DIR and STEPS_ONNX");
+            return;
+        };
+        use crate::bfs::Evaluator;
+        use rand::SeedableRng;
+        let le = OrtLatticeEval::load(Path::new(&lat), "trt", true, 1).unwrap();
+        let se = crate::bfs::OnnxEval::load(Path::new(&steps), "trt", true, "/tmp/steps_trt", 1)
+            .unwrap();
+        let sv = |s: &StepState| -> f32 {
+            if s.is_terminal() {
+                s.terminal_value()
+            } else {
+                se.eval(&[s.view()]).unwrap()[0]
+            }
+        };
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(5);
+        for g in 0..4 {
+            let real = crate::selfplay::random_opening(22, 1.0884, &mut rng).0;
+            let start = StepState::begin(&real, g);
+            if start.is_terminal() || crate::lattice::necro_kill(&start).is_ok() {
+                continue;
+            }
+            let v0 = sv(&start);
+            let mut t = crate::tier1::Tier1::new(start.clone(), Default::default());
+            t.run_inflight(&le, 400, 16).unwrap();
+            let gr = crate::stepsp::greedy_turn(&real, &se, g).unwrap();
+            let gs = StepState::begin(&gr, g);
+            let gv = 1.0 - sv(&gs);
+            eprintln!(
+                "position {g}: static {v0:.3}, search {:.3}, {} root children, {} nodes; greedy turn static {gv:.3}",
+                t.root_value(),
+                t.nodes[0].children.len(),
+                t.nodes.len()
+            );
+            let mut kids = t.nodes[0].children.clone();
+            kids.sort_by_key(|&c| std::cmp::Reverse(t.nodes[c as usize].n));
+            for c in kids.iter().take(12) {
+                let nd = &t.nodes[*c as usize];
+                eprintln!(
+                    "  n {:4} q {:.3} static {:.3} kids {}",
+                    nd.n,
+                    1.0 - nd.q(),
+                    1.0 - sv(&nd.state),
+                    nd.children.len()
+                );
+            }
+            let best = kids
+                .iter()
+                .map(|&c| 1.0 - sv(&t.nodes[c as usize].state))
+                .fold(f32::MIN, f32::max);
+            eprintln!("  best static among root children {best:.3}");
+        }
+    }
+
     #[test]
     #[ignore]
     fn lattice_onnx_parity() {

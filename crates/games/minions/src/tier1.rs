@@ -402,6 +402,106 @@ impl Tier1 {
         }
         Ok(())
     }
+
+    /// `visits` tier-1 visits with up to `inflight` of them at a time, each
+    /// round's requests in one `eval.both` call (the match player).
+    pub fn run_inflight(
+        &mut self,
+        eval: &dyn LatticeEval,
+        visits: u32,
+        inflight: usize,
+    ) -> Result<()> {
+        enum R {
+            Expand(u32, u32),
+            Sink(u32, u32),
+            Node(u32),
+        }
+        let mut vis: Vec<Visit> = Vec::new();
+        let mut started = 0;
+        loop {
+            if self.nodes[0].terminal.is_some() || (started >= visits && vis.is_empty()) {
+                return Ok(());
+            }
+            // Advance every visit until none finishes; the rest wait on a
+            // request (handed in once: a busy node makes the next pass Wait).
+            let mut reqs = Vec::new();
+            loop {
+                while started < visits && vis.len() < inflight.max(1) {
+                    vis.push(self.visit());
+                    started += 1;
+                }
+                let mut progressed = false;
+                let mut i = 0;
+                while i < vis.len() {
+                    match self.advance(&mut vis[i])? {
+                        Need1::Expand { t, n } => reqs.push(R::Expand(t, n)),
+                        Need1::SinkValue { t, n } => reqs.push(R::Sink(t, n)),
+                        Need1::NodeValue { t } => reqs.push(R::Node(t)),
+                        Need1::Wait => {}
+                        Need1::Done => {
+                            vis.swap_remove(i);
+                            progressed = true;
+                            continue;
+                        }
+                    }
+                    i += 1;
+                }
+                if !progressed || self.nodes[0].terminal.is_some() {
+                    break;
+                }
+            }
+            if reqs.is_empty() {
+                if vis.is_empty() {
+                    continue;
+                }
+                bail!("{} visits wait on nothing", vis.len());
+            }
+            let slots: Vec<Vec<(u8, u8)>> = reqs
+                .iter()
+                .filter_map(|r| match *r {
+                    R::Expand(t, n) => Some(self.lattice(t).request(n).0),
+                    _ => None,
+                })
+                .collect();
+            let (outs, vals) = {
+                let mut ex = Vec::with_capacity(slots.len());
+                let mut states = Vec::new();
+                for r in &reqs {
+                    match *r {
+                        R::Expand(t, n) => {
+                            let l = self.lattice(t);
+                            ex.push(ExpandReq {
+                                root: &l.start,
+                                node: &l.nodes[n as usize].state,
+                                slots: &slots[ex.len()],
+                                trunk: l.trunk.clone(),
+                            });
+                        }
+                        R::Sink(t, n) => states.push(&self.lattice(t).nodes[n as usize].state),
+                        R::Node(t) => states.push(&self.nodes[t as usize].state),
+                    }
+                }
+                eval.both(&ex, &states)?
+            };
+            let (mut e, mut v) = (outs.iter(), vals.iter());
+            for r in reqs {
+                match r {
+                    R::Expand(t, n) => self.feed_expand(t, n, e.next().expect("an output")),
+                    R::Sink(t, n) => self.feed_sink_value(t, n, v.next().expect("a value")),
+                    R::Node(t) => self.feed_node_value(t, v.next().expect("a value")),
+                }
+            }
+        }
+    }
+
+    /// The most visited root child (ties: higher mean value).
+    pub fn best_child(&self) -> Option<u32> {
+        let root = &self.nodes[0];
+        root.children.iter().copied().max_by(|&a, &b| {
+            let (x, y) = (&self.nodes[a as usize], &self.nodes[b as usize]);
+            x.n.cmp(&y.n).then(y.q().total_cmp(&x.q()))
+        })
+    }
 }
 
 #[cfg(test)]

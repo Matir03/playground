@@ -634,6 +634,12 @@ enum Cmd {
         /// or `static` (its value when found).
         #[arg(long, default_value = "current")]
         t2_widen: String,
+        /// A or B given as a lattice net directory (tier1.onnx + tier2.onnx)
+        /// plays by tier-1 lattice search: visits per turn, and in flight.
+        #[arg(long, default_value_t = 200)]
+        n1: u32,
+        #[arg(long, default_value_t = 16)]
+        lattice_inflight: usize,
     },
     /// The step search (best-first) against the old sampled-AZ MCTS, standard
     /// openings with bidding. Old side defaults to the old ladder's eval
@@ -671,6 +677,11 @@ enum Cmd {
         /// (`--expansions` is then only the first round's budget).
         #[arg(long)]
         equal_time: bool,
+        /// `a` as a lattice net directory: tier-1 visits per turn, in flight.
+        #[arg(long, default_value_t = 200)]
+        n1: u32,
+        #[arg(long, default_value_t = 16)]
+        lattice_inflight: usize,
     },
     /// Check a step-trained MLP's CPU evaluator against its ONNX graph on
     /// random step-tree positions.
@@ -782,6 +793,10 @@ enum Cmd {
         lattice_sessions: usize,
         #[arg(long, default_value_t = 20000)]
         chunk_records: usize,
+        /// Also record non-root tier-1 turns with at least this many visits
+        /// as tier-1 value targets (0 = roots only).
+        #[arg(long, default_value_t = 16)]
+        t1_min_visits: u32,
     },
     StepsSelfplay {
         /// Record output directory.
@@ -893,6 +908,19 @@ enum Cmd {
         #[arg(long, default_value = "current")]
         t2_widen: String,
     },
+}
+
+/// A match spec naming a lattice net directory (tier1.onnx + tier2.onnx):
+/// its tier-1 net as a steps value net (for bids) and the lattice player.
+/// Anything else is a steps spec, passed through.
+fn lattice_play(spec: &str, n1: u32, inflight: usize) -> anyhow::Result<(String, Option<minions_engine::stepsp::LatticePlay>)> {
+    let dir = std::path::Path::new(spec);
+    if !dir.join("tier1.onnx").is_file() {
+        return Ok((spec.to_string(), None));
+    }
+    let eval = std::sync::Arc::new(minions_engine::lattice_ort::OrtLatticeEval::load(dir, "trt", true, 1)?);
+    let play = minions_engine::stepsp::LatticePlay { eval, n1, inflight, params: Default::default() };
+    Ok((dir.join("value_sparse.onnx").to_string_lossy().into_owned(), Some(play)))
 }
 
 #[tokio::main]
@@ -1393,7 +1421,7 @@ async fn main() -> anyhow::Result<()> {
             )?;
         }
         Cmd::NnueBench { active, reps } => minions_engine::nnue::bench_sweep(active, reps),
-        Cmd::StepsMatch { a, b, pairs, opening_max, opening_decay, ep, seed, expansions, expansions_b, power, power_b, heads, threads, two_tier_a, two_tier_b, t2_c, t2_retries, t2_widen } => {
+        Cmd::StepsMatch { a, b, pairs, opening_max, opening_decay, ep, seed, expansions, expansions_b, power, power_b, heads, threads, two_tier_a, two_tier_b, t2_c, t2_retries, t2_widen, n1, lattice_inflight } => {
             // A match evaluates one batch at a time per game thread, so one
             // runner (two sessions per net, not four) is enough: the session
             // builds were most of a short match's time and memory.
@@ -1402,7 +1430,8 @@ async fn main() -> anyhow::Result<()> {
             let player = |spec: &str, expansions: u64, power: f32, two: bool| -> anyhow::Result<minions_engine::stepsp::Player> {
                 let params = minions_engine::bfs::Params { heads, power, ..Default::default() };
                 let two_tier = two.then(|| tt.clone());
-                Ok(minions_engine::stepsp::Player { eval: load_step_eval_runners(spec, &ep, 1)?, expansions, params, two_tier })
+                let (spec, lattice) = lattice_play(spec, n1, lattice_inflight)?;
+                Ok(minions_engine::stepsp::Player { eval: load_step_eval_runners(&spec, &ep, 1)?, expansions, params, two_tier, lattice })
             };
             let pa = player(&a, expansions, power, two_tier_a)?;
             // `--b x,y,...`: a match against each in turn (seed + its index),
@@ -1427,13 +1456,15 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
-        Cmd::StepsVsMcts { a, old, pairs, ep, seed, expansions, heads, sims, candidates, t_steps, resample_every, threads, equal_time } => {
+        Cmd::StepsVsMcts { a, old, pairs, ep, seed, expansions, heads, sims, candidates, t_steps, resample_every, threads, equal_time, n1, lattice_inflight } => {
+            let (a_eval, lattice) = lattice_play(&a, n1, lattice_inflight)?;
             let t = std::time::Instant::now();
             let steps = minions_engine::stepsp::Player {
-                eval: load_step_eval(&a, &ep)?,
+                eval: load_step_eval(&a_eval, &ep)?,
                 expansions,
                 params: minions_engine::bfs::Params { heads, ..Default::default() },
                 two_tier: None,
+                lattice,
             };
             let (sampler, params) = minions_engine::eval::match_search(sims, candidates, t_steps, 2 * pairs, seed);
             let params = playground_core::sampled_mcts::SampledParams { resample_every, ..params };
@@ -1491,7 +1522,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::LatticeGen {
             out, onnx, ep, batcher, workers, games, n1, inflight, n2, c1, c2, pw_c, pw_alpha, retries,
             temp1, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, secs,
-            target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions,
+            target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits,
         } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
             // A directory is the lattice nets (tier1/tier2.onnx); a file a steps value net behind the bridge.
@@ -1524,6 +1555,7 @@ async fn main() -> anyhow::Result<()> {
                 target_t2,
                 seed,
                 chunk_records,
+                t1_min_visits,
             };
             minions_engine::latgen::generate(&cfg, bridge)?;
         }

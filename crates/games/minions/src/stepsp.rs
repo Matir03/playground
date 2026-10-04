@@ -1303,6 +1303,39 @@ pub struct Player {
     /// Search with [`crate::two_tier`] (budget `expansions`) instead of
     /// best-first.
     pub two_tier: Option<crate::two_tier::TwoTierParams>,
+    /// Play by turn-lattice tier-1 search instead (`eval` then only bids).
+    pub lattice: Option<LatticePlay>,
+}
+
+/// A turn-lattice player: `n1` tier-1 visits, `inflight` at a time, then
+/// the most visited turn.
+#[derive(Clone)]
+pub struct LatticePlay {
+    pub eval: Arc<dyn crate::lattice::LatticeEval>,
+    pub n1: u32,
+    pub inflight: usize,
+    pub params: crate::tier1::T1Params,
+}
+
+/// One turn by tier-1 lattice search.
+pub fn lattice_turn(
+    real: &crate::game::MinionsState,
+    lp: &LatticePlay,
+    salt: u64,
+) -> anyhow::Result<crate::game::MinionsState> {
+    let start = StepState::begin(real, salt);
+    // The mover kills the enemy necromancer: that ends the game.
+    if !start.is_terminal() {
+        if let Ok(end) = crate::lattice::necro_kill(&start) {
+            return Ok(end.real_base());
+        }
+    }
+    let mut t = crate::tier1::Tier1::new(start, lp.params.clone());
+    t.run_inflight(lp.eval.as_ref(), lp.n1, lp.inflight)?;
+    let b = t
+        .best_child()
+        .ok_or_else(|| anyhow::anyhow!("no turn found\n{}", real.render()))?;
+    Ok(t.nodes[b as usize].state.real_base())
 }
 
 impl Player {
@@ -1311,7 +1344,9 @@ impl Player {
         real: &crate::game::MinionsState,
         salt: u64,
     ) -> anyhow::Result<crate::game::MinionsState> {
-        if self.expansions == 0 {
+        if let Some(lp) = &self.lattice {
+            lattice_turn(real, lp, salt)
+        } else if self.expansions == 0 {
             greedy_turn(real, self.eval.as_ref(), salt)
         } else if let Some(tt) = &self.two_tier {
             two_tier_turn(real, self.eval.as_ref(), tt, self.expansions, salt).map(|t| t.next)

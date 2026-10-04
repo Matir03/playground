@@ -16,7 +16,10 @@ Training (`--data`: `lattice-gen` output dirs, reading `t2/`):
           cell's offered slots and its children's visit shares
   values  BCE of each child's value against its mean value in the search
   node    BCE of the node value against the node's mean value
-The tier-1 trunk is frozen (taken from `--t1`, a steps net.pt).
+  t1      BCE of the tier-1 value against the tier-1 search value (`t1/`)
+trained jointly: the tier-2 losses train the trunk too, so the trunk learns
+from the (many more) tier-2 records. `--freeze-trunk` trains tier 2 alone on
+a fixed tier 1. Tier 1 starts from `--t1` (a steps net.pt) or random weights.
 
 Export (`--out`), two graphs so the trunk runs once per turn start:
   tier1.onnx  ridx [B,96] int32, rscal [B,16] (the turn start)
@@ -25,6 +28,8 @@ Export (`--out`), two graphs so the trunk runs once per turn start:
               kid [T] int32 (row * 49*37 + cell * 37 + slot, all rows' children)
               -> logit [T] prior logits, value [T] child values, v2 [B]
   lattice.json  {"c_trunk": C}
+plus net.pt / t2.pt and the tier-1 net alone as a steps value net
+(value.onnx, value_sparse.onnx).
 """
 
 import argparse
@@ -46,8 +51,11 @@ from minions_steps_learner import (
     SPARSE_DIM,
     SPARSE_PLANES,
     ResBlock,
+    SparseSet,
     build,
+    load_chunks,
 )
+from minions_steps_learner import export_onnx as steps_export_onnx
 
 SLOTS = 37
 T2_REC_BYTES = 528
@@ -261,8 +269,8 @@ class T2Set:
         return rec_of, kid
 
 
-def losses(trunk, t2, ds, idx):
-    with torch.no_grad():
+def losses(trunk, t2, ds, idx, grad_trunk=False):
+    with torch.set_grad_enabled(grad_trunk and torch.is_grad_enabled()):
         h, _ = trunk(dense(ds.ract[idx], ds.rn[idx], ds.rscal[idx]))
     logit, vlog, v = t2(h, dense(ds.nact[idx], ds.nn[idx], ds.nscal[idx]))
     rec_of, kid = ds.batch(idx)
@@ -284,35 +292,54 @@ def losses(trunk, t2, ds, idx):
     return l_prior, l_val, l_node, h_tgt
 
 
+def t1_loss(net, xs, ys, idx):
+    return F.binary_cross_entropy_with_logits(net(xs.dense(idx)), ys[idx])
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", nargs="+", required=True)
-    ap.add_argument("--t1", required=True, help="steps net.pt for the tier-1 trunk + value head")
+    ap.add_argument("--data", nargs="+", help="lattice-gen output dirs (their t1/ and t2/)")
+    ap.add_argument("--t1", help="tier-1 steps net.pt to start from (default: random init)")
     ap.add_argument("--t1-arch", default="res:32x4")
     ap.add_argument("--arch", default="32x2", help="tier-2 CHANNELSxBLOCKS")
     ap.add_argument("--init", help="tier-2 weights to start from (t2.pt)")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--epochs", type=float, default=2.0)
-    ap.add_argument("--batch", type=int, default=512)
+    ap.add_argument("--epochs", type=float, default=2.0, help="passes over the tier-2 records")
+    ap.add_argument("--batch", type=int, default=512, help="tier-2 records per step")
+    ap.add_argument("--t1-batch", type=int, default=256, help="tier-1 records per step")
+    ap.add_argument("--t1-weight", type=float, default=1.0)
+    ap.add_argument("--freeze-trunk", action="store_true", help="train tier 2 only, on a fixed tier 1")
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--wd", type=float, default=1e-4)
     ap.add_argument("--holdout-every", type=int, default=20)
-    ap.add_argument("--export-only", action="store_true")
+    ap.add_argument("--export-only", action="store_true", help="export --t1/--init (or random weights) to --out")
+    ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
+    torch.manual_seed(args.seed)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(args.out, exist_ok=True)
     net1 = build(args.t1_arch).to(dev)
-    net1.load_state_dict(torch.load(args.t1, map_location=dev))
-    trunk = Trunk(net1).to(dev).eval()
-    for p in trunk.parameters():
-        p.requires_grad_(False)
+    if args.t1:
+        net1.load_state_dict(torch.load(args.t1, map_location=dev))
+    trunk = Trunk(net1).to(dev)
     c_trunk = net1.stem[0].out_channels
     ch, blocks = (int(v) for v in args.arch.split("x"))
     t2 = T2Net(c_trunk, ch, blocks).to(dev)
     if args.init:
         t2.load_state_dict(torch.load(args.init, map_location=dev))
-    if args.export_only:
+
+    def save(meta):
+        torch.save(net1.state_dict(), os.path.join(args.out, "net.pt"))
         torch.save(t2.state_dict(), os.path.join(args.out, "t2.pt"))
         export_onnx(trunk, t2, args.out, dev)
+        # The tier-1 net alone, as a steps value net (steps-match etc.).
+        steps_export_onnx(net1, args.out, dev)
+        with open(os.path.join(args.out, "meta.json"), "w") as f:
+            json.dump(meta | {"t1_arch": args.t1_arch, "arch": args.arch}, f, indent=1)
+
+    if args.export_only:
+        save({"t1": args.t1, "init": args.init, "export_only": True})
+        print(f"exported to {args.out}")
         return
     t0 = time.time()
     recs, kids = load_t2(args.data)
@@ -320,45 +347,81 @@ def main():
     all_idx = torch.arange(ds.n, device=dev)
     ho_mask = (all_idx % args.holdout_every) == 0
     ho, tr = all_idx[ho_mask], all_idx[~ho_mask]
-    print(f"{ds.n} records ({len(kids)} kids, {len(kids) / max(ds.n, 1):.1f}/record), {len(tr)} train, load {time.time() - t0:.0f}s")
-    print("stages:", np.bincount(ds.stage, minlength=4).tolist())
+    r1, _, nf1 = load_chunks([os.path.join(d, "t1") for d in args.data])
+    xs1 = SparseSet(r1, dev)
+    ys1 = torch.from_numpy(r1["target"].astype(np.float32)).to(dev)
+    i1 = torch.arange(len(r1), device=dev)
+    ho1, tr1 = i1[i1 % args.holdout_every == 0], i1[i1 % args.holdout_every != 0]
+    print(
+        f"t2: {ds.n} records ({len(kids)} kids, {len(kids) / max(ds.n, 1):.1f}/record), {len(tr)} train; "
+        f"t1: {len(r1)} records ({nf1} chunks, visits median {int(np.median(r1['visits'])) if len(r1) else 0}), "
+        f"target mean {r1['target'].mean():.3f} std {r1['target'].std():.3f}; load {time.time() - t0:.0f}s"
+    )
+    print("t2 stages:", np.bincount(ds.stage, minlength=4).tolist())
 
     def holdout():
+        trunk.eval()
         t2.eval()
-        out = np.zeros(4)
+        out = np.zeros(5)
         with torch.no_grad():
             for i in range(0, len(ho), 4096):
-                out += np.array([x.item() for x in losses(trunk, t2, ds, ho[i : i + 4096])]) * len(ho[i : i + 4096])
+                out[:4] += np.array([x.item() for x in losses(trunk, t2, ds, ho[i : i + 4096])]) * len(ho[i : i + 4096])
+            out[:4] /= max(len(ho), 1)
+            for i in range(0, len(ho1), 8192):
+                out[4] += t1_loss(net1, xs1, ys1, ho1[i : i + 8192]).item() * len(ho1[i : i + 8192])
+            out[4] /= max(len(ho1), 1)
+            # The t1 targets' own entropy: the floor of their BCE.
+            y = ys1[ho1].clamp(1e-6, 1 - 1e-6)
+            h1 = -(y * y.log() + (1 - y) * (1 - y).log()).mean().item() if len(ho1) else 0.0
+        trunk.train()
         t2.train()
-        o = out / max(len(ho), 1)
-        return {"prior": o[0], "prior_excess": o[0] - o[3], "value": o[1], "node": o[2]}
+        o = out
+        return {"prior": o[0], "prior_excess": o[0] - o[3], "value": o[1], "node": o[2], "t1_bce_excess": o[4] - h1}
 
     base = holdout()
     print("holdout before:", json.dumps(base))
-    opt = torch.optim.AdamW(t2.parameters(), lr=args.lr, weight_decay=1e-4)
-    steps = int(args.epochs * len(tr) / args.batch)
-    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=max(steps, 1))
+    if args.freeze_trunk:
+        for p in trunk.parameters():
+            p.requires_grad_(False)
+        params = list(t2.parameters())
+    else:
+        params = list(t2.parameters()) + list(net1.parameters())
+    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.wd)
+    steps = max(int(args.epochs * len(tr) / args.batch), 1)
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=steps, pct_start=0.05)
+    trunk.train(not args.freeze_trunk)
     t2.train()
+    t0 = time.time()
     for step in range(steps):
         idx = tr[torch.randint(len(tr), (args.batch,), device=dev)]
-        lp, lv, ln, _ = losses(trunk, t2, ds, idx)
-        loss = lp + lv + ln
+        lp, lv, ln, _ = losses(trunk, t2, ds, idx, grad_trunk=not args.freeze_trunk)
+        if args.freeze_trunk:
+            l1 = torch.zeros((), device=dev)
+        else:
+            l1 = t1_loss(net1, xs1, ys1, tr1[torch.randint(len(tr1), (args.t1_batch,), device=dev)]) if len(tr1) else torch.zeros((), device=dev)
+        loss = lp + lv + ln + args.t1_weight * l1
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
         sched.step()
         if step % max(steps // 10, 1) == 0 or step == steps - 1:
-            print(f"step {step}/{steps} prior {lp.item():.4f} value {lv.item():.4f} node {ln.item():.4f}", flush=True)
+            print(f"step {step}/{steps} prior {lp.item():.4f} value {lv.item():.4f} node {ln.item():.4f} t1 {l1.item():.4f} ({time.time() - t0:.0f}s)", flush=True)
     final = holdout()
     print("holdout after:", json.dumps(final))
-    torch.save(t2.state_dict(), os.path.join(args.out, "t2.pt"))
-    export_onnx(trunk, t2, args.out, dev)
-    with open(os.path.join(args.out, "meta.json"), "w") as f:
-        json.dump(
-            {"t1": args.t1, "arch": args.arch, "data": args.data, "records": ds.n, "holdout_before": base, "holdout": final, "steps": steps},
-            f,
-            indent=1,
-        )
+    save(
+        {
+            "t1": args.t1,
+            "init": args.init,
+            "data": args.data,
+            "records": ds.n,
+            "t1_records": len(r1),
+            "holdout_before": base,
+            "holdout": final,
+            "steps": steps,
+            "train_seconds": time.time() - t0,
+        }
+    )
+    print("final", json.dumps({"holdout": final, "records": ds.n, "t1_records": len(r1), "steps": steps}))
 
 
 if __name__ == "__main__":
