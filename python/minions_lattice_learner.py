@@ -370,7 +370,12 @@ def losses(trunk, t2, ds, idx, grad_trunk=False, counts=False):
     lp = group_log_softmax(lg, group, ng)
     tot = torch.zeros(ng, device=lg.device).index_add_(0, group, ds.kn[kid])
     tgt = ds.kn[kid] / tot[group].clamp(min=1e-9)
-    n_cells = (tot > 0).sum().clamp(min=1)
+    # Cells where fewer than min_support kids have visits carry no
+    # comparison between choices (one-hot: the only one tried); skip them.
+    supp = torch.zeros(ng, device=lg.device).index_add_(0, group, (ds.kn[kid] > 0).float())
+    cell_ok = (tot > 0) & (supp >= getattr(ds, "min_support", 1))
+    tgt = tgt * cell_ok[group]
+    n_cells = cell_ok.sum().clamp(min=1)
     l_prior = -(tgt * lp).sum() / n_cells
     # Its floor: the targets' own entropy.
     h_tgt = -(tgt * torch.log(tgt.clamp(min=1e-9))).sum() / n_cells
@@ -401,6 +406,7 @@ def main():
     ap.add_argument("--freeze-bn", action="store_true", help="keep BatchNorm statistics fixed (layers in eval mode) while training the weights")
     ap.add_argument("--bn-recal", type=int, default=200, help="re-estimate BatchNorm statistics exactly over this many batches after training (0 = keep the moving estimate)")
     ap.add_argument("--prior-weight", type=float, default=1.0)
+    ap.add_argument("--min-cell-support", type=int, default=1, help="prior targets only for cells where at least this many kids have visits")
     ap.add_argument("--value-weight", type=float, default=1.0, help="tier-2 child and node values")
     ap.add_argument("--freeze-trunk", action="store_true", help="train tier 2 only, on a fixed tier 1")
     ap.add_argument("--t2-detach", action="store_true", help="tier-2 losses do not train the shared trunk (tier 1 learns from its own targets only)")
@@ -444,6 +450,7 @@ def main():
     t0 = time.time()
     recs, kids = load_t2(args.data)
     ds = T2Set(recs, kids, dev, args.all_visit_targets)
+    ds.min_support = args.min_cell_support
     all_idx = torch.arange(ds.n, device=dev)
     ho_mask = (all_idx % args.holdout_every) == 0
     ho, tr = all_idx[ho_mask], all_idx[~ho_mask]
