@@ -638,6 +638,9 @@ enum Cmd {
         /// plays by tier-1 lattice search: visits per turn, and in flight.
         #[arg(long, default_value_t = 200)]
         n1: u32,
+        /// B's tier-1 visits, if different from A's.
+        #[arg(long)]
+        n1_b: Option<u32>,
         #[arg(long, default_value_t = 16)]
         lattice_inflight: usize,
     },
@@ -1459,19 +1462,19 @@ async fn main() -> anyhow::Result<()> {
             )?;
         }
         Cmd::NnueBench { active, reps } => minions_engine::nnue::bench_sweep(active, reps),
-        Cmd::StepsMatch { a, b, pairs, opening_max, opening_decay, ep, seed, expansions, expansions_b, power, power_b, heads, threads, two_tier_a, two_tier_b, t2_c, t2_retries, t2_widen, n1, lattice_inflight } => {
+        Cmd::StepsMatch { a, b, pairs, opening_max, opening_decay, ep, seed, expansions, expansions_b, power, power_b, heads, threads, two_tier_a, two_tier_b, t2_c, t2_retries, t2_widen, n1, n1_b, lattice_inflight } => {
             // A match evaluates one batch at a time per game thread, so one
             // runner (two sessions per net, not four) is enough: the session
             // builds were most of a short match's time and memory.
             anyhow::ensure!(t2_widen == "current" || t2_widen == "static", "--t2-widen: current or static");
             let tt = minions_engine::two_tier::TwoTierParams { c_uct: t2_c, retries: t2_retries, widen_current: t2_widen == "current" };
-            let player = |spec: &str, expansions: u64, power: f32, two: bool| -> anyhow::Result<minions_engine::stepsp::Player> {
+            let player = |spec: &str, expansions: u64, power: f32, two: bool, n1: u32| -> anyhow::Result<minions_engine::stepsp::Player> {
                 let params = minions_engine::bfs::Params { heads, power, ..Default::default() };
                 let two_tier = two.then(|| tt.clone());
                 let (spec, lattice) = lattice_play(spec, n1, lattice_inflight)?;
                 Ok(minions_engine::stepsp::Player { eval: load_step_eval_runners(&spec, &ep, 1)?, expansions, params, two_tier, lattice, solver: false })
             };
-            let pa = player(&a, expansions, power, two_tier_a)?;
+            let pa = player(&a, expansions, power, two_tier_a, n1)?;
             // `--b x,y,...`: a match against each in turn (seed + its index),
             // A loaded once and each B freed after its match.
             for (k, b) in b.split(',').enumerate() {
@@ -1480,7 +1483,7 @@ async fn main() -> anyhow::Result<()> {
                 let pb = if b == "greedy" {
                     Ok(minions_engine::stepsp::Player { solver: true, lattice: None, two_tier: None, expansions: 0, ..pa.clone() })
                 } else {
-                    player(b, expansions_b.unwrap_or(expansions), power_b.unwrap_or(power), two_tier_b)
+                    player(b, expansions_b.unwrap_or(expansions), power_b.unwrap_or(power), two_tier_b, n1_b.unwrap_or(n1))
                 };
                 let res = pb.and_then(|pb| {
                     minions_engine::stepsp::play_match(&pa, &pb, pairs, opening_max, opening_decay, seed + k as u64, threads)

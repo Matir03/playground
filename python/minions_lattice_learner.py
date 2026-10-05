@@ -398,6 +398,10 @@ def main():
     ap.add_argument("--batch", type=int, default=512, help="tier-2 records per step")
     ap.add_argument("--t1-batch", type=int, default=256, help="tier-1 records per step")
     ap.add_argument("--t1-weight", type=float, default=1.0)
+    ap.add_argument("--freeze-bn", action="store_true", help="keep BatchNorm statistics fixed (layers in eval mode) while training the weights")
+    ap.add_argument("--bn-recal", type=int, default=200, help="re-estimate BatchNorm statistics exactly over this many batches after training (0 = keep the moving estimate)")
+    ap.add_argument("--prior-weight", type=float, default=1.0)
+    ap.add_argument("--value-weight", type=float, default=1.0, help="tier-2 child and node values")
     ap.add_argument("--freeze-trunk", action="store_true", help="train tier 2 only, on a fixed tier 1")
     ap.add_argument("--t2-detach", action="store_true", help="tier-2 losses do not train the shared trunk (tier 1 learns from its own targets only)")
     ap.add_argument("--all-visit-targets", action="store_true", help="also train values on older records, whose values averaged every visit")
@@ -500,6 +504,10 @@ def main():
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=steps, pct_start=0.05)
     trunk.train(not args.freeze_trunk)
     t2.train()
+    bn_all = [m for m in list(net1.modules()) + list(t2.modules()) if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d))]
+    if args.freeze_bn:
+        for m in bn_all:
+            m.eval()
     t0 = time.time()
     for step in range(steps):
         idx = tr[torch.randint(len(tr), (args.batch,), device=dev)]
@@ -508,13 +516,34 @@ def main():
             l1 = torch.zeros((), device=dev)
         else:
             l1 = t1_loss(net1, xs1, ys1, tr1[torch.randint(len(tr1), (args.t1_batch,), device=dev)]) if len(tr1) else torch.zeros((), device=dev)
-        loss = lp + lv + ln + args.t1_weight * l1
+        loss = args.prior_weight * lp + args.value_weight * (lv + ln) + args.t1_weight * l1
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
         sched.step()
         if step % max(steps // 10, 1) == 0 or step == steps - 1:
             print(f"step {step}/{steps} prior {lp.item():.4f} value {lv.item():.4f} node {ln.item():.4f} t1 {l1.item():.4f} ({time.time() - t0:.0f}s)", flush=True)
+    if args.bn_recal > 0 and not args.freeze_bn:
+        # BatchNorm's moving estimate (momentum 0.1) follows the last few
+        # dozen batches; a rare feature's channel then gets a near-zero
+        # variance and the net breaks at inference (2026-10-05: training at
+        # lr 1e-8 alone cost gen 45 0.30 vs itself). Re-estimate exactly:
+        # a cumulative average over many batches of both streams.
+        bns = [m for m in list(net1.modules()) + list(t2.modules()) if isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.BatchNorm1d)]
+        for m in bns:
+            m.reset_running_stats()
+            m.momentum = None
+        trunk.train()
+        t2.train()
+        with torch.no_grad():
+            for _ in range(args.bn_recal):
+                idx = tr[torch.randint(len(tr), (args.batch,), device=dev)]
+                losses(trunk, t2, ds, idx)
+                if len(tr1):
+                    net1(xs1.dense(tr1[torch.randint(len(tr1), (args.t1_batch,), device=dev)]))
+        for m in bns:
+            m.momentum = 0.1
+        print(f"BatchNorm statistics re-estimated over {args.bn_recal} batches")
     if args.anchor > 0:
         a = args.anchor
         with torch.no_grad():
