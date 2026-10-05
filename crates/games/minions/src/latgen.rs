@@ -35,6 +35,7 @@
 //!   record's kids in order: `u8 cell, u8 slot, u16 pad, f32 visits, f32
 //!   mean value`.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -95,6 +96,14 @@ pub struct GenConfig {
     /// Tier-2 records from the tier-1 search (see
     /// [`Lattice::tier1_records`]) instead of the walk.
     pub t2_from_t1: bool,
+    /// Distillation (if positive): the tier-2 records are the expansions
+    /// themselves, a `distill_frac` sample of them, with the evaluator's
+    /// child and node values as value targets and a softmax of the child
+    /// values within each cell at this temperature as prior targets. Run
+    /// with a steps value net (the bridge) to distill it into tier 2; no
+    /// other tier-2 records are written.
+    pub distill_tau: f64,
+    pub distill_frac: f64,
     /// Groups of games per worker taking turns, so that the worker advances
     /// one group while another's net call is in flight (1 = no overlap).
     pub pipeline: usize,
@@ -712,7 +721,9 @@ impl Worker<'_> {
             &mut self.rng,
         )];
         let mut out = Vec::with_capacity(2);
-        if self.cfg.t2_from_t1 {
+        if self.cfg.distill_tau > 0.0 {
+            // Distilling: the expansions are the tier-2 records.
+        } else if self.cfg.t2_from_t1 {
             if let Some(mut lat) = t1.nodes[0].lattice.take() {
                 let turns: Vec<(u32, f64, f64)> = t1.nodes[0]
                     .children
@@ -886,6 +897,34 @@ impl Worker<'_> {
             let (ti, Req::Expand { t1, n }) = reqs[k] else {
                 unreachable!()
             };
+            if self.cfg.distill_tau > 0.0 && self.rng.gen::<f64>() < self.cfg.distill_frac {
+                let l = lat_of(&tasks[ti], t1);
+                let o = &outs[j];
+                let slots = l.request(n).0;
+                let tau = self.cfg.distill_tau;
+                let mut best: HashMap<u8, f32> = HashMap::new();
+                for (&(cell, _), &v) in slots.iter().zip(&o.values) {
+                    let b = best.entry(cell).or_insert(v);
+                    *b = b.max(v);
+                }
+                let kids = slots
+                    .iter()
+                    .zip(&o.values)
+                    .map(|(&(cell, slot), &v)| {
+                        let w = (f64::from(v - best[&cell]) / tau).exp() as f32;
+                        (cell, slot, w, v, 1.0)
+                    })
+                    .collect();
+                let rec = T2Record {
+                    node: l.nodes[n as usize].state.clone(),
+                    kids,
+                    n: 1.0,
+                    q: o.value,
+                    ns: 1.0,
+                };
+                encode_t2(&l.start, &rec, &mut self.t2w)?;
+                self.c.t2_records.fetch_add(1, Relaxed);
+            }
             match &mut tasks[ti] {
                 Task::Search { t1: s, .. } => s.feed_expand(t1, n, &outs[j]),
                 Task::Opening { lat, .. } | Task::Walk { lat, .. } => lat.feed_expand(n, &outs[j]),

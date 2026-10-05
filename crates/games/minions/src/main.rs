@@ -817,6 +817,14 @@ enum Cmd {
         /// of the walk.
         #[arg(long)]
         t2_from_t1: bool,
+        /// Distill the evaluator into tier 2: expansions become the tier-2
+        /// records (child values as value targets, a per-cell softmax of
+        /// them at this temperature as prior targets; 0 = off).
+        #[arg(long, default_value_t = 0.0)]
+        distill_tau: f64,
+        /// The share of expansions recorded when distilling.
+        #[arg(long, default_value_t = 0.25)]
+        distill_frac: f64,
         /// Groups of games per worker taking turns, so a worker advances one
         /// group while another's net call is in flight (1 = no overlap).
         #[arg(long, default_value_t = 2)]
@@ -1575,7 +1583,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::LatticeGen {
             out, onnx, ep, batcher, workers, games, n1, inflight, n2, c1, c2, pw_c, pw_alpha, retries,
             temp1, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, start_turn_mean, secs,
-            target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, view_min_visits, t2_from_t1, pipeline, openings, open_workers, pool, refill_to,
+            target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, pipeline, openings, open_workers, pool, refill_to,
         } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
             // A directory is the lattice nets (tier1/tier2.onnx); a file a steps value net behind the bridge.
@@ -1613,6 +1621,8 @@ async fn main() -> anyhow::Result<()> {
                 t1_min_visits,
                 view_min_visits,
                 t2_from_t1,
+                distill_tau,
+                distill_frac,
                 pipeline,
                 openings,
                 pool,
