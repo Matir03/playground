@@ -66,7 +66,9 @@ T2_DTYPE = np.dtype(
         ("rn", "u1"),
         ("nn", "u1"),
         ("stage", "u1"),
-        ("pad", "u1"),
+        # 1: the values average sink returns only (-1 = no target); 0: older
+        # records, whose values averaged every visit (intermediate ones too).
+        ("sink", "u1"),
         ("kids", "<u2"),
         ("turn", "<u2"),
         ("n", "<f4"),
@@ -242,7 +244,7 @@ def group_log_softmax(logit, group, n_groups):
 class T2Set:
     """Records and kids on the device, with CSR offsets."""
 
-    def __init__(self, recs, kids, dev):
+    def __init__(self, recs, kids, dev, all_visit_targets=False):
         t = lambda a, dt=None: torch.from_numpy(np.ascontiguousarray(a if dt is None else a.astype(dt))).to(dev)
         self.ract = t(recs["ract"].view(np.int16))
         self.rn = t(recs["rn"])
@@ -257,6 +259,11 @@ class T2Set:
         self.kcell = t(kids["cell"], np.int64)
         self.kn = t(kids["n"], np.float32)
         self.kq = t(kids["q"], np.float32)
+        # Value targets: sink-return means only (unless the older all-visit
+        # values are asked for); records without one train the priors only.
+        ok = (recs["sink"] == 1) | all_visit_targets
+        self.qok = t(ok & (recs["q"] >= 0))
+        self.kqok = t(np.repeat(ok, recs["kids"].astype(np.int64)) & (kids["q"] >= 0))
         self.stage = recs["stage"]
         self.n = len(recs)
 
@@ -267,6 +274,12 @@ class T2Set:
         first = torch.repeat_interleave(torch.cumsum(cnt, 0) - cnt, cnt)
         kid = start + torch.arange(len(rec_of), device=idx.device) - first
         return rec_of, kid
+
+
+def masked_bce(logit, y, m):
+    if not bool(m.any()):
+        return logit.sum() * 0.0
+    return F.binary_cross_entropy_with_logits(logit[m], y[m])
 
 
 def losses(trunk, t2, ds, idx, grad_trunk=False):
@@ -287,8 +300,9 @@ def losses(trunk, t2, ds, idx, grad_trunk=False):
     l_prior = -(tgt * lp).sum() / n_cells
     # Its floor: the targets' own entropy.
     h_tgt = -(tgt * torch.log(tgt.clamp(min=1e-9))).sum() / n_cells
-    l_val = F.binary_cross_entropy_with_logits(vl, ds.kq[kid])
-    l_node = F.binary_cross_entropy_with_logits(v, ds.q[idx])
+    km, qm = ds.kqok[kid], ds.qok[idx]
+    l_val = masked_bce(vl, ds.kq[kid], km)
+    l_node = masked_bce(v, ds.q[idx], qm)
     return l_prior, l_val, l_node, h_tgt
 
 
@@ -309,6 +323,9 @@ def main():
     ap.add_argument("--t1-batch", type=int, default=256, help="tier-1 records per step")
     ap.add_argument("--t1-weight", type=float, default=1.0)
     ap.add_argument("--freeze-trunk", action="store_true", help="train tier 2 only, on a fixed tier 1")
+    ap.add_argument("--t2-detach", action="store_true", help="tier-2 losses do not train the shared trunk (tier 1 learns from its own targets only)")
+    ap.add_argument("--all-visit-targets", action="store_true", help="also train values on older records, whose values averaged every visit")
+    ap.add_argument("--anchor", type=float, default=0.0, help="blend the trained weights toward the starting ones: w = a * w0 + (1 - a) * w")
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--wd", type=float, default=1e-4)
     ap.add_argument("--holdout-every", type=int, default=20)
@@ -343,7 +360,7 @@ def main():
         return
     t0 = time.time()
     recs, kids = load_t2(args.data)
-    ds = T2Set(recs, kids, dev)
+    ds = T2Set(recs, kids, dev, args.all_visit_targets)
     all_idx = torch.arange(ds.n, device=dev)
     ho_mask = (all_idx % args.holdout_every) == 0
     ho, tr = all_idx[ho_mask], all_idx[~ho_mask]
@@ -358,6 +375,10 @@ def main():
         f"target mean {r1['target'].mean():.3f} std {r1['target'].std():.3f}; load {time.time() - t0:.0f}s"
     )
     print("t2 stages:", np.bincount(ds.stage, minlength=4).tolist())
+    print(
+        f"value targets: {ds.qok.float().mean().item():.3f} of records, "
+        f"{ds.kqok.float().mean().item():.3f} of kids (sink-return records {(recs['sink'] == 1).mean():.3f})"
+    )
 
     def holdout():
         trunk.eval()
@@ -380,6 +401,7 @@ def main():
 
     base = holdout()
     print("holdout before:", json.dumps(base))
+    w0 = {k: v.detach().clone() for k, v in list(net1.state_dict().items()) + [("t2." + k, v) for k, v in t2.state_dict().items()]}
     if args.freeze_trunk:
         for p in trunk.parameters():
             p.requires_grad_(False)
@@ -394,7 +416,7 @@ def main():
     t0 = time.time()
     for step in range(steps):
         idx = tr[torch.randint(len(tr), (args.batch,), device=dev)]
-        lp, lv, ln, _ = losses(trunk, t2, ds, idx, grad_trunk=not args.freeze_trunk)
+        lp, lv, ln, _ = losses(trunk, t2, ds, idx, grad_trunk=not (args.freeze_trunk or args.t2_detach))
         if args.freeze_trunk:
             l1 = torch.zeros((), device=dev)
         else:
@@ -406,6 +428,14 @@ def main():
         sched.step()
         if step % max(steps // 10, 1) == 0 or step == steps - 1:
             print(f"step {step}/{steps} prior {lp.item():.4f} value {lv.item():.4f} node {ln.item():.4f} t1 {l1.item():.4f} ({time.time() - t0:.0f}s)", flush=True)
+    if args.anchor > 0:
+        a = args.anchor
+        with torch.no_grad():
+            for m, pre in ((net1, ""), (t2, "t2.")):
+                sd = m.state_dict()
+                for k, v in sd.items():
+                    if v.dtype.is_floating_point:
+                        v.mul_(1 - a).add_(w0[pre + k], alpha=a)
     final = holdout()
     print("holdout after:", json.dumps(final))
     save(

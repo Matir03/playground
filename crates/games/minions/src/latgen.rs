@@ -87,9 +87,10 @@ pub struct GenConfig {
     /// Also record every non-root tier-1 node with at least this many
     /// visits as a tier-1 value target (0 = the root only).
     pub t1_min_visits: u32,
-    /// Also record each tier-2 record's node, and each of its kids with at
-    /// least this many visits, as tier-1 value targets on their (partial
-    /// turn) views: the targets a bridge evaluator needs (0 = none).
+    /// Also record each tier-2 record's node, and each of its kids, with at
+    /// least this many sink returns below it as tier-1 value targets on
+    /// their (partial turn) views, at the returns' mean: the targets a
+    /// bridge evaluator needs (0 = none).
     pub view_min_visits: u32,
     /// Groups of games per worker taking turns, so that the worker advances
     /// one group while another's net call is in flight (1 = no overlap).
@@ -373,10 +374,14 @@ pub fn t2_view(s: &StepState) -> View {
     v
 }
 
+/// Header byte 3 of a tier-2 record: its values average sink returns only
+/// (-1 = no target). Older records (0) averaged every visit.
+const T2_SINK_TARGETS: u8 = 1;
+
 fn encode_t2(root: &StepState, r: &T2Record, w: &mut ChunkWriter) -> Result<()> {
     let start = w.buf.len();
     w.buf
-        .extend_from_slice(&[0, 0, stage_code(r.node.stage), 0]);
+        .extend_from_slice(&[0, 0, stage_code(r.node.stage), T2_SINK_TARGETS]);
     w.buf
         .extend_from_slice(&(r.kids.len() as u16).to_le_bytes());
     w.buf.extend_from_slice(&r.node.base.turn.to_le_bytes());
@@ -390,7 +395,7 @@ fn encode_t2(root: &StepState, r: &T2Record, w: &mut ChunkWriter) -> Result<()> 
     w.buf[start + 1] = na;
     debug_assert_eq!(w.buf.len() - start, T2_REC_BYTES);
     let side = &mut w.side.as_mut().expect("kids file").1;
-    for &(cell, slot, n, q) in &r.kids {
+    for &(cell, slot, n, q, _) in &r.kids {
         side.extend_from_slice(&[cell, slot, 0, 0]);
         side.extend_from_slice(&n.to_le_bytes());
         side.extend_from_slice(&q.to_le_bytes());
@@ -622,12 +627,13 @@ impl Worker<'_> {
             w.added()
         };
         let mut k = 0;
-        if r.n >= min as f32 && !r.node.is_terminal() {
-            put(&mut self.t1w, &r.node, r.q, r.n)?;
+        // Sink-return means only, from at least `min` returns.
+        if r.ns >= min as f32 && !r.node.is_terminal() {
+            put(&mut self.t1w, &r.node, r.q, r.ns)?;
             k += 1;
         }
-        for &(cell, slot, n, q) in &r.kids {
-            if n < min as f32 {
+        for &(cell, slot, _, q, ns) in &r.kids {
+            if ns < min as f32 {
                 continue;
             }
             let c = r.node.with_next(cell).child_unchecked(slot);
@@ -639,7 +645,7 @@ impl Worker<'_> {
             } else {
                 q
             };
-            put(&mut self.t1w, &c, v, n)?;
+            put(&mut self.t1w, &c, v, ns)?;
             k += 1;
         }
         self.c.t1_records.fetch_add(k, Relaxed);

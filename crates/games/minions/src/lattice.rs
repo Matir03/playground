@@ -15,6 +15,10 @@
 //! direct visit to it (at its own predicted value) and to each of its
 //! children (at theirs); a sink is a direct visit at its tier-1 value or its
 //! terminal score.
+//!
+//! The intermediate visits (expansions' predicted values) only steer the
+//! search. Training targets average the sinks' returns alone: tier-1 values
+//! of complete turns ([`Stats::sn`], [`Stats::skids`]).
 
 use std::collections::HashMap;
 
@@ -292,6 +296,10 @@ pub struct LNode {
     pub terminal: bool,
     pub lp_sum: f64,
     pub lp_n: u32,
+    /// A sink's returns (descents that ended here) and their value sum: the
+    /// tier-1 values the training targets average.
+    pub ret_n: u32,
+    pub ret_w: f64,
     parents: Vec<(u32, u16)>,
     /// A sink's trunk image (from its tier-1 value), for its own lattice.
     pub trunk: Option<Trunk>,
@@ -339,6 +347,8 @@ impl LNode {
             terminal: false,
             lp_sum: 0.0,
             lp_n: 0,
+            ret_n: 0,
+            ret_w: 0.0,
             parents: Vec::new(),
             trunk: None,
         }
@@ -401,6 +411,11 @@ pub struct Stats {
     pub w: f64,
     /// Per kid (parallel to the node's kids): visits and value sum.
     pub kids: Vec<(f64, f64)>,
+    /// The same over the sinks' returns only (complete turns at their
+    /// tier-1 values): the training targets.
+    pub sn: f64,
+    pub sw: f64,
+    pub skids: Vec<(f64, f64)>,
 }
 
 pub struct Lattice {
@@ -1059,6 +1074,9 @@ impl Lattice {
             n: 0.0,
             w: 0.0,
             kids: vec![(0.0, 0.0); pn.kids.len()],
+            sn: 0.0,
+            sw: 0.0,
+            skids: vec![(0.0, 0.0); pn.kids.len()],
         };
         let slot = &*slot_m;
         let credit = |st: &mut Stats, x: &Key, mut extra: u64, cn: f64, cw: f64| {
@@ -1084,6 +1102,21 @@ impl Lattice {
             let extra = xk.mask & !pk.mask & allowed;
             if missing == 0 {
                 credit(&mut st, xk, extra, f64::from(xn.n), xn.w);
+                if xn.ret_n > 0 {
+                    let (cn, cw) = (f64::from(xn.ret_n), xn.ret_w);
+                    st.sn += cn;
+                    st.sw += cw;
+                    let mut e = extra;
+                    while e != 0 {
+                        let v = e.trailing_zeros() as usize;
+                        e &= e - 1;
+                        let s = slot[v * 64 + xk.get(v) as usize];
+                        if s != u16::MAX {
+                            st.skids[s as usize].0 += cn;
+                            st.skids[s as usize].1 += cw;
+                        }
+                    }
+                }
                 if xn.expanded && xn.kid_n > 0 {
                     credit(&mut st, xk, extra, f64::from(xn.kid_n), xn.kid_w);
                     for kid in &xn.kids {
@@ -1184,6 +1217,8 @@ impl Lattice {
                     self.move_vl(cur, NONE);
                     self.visit(n, v);
                     let node = &mut self.nodes[n as usize];
+                    node.ret_n += 1;
+                    node.ret_w += f64::from(v);
                     let fresh = node.lp_n == 0;
                     node.lp_sum += cur.lp;
                     node.lp_n += 1;
@@ -1402,10 +1437,23 @@ pub fn noisy_pick(
 /// children's statistics (indirect visits included) at that time.
 pub struct T2Record {
     pub node: StepState,
-    /// Per kid: cell, slot (the choice), visits, mean value.
-    pub kids: Vec<(u8, u8, f32, f32)>,
+    /// Per kid: cell, slot (the choice), visits, and the mean of the sink
+    /// returns below it (-1 if none) with their count.
+    pub kids: Vec<(u8, u8, f32, f32, f32)>,
+    /// Visits; the mean of the sink returns below the node (-1 if none) and
+    /// their count.
     pub n: f32,
     pub q: f32,
+    pub ns: f32,
+}
+
+/// A sink-return mean, or -1 (no target) without returns.
+fn ret_mean(n: f64, w: f64) -> f32 {
+    if n > 0.0 {
+        (w / n) as f32
+    } else {
+        -1.0
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1521,12 +1569,15 @@ impl Lattice {
                 kids: nd
                     .kids
                     .iter()
-                    .zip(&st.kids)
+                    .zip(st.kids.iter().zip(&st.skids))
                     .filter(|(k, _)| !k.dead)
-                    .map(|(k, &(n, sw))| (k.cell, k.choice, n as f32, (sw / n.max(1.0)) as f32))
+                    .map(|(k, (&(n, _), &(rn, rw)))| {
+                        (k.cell, k.choice, n as f32, ret_mean(rn, rw), rn as f32)
+                    })
                     .collect(),
                 n: st.n as f32,
-                q: (st.w / st.n.max(1.0)) as f32,
+                q: ret_mean(st.sn, st.sw),
+                ns: st.sn as f32,
             });
             let mut vars: Vec<u8> = nd.kids.iter().filter(|k| !k.dead).map(|k| k.var).collect();
             vars.dedup();
@@ -1623,9 +1674,35 @@ pub(crate) mod tests {
                 .fold((0.0, 0.0), |s, a| (s.0 + a.1, s.1 + a.2))
         };
         let (n, w) = sum(&pn.key);
+        let rets: Vec<(Key, f64, f64)> = l
+            .nodes
+            .iter()
+            .filter(|x| x.kind != Kind::Dead && x.ret_n > 0)
+            .map(|x| (x.key, f64::from(x.ret_n), x.ret_w))
+            .collect();
+        let ssum = |key: &Key| {
+            rets.iter()
+                .filter(|a| a.0.includes(key))
+                .fold((0.0, 0.0), |s, a| (s.0 + a.1, s.1 + a.2))
+        };
+        let (sn, sw) = ssum(&pn.key);
+        let skids = pn
+            .kids
+            .iter()
+            .map(|k| {
+                if k.dead {
+                    (0.0, 0.0)
+                } else {
+                    ssum(&pn.key.with(k.var as usize, k.choice))
+                }
+            })
+            .collect();
         Stats {
             n,
             w,
+            sn,
+            sw,
+            skids,
             kids: pn
                 .kids
                 .iter()
@@ -1655,6 +1732,16 @@ pub(crate) mod tests {
                 assert!(
                     (x.0 - y.0).abs() < 1e-6 && (x.1 - y.1).abs() < 1e-6,
                     "node {p} kid {i}: {x:?} vs {y:?}"
+                );
+            }
+            assert!(
+                (a.sn - b.sn).abs() < 1e-6 && (a.sw - b.sw).abs() < 1e-6,
+                "node {p} sinks: {a:?} vs {b:?}"
+            );
+            for (i, (x, y)) in a.skids.iter().zip(&b.skids).enumerate() {
+                assert!(
+                    (x.0 - y.0).abs() < 1e-6 && (x.1 - y.1).abs() < 1e-6,
+                    "node {p} kid {i} sinks: {x:?} vs {y:?}"
                 );
             }
         }
