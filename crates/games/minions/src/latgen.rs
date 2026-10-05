@@ -92,6 +92,9 @@ pub struct GenConfig {
     /// their (partial turn) views, at the returns' mean: the targets a
     /// bridge evaluator needs (0 = none).
     pub view_min_visits: u32,
+    /// Tier-2 records from the tier-1 search (see
+    /// [`Lattice::tier1_records`]) instead of the walk.
+    pub t2_from_t1: bool,
     /// Groups of games per worker taking turns, so that the worker advances
     /// one group while another's net call is in flight (1 = no overlap).
     pub pipeline: usize,
@@ -709,7 +712,25 @@ impl Worker<'_> {
             &mut self.rng,
         )];
         let mut out = Vec::with_capacity(2);
-        if let Some(lat) = t1.nodes[0].lattice.take() {
+        if self.cfg.t2_from_t1 {
+            if let Some(mut lat) = t1.nodes[0].lattice.take() {
+                let turns: Vec<(u32, f64, f64)> = t1.nodes[0]
+                    .children
+                    .iter()
+                    .map(|&c| {
+                        let ch = &t1.nodes[c as usize];
+                        // The child's value is its own mover's.
+                        (ch.sink, f64::from(ch.n), f64::from(ch.n) - ch.w)
+                    })
+                    .collect();
+                let target = t1.nodes[pick as usize].sink;
+                let recs = lat.tier1_records(&turns, target, &mut self.rng)?;
+                for r in &recs {
+                    encode_t2(&lat.start, r, &mut self.t2w)?;
+                }
+                self.c.t2_records.fetch_add(recs.len() as u64, Relaxed);
+            }
+        } else if let Some(lat) = t1.nodes[0].lattice.take() {
             out.push(Task::Walk {
                 lat,
                 walk: Walk::new(&self.cfg.walk),

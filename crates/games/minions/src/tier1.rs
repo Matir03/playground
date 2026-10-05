@@ -589,6 +589,42 @@ mod tests {
         assert_eq!(sinks.len(), kids.len(), "two children are the same turn");
     }
 
+    /// Tier-2 records from the tier-1 search: along the path, each cell's
+    /// kids split the node's tier-1 visits exactly, and the path ends at the
+    /// target turn.
+    #[test]
+    fn tier1_records_consistent() {
+        use rand::SeedableRng;
+        let s = StepState::begin(&MinionsState::with_bid(0), 9);
+        let mut t = Tier1::new(s, T1Params::default());
+        t.run(&HashLatticeEval, 200).unwrap();
+        let turns: Vec<(u32, f64, f64)> = t.nodes[0]
+            .children
+            .iter()
+            .map(|&c| {
+                let ch = &t.nodes[c as usize];
+                (ch.sink, f64::from(ch.n), f64::from(ch.n) - ch.w)
+            })
+            .collect();
+        let target = t.nodes[t.best_child().unwrap() as usize].sink;
+        let mut lat = t.nodes[0].lattice.take().unwrap();
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(1);
+        let recs = lat.tier1_records(&turns, target, &mut rng).unwrap();
+        assert!(recs.len() > 3, "{} records", recs.len());
+        let total: f64 = turns.iter().map(|t| t.1).sum();
+        assert!((f64::from(recs[0].n) - total).abs() < 1e-3);
+        for r in &recs {
+            let mut cells: Vec<u8> = r.kids.iter().map(|k| k.0).collect();
+            cells.sort();
+            cells.dedup();
+            for c in cells {
+                let n: f32 = r.kids.iter().filter(|k| k.0 == c).map(|k| k.2).sum();
+                assert!((n - r.n).abs() < 1e-3, "cell {c}: kids {n} vs node {}", r.n);
+            }
+            assert!(r.q >= 0.0 && r.q <= 1.0);
+        }
+    }
+
     #[test]
     fn tier1_inflight() {
         let s = StepState::begin(&MinionsState::with_bid(0), 9);

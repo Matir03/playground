@@ -1510,6 +1510,75 @@ impl Walk {
 }
 
 impl Lattice {
+    /// Tier-2 records whose targets come from the tier-1 search alone:
+    /// `turns` are the tier-1 children (sink, visits, value sum for this
+    /// lattice's mover). Along a path to `target` (one undecided variable at
+    /// a time, in random order), each node records, per kid, the visits of
+    /// the turns that contain it and their mean value (-1: none), and the
+    /// same for the node. No net calls: nodes are only prepared.
+    pub fn tier1_records(
+        &mut self,
+        turns: &[(u32, f64, f64)],
+        target: u32,
+        rng: &mut impl rand::Rng,
+    ) -> Result<Vec<T2Record>> {
+        let keys: Vec<(Key, f64, f64)> = turns
+            .iter()
+            .map(|&(s, n, w)| (self.nodes[s as usize].key, n, w))
+            .collect();
+        let tk = self.nodes[target as usize].key;
+        let sum = |k: &Key| {
+            keys.iter()
+                .filter(|t| t.0.includes(k))
+                .fold((0.0, 0.0), |a, t| (a.0 + t.1, a.1 + t.2))
+        };
+        let mut out = Vec::new();
+        let mut at = 0u32;
+        while self.nodes[at as usize].kind == Kind::Inner {
+            if !self.nodes[at as usize].prepared && !self.prepare(at)? {
+                break;
+            }
+            let nd = &self.nodes[at as usize];
+            let (n, w) = sum(&nd.key);
+            if n <= 0.0 {
+                break;
+            }
+            let kids: Vec<(u8, u8, f32, f32, f32)> = nd
+                .kids
+                .iter()
+                .filter(|k| !k.dead)
+                .map(|k| {
+                    let (kn, kw) = sum(&nd.key.with(k.var as usize, k.choice));
+                    (k.cell, k.choice, kn as f32, ret_mean(kn, kw), kn as f32)
+                })
+                .collect();
+            out.push(T2Record {
+                node: nd.state.clone(),
+                kids,
+                n: n as f32,
+                q: ret_mean(n, w),
+                ns: n as f32,
+            });
+            let mut vars: Vec<u8> = nd.kids.iter().filter(|k| !k.dead).map(|k| k.var).collect();
+            vars.dedup();
+            vars.retain(|&v| tk.mask & (1 << v) != 0);
+            if vars.is_empty() {
+                break;
+            }
+            let var = vars[rng.gen_range(0..vars.len())];
+            let c = tk.get(var as usize);
+            let Some(k) = nd
+                .kids
+                .iter()
+                .position(|k| k.var == var && k.choice == c && !k.dead)
+            else {
+                break;
+            };
+            at = self.child(at, k)?;
+        }
+        Ok(out)
+    }
+
     /// Run walk `w` until every descent in flight (up to `p.inflight` at a
     /// time) waits on the net; their requests go to `out`. True once the walk
     /// is over.
