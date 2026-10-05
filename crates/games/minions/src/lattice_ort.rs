@@ -130,7 +130,10 @@ impl Drop for OrtLatticeEval {
     }
 }
 
-fn run_batch(s1: &mut Session, s2: &mut Session, c: usize, b: Batch) -> Result<Outs> {
+/// `gather`: `tier2.onnx` takes the call's distinct trunk images (`hs`) and
+/// each row's index into them (`hidx`) rather than an image per row (`h`;
+/// nets exported before 2026-10-05).
+fn run_batch(s1: &mut Session, s2: &mut Session, c: usize, gather: bool, b: Batch) -> Result<Outs> {
     use ort::value::Tensor;
     let e = |e: ort::Error| anyhow::anyhow!("{e}");
     let hw = c * CELLS;
@@ -175,24 +178,53 @@ fn run_batch(s1: &mut Session, s2: &mut Session, c: usize, b: Batch) -> Result<O
         );
         let t = kid.len().max(1);
         let kid = if kid.is_empty() { vec![0] } else { kid };
-        let mut h = Vec::with_capacity(n2 * hw);
-        for tr in &b.trunk {
-            match tr {
-                TrunkSrc::Given(x) => h.extend_from_slice(x),
-                TrunkSrc::Row(i) => h.extend_from_slice(&out.h[*i]),
+        let (n, a, sc) = (n2 as i64, MAX_ACTIVE as i64, N_SCALARS as i64);
+        let mut h = Vec::with_capacity(if gather { 64 * hw } else { n2 * hw });
+        let mut hidx: Vec<i32> = Vec::with_capacity(n2);
+        if gather {
+            // One image per distinct trunk: a given trunk by its allocation
+            // (a lattice hands the same one to all its expansions), a
+            // computed one by its tier-1 row.
+            let mut seen: HashMap<(bool, usize), i32> = HashMap::new();
+            for tr in &b.trunk {
+                let (key, img): ((bool, usize), &[f16]) = match tr {
+                    TrunkSrc::Given(x) => ((false, x.as_ptr() as usize), x),
+                    TrunkSrc::Row(i) => ((true, *i), &out.h[*i]),
+                };
+                let u = *seen.entry(key).or_insert_with(|| {
+                    h.extend_from_slice(img);
+                    (h.len() / hw - 1) as i32
+                });
+                hidx.push(u);
+            }
+        } else {
+            for tr in &b.trunk {
+                match tr {
+                    TrunkSrc::Given(x) => h.extend_from_slice(x),
+                    TrunkSrc::Row(i) => h.extend_from_slice(&out.h[*i]),
+                }
             }
         }
-        let (n, a, sc) = (n2 as i64, MAX_ACTIVE as i64, N_SCALARS as i64);
+        let nh = (h.len() / hw) as i64;
         RUN_PROF[6].fetch_add(t_prep.elapsed().as_nanos() as u64, Relaxed);
         let t_run = std::time::Instant::now();
-        let outs = s2
-            .run(ort::inputs![
+        let outs = if gather {
+            s2.run(ort::inputs![
+                "hs" => Tensor::from_array((vec![nh, c as i64, 7, 7], h)).map_err(e)?,
+                "hidx" => Tensor::from_array((vec![n], hidx)).map_err(e)?,
+                "nidx" => Tensor::from_array((vec![n, a], b.nidx)).map_err(e)?,
+                "nscal" => Tensor::from_array((vec![n, sc], b.nscal)).map_err(e)?,
+                "kid" => Tensor::from_array((vec![t as i64], kid)).map_err(e)?,
+            ])
+        } else {
+            s2.run(ort::inputs![
                 "h" => Tensor::from_array((vec![n, c as i64, 7, 7], h)).map_err(e)?,
                 "nidx" => Tensor::from_array((vec![n, a], b.nidx)).map_err(e)?,
                 "nscal" => Tensor::from_array((vec![n, sc], b.nscal)).map_err(e)?,
                 "kid" => Tensor::from_array((vec![t as i64], kid)).map_err(e)?,
             ])
-            .map_err(e)?;
+        }
+        .map_err(e)?;
         RUN_PROF[7].fetch_add(t_run.elapsed().as_nanos() as u64, Relaxed);
         let get = |name: &str| -> Result<Vec<f32>> {
             let (_, v) = outs[name].try_extract_tensor::<f32>().map_err(e)?;
@@ -240,7 +272,7 @@ fn batch_wait() -> std::time::Duration {
     }))
 }
 
-fn runner(mut s1: Session, mut s2: Session, c: usize, q: &Queue) {
+fn runner(mut s1: Session, mut s2: Session, c: usize, gather: bool, q: &Queue) {
     loop {
         let mut jobs = Vec::new();
         {
@@ -288,7 +320,7 @@ fn runner(mut s1: Session, mut s2: Session, c: usize, q: &Queue) {
         }
         let rows = all.rows();
         RUN_PROF[0].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
-        match run_batch(&mut s1, &mut s2, c, all) {
+        match run_batch(&mut s1, &mut s2, c, gather, all) {
             Ok(o) => {
                 let t2 = std::time::Instant::now();
                 RUN_PROF[4].fetch_add(1, Relaxed);
@@ -328,9 +360,16 @@ impl OrtLatticeEval {
             .as_u64()
             .ok_or_else(|| anyhow::anyhow!("lattice.json has no c_trunk"))?
             as usize;
+        let gather = meta["trunk_gather"].as_bool().unwrap_or(false);
         let p1 = |b: usize| format!("ridx:{b}x{MAX_ACTIVE},rscal:{b}x{N_SCALARS}");
-        let p2 = |b: usize, t: usize| {
-            format!("h:{b}x{c}x7x7,nidx:{b}x{MAX_ACTIVE},nscal:{b}x{N_SCALARS},kid:{t}")
+        // `u`: distinct trunk images (gather nets).
+        let p2 = |b: usize, t: usize, u: usize| {
+            let h = if gather {
+                format!("hs:{u}x{c}x7x7,hidx:{b}")
+            } else {
+                format!("h:{b}x{c}x7x7")
+            };
+            format!("{h},nidx:{b}x{MAX_ACTIVE},nscal:{b}x{N_SCALARS},kid:{t}")
         };
         let build = |name: &str, min: String, opt: String, max: String| -> Result<Session> {
             let p = dir.join(name);
@@ -350,12 +389,12 @@ impl OrtLatticeEval {
             let s1 = build("tier1.onnx", p1(1), p1(128), p1(MAX_ROWS))?;
             let s2 = build(
                 "tier2.onnx",
-                p2(1, 1),
-                p2(1024, 32 * 1024),
-                p2(MAX_ROWS, MAX_TOTAL_KIDS),
+                p2(1, 1, 1),
+                p2(1024, 32 * 1024, 64),
+                p2(MAX_ROWS, MAX_TOTAL_KIDS, MAX_ROWS),
             )?;
             let q = queue.clone();
-            hs.push(std::thread::spawn(move || runner(s1, s2, c, &q)));
+            hs.push(std::thread::spawn(move || runner(s1, s2, c, gather, &q)));
         }
         Ok(OrtLatticeEval { queue, runners: hs })
     }
@@ -540,7 +579,7 @@ mod tests {
         for round in 0..32 {
             for (i, &(n1, n2, k)) in shapes.iter().enumerate() {
                 let t0 = std::time::Instant::now();
-                run_batch(&mut s1, &mut s2, c, batch(n1, n2, k)).unwrap();
+                run_batch(&mut s1, &mut s2, c, false, batch(n1, n2, k)).unwrap();
                 if round >= 2 {
                     times[i].push(t0.elapsed().as_secs_f64() * 1e3);
                 }
@@ -615,6 +654,68 @@ mod tests {
                 .fold(f32::MIN, f32::max);
             eprintln!("  best static among root children {best:.3}");
         }
+    }
+
+    /// The same weights exported with an image per row (`LATTICE_A`) and as
+    /// distinct images plus indices (`LATTICE_B`) give the same outputs, on
+    /// expansions mixing cached and computed trunks across lattices.
+    #[test]
+    #[ignore]
+    fn trunk_gather_parity() {
+        let (Ok(a), Ok(b)) = (std::env::var("LATTICE_A"), std::env::var("LATTICE_B")) else {
+            eprintln!("set LATTICE_A and LATTICE_B");
+            return;
+        };
+        let ea = OrtLatticeEval::load(Path::new(&a), "trt", true, 1).unwrap();
+        let eb = OrtLatticeEval::load(Path::new(&b), "trt", true, 1).unwrap();
+        let mut lats = Vec::new();
+        for seed in 0..6u64 {
+            let s = StepState::begin(&crate::game::MinionsState::with_bid(3), seed);
+            let mut l = crate::lattice::Lattice::new(s).unwrap();
+            l.descend(&ea, crate::lattice::Cursor::at(0, 0.0), 1.5).unwrap();
+            lats.push(l);
+        }
+        let mut slots = Vec::new();
+        let mut nodes = Vec::new();
+        for l in &mut lats {
+            for n in 0..l.nodes.len().min(6) as u32 {
+                if l.nodes[n as usize].kind == crate::lattice::Kind::Inner {
+                    slots.push(l.request(n).0);
+                    nodes.push((nodes.len(), n));
+                }
+            }
+        }
+        let mut reqs = Vec::new();
+        let mut k = 0;
+        for (li, l) in lats.iter().enumerate() {
+            for n in 0..l.nodes.len().min(6) as u32 {
+                if l.nodes[n as usize].kind != crate::lattice::Kind::Inner {
+                    continue;
+                }
+                reqs.push(ExpandReq {
+                    root: &l.start,
+                    node: &l.nodes[n as usize].state,
+                    slots: &slots[k],
+                    // Odd lattices: computed in the call.
+                    trunk: if li % 2 == 0 { l.trunk.clone() } else { None },
+                });
+                k += 1;
+            }
+        }
+        let (oa, _) = ea.both(&reqs, &[]).unwrap();
+        let (ob, _) = eb.both(&reqs, &[]).unwrap();
+        let mut worst = 0f32;
+        for (x, y) in oa.iter().zip(&ob) {
+            worst = worst.max((x.value - y.value).abs());
+            for (p, q) in x.logits.iter().zip(&y.logits) {
+                worst = worst.max((p - q).abs());
+            }
+            for (p, q) in x.values.iter().zip(&y.values) {
+                worst = worst.max((p - q).abs());
+            }
+        }
+        eprintln!("{} expansions, worst difference {worst}", oa.len());
+        assert!(worst < 1e-2, "worst difference {worst}");
     }
 
     #[test]

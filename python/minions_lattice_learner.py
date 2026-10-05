@@ -248,8 +248,11 @@ class Tier2Export(nn.Module):
         super().__init__()
         self.t2 = t2
 
-    def forward(self, h, nidx, nscal, kid):
+    def forward(self, hs, hidx, nidx, nscal, kid):
+        # hs: the call's distinct trunk images [U, C, 7, 7]; hidx [B] each
+        # row's (one upload per turn start, not per row).
         # kid: flat [T] indices row * 49*37 + cell * 37 + slot (no padding).
+        h = hs.index_select(0, hidx.long())
         logit, vlog, v2 = self.t2(h.float(), dense_x(nidx, nscal))
         k = kid.long()
         return logit.reshape(-1).gather(0, k), torch.sigmoid(vlog.reshape(-1).gather(0, k)), torch.sigmoid(v2)
@@ -277,12 +280,19 @@ def export_onnx(trunk, t2, out, dev):
     )
     torch.onnx.export(
         Tier2Export(t2).to(dev).eval(),
-        (torch.zeros(b, c, N, N, dtype=torch.float16, device=dev), pad.clone(), sc.clone(), torch.zeros(b * k, dtype=torch.int32, device=dev)),
+        (
+            torch.zeros(8, c, N, N, dtype=torch.float16, device=dev),
+            torch.zeros(b, dtype=torch.int32, device=dev),
+            pad.clone(),
+            sc.clone(),
+            torch.zeros(b * k, dtype=torch.int32, device=dev),
+        ),
         os.path.join(out, "tier2.onnx"),
-        input_names=["h", "nidx", "nscal", "kid"],
+        input_names=["hs", "hidx", "nidx", "nscal", "kid"],
         output_names=["logit", "value", "v2"],
         dynamic_axes={
-            "h": {0: "b"},
+            "hs": {0: "u"},
+            "hidx": {0: "b"},
             "nidx": {0: "b"},
             "nscal": {0: "b"},
             "kid": {0: "t"},
@@ -294,7 +304,7 @@ def export_onnx(trunk, t2, out, dev):
         dynamo=False,
     )
     with open(os.path.join(out, "lattice.json"), "w") as f:
-        json.dump({"c_trunk": c}, f)
+        json.dump({"c_trunk": c, "trunk_gather": True}, f)
 
 
 def group_log_softmax(logit, group, n_groups):
