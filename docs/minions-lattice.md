@@ -124,9 +124,16 @@ word operations.
    3. Re-root there and repeat until a full turn.
 
    Each locked-from node gives a **tier-2 record**: per-hex child visit
-   distributions (including indirect visits) as prior targets, children's
-   Q as post-move value targets, and the node's Q as its partial-move value
-   target.
+   distributions (including indirect visits) as prior targets, and value
+   targets for the children and the node.
+
+   **Targets average complete turns only** (the user's rule, 2026-10-04).
+   The lattice's intermediate values, i.e. expansions' predicted node and
+   child values, only steer the tier-2 search. Every value target is the
+   mean of the sink returns below the node or child: descents that ended
+   at a complete turn, valued by tier 1. Children with no return below
+   them train the prior only. Likewise, a tier-1 node's Q averages tier-1
+   evaluations only, and lattice values never reach it.
 4. Continue until the game ends. The game result is not trained on.
 
 **Throughput comes first,** before any learning use:
@@ -139,8 +146,13 @@ word operations.
 ## Nets
 
 - **Tier-1 trunk:** relatively big, run once per tier-1 node. Input is the
-  start-of-turn position. Output is an image tensor (C × 7 × 7, same
-  geometry).
+  start-of-turn position, and only that: partial turns are not
+  representable in it (the user's rule, 2026-10-04). That means unit and
+  graveyard planes, money, reinforcements and turns left
+  (`minions_lattice_learner.py` `PosNet`, `pos:CxB`). Decision planes and
+  stage flags reach tier 2 only. Tier 1 trains on turn records only, tier 2
+  on the partial (lattice) records. Output is an image tensor
+  (C × 7 × 7, same geometry).
 - **Tier-1 value head:** can be big. A tier-1 energy head is optional,
   maybe later.
 - **Tier-2 net:** small, called once per lattice expansion. Inputs are the
@@ -261,6 +273,34 @@ per-node StepState).
 
 Throughput is good enough to train on (~12 turns/s, ~220 tier-2 records/s);
 the next step is the cycle from random init.
+
+## Pre-trained lineage (`data/models/minions/lattice537`, from 2026-10-04)
+
+The from-scratch lineage was shelved at gen 76. Its nets lost 1–31 to the
+heuristic greedy bot in full games.
+
+The pre-trained lineage starts with tier 1 = Athenan gen 537 (`res:32x4`)
+and tier 2 seeded from the distilled `lt1`. Start turns are geometric on
+0, 1, 2, ... with mean 10 (`--start-turn-mean`), drawn from the lineage's
+own opening pool.
+
+- **Tier 2 was the weak part.** Lattice + T2 (the full design) lost 0–16
+  to Athenan-537 played without search. Lattice + V537, the "bridge" (the
+  same search valuing each lattice child with Athenan gen 537's value net),
+  went 9–7.
+- **Gens 13–45 generated with the bridge.** Mid-turn tier-1 records kept
+  its value net sound on partial turns. They brought Lattice + V<g> to
+  Athenan-537's level, never past it: 0.41–0.53 vs Lattice + V537 over
+  64 games at gens 20 and 29.
+- **Fitting variants did not help.** Cutting the tier-2 gradient into the
+  trunk, and a light fit anchored to the previous net, were all level with
+  gen 29.
+- **The mid-turn records were the wrong design.** They were 97% of the
+  tier-1 data, and the value net then fit turn starts at 0.028 excess.
+- **From gen 46:** the bridge is retired, the trunk reads positions only
+  (converted from `res`: the constant plane takes the fates flag, and only
+  the `next` marker is lost), tier 1 trains on turn records, and targets
+  average sink returns only.
 
 ## Training cycle (from random init, started 2026-10-03 22:20)
 
