@@ -51,6 +51,7 @@ from minions_steps_learner import (
     SPARSE_DIM,
     SPARSE_PLANES,
     ResBlock,
+    ResNet,
     SparseSet,
     build,
     load_chunks,
@@ -105,6 +106,68 @@ def load_t2(dirs):
     return np.concatenate(recs), np.concatenate(kids)
 
 
+# The trunk's input is a full-turn position only (2026-10-04, the user's
+# call): unit and graveyard planes (steps.rs P_UNITS..P_GRAVE) and the
+# position scalars (money, reinforcements, turns left: scalars 0..12), plus
+# one constant plane. Decision planes and stage flags -- partial turns --
+# are not part of it; they reach tier 2 only, on top of the trunk.
+POS_PLANES = 13
+POS_SCALARS = 13
+P_NEXT = 16
+
+
+class PosNet(ResNet):
+    """The steps ResNet on full-turn positions: reads the steps feature
+    layout but only its position channels."""
+
+    def __init__(self, ch, blocks):
+        super().__init__(ch, blocks)
+        self.stem = nn.Sequential(
+            nn.Conv2d(POS_PLANES + POS_SCALARS + 1, ch, 3, padding=1, bias=False), nn.BatchNorm2d(ch), nn.ReLU()
+        )
+
+    def inputs(self, x):
+        b = x.shape[0]
+        planes = x[:, :SPARSE_DIM].reshape(b, SPARSE_PLANES, N, N)[:, :POS_PLANES]
+        sc = x[:, SPARSE_DIM : SPARSE_DIM + POS_SCALARS].reshape(b, POS_SCALARS, 1, 1).expand(b, POS_SCALARS, N, N)
+        return torch.cat([planes, sc, torch.ones(b, 1, N, N, device=x.device, dtype=x.dtype)], 1)
+
+    def forward(self, x):
+        return self.head(self.blocks(self.stem(self.inputs(x))))
+
+
+def pos_from_res(sd):
+    """A steps ResNet's weights for a PosNet: the stem keeps the position
+    channels, and the constant plane takes the turn-start stage flag
+    (fates, scalar 13), so turn starts read as before but for the `next`
+    marker, which is dropped."""
+    w = sd["stem.0.weight"]
+    if w.shape[1] == POS_PLANES + POS_SCALARS + 1:
+        return sd
+    assert w.shape[1] == SPARSE_PLANES + N_SCALARS, w.shape
+    sd = dict(sd)
+    sd["stem.0.weight"] = torch.cat(
+        [w[:, :POS_PLANES], w[:, SPARSE_PLANES : SPARSE_PLANES + POS_SCALARS], w[:, SPARSE_PLANES + 13 : SPARSE_PLANES + 14]], 1
+    )
+    return sd
+
+
+def build_t1(arch):
+    if arch.startswith("pos:"):
+        ch, blocks = (int(v) for v in arch[4:].split("x"))
+        return PosNet(ch, blocks)
+    return build(arch)
+
+
+def turn_records(r1):
+    """Tier-1 records of turn starts only: older generations also wrote
+    mid-turn records (decision planes or a later stage)."""
+    plane = r1["active"].astype(np.int64) // CELLS
+    live = np.arange(MAX_ACTIVE)[None, :] < r1["n_active"][:, None]
+    dec = live & (plane >= POS_PLANES) & (plane != P_NEXT)
+    return (r1["stage"] == 0) & ~dec.any(1)
+
+
 def dense(act, cnt, scal):
     """Sparse feature rows -> dense [B, 1241] on act's device."""
     b = act.shape[0]
@@ -130,7 +193,8 @@ class Trunk(nn.Module):
         self.net = net
 
     def forward(self, x):
-        h = self.net.blocks(self.net.stem(planes_of(x)))
+        inp = self.net.inputs(x) if hasattr(self.net, "inputs") else planes_of(x)
+        h = self.net.blocks(self.net.stem(inp))
         return h, self.net.head(h)
 
 
@@ -335,9 +399,12 @@ def main():
     torch.manual_seed(args.seed)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(args.out, exist_ok=True)
-    net1 = build(args.t1_arch).to(dev)
+    net1 = build_t1(args.t1_arch).to(dev)
     if args.t1:
-        net1.load_state_dict(torch.load(args.t1, map_location=dev))
+        sd = torch.load(args.t1, map_location=dev)
+        if isinstance(net1, PosNet):
+            sd = pos_from_res(sd)
+        net1.load_state_dict(sd)
     trunk = Trunk(net1).to(dev)
     c_trunk = net1.stem[0].out_channels
     ch, blocks = (int(v) for v in args.arch.split("x"))
@@ -365,6 +432,9 @@ def main():
     ho_mask = (all_idx % args.holdout_every) == 0
     ho, tr = all_idx[ho_mask], all_idx[~ho_mask]
     r1, _, nf1 = load_chunks([os.path.join(d, "t1") for d in args.data])
+    keep = turn_records(r1)
+    print(f"t1: {len(r1)} records, {keep.sum()} turn starts kept")
+    r1 = r1[keep]
     xs1 = SparseSet(r1, dev)
     ys1 = torch.from_numpy(r1["target"].astype(np.float32)).to(dev)
     i1 = torch.arange(len(r1), device=dev)
