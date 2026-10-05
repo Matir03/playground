@@ -346,7 +346,7 @@ def masked_bce(logit, y, m):
     return F.binary_cross_entropy_with_logits(logit[m], y[m])
 
 
-def losses(trunk, t2, ds, idx, grad_trunk=False):
+def losses(trunk, t2, ds, idx, grad_trunk=False, counts=False):
     with torch.set_grad_enabled(grad_trunk and torch.is_grad_enabled()):
         h, _ = trunk(dense(ds.ract[idx], ds.rn[idx], ds.rscal[idx]))
     logit, vlog, v = t2(h, dense(ds.nact[idx], ds.nn[idx], ds.nscal[idx]))
@@ -367,6 +367,8 @@ def losses(trunk, t2, ds, idx, grad_trunk=False):
     km, qm = ds.kqok[kid], ds.qok[idx]
     l_val = masked_bce(vl, ds.kq[kid], km)
     l_node = masked_bce(v, ds.q[idx], qm)
+    if counts:
+        return l_prior, l_val, l_node, h_tgt, int(km.sum()), int(qm.sum())
     return l_prior, l_val, l_node, h_tgt
 
 
@@ -455,9 +457,14 @@ def main():
         t2.eval()
         out = np.zeros(5)
         with torch.no_grad():
+            # Value losses weighted by their (masked) target counts.
+            wsum = np.zeros(4)
             for i in range(0, len(ho), 4096):
-                out[:4] += np.array([x.item() for x in losses(trunk, t2, ds, ho[i : i + 4096])]) * len(ho[i : i + 4096])
-            out[:4] /= max(len(ho), 1)
+                lp, lv, ln, h, nk, nq = losses(trunk, t2, ds, ho[i : i + 4096], counts=True)
+                w = np.array([len(ho[i : i + 4096]), nk, nq, len(ho[i : i + 4096])], dtype=float)
+                out[:4] += np.array([lp.item(), lv.item(), ln.item(), h.item()]) * w
+                wsum += w
+            out[:4] /= np.maximum(wsum, 1)
             for i in range(0, len(ho1), 8192):
                 out[4] += t1_loss(net1, xs1, ys1, ho1[i : i + 8192]).item() * len(ho1[i : i + 8192])
             out[4] /= max(len(ho1), 1)
