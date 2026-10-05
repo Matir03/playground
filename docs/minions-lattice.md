@@ -302,6 +302,31 @@ own opening pool.
   the `next` marker is lost), tier 1 trains on turn records, and targets
   average sink returns only.
 
+### Night of 2026-10-04/05: a regression, its cause, and gating
+
+- **Gens 46–59 slid.** Lattice + T2-50 scored 0.20 vs gen 40 and 0.28 vs
+  gen 45 over 64 games, and the same at 400 tier-1 visits.
+- **Fitting knobs ruled out.** None of these helped: light fit + anchor,
+  frozen trunk, low lr, BatchNorm moving / exactly re-estimated / frozen,
+  priors only, tier-2 values only, tier-1 only.
+- **Cause:** the walk's 20 descents per locked ply. Their visit shares
+  mostly echoed tier 2's own priors, which was fine while the bridge's
+  priors were uniform. From gen 45, one gen of `n2` 20 data scored 0.234 vs
+  gen 45, and one gen of `n2` 100 data scored 0.484.
+- **`--t2-from-t1`** derives the tier-2 records from the tier-1 search:
+  each kid's targets are the visits and mean value of the tier-1 turns
+  containing it, along a path to the chosen turn. There is no walk, so
+  throughput roughly doubled, to ~9k searched turns per gen.
+- **Gating (from gen 55).** Generation uses a champion. Candidates train
+  from the champion on the last 4 gens, and every 2 gens play it 64 games
+  at n1 100, taking over at ≥ 0.55.
+  - Gen 54 beat gen 45 0.719; gen 60 beat gen 54 0.594.
+  - Gates 62–76 all fell between 0.41 and 0.55.
+  - Gen 60 is level with gen 40 (0.547), but Lattice + T2-60 still loses
+    2–62 to Athenan-537 played without search.
+- **Search scales:** at 400 tier-1 visits, gen 45 beat itself at 100,
+  0.844.
+
 ## Training cycle (from random init, started 2026-10-03 22:20)
 
 `data/models/minions/lattice/cycle.sh` (untracked, like the steps cycle),
