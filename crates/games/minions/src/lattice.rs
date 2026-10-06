@@ -1499,6 +1499,9 @@ pub struct Walk {
     curs: Vec<Cursor>,
     pub records: Vec<T2Record>,
     pub done: bool,
+    /// The complete turns (sink, value for the lattice's mover) reached by
+    /// this ply's descents: the record's targets count these alone.
+    ply_sinks: Vec<(u32, f32)>,
     /// Self-distillation: the nodes still to record, the one being recorded
     /// (`NONE`: none), its kids' best complete-turn values so far, the
     /// descents still to start (kid index), and those in flight.
@@ -1519,6 +1522,7 @@ impl Walk {
             curs: Vec::new(),
             records: Vec::new(),
             done: false,
+            ply_sinks: Vec::new(),
             sd: Vec::new(),
             sd_at: NONE,
             sd_best: Vec::new(),
@@ -1770,7 +1774,8 @@ impl Lattice {
                 let mut i = 0;
                 while i < w.curs.len() {
                     match self.advance(&mut w.curs[i], p.c2)? {
-                        Need::Done { .. } => {
+                        Need::Done { sink, value, .. } => {
+                            w.ply_sinks.push((sink, value));
                             w.curs.swap_remove(i);
                             w.finished += 1;
                             progressed = true;
@@ -1794,23 +1799,46 @@ impl Lattice {
                 }
                 continue;
             }
+            // The ply's targets: this ply's own descents only (not the
+            // lattice's accumulated statistics, which hold every earlier
+            // search's descents and one atom per child of every expansion).
+            // A descent ends at a complete turn, which takes exactly one
+            // choice per variable, so each variable's kid visits sum to n2.
             let at = w.at;
-            let st = self.stats(at);
+            let sinks: Vec<(Key, f32)> = std::mem::take(&mut w.ply_sinks)
+                .into_iter()
+                .map(|(s, v)| (self.nodes[s as usize].key, v))
+                .collect();
             let nd = &self.nodes[at as usize];
+            let count = |k: &Key| {
+                sinks
+                    .iter()
+                    .filter(|x| x.0.includes(k))
+                    .fold((0.0f64, 0.0f64), |a, x| (a.0 + 1.0, a.1 + f64::from(x.1)))
+            };
+            let kid_n: Vec<(f64, f64)> = nd
+                .kids
+                .iter()
+                .map(|k| count(&nd.key.with(k.var as usize, k.choice)))
+                .collect();
+            let (n, wsum) = (
+                sinks.len() as f64,
+                sinks.iter().map(|x| f64::from(x.1)).sum::<f64>(),
+            );
             w.records.push(T2Record {
                 node: nd.state.clone(),
                 kids: nd
                     .kids
                     .iter()
-                    .zip(st.kids.iter().zip(&st.skids))
+                    .zip(&kid_n)
                     .filter(|(k, _)| !k.dead)
-                    .map(|(k, (&(n, _), &(rn, rw)))| {
-                        (k.cell, k.choice, n as f32, ret_mean(rn, rw), rn as f32)
+                    .map(|(k, &(kn, kw))| {
+                        (k.cell, k.choice, kn as f32, ret_mean(kn, kw), kn as f32)
                     })
                     .collect(),
-                n: st.n as f32,
-                q: ret_mean(st.sn, st.sw),
-                ns: st.sn as f32,
+                n: n as f32,
+                q: ret_mean(n, wsum),
+                ns: n as f32,
             });
             let mut vars: Vec<u8> = nd.kids.iter().filter(|k| !k.dead).map(|k| k.var).collect();
             vars.dedup();
@@ -1818,7 +1846,7 @@ impl Lattice {
             let idx: Vec<usize> = (0..nd.kids.len())
                 .filter(|&i| nd.kids[i].var == var && !nd.kids[i].dead)
                 .collect();
-            let wts: Vec<f64> = idx.iter().map(|&i| st.kids[i].0).collect();
+            let wts: Vec<f64> = idx.iter().map(|&i| kid_n[i].0).collect();
             let k = idx[noisy_pick(&wts, p.temp, p.dir_alpha, p.dir_frac, rng)];
             w.lp += f64::from(nd.kids[k].logp);
             w.at = self.child(at, k)?;
@@ -2226,7 +2254,9 @@ pub(crate) mod tests {
                 if l.terminal.is_some() {
                     continue;
                 }
-                let (sink, _, _) = l.descend(&HashLatticeEval, Cursor::at(0, 0.0), 1.5).unwrap();
+                let (sink, _, _) = l
+                    .descend(&HashLatticeEval, Cursor::at(0, 0.0), 1.5)
+                    .unwrap();
                 let path = l.path_to(sink, &mut rng).unwrap();
                 assert!(!path.is_empty() && path[0] == 0);
                 let mut w = Walk::self_distill(&p, path.clone());
@@ -2269,7 +2299,12 @@ pub(crate) mod tests {
                     let mut cells: Vec<u8> = r.kids.iter().map(|k| k.0).collect();
                     cells.dedup();
                     for c in cells {
-                        let m = r.kids.iter().filter(|k| k.0 == c).map(|k| k.2).fold(0.0, f32::max);
+                        let m = r
+                            .kids
+                            .iter()
+                            .filter(|k| k.0 == c)
+                            .map(|k| k.2)
+                            .fold(0.0, f32::max);
                         assert_eq!(m, 1.0);
                     }
                 }
@@ -2327,9 +2362,19 @@ pub(crate) mod tests {
                 }
                 assert_eq!(l.nodes[w.at as usize].kind, Kind::Sink);
                 assert!(!w.records.is_empty());
+                // Each record counts its ply's n2 descents alone, and every
+                // variable's kids split them (a complete turn takes one
+                // choice per variable).
                 for r in &w.records {
-                    assert!(r.kids.iter().all(|k| k.2 >= 1.0));
-                    assert!(r.n >= p.n2 as f32);
+                    assert_eq!(r.n, p.n2 as f32);
+                    let mut cells: Vec<u8> = r.kids.iter().map(|k| k.0).collect();
+                    cells.sort();
+                    cells.dedup();
+                    for c in cells {
+                        let n: f32 = r.kids.iter().filter(|k| k.0 == c).map(|k| k.2).sum();
+                        assert_eq!(n, r.n, "cell {c}");
+                    }
+                    assert!(r.q >= 0.0 && r.q <= 1.0);
                 }
                 // No virtual loss left behind.
                 let direct: u32 = l.nodes.iter().map(|n| n.n).sum();
