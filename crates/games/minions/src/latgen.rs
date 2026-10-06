@@ -104,6 +104,10 @@ pub struct GenConfig {
     /// other tier-2 records are written.
     pub distill_tau: f64,
     pub distill_frac: f64,
+    /// Self-distillation (if positive): tier-2 records from
+    /// [`Lattice::advance_sd`] at each node on the path to the chosen turn
+    /// with this probability, instead of any other tier-2 records.
+    pub sd_frac: f64,
     /// Groups of games per worker taking turns, so that the worker advances
     /// one group while another's net call is in flight (1 = no overlap).
     pub pipeline: usize,
@@ -599,7 +603,12 @@ impl Worker<'_> {
             }
             Task::Walk { lat, walk } => {
                 let mut needs = Vec::new();
-                if !lat.advance_walk(walk, &self.cfg.walk, &mut self.rng, &mut needs)? {
+                let over = if self.cfg.sd_frac > 0.0 {
+                    lat.advance_sd(walk, &self.cfg.walk, &mut needs)?
+                } else {
+                    lat.advance_walk(walk, &self.cfg.walk, &mut self.rng, &mut needs)?
+                };
+                if !over {
                     return Ok(Next::Wait(
                         needs
                             .into_iter()
@@ -723,6 +732,19 @@ impl Worker<'_> {
         let mut out = Vec::with_capacity(2);
         if self.cfg.distill_tau > 0.0 {
             // Distilling: the expansions are the tier-2 records.
+        } else if self.cfg.sd_frac > 0.0 {
+            if let Some(mut lat) = t1.nodes[0].lattice.take() {
+                let target = t1.nodes[pick as usize].sink;
+                let mut nodes = lat.path_to(target, &mut self.rng)?;
+                let f = self.cfg.sd_frac;
+                nodes.retain(|_| self.rng.gen::<f64>() < f);
+                if !nodes.is_empty() {
+                    out.push(Task::Walk {
+                        lat,
+                        walk: Walk::self_distill(&self.cfg.walk, nodes),
+                    });
+                }
+            }
         } else if self.cfg.t2_from_t1 {
             if let Some(mut lat) = t1.nodes[0].lattice.take() {
                 let turns: Vec<(u32, f64, f64)> = t1.nodes[0]

@@ -1466,6 +1466,10 @@ pub struct WalkParams {
     pub dir_frac: f64,
     /// Descents in flight at a time.
     pub inflight: usize,
+    /// Self-distillation (see [`Lattice::advance_sd`]): descents per kid,
+    /// and the temperature of the per-cell softmax prior targets.
+    pub sd_descents: u32,
+    pub sd_tau: f64,
 }
 
 impl Default for WalkParams {
@@ -1477,6 +1481,8 @@ impl Default for WalkParams {
             dir_alpha: 0.3,
             dir_frac: 0.25,
             inflight: 1,
+            sd_descents: 1,
+            sd_tau: 0.02,
         }
     }
 }
@@ -1493,6 +1499,14 @@ pub struct Walk {
     curs: Vec<Cursor>,
     pub records: Vec<T2Record>,
     pub done: bool,
+    /// Self-distillation: the nodes still to record, the one being recorded
+    /// (`NONE`: none), its kids' best complete-turn values so far, the
+    /// descents still to start (kid index), and those in flight.
+    pub sd: Vec<u32>,
+    sd_at: u32,
+    sd_best: Vec<f32>,
+    sd_todo: Vec<usize>,
+    sd_curs: Vec<(Cursor, usize)>,
 }
 
 impl Walk {
@@ -1505,7 +1519,21 @@ impl Walk {
             curs: Vec::new(),
             records: Vec::new(),
             done: false,
+            sd: Vec::new(),
+            sd_at: NONE,
+            sd_best: Vec::new(),
+            sd_todo: Vec::new(),
+            sd_curs: Vec::new(),
         }
+    }
+
+    /// A self-distillation walk recording `nodes` (see
+    /// [`Lattice::advance_sd`]).
+    pub fn self_distill(p: &WalkParams, mut nodes: Vec<u32>) -> Self {
+        nodes.reverse();
+        let mut w = Walk::new(p);
+        w.sd = nodes;
+        w
     }
 }
 
@@ -1577,6 +1605,142 @@ impl Lattice {
             at = self.child(at, k)?;
         }
         Ok(out)
+    }
+
+    /// The nodes along a path from the root to `target` (each step commits
+    /// one of the target's variables, picked uniformly at random), the root
+    /// included and the target not. Nodes are prepared, not expanded.
+    pub fn path_to(&mut self, target: u32, rng: &mut impl rand::Rng) -> Result<Vec<u32>> {
+        let tk = self.nodes[target as usize].key;
+        let mut out = Vec::new();
+        let mut at = 0u32;
+        while self.nodes[at as usize].kind == Kind::Inner {
+            if !self.nodes[at as usize].prepared && !self.prepare(at)? {
+                break;
+            }
+            out.push(at);
+            let nd = &self.nodes[at as usize];
+            let mut vars: Vec<u8> = nd.kids.iter().filter(|k| !k.dead).map(|k| k.var).collect();
+            vars.dedup();
+            vars.retain(|&v| tk.mask & (1 << v) != 0);
+            if vars.is_empty() {
+                break;
+            }
+            let var = vars[rng.gen_range(0..vars.len())];
+            let c = tk.get(var as usize);
+            let Some(k) = nd
+                .kids
+                .iter()
+                .position(|k| k.var == var && k.choice == c && !k.dead)
+            else {
+                break;
+            };
+            at = self.child(at, k)?;
+        }
+        Ok(out)
+    }
+
+    /// Self-distillation: for each of `w.sd`'s nodes, `p.sd_descents`
+    /// descents from each live kid, each ending at a complete turn valued by
+    /// tier 1. A kid's targets are the best of those values (value) and a
+    /// per-cell softmax of them at `p.sd_tau` (prior); the node's value is
+    /// its best kid's. Intermediate values only steer the descents. Requests
+    /// go to `out`; true once every node is recorded.
+    pub fn advance_sd(
+        &mut self,
+        w: &mut Walk,
+        p: &WalkParams,
+        out: &mut Vec<Need>,
+    ) -> Result<bool> {
+        loop {
+            if w.sd_at == NONE {
+                let Some(n) = w.sd.pop() else {
+                    w.done = true;
+                    return Ok(true);
+                };
+                if self.nodes[n as usize].kind != Kind::Inner || !self.nodes[n as usize].prepared {
+                    continue;
+                }
+                let nk = self.nodes[n as usize].kids.len();
+                w.sd_at = n;
+                w.sd_best = vec![f32::NEG_INFINITY; nk];
+                w.sd_todo = (0..nk)
+                    .filter(|&k| !self.nodes[n as usize].kids[k].dead)
+                    .flat_map(|k| std::iter::repeat(k).take(p.sd_descents.max(1) as usize))
+                    .collect();
+            }
+            let at = w.sd_at;
+            while w.sd_curs.len() < p.inflight.max(1) {
+                let Some(k) = w.sd_todo.pop() else { break };
+                if self.nodes[at as usize].kids[k].dead {
+                    continue;
+                }
+                let c = self.child(at, k)?;
+                w.sd_curs.push((Cursor::at(c, 0.0), k));
+            }
+            let mut progressed = false;
+            let mut i = 0;
+            while i < w.sd_curs.len() {
+                match self.advance(&mut w.sd_curs[i].0, p.c2)? {
+                    Need::Done { value, .. } => {
+                        let k = w.sd_curs[i].1;
+                        w.sd_best[k] = w.sd_best[k].max(value);
+                        w.sd_curs.swap_remove(i);
+                        progressed = true;
+                    }
+                    Need::Dead => {
+                        w.sd_curs.swap_remove(i);
+                        progressed = true;
+                    }
+                    Need::Wait => i += 1,
+                    need => {
+                        out.push(need);
+                        i += 1;
+                    }
+                }
+            }
+            if !w.sd_curs.is_empty() || !w.sd_todo.is_empty() {
+                if !progressed {
+                    return Ok(false);
+                }
+                continue;
+            }
+            // Every descent from this node is in: record it.
+            let nd = &self.nodes[at as usize];
+            let live: Vec<usize> = (0..nd.kids.len())
+                .filter(|&k| !nd.kids[k].dead && w.sd_best[k].is_finite())
+                .collect();
+            if !live.is_empty() {
+                let mut cell_best: HashMap<u8, f32> = HashMap::new();
+                for &k in &live {
+                    let b = cell_best
+                        .entry(nd.kids[k].cell)
+                        .or_insert(f32::NEG_INFINITY);
+                    *b = b.max(w.sd_best[k]);
+                }
+                let kids = live
+                    .iter()
+                    .map(|&k| {
+                        let kid = &nd.kids[k];
+                        let v = w.sd_best[k];
+                        let wt = (f64::from(v - cell_best[&kid.cell]) / p.sd_tau).exp() as f32;
+                        (kid.cell, kid.choice, wt, v, 1.0)
+                    })
+                    .collect();
+                let q = live
+                    .iter()
+                    .map(|&k| w.sd_best[k])
+                    .fold(f32::NEG_INFINITY, f32::max);
+                w.records.push(T2Record {
+                    node: nd.state.clone(),
+                    kids,
+                    n: 1.0,
+                    q,
+                    ns: 1.0,
+                });
+            }
+            w.sd_at = NONE;
+        }
     }
 
     /// Run walk `w` until every descent in flight (up to `p.inflight` at a
@@ -2044,6 +2208,77 @@ pub(crate) mod tests {
 
     /// The walk ends on a full turn, records one node per locked ply, and
     /// each record's kid visits are at least one (the expansion's).
+    /// Self-distillation records every path node with a live kid; each
+    /// kid's value is a complete turn's (in [0, 1]), the node's is its best
+    /// kid's, and the best kid of each cell has prior weight 1.
+    #[test]
+    fn self_distill_records() {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(3);
+        for (inflight, descents) in [(1, 1), (4, 2)] {
+            let p = WalkParams {
+                inflight,
+                sd_descents: descents,
+                ..WalkParams::default()
+            };
+            let mut total = 0;
+            for s in positions(4, 31) {
+                let mut l = Lattice::new(s).unwrap();
+                if l.terminal.is_some() {
+                    continue;
+                }
+                let (sink, _, _) = l.descend(&HashLatticeEval, Cursor::at(0, 0.0), 1.5).unwrap();
+                let path = l.path_to(sink, &mut rng).unwrap();
+                assert!(!path.is_empty() && path[0] == 0);
+                let mut w = Walk::self_distill(&p, path.clone());
+                let mut needs = Vec::new();
+                while !l.advance_sd(&mut w, &p, &mut needs).unwrap() {
+                    assert!(!needs.is_empty(), "stalled without requests");
+                    for need in needs.drain(..) {
+                        match need {
+                            Need::Expand(n) => {
+                                let (slots, node) = l.request(n);
+                                let req = ExpandReq {
+                                    root: &l.start,
+                                    node,
+                                    slots: &slots,
+                                    trunk: None,
+                                };
+                                let out = HashLatticeEval.expand(&[req]).unwrap().pop().unwrap();
+                                l.feed_expand(n, &out);
+                            }
+                            Need::Value(n) => {
+                                let o = HashLatticeEval
+                                    .both(&[], &[&l.nodes[n as usize].state])
+                                    .unwrap()
+                                    .1
+                                    .pop()
+                                    .unwrap();
+                                l.feed_value(n, &o);
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                assert_eq!(w.records.len(), path.len());
+                for r in &w.records {
+                    let best = r.kids.iter().map(|k| k.3).fold(f32::NEG_INFINITY, f32::max);
+                    assert_eq!(r.q, best);
+                    for k in &r.kids {
+                        assert!((0.0..=1.0).contains(&k.3) && k.2 > 0.0 && k.2 <= 1.0);
+                    }
+                    let mut cells: Vec<u8> = r.kids.iter().map(|k| k.0).collect();
+                    cells.dedup();
+                    for c in cells {
+                        let m = r.kids.iter().filter(|k| k.0 == c).map(|k| k.2).fold(0.0, f32::max);
+                        assert_eq!(m, 1.0);
+                    }
+                }
+                total += w.records.len();
+            }
+            assert!(total > 10, "{total} records");
+        }
+    }
+
     #[test]
     fn walk_locks_down_to_a_turn() {
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(9);
