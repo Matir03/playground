@@ -120,6 +120,9 @@ pub struct OrtLatticeEval {
     /// logits are their values over this temperature: the prior head is not
     /// used.
     value_prior_tau: f32,
+    /// lattice.json `prior_temp` (default 1): the prior logits are divided
+    /// by it (> 1 flattens the search's priors).
+    prior_temp: f32,
 }
 
 impl Drop for OrtLatticeEval {
@@ -366,6 +369,7 @@ impl OrtLatticeEval {
             as usize;
         let gather = meta["trunk_gather"].as_bool().unwrap_or(false);
         let value_prior_tau = meta["value_prior_tau"].as_f64().unwrap_or(0.0) as f32;
+        let prior_temp = meta["prior_temp"].as_f64().unwrap_or(1.0) as f32;
         let p1 = |b: usize| format!("ridx:{b}x{MAX_ACTIVE},rscal:{b}x{N_SCALARS}");
         // `u`: distinct trunk images (gather nets).
         let p2 = |b: usize, t: usize, u: usize| {
@@ -405,6 +409,7 @@ impl OrtLatticeEval {
             queue,
             runners: hs,
             value_prior_tau,
+            prior_temp,
         })
     }
 
@@ -472,6 +477,7 @@ impl LatticeEval for OrtLatticeEval {
         let rx = (b.rows() > 0).then(|| self.enqueue(b));
         let n_reqs = reqs.len();
         let tau = self.value_prior_tau;
+        let temp = self.prior_temp;
         let terminal: Vec<f32> = states.iter().map(|s| s.terminal_value()).collect();
         Ok(Pending::new(move || {
             let o = match rx {
@@ -480,7 +486,7 @@ impl LatticeEval for OrtLatticeEval {
                     .map_err(|_| anyhow::anyhow!("lattice runner gone"))??,
                 None => Outs::default(),
             };
-            Ok(unpack(o, n_reqs, &computed, &terminal, &live, tau))
+            Ok(unpack(o, n_reqs, &computed, &terminal, &live, tau, temp))
         }))
     }
 }
@@ -493,6 +499,7 @@ fn unpack(
     terminal: &[f32],
     live: &[usize],
     value_prior_tau: f32,
+    prior_temp: f32,
 ) -> (Vec<ExpandOut>, Vec<ValueOut>) {
     {
         let reqs_len = n_reqs;
@@ -505,6 +512,8 @@ fn unpack(
                 ExpandOut {
                     logits: if value_prior_tau > 0.0 {
                         values.iter().map(|v| v / value_prior_tau).collect()
+                    } else if prior_temp != 1.0 {
+                        logits.iter().map(|l| l / prior_temp).collect()
                     } else {
                         logits
                     },

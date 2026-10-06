@@ -1522,6 +1522,12 @@ pub struct WalkParams {
     /// n2-visit search per ply, see [`Lattice::advance_fresh`]) instead of
     /// the lattice's accumulated ones.
     pub fresh: bool,
+    /// The records count each descent's first step from the recorded node
+    /// (the commitment the search chose to make there: AlphaZero's edge
+    /// visits) instead of the complete turns containing each kid (the
+    /// marginals, which also count choices left over once other variables
+    /// were committed).
+    pub first_step: bool,
 }
 
 impl Default for WalkParams {
@@ -1536,6 +1542,7 @@ impl Default for WalkParams {
             sd_descents: 1,
             sd_tau: 0.02,
             fresh: true,
+            first_step: true,
         }
     }
 }
@@ -1555,6 +1562,9 @@ pub struct Walk {
     /// The complete turns (sink, value for the lattice's mover) reached by
     /// this ply's descents: the record's targets count these alone.
     ply_sinks: Vec<(u32, f32)>,
+    /// Per finished descent of this ply: its first step's kid index at the
+    /// locked node, and its complete turn's value.
+    ply_first: Vec<(u16, f32)>,
     /// Self-distillation: the nodes still to record, the one being recorded
     /// (`NONE`: none), its kids' best complete-turn values so far, the
     /// descents still to start (kid index), and those in flight.
@@ -1576,6 +1586,7 @@ impl Walk {
             records: Vec::new(),
             done: false,
             ply_sinks: Vec::new(),
+            ply_first: Vec::new(),
             sd: Vec::new(),
             sd_at: NONE,
             sd_best: Vec::new(),
@@ -1932,6 +1943,11 @@ impl Lattice {
                     match need {
                         Need::Done { sink, value, .. } => {
                             w.ply_sinks.push((sink, value));
+                            if let Some(&(n0, k0)) = w.curs[i].path.first() {
+                                if n0 == w.at {
+                                    w.ply_first.push((k0, value));
+                                }
+                            }
                             w.curs.swap_remove(i);
                             w.finished += 1;
                             progressed = true;
@@ -1972,11 +1988,20 @@ impl Lattice {
                     .filter(|x| x.0.includes(k))
                     .fold((0.0f64, 0.0f64), |a, x| (a.0 + 1.0, a.1 + f64::from(x.1)))
             };
-            let kid_n: Vec<(f64, f64)> = nd
-                .kids
-                .iter()
-                .map(|k| count(&nd.key.with(k.var as usize, k.choice)))
-                .collect();
+            let first = std::mem::take(&mut w.ply_first);
+            let kid_n: Vec<(f64, f64)> = if p.first_step {
+                let mut v = vec![(0.0f64, 0.0f64); nd.kids.len()];
+                for &(k, val) in &first {
+                    v[k as usize].0 += 1.0;
+                    v[k as usize].1 += f64::from(val);
+                }
+                v
+            } else {
+                nd.kids
+                    .iter()
+                    .map(|k| count(&nd.key.with(k.var as usize, k.choice)))
+                    .collect()
+            };
             let (n, wsum) = (
                 sinks.len() as f64,
                 sinks.iter().map(|x| f64::from(x.1)).sum::<f64>(),
@@ -2002,7 +2027,15 @@ impl Lattice {
             let idx: Vec<usize> = (0..nd.kids.len())
                 .filter(|&i| nd.kids[i].var == var && !nd.kids[i].dead)
                 .collect();
-            let wts: Vec<f64> = idx.iter().map(|&i| kid_n[i].0).collect();
+            // Lock by the complete turns found (the marginals): the walk
+            // follows one of them down, whichever targets were recorded.
+            let wts: Vec<f64> = idx
+                .iter()
+                .map(|&i| {
+                    let k = &nd.kids[i];
+                    count(&nd.key.with(k.var as usize, k.choice)).0
+                })
+                .collect();
             let k = idx[noisy_pick(&wts, p.temp, p.dir_alpha, p.dir_frac, rng)];
             w.lp += f64::from(nd.kids[k].logp);
             w.at = self.child(at, k)?;
@@ -2473,10 +2506,18 @@ pub(crate) mod tests {
     #[test]
     fn walk_locks_down_to_a_turn() {
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(9);
-        for (inflight, fresh) in [(1, false), (4, false), (1, true), (4, true)] {
+        for (inflight, fresh, first_step) in [
+            (1, false, false),
+            (4, false, false),
+            (1, true, false),
+            (4, true, false),
+            (1, true, true),
+            (4, true, true),
+        ] {
             let p = WalkParams {
                 inflight,
                 fresh,
+                first_step,
                 ..WalkParams::default()
             };
             for s in positions(5, 21) {
@@ -2524,6 +2565,12 @@ pub(crate) mod tests {
                 // choice per variable).
                 for r in &w.records {
                     assert_eq!(r.n, p.n2 as f32);
+                    if first_step {
+                        // One first step per descent, over all the kids.
+                        let n: f32 = r.kids.iter().map(|k| k.2).sum();
+                        assert_eq!(n, r.n);
+                        continue;
+                    }
                     let mut cells: Vec<u8> = r.kids.iter().map(|k| k.0).collect();
                     cells.sort();
                     cells.dedup();

@@ -845,6 +845,15 @@ enum Cmd {
         /// expands from --onnx.
         #[arg(long)]
         sink_values: Option<String>,
+        /// The walk's descents in flight per game (default: --inflight). With
+        /// n2 descents per ply all in flight at once, their virtual losses
+        /// spread them by prior order before any value comes back.
+        #[arg(long)]
+        walk_inflight: Option<usize>,
+        /// Walk records count the complete turns containing each kid (the
+        /// marginals) instead of each descent's first step.
+        #[arg(long)]
+        walk_marginal: bool,
         /// Groups of games per worker taking turns, so a worker advances one
         /// group while another's net call is in flight (1 = no overlap).
         #[arg(long, default_value_t = 2)]
@@ -1603,7 +1612,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::LatticeGen {
             out, onnx, ep, batcher, workers, games, n1, inflight, n2, c1, c2, pw_c, pw_alpha, retries,
             temp1, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, start_turn_mean, secs,
-            target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, sd_frac, sd_descents, sd_tau, walk_accumulated, sink_values, pipeline, openings, open_workers, pool, refill_to,
+            target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, sd_frac, sd_descents, sd_tau, walk_accumulated, sink_values, walk_inflight, walk_marginal, pipeline, openings, open_workers, pool, refill_to,
         } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
             // A directory is the lattice nets (tier1/tier2.onnx); a file a steps value net behind the bridge.
@@ -1633,10 +1642,11 @@ async fn main() -> anyhow::Result<()> {
                     temp: temp2,
                     dir_alpha: dir2_alpha,
                     dir_frac: dir2_frac,
-                    inflight,
+                    inflight: walk_inflight.unwrap_or(inflight),
                     sd_descents,
                     sd_tau,
                     fresh: !walk_accumulated,
+                    first_step: !walk_marginal,
                 },
                 temp1,
                 dir1_alpha,
