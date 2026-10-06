@@ -1470,6 +1470,10 @@ pub struct WalkParams {
     /// and the temperature of the per-cell softmax prior targets.
     pub sd_descents: u32,
     pub sd_tau: f64,
+    /// The walk's descents select on their own ply's statistics (a fresh
+    /// n2-visit search per ply, see [`Lattice::advance_fresh`]) instead of
+    /// the lattice's accumulated ones.
+    pub fresh: bool,
 }
 
 impl Default for WalkParams {
@@ -1483,6 +1487,7 @@ impl Default for WalkParams {
             inflight: 1,
             sd_descents: 1,
             sd_tau: 0.02,
+            fresh: true,
         }
     }
 }
@@ -1644,6 +1649,104 @@ impl Lattice {
         Ok(out)
     }
 
+    /// Run descent `curs[i]` of a fresh per-ply search until it needs the
+    /// net or reaches a complete turn. Selection is PUCT over this ply's own
+    /// statistics only: a kid's visits are the ply's finished descents whose
+    /// turn contains it (`done`: sink, value) plus the other descents in
+    /// flight that passed through it (virtual losses, value 0); its value is
+    /// the mean of those turns' tier-1 values, or its intermediate value
+    /// while unvisited. The lattice's own statistics are left alone.
+    pub fn advance_fresh(
+        &mut self,
+        curs: &mut [Cursor],
+        i: usize,
+        done: &[(u32, f32)],
+        c_puct: f32,
+    ) -> Result<Need> {
+        let mut atoms: Vec<(Key, f32)> = done
+            .iter()
+            .map(|&(s, v)| (self.nodes[s as usize].key, v))
+            .collect();
+        for (j, c) in curs.iter().enumerate() {
+            if j != i {
+                atoms.push((self.nodes[c.at as usize].key, 0.0));
+            }
+        }
+        let cur = &mut curs[i];
+        for _ in 0..1_000_000 {
+            let n = cur.at;
+            let node = &self.nodes[n as usize];
+            match node.kind {
+                Kind::Dead => {
+                    let Some((p, k)) = cur.path.pop() else {
+                        return Ok(Need::Dead);
+                    };
+                    cur.lp -= f64::from(self.nodes[p as usize].kids[k as usize].logp);
+                    cur.at = p;
+                }
+                Kind::Sink => {
+                    let Some(v) = node.value else {
+                        if node.busy {
+                            return Ok(Need::Wait);
+                        }
+                        self.nodes[n as usize].busy = true;
+                        return Ok(Need::Value(n));
+                    };
+                    // No direct visit: the lattice's statistics stay as the
+                    // tier-1 search left them.
+                    return Ok(Need::Done {
+                        sink: n,
+                        value: v,
+                        fresh: false,
+                    });
+                }
+                Kind::Inner if !node.expanded => {
+                    if node.busy {
+                        return Ok(Need::Wait);
+                    }
+                    if node.prepared || self.prepare(n)? {
+                        self.nodes[n as usize].busy = true;
+                        return Ok(Need::Expand(n));
+                    }
+                    self.kill(n)?;
+                }
+                Kind::Inner => {
+                    let pk = node.key;
+                    let tot = atoms.iter().filter(|a| a.0.includes(&pk)).count() as f64;
+                    let sq = tot.max(1.0).sqrt();
+                    let mut best = None;
+                    let mut best_u = f64::NEG_INFINITY;
+                    for (k, kid) in node.kids.iter().enumerate() {
+                        if kid.dead {
+                            continue;
+                        }
+                        let kk = pk.with(kid.var as usize, kid.choice);
+                        let (kn, kw) = atoms
+                            .iter()
+                            .filter(|a| a.0.includes(&kk))
+                            .fold((0.0f64, 0.0f64), |s, a| (s.0 + 1.0, s.1 + f64::from(a.1)));
+                        let q = if kn > 0.0 { kw / kn } else { f64::from(kid.v) };
+                        let u = q + f64::from(c_puct) * f64::from(kid.logp).exp() * sq / (1.0 + kn);
+                        if u > best_u {
+                            best_u = u;
+                            best = Some(k);
+                        }
+                    }
+                    match best {
+                        None => self.kill(n)?,
+                        Some(k) => {
+                            let c = self.child(n, k)?;
+                            cur.lp += f64::from(self.nodes[n as usize].kids[k].logp);
+                            cur.path.push((n, k as u16));
+                            cur.at = c;
+                        }
+                    }
+                }
+            }
+        }
+        bail!("fresh lattice descent made no progress in 1e6 steps")
+    }
+
     /// Self-distillation: for each of `w.sd`'s nodes, `p.sd_descents`
     /// descents from each live kid, each ending at a complete turn valued by
     /// tier 1. A kid's targets are the best of those values (value) and a
@@ -1773,7 +1876,12 @@ impl Lattice {
                 let mut progressed = false;
                 let mut i = 0;
                 while i < w.curs.len() {
-                    match self.advance(&mut w.curs[i], p.c2)? {
+                    let need = if p.fresh {
+                        self.advance_fresh(&mut w.curs, i, &w.ply_sinks, p.c2)?
+                    } else {
+                        self.advance(&mut w.curs[i], p.c2)?
+                    };
+                    match need {
                         Need::Done { sink, value, .. } => {
                             w.ply_sinks.push((sink, value));
                             w.curs.swap_remove(i);
@@ -2317,9 +2425,10 @@ pub(crate) mod tests {
     #[test]
     fn walk_locks_down_to_a_turn() {
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(9);
-        for inflight in [1, 4] {
+        for (inflight, fresh) in [(1, false), (4, false), (1, true), (4, true)] {
             let p = WalkParams {
                 inflight,
+                fresh,
                 ..WalkParams::default()
             };
             for s in positions(5, 21) {

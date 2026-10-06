@@ -836,6 +836,10 @@ enum Cmd {
         /// Self-distillation: temperature of the per-cell softmax priors.
         #[arg(long, default_value_t = 0.02)]
         sd_tau: f64,
+        /// The walk's descents select on the lattice's accumulated statistics
+        /// (the tier-1 search's included) instead of a fresh per-ply search.
+        #[arg(long)]
+        walk_accumulated: bool,
         /// Groups of games per worker taking turns, so a worker advances one
         /// group while another's net call is in flight (1 = no overlap).
         #[arg(long, default_value_t = 2)]
@@ -1594,7 +1598,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::LatticeGen {
             out, onnx, ep, batcher, workers, games, n1, inflight, n2, c1, c2, pw_c, pw_alpha, retries,
             temp1, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, start_turn_mean, secs,
-            target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, sd_frac, sd_descents, sd_tau, pipeline, openings, open_workers, pool, refill_to,
+            target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, sd_frac, sd_descents, sd_tau, walk_accumulated, pipeline, openings, open_workers, pool, refill_to,
         } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
             // A directory is the lattice nets (tier1/tier2.onnx); a file a steps value net behind the bridge.
@@ -1620,6 +1624,7 @@ async fn main() -> anyhow::Result<()> {
                     inflight,
                     sd_descents,
                     sd_tau,
+                    fresh: !walk_accumulated,
                 },
                 temp1,
                 dir1_alpha,
