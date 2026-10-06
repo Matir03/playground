@@ -234,12 +234,19 @@ def dense_x(idx, scal):
 
 
 class Tier1Export(nn.Module):
-    def __init__(self, trunk):
+    def __init__(self, trunk, t2=None):
         super().__init__()
         self.trunk = trunk
+        self.t2 = t2
 
     def forward(self, ridx, rscal):
-        h, v1 = self.trunk(dense_x(ridx, rscal))
+        x = dense_x(ridx, rscal)
+        h, v1 = self.trunk(x)
+        if self.t2 is not None:
+            # One value function: the tier-2 head's node value at the lattice
+            # root (the turn start, nothing committed) -- the tier-1 call's
+            # features are the root node's.
+            v1 = self.t2(h, x)[2]
         return torch.sigmoid(v1), h.half()
 
 
@@ -258,7 +265,7 @@ class Tier2Export(nn.Module):
         return logit.reshape(-1).gather(0, k), torch.sigmoid(vlog.reshape(-1).gather(0, k)), torch.sigmoid(v2)
 
 
-def export_onnx(trunk, t2, out, dev, value_prior_tau=0.0):
+def export_onnx(trunk, t2, out, dev, value_prior_tau=0.0, t1_from_t2=False):
     """`tier1.onnx` (turn start -> value, fp16 trunk image), `tier2.onnx`
     (trunk image + node + children -> children's logits and values, node
     value) and `lattice.json` (the trunk's width)."""
@@ -269,7 +276,7 @@ def export_onnx(trunk, t2, out, dev, value_prior_tau=0.0):
     pad = torch.full((b, MAX_ACTIVE), SPARSE_DIM, dtype=torch.int32, device=dev)
     sc = torch.zeros(b, N_SCALARS, device=dev)
     torch.onnx.export(
-        Tier1Export(trunk).to(dev).eval(),
+        Tier1Export(trunk, t2 if t1_from_t2 else None).to(dev).eval(),
         (pad, sc),
         os.path.join(out, "tier1.onnx"),
         input_names=["ridx", "rscal"],
@@ -395,6 +402,20 @@ def t1_loss(net, xs, ys, idx):
     return F.binary_cross_entropy_with_logits(net(xs.dense(idx)), ys[idx])
 
 
+class RootValue(nn.Module):
+    """Tier 1 as the tier-2 head's node value at the lattice root: trunk
+    image, then the head on the same (turn-start) features."""
+
+    def __init__(self, trunk, t2):
+        super().__init__()
+        self.trunk = trunk
+        self.t2 = t2
+
+    def forward(self, x):
+        h, _ = self.trunk(x)
+        return self.t2(h, x)[2]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", nargs="+", help="lattice-gen output dirs (their t1/ and t2/)")
@@ -410,6 +431,7 @@ def main():
     ap.add_argument("--freeze-bn", action="store_true", help="keep BatchNorm statistics fixed (layers in eval mode) while training the weights")
     ap.add_argument("--bn-recal", type=int, default=200, help="re-estimate BatchNorm statistics exactly over this many batches after training (0 = keep the moving estimate)")
     ap.add_argument("--prior-weight", type=float, default=1.0)
+    ap.add_argument("--t1-from-t2", action="store_true", help="no separate tier-1 value: tier 1 is the tier-2 head's node value at the lattice root (turn records train it there)")
     ap.add_argument("--value-prior-tau", type=float, default=0.0, help="export with value-based search priors at this temperature (lattice.json); the prior head is then unused")
     ap.add_argument("--min-cell-support", type=int, default=1, help="prior targets only for cells where at least this many kids have visits")
     ap.add_argument("--value-weight", type=float, default=1.0, help="tier-2 child and node values")
@@ -438,15 +460,16 @@ def main():
     t2 = T2Net(c_trunk, ch, blocks).to(dev)
     if args.init:
         t2.load_state_dict(torch.load(args.init, map_location=dev))
+    v1net = RootValue(trunk, t2) if args.t1_from_t2 else net1
 
     def save(meta):
         torch.save(net1.state_dict(), os.path.join(args.out, "net.pt"))
         torch.save(t2.state_dict(), os.path.join(args.out, "t2.pt"))
-        export_onnx(trunk, t2, args.out, dev, args.value_prior_tau)
+        export_onnx(trunk, t2, args.out, dev, args.value_prior_tau, args.t1_from_t2)
         # The tier-1 net alone, as a steps value net (steps-match etc.).
         steps_export_onnx(net1, args.out, dev)
         with open(os.path.join(args.out, "meta.json"), "w") as f:
-            json.dump(meta | {"t1_arch": args.t1_arch, "arch": args.arch}, f, indent=1)
+            json.dump(meta | {"t1_arch": args.t1_arch, "arch": args.arch, "t1_from_t2": args.t1_from_t2}, f, indent=1)
 
     if args.export_only:
         save({"t1": args.t1, "init": args.init, "export_only": True})
@@ -492,7 +515,7 @@ def main():
                 wsum += w
             out[:4] /= np.maximum(wsum, 1)
             for i in range(0, len(ho1), 8192):
-                out[4] += t1_loss(net1, xs1, ys1, ho1[i : i + 8192]).item() * len(ho1[i : i + 8192])
+                out[4] += t1_loss(v1net, xs1, ys1, ho1[i : i + 8192]).item() * len(ho1[i : i + 8192])
             out[4] /= max(len(ho1), 1)
             # The t1 targets' own entropy: the floor of their BCE.
             y = ys1[ho1].clamp(1e-6, 1 - 1e-6)
@@ -527,7 +550,7 @@ def main():
         if args.freeze_trunk:
             l1 = torch.zeros((), device=dev)
         else:
-            l1 = t1_loss(net1, xs1, ys1, tr1[torch.randint(len(tr1), (args.t1_batch,), device=dev)]) if len(tr1) else torch.zeros((), device=dev)
+            l1 = t1_loss(v1net, xs1, ys1, tr1[torch.randint(len(tr1), (args.t1_batch,), device=dev)]) if len(tr1) else torch.zeros((), device=dev)
         loss = args.prior_weight * lp + args.value_weight * (lv + ln) + args.t1_weight * l1
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -552,7 +575,7 @@ def main():
                 idx = tr[torch.randint(len(tr), (args.batch,), device=dev)]
                 losses(trunk, t2, ds, idx)
                 if len(tr1):
-                    net1(xs1.dense(tr1[torch.randint(len(tr1), (args.t1_batch,), device=dev)]))
+                    v1net(xs1.dense(tr1[torch.randint(len(tr1), (args.t1_batch,), device=dev)]))
         for m in bns:
             m.momentum = 0.1
         print(f"BatchNorm statistics re-estimated over {args.bn_recal} batches")

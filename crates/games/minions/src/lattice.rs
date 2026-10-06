@@ -1313,6 +1313,54 @@ impl Lattice {
     }
 }
 
+/// Expansions from one evaluator, turn-start (tier-1) values from another:
+/// e.g. a lattice net's tier 2 with complete turns valued by a steps value
+/// net. The values carry no trunk image, so the expansions compute their own.
+pub struct HybridEval {
+    pub expand: std::sync::Arc<dyn LatticeEval>,
+    pub values: std::sync::Arc<dyn LatticeEval>,
+}
+
+impl LatticeEval for HybridEval {
+    fn both(
+        &self,
+        reqs: &[ExpandReq],
+        states: &[&StepState],
+    ) -> Result<(Vec<ExpandOut>, Vec<ValueOut>)> {
+        let e = if reqs.is_empty() {
+            Vec::new()
+        } else {
+            self.expand.both(reqs, &[])?.0
+        };
+        let v = if states.is_empty() {
+            Vec::new()
+        } else {
+            self.values.both(&[], states)?.1
+        };
+        Ok((e, v))
+    }
+
+    fn submit(&self, reqs: &[ExpandReq], states: &[&StepState]) -> Result<Pending> {
+        let p = if reqs.is_empty() {
+            None
+        } else {
+            Some(self.expand.submit(reqs, &[])?)
+        };
+        let v = if states.is_empty() {
+            Vec::new()
+        } else {
+            self.values.both(&[], states)?.1
+        };
+        Ok(Pending::new(move || {
+            let e = match p {
+                Some(p) => p.wait()?.0,
+                None => Vec::new(),
+            };
+            Ok((e, v))
+        }))
+    }
+}
+
 /// Bootstrap evaluator from a steps-mode value net: a child's value is the
 /// net's value of the child state, priors are uniform, and tier-1 values
 /// are the net's values of turn starts.

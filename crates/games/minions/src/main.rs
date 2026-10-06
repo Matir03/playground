@@ -840,6 +840,11 @@ enum Cmd {
         /// (the tier-1 search's included) instead of a fresh per-ply search.
         #[arg(long)]
         walk_accumulated: bool,
+        /// Value turn starts (complete turns, tier-1 nodes) with this steps
+        /// value net instead of the lattice net's tier 1; tier 2 still
+        /// expands from --onnx.
+        #[arg(long)]
+        sink_values: Option<String>,
         /// Groups of games per worker taking turns, so a worker advances one
         /// group while another's net call is in flight (1 = no overlap).
         #[arg(long, default_value_t = 2)]
@@ -1598,7 +1603,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::LatticeGen {
             out, onnx, ep, batcher, workers, games, n1, inflight, n2, c1, c2, pw_c, pw_alpha, retries,
             temp1, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, start_turn_mean, secs,
-            target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, sd_frac, sd_descents, sd_tau, walk_accumulated, pipeline, openings, open_workers, pool, refill_to,
+            target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, sd_frac, sd_descents, sd_tau, walk_accumulated, sink_values, pipeline, openings, open_workers, pool, refill_to,
         } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
             // A directory is the lattice nets (tier1/tier2.onnx); a file a steps value net behind the bridge.
@@ -1607,6 +1612,13 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 let eval = load_step_eval_runners(&onnx, &ep, batcher)?;
                 std::sync::Arc::new(minions_engine::lattice::StepsBridge { eval })
+            };
+            let bridge: std::sync::Arc<dyn minions_engine::lattice::LatticeEval> = match &sink_values {
+                Some(net) => std::sync::Arc::new(minions_engine::lattice::HybridEval {
+                    expand: bridge,
+                    values: std::sync::Arc::new(minions_engine::lattice::StepsBridge { eval: load_step_eval_runners(net, &ep, batcher)? }),
+                }),
+                None => bridge,
             };
             let cfg = minions_engine::latgen::GenConfig {
                 out: out.into(),
