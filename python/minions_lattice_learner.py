@@ -258,7 +258,7 @@ class Tier2Export(nn.Module):
         return logit.reshape(-1).gather(0, k), torch.sigmoid(vlog.reshape(-1).gather(0, k)), torch.sigmoid(v2)
 
 
-def export_onnx(trunk, t2, out, dev):
+def export_onnx(trunk, t2, out, dev, value_prior_tau=0.0):
     """`tier1.onnx` (turn start -> value, fp16 trunk image), `tier2.onnx`
     (trunk image + node + children -> children's logits and values, node
     value) and `lattice.json` (the trunk's width)."""
@@ -304,7 +304,11 @@ def export_onnx(trunk, t2, out, dev):
         dynamo=False,
     )
     with open(os.path.join(out, "lattice.json"), "w") as f:
-        json.dump({"c_trunk": c, "trunk_gather": True}, f)
+        meta = {"c_trunk": c, "trunk_gather": True}
+        if value_prior_tau > 0:
+            # The search's priors: children's values over this temperature.
+            meta["value_prior_tau"] = value_prior_tau
+        json.dump(meta, f)
 
 
 def group_log_softmax(logit, group, n_groups):
@@ -406,6 +410,7 @@ def main():
     ap.add_argument("--freeze-bn", action="store_true", help="keep BatchNorm statistics fixed (layers in eval mode) while training the weights")
     ap.add_argument("--bn-recal", type=int, default=200, help="re-estimate BatchNorm statistics exactly over this many batches after training (0 = keep the moving estimate)")
     ap.add_argument("--prior-weight", type=float, default=1.0)
+    ap.add_argument("--value-prior-tau", type=float, default=0.0, help="export with value-based search priors at this temperature (lattice.json); the prior head is then unused")
     ap.add_argument("--min-cell-support", type=int, default=1, help="prior targets only for cells where at least this many kids have visits")
     ap.add_argument("--value-weight", type=float, default=1.0, help="tier-2 child and node values")
     ap.add_argument("--freeze-trunk", action="store_true", help="train tier 2 only, on a fixed tier 1")
@@ -437,7 +442,7 @@ def main():
     def save(meta):
         torch.save(net1.state_dict(), os.path.join(args.out, "net.pt"))
         torch.save(t2.state_dict(), os.path.join(args.out, "t2.pt"))
-        export_onnx(trunk, t2, args.out, dev)
+        export_onnx(trunk, t2, args.out, dev, args.value_prior_tau)
         # The tier-1 net alone, as a steps value net (steps-match etc.).
         steps_export_onnx(net1, args.out, dev)
         with open(os.path.join(args.out, "meta.json"), "w") as f:

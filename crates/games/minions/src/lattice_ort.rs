@@ -116,6 +116,10 @@ struct Queue {
 pub struct OrtLatticeEval {
     queue: Arc<Queue>,
     runners: Vec<std::thread::JoinHandle<()>>,
+    /// If positive (lattice.json `value_prior_tau`), the children's prior
+    /// logits are their values over this temperature: the prior head is not
+    /// used.
+    value_prior_tau: f32,
 }
 
 impl Drop for OrtLatticeEval {
@@ -361,6 +365,7 @@ impl OrtLatticeEval {
             .ok_or_else(|| anyhow::anyhow!("lattice.json has no c_trunk"))?
             as usize;
         let gather = meta["trunk_gather"].as_bool().unwrap_or(false);
+        let value_prior_tau = meta["value_prior_tau"].as_f64().unwrap_or(0.0) as f32;
         let p1 = |b: usize| format!("ridx:{b}x{MAX_ACTIVE},rscal:{b}x{N_SCALARS}");
         // `u`: distinct trunk images (gather nets).
         let p2 = |b: usize, t: usize, u: usize| {
@@ -396,7 +401,11 @@ impl OrtLatticeEval {
             let q = queue.clone();
             hs.push(std::thread::spawn(move || runner(s1, s2, c, gather, &q)));
         }
-        Ok(OrtLatticeEval { queue, runners: hs })
+        Ok(OrtLatticeEval {
+            queue,
+            runners: hs,
+            value_prior_tau,
+        })
     }
 
     /// Queue `batch` for a runner; its results arrive on the receiver.
@@ -462,6 +471,7 @@ impl LatticeEval for OrtLatticeEval {
         }
         let rx = (b.rows() > 0).then(|| self.enqueue(b));
         let n_reqs = reqs.len();
+        let tau = self.value_prior_tau;
         let terminal: Vec<f32> = states.iter().map(|s| s.terminal_value()).collect();
         Ok(Pending::new(move || {
             let o = match rx {
@@ -470,7 +480,7 @@ impl LatticeEval for OrtLatticeEval {
                     .map_err(|_| anyhow::anyhow!("lattice runner gone"))??,
                 None => Outs::default(),
             };
-            Ok(unpack(o, n_reqs, &computed, &terminal, &live))
+            Ok(unpack(o, n_reqs, &computed, &terminal, &live, tau))
         }))
     }
 }
@@ -482,17 +492,26 @@ fn unpack(
     computed: &[Option<usize>],
     terminal: &[f32],
     live: &[usize],
+    value_prior_tau: f32,
 ) -> (Vec<ExpandOut>, Vec<ValueOut>) {
     {
         let reqs_len = n_reqs;
         let mut lg = o.logit.into_iter();
         let mut va = o.value.into_iter();
         let out = (0..reqs_len)
-            .map(|i| ExpandOut {
-                logits: lg.next().expect("row"),
-                values: va.next().expect("row"),
-                value: o.v2[i],
-                trunk: computed[i].map(|r| o.h[r].clone()),
+            .map(|i| {
+                let logits = lg.next().expect("row");
+                let values: Vec<f32> = va.next().expect("row");
+                ExpandOut {
+                    logits: if value_prior_tau > 0.0 {
+                        values.iter().map(|v| v / value_prior_tau).collect()
+                    } else {
+                        logits
+                    },
+                    values,
+                    value: o.v2[i],
+                    trunk: computed[i].map(|r| o.h[r].clone()),
+                }
             })
             .collect();
         let mut vals: Vec<ValueOut> = terminal
@@ -672,7 +691,8 @@ mod tests {
         for seed in 0..6u64 {
             let s = StepState::begin(&crate::game::MinionsState::with_bid(3), seed);
             let mut l = crate::lattice::Lattice::new(s).unwrap();
-            l.descend(&ea, crate::lattice::Cursor::at(0, 0.0), 1.5).unwrap();
+            l.descend(&ea, crate::lattice::Cursor::at(0, 0.0), 1.5)
+                .unwrap();
             lats.push(l);
         }
         let mut slots = Vec::new();
