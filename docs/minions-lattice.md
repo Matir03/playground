@@ -327,6 +327,42 @@ own opening pool.
 - **Search scales:** at 400 tier-1 visits, gen 45 beat itself at 100,
   0.844.
 
+### 2026-10-05/06: what tier 2 can be trained on
+
+- **Athenan distillation works.** A 64×4 tier 2 (D0) trained on the
+  bridge's expansions: each child's value is Athenan-537's value of it,
+  and the prior target is a sharp per-cell softmax of those values. Over
+  gen 60's trunk it beat gen 60 64–0 and Athenan-537 0.594. Three times
+  the data gave nothing more.
+- **Visit counts are not usable prior targets in the order-free lattice.**
+  - *Marginals* (complete turns containing each choice) also count
+    choices left over once other variables were committed. On D0's data
+    the search's top choice disagreed with D0's prior in 35% of cells and
+    was worse by the search's own values. Fine-tuning collapsed D0 to
+    0.14–0.25, whoever valued the turns (tier 1 or Athenan), however
+    sharp the priors, and however many descents were in flight.
+  - *First steps* point the other way: a complete turn is a visit for all
+    of its choices, so PUCT's bonus sends later first steps to choices
+    not yet in any found turn. Training on them lost 0–64.
+  - The walk's records also had two plain bugs, both fixed: they counted
+    the lattice's accumulated statistics (median 15k visits per record),
+    and they steered on them.
+- **Value-based targets are safe.**
+  - Self-distillation (each child completed to a full turn, valued by
+    tier 1, prior = per-cell softmax) never hurt and promoted three
+    times in 70 generations.
+  - Completed-Q walk records (`--walk-cq`, after Gumbel MuZero): the
+    first step selects on edge statistics, and the prior target is
+    softmax(log prior + σ·q). q must be min-max normalized per variable;
+    raw values differ by ~0.02 and give the prior back. One round from
+    gen 226 scored 0.500. The cycle runs on them from gen 278.
+- **One value function and a 64×6 trunk** (the user's design,
+  `--t1-from-t2`): the tier-1 value is the tier-2 head's node value at the
+  lattice root. Trained from scratch on the Athenan distillation data
+  (gen 200) it scored 0.531 vs D0 and 0.672 vs Athenan-537.
+- **Match hangs** came from eager witness checks in `steps-match`;
+  self-play was always lazy. Matches are lazy now.
+
 ## Training cycle (from random init, started 2026-10-03 22:20)
 
 `data/models/minions/lattice/cycle.sh` (untracked, like the steps cycle),
