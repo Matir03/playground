@@ -113,6 +113,9 @@ pub struct GenConfig {
     /// turn start, then its tier-1 children's complete declarations with
     /// their visits).
     pub lview: bool,
+    /// Interior tier-1 turns with at least this many visits also write
+    /// energy groups (0: the root's only).
+    pub energy_min_visits: u32,
     /// Groups of games per worker taking turns, so that the worker advances
     /// one group while another's net call is in flight (1 = no overlap).
     pub pipeline: usize,
@@ -751,19 +754,34 @@ impl Worker<'_> {
         }
         self.t1w.buf.extend_from_slice(&rec);
         self.t1w.added()?;
-        if self.cfg.lview && root.children.len() > 1 {
-            // Energy targets: the root's children (complete turns) and
-            // their visits; a group never spans two chunks.
+        // Energy targets: a turn start's children (complete turns) and their
+        // visits -- the root's, and interior turns' searched at least
+        // `energy_min_visits` deep (0: the root only).
+        for (i, nd) in t1.nodes.iter().enumerate() {
+            let min = if i == 0 {
+                1
+            } else {
+                self.cfg.energy_min_visits
+            };
+            if !self.cfg.lview
+                || min == 0
+                || nd.n < min
+                || nd.children.len() < 2
+                || nd.terminal.is_some()
+                || nd.state.is_terminal()
+            {
+                continue;
+            }
             let (mut act, mut sc) = (Vec::with_capacity(MAX_ACTIVE), [0f32; N_SCALARS]);
-            crate::lview::node_features(&root.state, &mut act, &mut sc);
-            encode_energy(0, root.n as f32, &act, &sc, &mut self.t1e.buf);
-            for &c in &root.children {
+            crate::lview::node_features(&nd.state, &mut act, &mut sc);
+            encode_energy(0, nd.n as f32, &act, &sc, &mut self.t1e.buf);
+            for &c in &nd.children {
                 let ch = &t1.nodes[c as usize];
-                crate::lview::decl_features(&root.state, &ch.state.done, &mut act, &mut sc);
+                crate::lview::decl_features(&nd.state, &ch.state.done, &mut act, &mut sc);
                 encode_energy(1, ch.n as f32, &act, &sc, &mut self.t1e.buf);
             }
             // Whole groups per chunk: flush only between groups.
-            self.t1e.n += 1 + root.children.len();
+            self.t1e.n += 1 + nd.children.len();
             if self.t1e.n >= self.t1e.per_chunk {
                 self.t1e.flush()?;
             }
