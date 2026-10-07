@@ -98,6 +98,19 @@ KID_DTYPE = np.dtype([("cell", "u1"), ("slot", "u1"), ("pad", "<u2"), ("n", "<f4
 assert KID_DTYPE.itemsize == T2_KID_BYTES
 
 
+OLD_DTYPE = np.dtype(
+    [
+        ("rn", "u1"),
+        ("nn", "u1"),
+        ("pad", "<u2"),
+        ("ract", "<u2", (MAX_ACTIVE,)),
+        ("rscal", "<f4", (N_SCALARS,)),
+        ("nact", "<u2", (MAX_ACTIVE,)),
+        ("nscal", "<f4", (N_SCALARS,)),
+    ]
+)
+
+
 def read_chunk(path, magic, dtype):
     with open(path, "rb") as f:
         head = f.read(16)
@@ -107,15 +120,25 @@ def read_chunk(path, magic, dtype):
         return np.frombuffer(f.read(), dtype, count=count)
 
 
-def load_t2(dirs):
-    recs, kids = [], []
+def load_t2(dirs, old=False):
+    """Records and kids; with `old`, only chunks with `.old` side files
+    (--teacher-view) and those too."""
+    recs, kids, olds = [], [], []
     for d in dirs:
         for p in sorted(glob.glob(os.path.join(d, "t2", "chunk_*.bin"))):
+            if old and not os.path.exists(p[:-4] + ".old"):
+                continue
             r = read_chunk(p, b"MLT2", T2_DTYPE)
             k = read_chunk(p[:-4] + ".kids", b"MLTK", KID_DTYPE)
             assert int(r["kids"].sum()) == len(k), p
             recs.append(r)
             kids.append(k)
+            if old:
+                o = read_chunk(p[:-4] + ".old", b"MLTO", OLD_DTYPE)
+                assert len(o) == len(r), p
+                olds.append(o)
+    if old:
+        return np.concatenate(recs), np.concatenate(kids), np.concatenate(olds)
     return np.concatenate(recs), np.concatenate(kids)
 
 
@@ -420,6 +443,19 @@ class T2Set:
         self.kqok = t(np.repeat(ok, recs["kids"].astype(np.int64)) & (kids["q"] >= 0))
         self.stage = recs["stage"]
         self.n = len(recs)
+        if slots == LV_SLOTS:
+            # The old (37 shared slots) slot of each kid, for a teacher.
+            off = np.array([LV_FATE_OFF, LV_MOVE_OFF, LV_SPAWN_OFF, LV_SPAWN_OFF])[np.repeat(recs["stage"], recs["kids"].astype(np.int64))]
+            self.kslot_old = t(kids["slot"].astype(np.int64) - off)
+
+    def set_old(self, old, dev):
+        t = lambda a, dt=None: torch.from_numpy(np.ascontiguousarray(a if dt is None else a.astype(dt))).to(dev)
+        self.oract = t(old["ract"].view(np.int16))
+        self.orn = t(old["rn"])
+        self.orscal = t(old["rscal"], np.float32)
+        self.onact = t(old["nact"].view(np.int16))
+        self.onn = t(old["nn"])
+        self.onscal = t(old["nscal"], np.float32)
 
     def batch(self, idx):
         cnt = self.nkids[idx]
@@ -438,7 +474,8 @@ def masked_bce(logit, y, m):
 
 def losses(trunk, t2, ds, idx, grad_trunk=False, counts=False):
     with torch.set_grad_enabled(grad_trunk and torch.is_grad_enabled()):
-        h, _ = trunk(dense(ds.ract[idx], ds.rn[idx], ds.rscal[idx]))
+        rx = dense(ds.ract[idx], ds.rn[idx], ds.rscal[idx])
+        h, _ = trunk(rx)
     logit, vlog, v, _ = t2(h, dense(ds.nact[idx], ds.nn[idx], ds.nscal[idx]))
     rec_of, kid = ds.batch(idx)
     flat = ds.kflat[kid]
@@ -448,6 +485,32 @@ def losses(trunk, t2, ds, idx, grad_trunk=False, counts=False):
     group = rec_of * CELLS + ds.kcell[kid]
     ng = len(idx) * CELLS
     lp = group_log_softmax(lg, group, ng)
+    teach = getattr(ds, "teacher", None)
+    if teach is not None:
+        # An old-view teacher's outputs on the same nodes are the targets:
+        # per-cell prior softmax over the offered kids, kid and node values,
+        # and its tier-1 value for the position value at the root.
+        tt, tt2 = teach
+        with torch.no_grad():
+            th, _ = tt(dense(ds.oract[idx], ds.orn[idx], ds.orscal[idx]))
+            tlog, tvlog, tv, _ = tt2(th, dense(ds.onact[idx], ds.onn[idx], ds.onscal[idx]))
+            oflat = ds.kcell[kid] * SLOTS + ds.kslot_old[kid]
+            tl = tlog[rec_of, oflat]
+            tp = torch.exp(group_log_softmax(tl, group, ng))
+            tkv = torch.sigmoid(tvlog[rec_of, oflat])
+            tnv = torch.sigmoid(tv)
+            troot = torch.sigmoid(tt2(th, dense(ds.oract[idx], ds.orn[idx], ds.orscal[idx]))[2])
+        n_cells = (torch.zeros(ng, device=lg.device).index_add_(0, group, torch.ones_like(tl)) > 0).sum().clamp(min=1)
+        h_t = -(tp * torch.log(tp.clamp(min=1e-9))).sum() / n_cells
+        l_prior = -(tp * lp).sum() / n_cells
+        l_val = F.binary_cross_entropy_with_logits(vl, tkv)
+        l_node = F.binary_cross_entropy_with_logits(v, tnv)
+        pv = t2(h, rx)[3][:, 0]
+        l_root = F.binary_cross_entropy_with_logits(pv, troot)
+        ds.last_root = l_root
+        if counts:
+            return l_prior, l_val, l_node, h_t, len(kid), len(idx)
+        return l_prior, l_val, l_node, h_t
     tot = torch.zeros(ng, device=lg.device).index_add_(0, group, ds.kn[kid])
     tgt = ds.kn[kid] / tot[group].clamp(min=1e-9)
     # Cells where fewer than min_support kids have visits carry no
@@ -559,6 +622,7 @@ def main():
     ap.add_argument("--t1-from-t2", action="store_true", help="no separate tier-1 value: tier 1 is the tier-2 head's node value at the lattice root (turn records train it there)")
     ap.add_argument("--value-prior-tau", type=float, default=0.0, help="export with value-based search priors at this temperature (lattice.json); the prior head is then unused")
     ap.add_argument("--lview", action="store_true", help="lattice-view records (lview.rs): per-kind output slots, a position-value output (tier 1 reads it) and an energy output trained on t1e/ groups")
+    ap.add_argument("--teacher", help="an old-view lattice net dir (net.pt, t2.pt, meta.json): tier-2 targets are its outputs on the same nodes (records need --teacher-view .old files); the position value learns its tier-1 value")
     ap.add_argument("--energy-weight", type=float, default=1.0)
     ap.add_argument("--energy-batch", type=int, default=64, help="energy groups per step")
     ap.add_argument("--min-cell-support", type=int, default=1, help="prior targets only for cells where at least this many kids have visits")
@@ -604,8 +668,22 @@ def main():
         print(f"exported to {args.out}")
         return
     t0 = time.time()
-    recs, kids = load_t2(args.data)
+    if args.teacher:
+        recs, kids, old = load_t2(args.data, old=True)
+    else:
+        recs, kids = load_t2(args.data)
     ds = T2Set(recs, kids, dev, args.all_visit_targets, t2.slots)
+    if args.teacher:
+        ds.set_old(old, dev)
+        del old
+        tm = json.load(open(os.path.join(args.teacher, "meta.json")))
+        tn1 = build_t1(tm["t1_arch"]).to(dev)
+        tn1.load_state_dict(torch.load(os.path.join(args.teacher, "net.pt"), map_location=dev))
+        tch, tbl = (int(v) for v in tm["arch"].split("x"))
+        tt2 = T2Net(tn1.stem[0].out_channels, tch, tbl).to(dev)
+        tt2.load_state_dict(torch.load(os.path.join(args.teacher, "t2.pt"), map_location=dev))
+        assert tm.get("t1_from_t2"), "teacher's tier-1 value must be its tier-2 root value"
+        ds.teacher = (Trunk(tn1).eval(), tt2.eval())
     es = ESet(load_energy(args.data), dev) if args.lview else None
     if es is not None:
         eg = torch.arange(es.n, device=dev)
@@ -688,7 +766,9 @@ def main():
     for step in range(steps):
         idx = tr[torch.randint(len(tr), (args.batch,), device=dev)]
         lp, lv, ln, _ = losses(trunk, t2, ds, idx, grad_trunk=not (args.freeze_trunk or args.t2_detach))
-        if args.freeze_trunk:
+        if args.teacher:
+            l1 = ds.last_root
+        elif args.freeze_trunk:
             l1 = torch.zeros((), device=dev)
         else:
             l1 = t1_loss(v1net, xs1, ys1, tr1[torch.randint(len(tr1), (args.t1_batch,), device=dev)]) if len(tr1) else torch.zeros((), device=dev)

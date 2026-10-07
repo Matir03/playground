@@ -116,6 +116,9 @@ pub struct GenConfig {
     /// Interior tier-1 turns with at least this many visits also write
     /// energy groups (0: the root's only).
     pub energy_min_visits: u32,
+    /// Tier-2 records also carry the old (steps) view of root and node in a
+    /// `.old` side file: targets from an old-view teacher net.
+    pub teacher_view: bool,
     /// Groups of games per worker taking turns, so that the worker advances
     /// one group while another's net call is in flight (1 = no overlap).
     pub pipeline: usize,
@@ -283,6 +286,8 @@ struct ChunkWriter {
     buf: Vec<u8>,
     n: usize,
     side: Option<(&'static [u8; 4], Vec<u8>, usize)>,
+    /// A second side file (`.old`), one record per main record.
+    side2: Option<(&'static [u8; 4], Vec<u8>, usize)>,
     per_chunk: usize,
 }
 
@@ -305,6 +310,7 @@ impl ChunkWriter {
             buf: Vec::new(),
             n: 0,
             side: None,
+            side2: None,
             per_chunk,
         }
     }
@@ -346,6 +352,17 @@ impl ChunkWriter {
         if let Some((magic, body, rec)) = self.side.as_mut() {
             Self::write(
                 &stem.with_extension("kids"),
+                magic,
+                self.version,
+                body.len() / *rec,
+                *rec,
+                body,
+            )?;
+            body.clear();
+        }
+        if let Some((magic, body, rec)) = self.side2.as_mut() {
+            Self::write(
+                &stem.with_extension("old"),
                 magic,
                 self.version,
                 body.len() / *rec,
@@ -435,7 +452,23 @@ pub fn t2_view(s: &StepState) -> View {
 /// (-1 = no target). Older records (0) averaged every visit.
 const T2_SINK_TARGETS: u8 = 1;
 
+/// A `.old` side record (`--teacher-view`): the root and node in the old
+/// (steps) view, for a teacher net reading it: active counts, 2 pad bytes,
+/// then root and node features.
+pub const OLD_REC_BYTES: usize = 4 + 2 * (MAX_ACTIVE * 2 + N_SCALARS * 4);
+
 fn encode_t2(root: &StepState, r: &T2Record, w: &mut ChunkWriter, lview: bool) -> Result<()> {
+    if let Some((_, body, _)) = w.side2.as_mut() {
+        let at = body.len();
+        body.extend_from_slice(&[0, 0, 0, 0]);
+        let mut tmp = Vec::with_capacity(512);
+        let ra = push_view(&root.view(), &mut tmp);
+        let na = push_view(&t2_view(&r.node), &mut tmp);
+        body.extend_from_slice(&tmp);
+        body[at] = ra;
+        body[at + 1] = na;
+        debug_assert_eq!(body.len() - at, OLD_REC_BYTES);
+    }
     let start = w.buf.len();
     w.buf
         .extend_from_slice(&[0, 0, stage_code(r.node.stage), T2_SINK_TARGETS]);
@@ -1151,6 +1184,9 @@ fn make_worker<'a>(
                 cfg.chunk_records,
             );
             x.side = Some((b"MLTK", Vec::new(), T2_KID_BYTES));
+            if cfg.teacher_view {
+                x.side2 = Some((b"MLTO", Vec::new(), OLD_REC_BYTES));
+            }
             x
         },
         t1e: ChunkWriter::new(
