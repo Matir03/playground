@@ -1528,6 +1528,15 @@ pub struct WalkParams {
     /// marginals, which also count choices left over once other variables
     /// were committed).
     pub first_step: bool,
+    /// Completed-Q records (Gumbel MuZero's policy improvement): at the
+    /// locked node the first step selects on edge statistics (the descents
+    /// that started with each kid), and the prior target is
+    /// softmax(log prior + sigma * q), q a kid's searched mean (its own
+    /// intermediate value if unvisited), sigma = (cq_visit + max visits) *
+    /// cq_scale. Value targets: visited kids' searched means.
+    pub cq: bool,
+    pub cq_visit: f64,
+    pub cq_scale: f64,
 }
 
 impl Default for WalkParams {
@@ -1543,6 +1552,9 @@ impl Default for WalkParams {
             sd_tau: 0.02,
             fresh: true,
             first_step: true,
+            cq: false,
+            cq_visit: 50.0,
+            cq_scale: 0.1,
         }
     }
 }
@@ -1720,8 +1732,24 @@ impl Lattice {
         curs: &mut [Cursor],
         i: usize,
         done: &[(u32, f32)],
+        root: Option<(u32, &[(u16, f32)])>,
         c_puct: f32,
     ) -> Result<Need> {
+        // Edge statistics at the root (completed-Q walks): finished first
+        // steps, plus the other descents in flight as virtual losses.
+        let mut edges: Vec<(u16, f32)> = Vec::new();
+        if let Some((r, first)) = root {
+            edges.extend_from_slice(first);
+            for (j, c) in curs.iter().enumerate() {
+                if j != i {
+                    if let Some(&(n0, k0)) = c.path.first() {
+                        if n0 == r {
+                            edges.push((k0, 0.0));
+                        }
+                    }
+                }
+            }
+        }
         let mut atoms: Vec<(Key, f32)> = done
             .iter()
             .map(|&(s, v)| (self.nodes[s as usize].key, v))
@@ -1768,6 +1796,35 @@ impl Lattice {
                         return Ok(Need::Expand(n));
                     }
                     self.kill(n)?;
+                }
+                Kind::Inner if root.is_some_and(|r| r.0 == n) && cur.path.is_empty() => {
+                    let sq = (edges.len() as f64).max(1.0).sqrt();
+                    let mut best = None;
+                    let mut best_u = f64::NEG_INFINITY;
+                    for (k, kid) in node.kids.iter().enumerate() {
+                        if kid.dead {
+                            continue;
+                        }
+                        let (kn, kw) = edges
+                            .iter()
+                            .filter(|e| e.0 as usize == k)
+                            .fold((0.0f64, 0.0f64), |s, e| (s.0 + 1.0, s.1 + f64::from(e.1)));
+                        let q = if kn > 0.0 { kw / kn } else { f64::from(kid.v) };
+                        let u = q + f64::from(c_puct) * f64::from(kid.logp).exp() * sq / (1.0 + kn);
+                        if u > best_u {
+                            best_u = u;
+                            best = Some(k);
+                        }
+                    }
+                    match best {
+                        None => self.kill(n)?,
+                        Some(k) => {
+                            let c = self.child(n, k)?;
+                            cur.lp += f64::from(self.nodes[n as usize].kids[k].logp);
+                            cur.path.push((n, k as u16));
+                            cur.at = c;
+                        }
+                    }
                 }
                 Kind::Inner => {
                     let pk = node.key;
@@ -1936,7 +1993,8 @@ impl Lattice {
                 let mut i = 0;
                 while i < w.curs.len() {
                     let need = if p.fresh {
-                        self.advance_fresh(&mut w.curs, i, &w.ply_sinks, p.c2)?
+                        let root = p.cq.then_some((w.at, &w.ply_first[..]));
+                        self.advance_fresh(&mut w.curs, i, &w.ply_sinks, root, p.c2)?
                     } else {
                         self.advance(&mut w.curs[i], p.c2)?
                     };
@@ -2006,17 +2064,54 @@ impl Lattice {
                 sinks.len() as f64,
                 sinks.iter().map(|x| f64::from(x.1)).sum::<f64>(),
             );
-            w.records.push(T2Record {
-                node: nd.state.clone(),
-                kids: nd
+            let kids: Vec<(u8, u8, f32, f32, f32)> = if p.cq {
+                // Completed Q over the edge statistics.
+                let mut e = vec![(0.0f64, 0.0f64); nd.kids.len()];
+                for &(k, val) in &first {
+                    e[k as usize].0 += 1.0;
+                    e[k as usize].1 += f64::from(val);
+                }
+                let maxn = e.iter().map(|x| x.0).fold(0.0, f64::max);
+                let sigma = (p.cq_visit + maxn) * p.cq_scale;
+                // Per variable: softmax(logp + sigma * q), as weights.
+                let score: Vec<f64> = nd
                     .kids
+                    .iter()
+                    .zip(&e)
+                    .map(|(k, &(kn, kw))| {
+                        let q = if kn > 0.0 { kw / kn } else { f64::from(k.v) };
+                        f64::from(k.logp) + sigma * q
+                    })
+                    .collect();
+                let mut top: HashMap<u8, f64> = HashMap::new();
+                for (k, &sc) in nd.kids.iter().zip(&score) {
+                    if !k.dead {
+                        let t = top.entry(k.var).or_insert(f64::NEG_INFINITY);
+                        *t = t.max(sc);
+                    }
+                }
+                nd.kids
+                    .iter()
+                    .zip(e.iter().zip(&score))
+                    .filter(|(k, _)| !k.dead)
+                    .map(|(k, (&(kn, kw), &sc))| {
+                        let wt = (sc - top[&k.var]).exp() as f32;
+                        (k.cell, k.choice, wt, ret_mean(kn, kw), kn as f32)
+                    })
+                    .collect()
+            } else {
+                nd.kids
                     .iter()
                     .zip(&kid_n)
                     .filter(|(k, _)| !k.dead)
                     .map(|(k, &(kn, kw))| {
                         (k.cell, k.choice, kn as f32, ret_mean(kn, kw), kn as f32)
                     })
-                    .collect(),
+                    .collect()
+            };
+            w.records.push(T2Record {
+                node: nd.state.clone(),
+                kids,
                 n: n as f32,
                 q: ret_mean(n, wsum),
                 ns: n as f32,
@@ -2506,18 +2601,21 @@ pub(crate) mod tests {
     #[test]
     fn walk_locks_down_to_a_turn() {
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(9);
-        for (inflight, fresh, first_step) in [
-            (1, false, false),
-            (4, false, false),
-            (1, true, false),
-            (4, true, false),
-            (1, true, true),
-            (4, true, true),
+        for (inflight, fresh, first_step, cq) in [
+            (1, false, false, false),
+            (4, false, false, false),
+            (1, true, false, false),
+            (4, true, false, false),
+            (1, true, true, false),
+            (4, true, true, false),
+            (1, true, false, true),
+            (4, true, false, true),
         ] {
             let p = WalkParams {
                 inflight,
                 fresh,
                 first_step,
+                cq,
                 ..WalkParams::default()
             };
             for s in positions(5, 21) {
@@ -2565,6 +2663,24 @@ pub(crate) mod tests {
                 // choice per variable).
                 for r in &w.records {
                     assert_eq!(r.n, p.n2 as f32);
+                    if cq {
+                        // Prior weights: each variable's best kid has 1.
+                        let mut cells: Vec<u8> = r.kids.iter().map(|k| k.0).collect();
+                        cells.dedup();
+                        for c in cells {
+                            let m = r
+                                .kids
+                                .iter()
+                                .filter(|k| k.0 == c)
+                                .map(|k| k.2)
+                                .fold(0.0, f32::max);
+                            assert!((m - 1.0).abs() < 1e-6, "cell {c}: top weight {m}");
+                        }
+                        // One first step per descent: the visit counts sum to n2.
+                        let n: f32 = r.kids.iter().map(|k| k.4).sum();
+                        assert_eq!(n, r.n);
+                        continue;
+                    }
                     if first_step {
                         // One first step per descent, over all the kids.
                         let n: f32 = r.kids.iter().map(|k| k.2).sum();

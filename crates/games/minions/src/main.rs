@@ -643,6 +643,11 @@ enum Cmd {
         n1_b: Option<u32>,
         #[arg(long, default_value_t = 16)]
         lattice_inflight: usize,
+        /// Check every candidate option eagerly in the lattices (self-play,
+        /// lattice-gen, defers them: `steps::LAZY_WITNESS`). Eager checks gave
+        /// single games a heavy tail of 30+ minutes.
+        #[arg(long)]
+        no_lazy_witness: bool,
     },
     /// The step search (best-first) against the old sampled-AZ MCTS, standard
     /// openings with bidding. Old side defaults to the old ladder's eval
@@ -854,6 +859,10 @@ enum Cmd {
         /// marginals) instead of each descent's first step.
         #[arg(long)]
         walk_marginal: bool,
+        /// Walk records with completed-Q targets (Gumbel-style policy
+        /// improvement over edge statistics at each locked node).
+        #[arg(long)]
+        walk_cq: bool,
         /// Groups of games per worker taking turns, so a worker advances one
         /// group while another's net call is in flight (1 = no overlap).
         #[arg(long, default_value_t = 2)]
@@ -1504,7 +1513,8 @@ async fn main() -> anyhow::Result<()> {
             )?;
         }
         Cmd::NnueBench { active, reps } => minions_engine::nnue::bench_sweep(active, reps),
-        Cmd::StepsMatch { a, b, pairs, opening_max, opening_decay, ep, seed, expansions, expansions_b, power, power_b, heads, threads, two_tier_a, two_tier_b, t2_c, t2_retries, t2_widen, n1, n1_b, lattice_inflight } => {
+        Cmd::StepsMatch { a, b, pairs, opening_max, opening_decay, ep, seed, expansions, expansions_b, power, power_b, heads, threads, two_tier_a, two_tier_b, t2_c, t2_retries, t2_widen, n1, n1_b, lattice_inflight, no_lazy_witness } => {
+            minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
             // A match evaluates one batch at a time per game thread, so one
             // runner (two sessions per net, not four) is enough: the session
             // builds were most of a short match's time and memory.
@@ -1612,7 +1622,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::LatticeGen {
             out, onnx, ep, batcher, workers, games, n1, inflight, n2, c1, c2, pw_c, pw_alpha, retries,
             temp1, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, start_turn_mean, secs,
-            target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, sd_frac, sd_descents, sd_tau, walk_accumulated, sink_values, walk_inflight, walk_marginal, pipeline, openings, open_workers, pool, refill_to,
+            target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, sd_frac, sd_descents, sd_tau, walk_accumulated, sink_values, walk_inflight, walk_marginal, walk_cq, pipeline, openings, open_workers, pool, refill_to,
         } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
             // A directory is the lattice nets (tier1/tier2.onnx); a file a steps value net behind the bridge.
@@ -1647,6 +1657,8 @@ async fn main() -> anyhow::Result<()> {
                     sd_tau,
                     fresh: !walk_accumulated,
                     first_step: !walk_marginal,
+                    cq: walk_cq,
+                    ..minions_engine::lattice::WalkParams::default()
                 },
                 temp1,
                 dir1_alpha,

@@ -1029,10 +1029,21 @@ pub fn greedy_turn(
                 q[i] = 1.0 - q[i]; // the child is the opponent's to move
             }
         }
-        let best = (0..kids.len())
-            .max_by(|&a, &b| q[a].total_cmp(&q[b]))
-            .expect("options");
-        s = kids.into_iter().nth(best).expect("best");
+        // Best first; under lazy witnesses an option may defer its check
+        // to the child, which can turn out a dead end: take the best child
+        // whose check succeeds.
+        let mut order: Vec<usize> = (0..kids.len()).collect();
+        order.sort_by(|&a, &b| q[b].total_cmp(&q[a]));
+        let mut kids: Vec<Option<StepState>> = kids.into_iter().map(Some).collect();
+        let mut next = None;
+        for i in order {
+            let mut k = kids[i].take().expect("kid");
+            if k.resolve_pending() {
+                next = Some(k);
+                break;
+            }
+        }
+        s = next.ok_or_else(|| anyhow::anyhow!("every option of a greedy step is a dead end"))?;
     }
     Ok(s.real_base())
 }
