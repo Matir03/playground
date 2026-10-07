@@ -799,6 +799,101 @@ mod tests {
         assert!(worst < 1e-2, "worst difference {worst}");
     }
 
+    /// Two nets (`LATTICE_A`, `LATTICE_B`; either view) on the same lattice
+    /// nodes from random openings: mean per-cell prior total variation,
+    /// mean |child value| and |node value| differences, and tier-1 values.
+    #[test]
+    #[ignore]
+    fn view_parity() {
+        let (Ok(a), Ok(b)) = (std::env::var("LATTICE_A"), std::env::var("LATTICE_B")) else {
+            eprintln!("set LATTICE_A and LATTICE_B");
+            return;
+        };
+        use rand::SeedableRng;
+        let ea = OrtLatticeEval::load(Path::new(&a), "trt", true, 1).unwrap();
+        let eb = OrtLatticeEval::load(Path::new(&b), "trt", true, 1).unwrap();
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(9);
+        let (mut tv, mut ncell, mut dv, mut nk, mut dn, mut nn, mut d1, mut n1) =
+            (0f64, 0usize, 0f64, 0usize, 0f64, 0usize, 0f64, 0usize);
+        let mut by_stage = [(0f64, 0usize); 3];
+        for g in 0..24u64 {
+            let real = crate::selfplay::random_opening(22, 1.0884, &mut rng).0;
+            let start = StepState::begin(&real, g);
+            if start.is_terminal() || crate::lattice::necro_kill(&start).is_ok() {
+                continue;
+            }
+            let mut l = crate::lattice::Lattice::new(start.clone()).unwrap();
+            for _ in 0..40 {
+                l.descend(&ea, crate::lattice::Cursor::at(0, 0.0), 1.5).unwrap();
+            }
+            let (_, va) = ea.both(&[], &[&start]).unwrap();
+            let (_, vb) = eb.both(&[], &[&start]).unwrap();
+            d1 += f64::from((va[0].v - vb[0].v).abs());
+            n1 += 1;
+            let ids: Vec<u32> = (0..l.nodes.len() as u32)
+                .filter(|&n| l.nodes[n as usize].kind == crate::lattice::Kind::Inner)
+                .take(64)
+                .collect();
+            let slots: Vec<_> = ids.iter().map(|&n| l.request(n).0).collect();
+            let reqs: Vec<ExpandReq> = ids
+                .iter()
+                .zip(&slots)
+                .map(|(&n, sl)| ExpandReq {
+                    root: &l.start,
+                    node: &l.nodes[n as usize].state,
+                    slots: sl,
+                    trunk: None,
+                })
+                .collect();
+            let (oa, _) = ea.both(&reqs, &[]).unwrap();
+            let (ob, _) = eb.both(&reqs, &[]).unwrap();
+            for ((x, y), (sl, r)) in oa.iter().zip(&ob).zip(slots.iter().zip(&reqs)) {
+                dn += f64::from((x.value - y.value).abs());
+                nn += 1;
+                for (p, q) in x.values.iter().zip(&y.values) {
+                    dv += f64::from((p - q).abs());
+                    nk += 1;
+                }
+                let mut cells: Vec<u8> = sl.iter().map(|&(c, _)| c).collect();
+                cells.sort();
+                cells.dedup();
+                for c in cells {
+                    let ix: Vec<usize> = (0..sl.len()).filter(|&i| sl[i].0 == c).collect();
+                    if ix.len() < 2 {
+                        continue;
+                    }
+                    let sm = |lg: &[f32]| {
+                        let m = ix.iter().map(|&i| lg[i]).fold(f32::MIN, f32::max);
+                        let e: Vec<f64> = ix.iter().map(|&i| f64::from(lg[i] - m).exp()).collect();
+                        let z: f64 = e.iter().sum();
+                        e.into_iter().map(|v| v / z).collect::<Vec<_>>()
+                    };
+                    let (pa, pb) = (sm(&x.logits), sm(&y.logits));
+                    let t: f64 = pa.iter().zip(&pb).map(|(u, v)| (u - v).abs()).sum::<f64>() / 2.0;
+                    tv += t;
+                    ncell += 1;
+                    let st = match r.node.stage {
+                        crate::steps::Stage::Fates => 0,
+                        crate::steps::Stage::Moves => 1,
+                        _ => 2,
+                    };
+                    by_stage[st].0 += t;
+                    by_stage[st].1 += 1;
+                }
+            }
+        }
+        eprintln!(
+            "prior TV {:.4} over {ncell} cells (fates {:.4}/{}, moves {:.4}/{}, spawns {:.4}/{}); child value |d| {:.4} over {nk}; node value |d| {:.4} over {nn}; tier-1 value |d| {:.4} over {n1}",
+            tv / ncell.max(1) as f64,
+            by_stage[0].0 / by_stage[0].1.max(1) as f64, by_stage[0].1,
+            by_stage[1].0 / by_stage[1].1.max(1) as f64, by_stage[1].1,
+            by_stage[2].0 / by_stage[2].1.max(1) as f64, by_stage[2].1,
+            dv / nk.max(1) as f64,
+            dn / nn.max(1) as f64,
+            d1 / n1.max(1) as f64
+        );
+    }
+
     #[test]
     #[ignore]
     fn lattice_onnx_parity() {

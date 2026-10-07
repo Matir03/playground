@@ -318,10 +318,11 @@ def dense_x(idx, scal):
 
 
 class Tier1Export(nn.Module):
-    def __init__(self, trunk, t2=None):
+    def __init__(self, trunk, t2=None, pos_value=True):
         super().__init__()
         self.trunk = trunk
         self.t2 = t2
+        self.pos_value = pos_value
 
     def forward(self, ridx, rscal):
         x = dense_x(ridx, rscal)
@@ -332,7 +333,7 @@ class Tier1Export(nn.Module):
             # features are the root node's.
             out = self.t2(h, x)
             # --lview: its position value output instead.
-            v1 = out[3][:, 0] if self.t2.lview else out[2]
+            v1 = out[3][:, 0] if self.t2.lview and self.pos_value else out[2]
         return torch.sigmoid(v1), h.half()
 
 
@@ -354,7 +355,7 @@ class Tier2Export(nn.Module):
         return out
 
 
-def export_onnx(trunk, t2, out, dev, value_prior_tau=0.0, t1_from_t2=False):
+def export_onnx(trunk, t2, out, dev, value_prior_tau=0.0, t1_from_t2=False, t1_node=False):
     """`tier1.onnx` (turn start -> value, fp16 trunk image), `tier2.onnx`
     (trunk image + node + children -> children's logits and values, node
     value) and `lattice.json` (the trunk's width)."""
@@ -365,7 +366,7 @@ def export_onnx(trunk, t2, out, dev, value_prior_tau=0.0, t1_from_t2=False):
     pad = torch.full((b, MAX_ACTIVE), SPARSE_DIM, dtype=torch.int32, device=dev)
     sc = torch.zeros(b, N_SCALARS, device=dev)
     torch.onnx.export(
-        Tier1Export(trunk, t2 if t1_from_t2 else None).to(dev).eval(),
+        Tier1Export(trunk, t2 if t1_from_t2 or t2.lview else None, not t1_node).to(dev).eval(),
         (pad, sc),
         os.path.join(out, "tier1.onnx"),
         input_names=["ridx", "rscal"],
@@ -536,17 +537,19 @@ def t1_loss(net, xs, ys, idx):
 
 class RootValue(nn.Module):
     """Tier 1 as the tier-2 head's node value at the lattice root: trunk
-    image, then the head on the same (turn-start) features."""
+    image, then the head on the same (turn-start) features. With --lview
+    its position-value output instead, unless `node`."""
 
-    def __init__(self, trunk, t2):
+    def __init__(self, trunk, t2, node=False):
         super().__init__()
         self.trunk = trunk
         self.t2 = t2
+        self.node = node
 
     def forward(self, x):
         h, _ = self.trunk(x)
         out = self.t2(h, x)
-        return out[3][:, 0] if self.t2.lview else out[2]
+        return out[3][:, 0] if self.t2.lview and not self.node else out[2]
 
 
 def load_energy(dirs):
@@ -622,6 +625,7 @@ def main():
     ap.add_argument("--t1-from-t2", action="store_true", help="no separate tier-1 value: tier 1 is the tier-2 head's node value at the lattice root (turn records train it there)")
     ap.add_argument("--value-prior-tau", type=float, default=0.0, help="export with value-based search priors at this temperature (lattice.json); the prior head is then unused")
     ap.add_argument("--lview", action="store_true", help="lattice-view records (lview.rs): per-kind output slots, a position-value output (tier 1 reads it) and an energy output trained on t1e/ groups")
+    ap.add_argument("--t1-node", action="store_true", help="--lview: export tier 1 as the node value at the root (as --t1-from-t2) instead of the position-value output")
     ap.add_argument("--teacher", help="an old-view lattice net dir (net.pt, t2.pt, meta.json): tier-2 targets are its outputs on the same nodes (records need --teacher-view .old files); the position value learns its tier-1 value")
     ap.add_argument("--energy-weight", type=float, default=1.0)
     ap.add_argument("--energy-batch", type=int, default=64, help="energy groups per step")
@@ -652,12 +656,15 @@ def main():
     t2 = T2Net(c_trunk, ch, blocks, args.lview).to(dev)
     if args.init:
         t2.load_state_dict(translate_t2(torch.load(args.init, map_location=dev), args.lview))
-    v1net = RootValue(trunk, t2) if args.t1_from_t2 or args.lview else net1
+    v1net = RootValue(trunk, t2, args.t1_node) if args.t1_from_t2 or args.lview else net1
+    # --t1-node: the position-value output learns the tier-1 targets too
+    # (beside the node value at the root, which tier 1 reads).
+    pvnet = RootValue(trunk, t2) if args.lview and args.t1_node else None
 
     def save(meta):
         torch.save(net1.state_dict(), os.path.join(args.out, "net.pt"))
         torch.save(t2.state_dict(), os.path.join(args.out, "t2.pt"))
-        export_onnx(trunk, t2, args.out, dev, args.value_prior_tau, args.t1_from_t2)
+        export_onnx(trunk, t2, args.out, dev, args.value_prior_tau, args.t1_from_t2, args.t1_node)
         # The tier-1 net alone, as a steps value net (steps-match etc.).
         steps_export_onnx(net1, args.out, dev)
         with open(os.path.join(args.out, "meta.json"), "w") as f:
@@ -728,6 +735,11 @@ def main():
             for i in range(0, len(ho1), 8192):
                 out[4] += t1_loss(v1net, xs1, ys1, ho1[i : i + 8192]).item() * len(ho1[i : i + 8192])
             out[4] /= max(len(ho1), 1)
+            pv = 0.0
+            if pvnet is not None:
+                for i in range(0, len(ho1), 8192):
+                    pv += t1_loss(pvnet, xs1, ys1, ho1[i : i + 8192]).item() * len(ho1[i : i + 8192])
+                pv /= max(len(ho1), 1)
             # The t1 targets' own entropy: the floor of their BCE.
             y = ys1[ho1].clamp(1e-6, 1 - 1e-6)
             h1 = -(y * y.log() + (1 - y) * (1 - y).log()).mean().item() if len(ho1) else 0.0
@@ -742,6 +754,8 @@ def main():
         trunk.train()
         t2.train()
         o = out
+        if pvnet is not None:
+            ex["pos_value_bce_excess"] = pv - h1
         return {"prior": o[0], "prior_excess": o[0] - o[3], "value": o[1], "node": o[2], "t1_bce_excess": o[4] - h1} | ex
 
     base = holdout()
@@ -771,7 +785,10 @@ def main():
         elif args.freeze_trunk:
             l1 = torch.zeros((), device=dev)
         else:
-            l1 = t1_loss(v1net, xs1, ys1, tr1[torch.randint(len(tr1), (args.t1_batch,), device=dev)]) if len(tr1) else torch.zeros((), device=dev)
+            b1 = tr1[torch.randint(len(tr1), (args.t1_batch,), device=dev)] if len(tr1) else None
+            l1 = t1_loss(v1net, xs1, ys1, b1) if len(tr1) else torch.zeros((), device=dev)
+            if pvnet is not None and len(tr1):
+                l1 = l1 + t1_loss(pvnet, xs1, ys1, b1)
         le = torch.zeros((), device=dev)
         if es is not None and len(tre):
             le, _ = energy_loss(trunk, t2, es, tre[torch.randint(len(tre), (args.energy_batch,), device=dev)], not (args.freeze_trunk or args.t2_detach))
