@@ -21,6 +21,7 @@ pub mod genpos;
 pub mod latgen;
 pub mod lattice;
 pub mod lattice_ort;
+pub mod lview;
 pub mod map;
 pub mod net;
 pub mod net_seat;

@@ -59,6 +59,19 @@ from minions_steps_learner import (
 from minions_steps_learner import export_onnx as steps_export_onnx
 
 SLOTS = 37
+# The lattice view (lview.rs, `--lview`): original position plus decisions,
+# and per-cell output slots in separate ranges per kind of variable.
+LV_FATE_OFF, LV_MOVE_OFF, LV_SPAWN_OFF, LV_SLOTS = 0, 3, 40, 46
+E_DTYPE = np.dtype(
+    [
+        ("kind", "u1"),  # 0: a turn start (opens a group), 1: one of its tier-1 children
+        ("n_active", "u1"),
+        ("pad", "<u2"),
+        ("visits", "<f4"),
+        ("active", "<u2", (MAX_ACTIVE,)),
+        ("scalars", "<f4", (N_SCALARS,)),
+    ]
+)
 T2_REC_BYTES = 528
 T2_KID_BYTES = 12
 
@@ -199,30 +212,78 @@ class Trunk(nn.Module):
 
 
 class T2Net(nn.Module):
-    def __init__(self, c_trunk, ch, blocks):
+    def __init__(self, c_trunk, ch, blocks, lview=False):
         super().__init__()
+        self.lview = lview
+        self.slots = SLOTS = LV_SLOTS if lview else globals()["SLOTS"]
+        # Scalar outputs: the node value; with --lview also the input
+        # position's value (tier 1) and the energy of a complete turn.
+        self.n_scalar = 3 if lview else 1
         self.inp = nn.Sequential(
             nn.Conv2d(c_trunk + SPARSE_PLANES + N_SCALARS, ch, 1, bias=False), nn.BatchNorm2d(ch), nn.ReLU()
         )
         self.blocks = nn.Sequential(*[ResBlock(ch) for _ in range(blocks)])
         self.kid = nn.Conv2d(ch, 2 * SLOTS, 1)
         self.vconv = nn.Sequential(nn.Conv2d(ch, 4, 1, bias=False), nn.BatchNorm2d(4), nn.ReLU())
-        self.vfc = nn.Sequential(nn.Linear(4 * CELLS, 64), nn.ReLU(), nn.Linear(64, 1))
+        self.vfc = nn.Sequential(nn.Linear(4 * CELLS, 64), nn.ReLU(), nn.Linear(64, self.n_scalar))
         # Start from uniform priors.
         nn.init.zeros_(self.kid.weight[:SLOTS])
         nn.init.zeros_(self.kid.bias[:SLOTS])
 
     def forward(self, h, x):
         """h: trunk image [B, C, 7, 7]; x: the node's dense features. Returns
-        per-(cell, slot) logits and value logits, flattened as cell * 37 +
-        slot, and the node's value logit."""
+        per-(cell, slot) logits and value logits, flattened as cell * slots +
+        slot, the node's value logit and the other scalar outputs [B, 0 or 2]
+        (position value logit, energy)."""
+        SLOTS = self.slots
         y = self.blocks(self.inp(torch.cat([h, planes_of(x)], 1)))
-        out = self.kid(y)  # [B, 74, 7, 7]
+        out = self.kid(y)  # [B, 2 * slots, 7, 7]
         b = out.shape[0]
         logit = out[:, :SLOTS].reshape(b, SLOTS, CELLS).transpose(1, 2).reshape(b, CELLS * SLOTS)
         vlog = out[:, SLOTS:].reshape(b, SLOTS, CELLS).transpose(1, 2).reshape(b, CELLS * SLOTS)
-        v = self.vfc(self.vconv(y).flatten(1)).squeeze(1)
-        return logit, vlog, v
+        sv = self.vfc(self.vconv(y).flatten(1))
+        return logit, vlog, sv[:, 0], sv[:, 1:]
+
+
+def translate_t2(sd, lview):
+    """Old (37 shared slots, one scalar) tier-2 weights as an --lview head's
+    starting point: each kind's slot range takes the old slots, the position
+    value starts as the old node value (what tier 1 read with --t1-from-t2),
+    the energy at zero, and the input planes as near their old meaning as
+    there is (the decision planes differ; distillation retrains them)."""
+    if not lview or sd["kid.weight"].shape[0] == 2 * LV_SLOTS:
+        return sd
+    sd = dict(sd)
+    for k in ("kid.weight", "kid.bias"):
+        w = sd[k]
+        new = torch.zeros((2 * LV_SLOTS,) + w.shape[1:], dtype=w.dtype, device=w.device)
+        for half in range(2):
+            o, n = half * SLOTS, half * LV_SLOTS
+            new[n + LV_FATE_OFF : n + LV_FATE_OFF + 3] = w[o : o + 3]
+            new[n + LV_MOVE_OFF : n + LV_MOVE_OFF + 37] = w[o : o + 37]
+            new[n + LV_SPAWN_OFF : n + LV_SPAWN_OFF + 6] = w[o : o + 6]
+        sd[k] = new
+    w, bias = sd["vfc.2.weight"], sd["vfc.2.bias"]
+    sd["vfc.2.weight"] = torch.cat([w, w, torch.zeros_like(w)], 0)
+    sd["vfc.2.bias"] = torch.cat([bias, bias, torch.zeros_like(bias)], 0)
+    w = sd["inp.0.weight"]
+    c = w.shape[1] - SPARSE_PLANES - N_SCALARS
+    old = lambda p: w[:, c + p]
+    new = w.clone()
+    # Old: 13 decided friend (at its destination), 14 decided enemy, 15
+    # decided spawn, 16 next, 17 killed, 18 unsummoned, 19..24 gone units.
+    # New: 13..16 fate stay/killed/unsummoned, 16 decided friend (origin),
+    # 17..23 final friendly units, 23 the final unit is a spawn.
+    new[:, c + 13] = old(14)
+    new[:, c + 14] = old(14) + old(17)
+    new[:, c + 15] = old(14) + old(18)
+    new[:, c + 16] = 0
+    for u in range(6):
+        new[:, c + 17 + u] = old(13) + old(u)
+    new[:, c + 23] = old(15)
+    new[:, c + 24] = 0
+    sd["inp.0.weight"] = new
+    return sd
 
 
 def dense_x(idx, scal):
@@ -246,7 +307,9 @@ class Tier1Export(nn.Module):
             # One value function: the tier-2 head's node value at the lattice
             # root (the turn start, nothing committed) -- the tier-1 call's
             # features are the root node's.
-            v1 = self.t2(h, x)[2]
+            out = self.t2(h, x)
+            # --lview: its position value output instead.
+            v1 = out[3][:, 0] if self.t2.lview else out[2]
         return torch.sigmoid(v1), h.half()
 
 
@@ -260,9 +323,12 @@ class Tier2Export(nn.Module):
         # row's (one upload per turn start, not per row).
         # kid: flat [T] indices row * 49*37 + cell * 37 + slot (no padding).
         h = hs.index_select(0, hidx.long())
-        logit, vlog, v2 = self.t2(h.float(), dense_x(nidx, nscal))
+        logit, vlog, v2, extra = self.t2(h.float(), dense_x(nidx, nscal))
         k = kid.long()
-        return logit.reshape(-1).gather(0, k), torch.sigmoid(vlog.reshape(-1).gather(0, k)), torch.sigmoid(v2)
+        out = (logit.reshape(-1).gather(0, k), torch.sigmoid(vlog.reshape(-1).gather(0, k)), torch.sigmoid(v2))
+        if self.t2.lview:
+            out = out + (extra[:, 1],)
+        return out
 
 
 def export_onnx(trunk, t2, out, dev, value_prior_tau=0.0, t1_from_t2=False):
@@ -296,7 +362,7 @@ def export_onnx(trunk, t2, out, dev, value_prior_tau=0.0, t1_from_t2=False):
         ),
         os.path.join(out, "tier2.onnx"),
         input_names=["hs", "hidx", "nidx", "nscal", "kid"],
-        output_names=["logit", "value", "v2"],
+        output_names=["logit", "value", "v2"] + (["energy"] if t2.lview else []),
         dynamic_axes={
             "hs": {0: "u"},
             "hidx": {0: "b"},
@@ -306,12 +372,15 @@ def export_onnx(trunk, t2, out, dev, value_prior_tau=0.0, t1_from_t2=False):
             "logit": {0: "t"},
             "value": {0: "t"},
             "v2": {0: "b"},
+            "energy": {0: "b"},
         },
         opset_version=17,
         dynamo=False,
     )
     with open(os.path.join(out, "lattice.json"), "w") as f:
         meta = {"c_trunk": c, "trunk_gather": True}
+        if t2.lview:
+            meta["lview"] = True
         if value_prior_tau > 0:
             # The search's priors: children's values over this temperature.
             meta["value_prior_tau"] = value_prior_tau
@@ -329,7 +398,7 @@ def group_log_softmax(logit, group, n_groups):
 class T2Set:
     """Records and kids on the device, with CSR offsets."""
 
-    def __init__(self, recs, kids, dev, all_visit_targets=False):
+    def __init__(self, recs, kids, dev, all_visit_targets=False, slots=SLOTS):
         t = lambda a, dt=None: torch.from_numpy(np.ascontiguousarray(a if dt is None else a.astype(dt))).to(dev)
         self.ract = t(recs["ract"].view(np.int16))
         self.rn = t(recs["rn"])
@@ -340,7 +409,7 @@ class T2Set:
         self.q = t(recs["q"], np.float32)
         self.nkids = t(recs["kids"], np.int64)
         self.off = torch.cumsum(self.nkids, 0) - self.nkids
-        self.kflat = t(kids["cell"], np.int64) * SLOTS + t(kids["slot"], np.int64)
+        self.kflat = t(kids["cell"], np.int64) * slots + t(kids["slot"], np.int64)
         self.kcell = t(kids["cell"], np.int64)
         self.kn = t(kids["n"], np.float32)
         self.kq = t(kids["q"], np.float32)
@@ -370,7 +439,7 @@ def masked_bce(logit, y, m):
 def losses(trunk, t2, ds, idx, grad_trunk=False, counts=False):
     with torch.set_grad_enabled(grad_trunk and torch.is_grad_enabled()):
         h, _ = trunk(dense(ds.ract[idx], ds.rn[idx], ds.rscal[idx]))
-    logit, vlog, v = t2(h, dense(ds.nact[idx], ds.nn[idx], ds.nscal[idx]))
+    logit, vlog, v, _ = t2(h, dense(ds.nact[idx], ds.nn[idx], ds.nscal[idx]))
     rec_of, kid = ds.batch(idx)
     flat = ds.kflat[kid]
     lg = logit[rec_of, flat]
@@ -413,7 +482,63 @@ class RootValue(nn.Module):
 
     def forward(self, x):
         h, _ = self.trunk(x)
-        return self.t2(h, x)[2]
+        out = self.t2(h, x)
+        return out[3][:, 0] if self.t2.lview else out[2]
+
+
+def load_energy(dirs):
+    rs = []
+    for d in dirs:
+        for p in sorted(glob.glob(os.path.join(d, "t1e", "chunk_*.bin"))):
+            rs.append(read_chunk(p, b"MLTE", E_DTYPE))
+    return np.concatenate(rs) if rs else np.zeros(0, E_DTYPE)
+
+
+class ESet:
+    """Energy groups: a turn start, then its tier-1 children (complete
+    declarations) with their visits. Sparse rows on the device."""
+
+    def __init__(self, recs, dev):
+        kind = recs["kind"]
+        start = np.flatnonzero(kind == 0)
+        gid = np.cumsum(kind == 0) - 1
+        child = np.flatnonzero((kind == 1) & (gid >= 0))
+        t = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(dev)
+        self.act = t(recs["active"].view(np.int16))
+        self.cnt = t(recs["n_active"])
+        self.scal = t(recs["scalars"].astype(np.float32))
+        self.visits = t(recs["visits"].astype(np.float32))
+        self.root = t(start.astype(np.int64))
+        # Children in CSR order per group.
+        self.child = t(child.astype(np.int64))
+        self.cgroup = t(gid[child].astype(np.int64))
+        n = np.bincount(gid[child], minlength=len(start))
+        self.n = len(start)
+        self.nkids = t(n.astype(np.int64))
+        self.off = torch.cumsum(self.nkids, 0) - self.nkids
+
+    def x(self, rows):
+        return dense(self.act[rows], self.cnt[rows], self.scal[rows])
+
+
+def energy_loss(trunk, t2, es, g, grad_trunk=True):
+    """Cross-entropy of the softmax over each group's children's energies
+    against their visit shares; and its floor (the targets' entropy)."""
+    with torch.set_grad_enabled(grad_trunk and torch.is_grad_enabled()):
+        h, _ = trunk(es.x(es.root[g]))
+    cnt = es.nkids[g]
+    grp = torch.repeat_interleave(torch.arange(len(g), device=g.device), cnt)
+    first = torch.repeat_interleave(torch.cumsum(cnt, 0) - cnt, cnt)
+    rows = es.child[torch.repeat_interleave(es.off[g], cnt) + torch.arange(len(grp), device=g.device) - first]
+    e = t2(h[grp], es.x(rows))[3][:, 1]
+    lp = group_log_softmax(e, grp, len(g))
+    n = es.visits[rows]
+    tot = torch.zeros(len(g), device=g.device).index_add_(0, grp, n)
+    tgt = n / tot[grp].clamp(min=1e-9)
+    ng = (tot > 0).sum().clamp(min=1)
+    ce = -(tgt * lp).sum() / ng
+    hf = -(tgt * torch.log(tgt.clamp(min=1e-9))).sum() / ng
+    return ce, hf
 
 
 def main():
@@ -433,6 +558,9 @@ def main():
     ap.add_argument("--prior-weight", type=float, default=1.0)
     ap.add_argument("--t1-from-t2", action="store_true", help="no separate tier-1 value: tier 1 is the tier-2 head's node value at the lattice root (turn records train it there)")
     ap.add_argument("--value-prior-tau", type=float, default=0.0, help="export with value-based search priors at this temperature (lattice.json); the prior head is then unused")
+    ap.add_argument("--lview", action="store_true", help="lattice-view records (lview.rs): per-kind output slots, a position-value output (tier 1 reads it) and an energy output trained on t1e/ groups")
+    ap.add_argument("--energy-weight", type=float, default=1.0)
+    ap.add_argument("--energy-batch", type=int, default=64, help="energy groups per step")
     ap.add_argument("--min-cell-support", type=int, default=1, help="prior targets only for cells where at least this many kids have visits")
     ap.add_argument("--value-weight", type=float, default=1.0, help="tier-2 child and node values")
     ap.add_argument("--freeze-trunk", action="store_true", help="train tier 2 only, on a fixed tier 1")
@@ -457,10 +585,10 @@ def main():
     trunk = Trunk(net1).to(dev)
     c_trunk = net1.stem[0].out_channels
     ch, blocks = (int(v) for v in args.arch.split("x"))
-    t2 = T2Net(c_trunk, ch, blocks).to(dev)
+    t2 = T2Net(c_trunk, ch, blocks, args.lview).to(dev)
     if args.init:
-        t2.load_state_dict(torch.load(args.init, map_location=dev))
-    v1net = RootValue(trunk, t2) if args.t1_from_t2 else net1
+        t2.load_state_dict(translate_t2(torch.load(args.init, map_location=dev), args.lview))
+    v1net = RootValue(trunk, t2) if args.t1_from_t2 or args.lview else net1
 
     def save(meta):
         torch.save(net1.state_dict(), os.path.join(args.out, "net.pt"))
@@ -469,7 +597,7 @@ def main():
         # The tier-1 net alone, as a steps value net (steps-match etc.).
         steps_export_onnx(net1, args.out, dev)
         with open(os.path.join(args.out, "meta.json"), "w") as f:
-            json.dump(meta | {"t1_arch": args.t1_arch, "arch": args.arch, "t1_from_t2": args.t1_from_t2}, f, indent=1)
+            json.dump(meta | {"t1_arch": args.t1_arch, "arch": args.arch, "t1_from_t2": args.t1_from_t2, "lview": args.lview}, f, indent=1)
 
     if args.export_only:
         save({"t1": args.t1, "init": args.init, "export_only": True})
@@ -477,7 +605,12 @@ def main():
         return
     t0 = time.time()
     recs, kids = load_t2(args.data)
-    ds = T2Set(recs, kids, dev, args.all_visit_targets)
+    ds = T2Set(recs, kids, dev, args.all_visit_targets, t2.slots)
+    es = ESet(load_energy(args.data), dev) if args.lview else None
+    if es is not None:
+        eg = torch.arange(es.n, device=dev)
+        hoe, tre = eg[eg % args.holdout_every == 0], eg[eg % args.holdout_every != 0]
+        print(f"energy: {es.n} groups, {len(es.child)} children ({len(es.child) / max(es.n, 1):.1f}/group)")
     ds.min_support = args.min_cell_support
     all_idx = torch.arange(ds.n, device=dev)
     ho_mask = (all_idx % args.holdout_every) == 0
@@ -520,10 +653,18 @@ def main():
             # The t1 targets' own entropy: the floor of their BCE.
             y = ys1[ho1].clamp(1e-6, 1 - 1e-6)
             h1 = -(y * y.log() + (1 - y) * (1 - y).log()).mean().item() if len(ho1) else 0.0
+            ex = {}
+            if es is not None and len(hoe):
+                ce = hf = 0.0
+                for i in range(0, len(hoe), 512):
+                    c_, h_ = energy_loss(trunk, t2, es, hoe[i : i + 512])
+                    ce += c_.item() * len(hoe[i : i + 512])
+                    hf += h_.item() * len(hoe[i : i + 512])
+                ex = {"energy": ce / len(hoe), "energy_excess": (ce - hf) / len(hoe)}
         trunk.train()
         t2.train()
         o = out
-        return {"prior": o[0], "prior_excess": o[0] - o[3], "value": o[1], "node": o[2], "t1_bce_excess": o[4] - h1}
+        return {"prior": o[0], "prior_excess": o[0] - o[3], "value": o[1], "node": o[2], "t1_bce_excess": o[4] - h1} | ex
 
     base = holdout()
     print("holdout before:", json.dumps(base))
@@ -551,13 +692,16 @@ def main():
             l1 = torch.zeros((), device=dev)
         else:
             l1 = t1_loss(v1net, xs1, ys1, tr1[torch.randint(len(tr1), (args.t1_batch,), device=dev)]) if len(tr1) else torch.zeros((), device=dev)
-        loss = args.prior_weight * lp + args.value_weight * (lv + ln) + args.t1_weight * l1
+        le = torch.zeros((), device=dev)
+        if es is not None and len(tre):
+            le, _ = energy_loss(trunk, t2, es, tre[torch.randint(len(tre), (args.energy_batch,), device=dev)], not (args.freeze_trunk or args.t2_detach))
+        loss = args.prior_weight * lp + args.value_weight * (lv + ln) + args.t1_weight * l1 + args.energy_weight * le
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
         sched.step()
         if step % max(steps // 10, 1) == 0 or step == steps - 1:
-            print(f"step {step}/{steps} prior {lp.item():.4f} value {lv.item():.4f} node {ln.item():.4f} t1 {l1.item():.4f} ({time.time() - t0:.0f}s)", flush=True)
+            print(f"step {step}/{steps} prior {lp.item():.4f} value {lv.item():.4f} node {ln.item():.4f} t1 {l1.item():.4f} energy {le.item():.4f} ({time.time() - t0:.0f}s)", flush=True)
     if args.bn_recal > 0 and not args.freeze_bn:
         # BatchNorm's moving estimate (momentum 0.1) follows the last few
         # dozen batches; a rare feature's channel then gets a near-zero
@@ -576,6 +720,8 @@ def main():
                 losses(trunk, t2, ds, idx)
                 if len(tr1):
                     v1net(xs1.dense(tr1[torch.randint(len(tr1), (args.t1_batch,), device=dev)]))
+                if es is not None and len(tre):
+                    energy_loss(trunk, t2, es, tre[torch.randint(len(tre), (args.energy_batch,), device=dev)])
         for m in bns:
             m.momentum = 0.1
         print(f"BatchNorm statistics re-estimated over {args.bn_recal} batches")

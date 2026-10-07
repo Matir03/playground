@@ -44,10 +44,22 @@ fn push_view(v: &View, idx: &mut Vec<i32>, scal: &mut Vec<f32>) {
     let mut act = Vec::with_capacity(MAX_ACTIVE);
     let mut sc = [0f32; N_SCALARS];
     v.features(&mut act, &mut sc);
+    push_act(&act, &sc, idx, scal);
+}
+
+fn push_act(act: &[u16], sc: &[f32; N_SCALARS], idx: &mut Vec<i32>, scal: &mut Vec<f32>) {
     for i in 0..MAX_ACTIVE {
         idx.push(act.get(i).map_or(SPARSE_DIM as i32, |&x| i32::from(x)));
     }
-    scal.extend_from_slice(&sc);
+    scal.extend_from_slice(sc);
+}
+
+/// A lattice node's (or turn start's) features in the lattice view.
+fn push_lview(s: &StepState, idx: &mut Vec<i32>, scal: &mut Vec<f32>) {
+    let mut act = Vec::with_capacity(MAX_ACTIVE);
+    let mut sc = [0f32; N_SCALARS];
+    crate::lview::node_features(s, &mut act, &mut sc);
+    push_act(&act, &sc, idx, scal);
 }
 
 /// Where a tier-2 row's trunk image comes from.
@@ -68,6 +80,9 @@ struct Batch {
     nidx: Vec<i32>,
     nscal: Vec<f32>,
     kids: Vec<Vec<i32>>,
+    /// Output slots per cell (37 for the steps-view nets, `lview::NET_SLOTS`
+    /// for lattice-view ones).
+    slots: usize,
 }
 
 impl Batch {
@@ -87,6 +102,9 @@ impl Batch {
         self.nidx.extend(o.nidx);
         self.nscal.extend(o.nscal);
         self.kids.extend(o.kids);
+        if self.slots == 0 {
+            self.slots = o.slots;
+        }
     }
 }
 
@@ -123,6 +141,9 @@ pub struct OrtLatticeEval {
     /// lattice.json `prior_temp` (default 1): the prior logits are divided
     /// by it (> 1 flattens the search's priors).
     prior_temp: f32,
+    /// lattice.json `lview`: the net reads [`crate::lview`] features and has
+    /// `lview::NET_SLOTS` output slots per cell.
+    lview: bool,
 }
 
 impl Drop for OrtLatticeEval {
@@ -171,7 +192,7 @@ fn run_batch(s1: &mut Session, s2: &mut Session, c: usize, gather: bool, b: Batc
     if n2 > 0 {
         let t_prep = std::time::Instant::now();
         // Children flattened over the batch: row * 49*37 + cell * 37 + slot.
-        let per_row = (CELLS * SLOTS) as i32;
+        let per_row = (CELLS * if b.slots > 0 { b.slots } else { SLOTS }) as i32;
         let kid: Vec<i32> = b
             .kids
             .iter()
@@ -370,6 +391,12 @@ impl OrtLatticeEval {
         let gather = meta["trunk_gather"].as_bool().unwrap_or(false);
         let value_prior_tau = meta["value_prior_tau"].as_f64().unwrap_or(0.0) as f32;
         let prior_temp = meta["prior_temp"].as_f64().unwrap_or(1.0) as f32;
+        let lview = meta["lview"].as_bool().unwrap_or(false);
+        let slots = if lview {
+            crate::lview::NET_SLOTS
+        } else {
+            SLOTS
+        };
         let p1 = |b: usize| format!("ridx:{b}x{MAX_ACTIVE},rscal:{b}x{N_SCALARS}");
         // `u`: distinct trunk images (gather nets).
         let p2 = |b: usize, t: usize, u: usize| {
@@ -378,6 +405,7 @@ impl OrtLatticeEval {
             } else {
                 format!("h:{b}x{c}x7x7")
             };
+            let _ = slots;
             format!("{h},nidx:{b}x{MAX_ACTIVE},nscal:{b}x{N_SCALARS},kid:{t}")
         };
         let build = |name: &str, min: String, opt: String, max: String| -> Result<Session> {
@@ -410,6 +438,7 @@ impl OrtLatticeEval {
             runners: hs,
             value_prior_tau,
             prior_temp,
+            lview,
         })
     }
 
@@ -436,13 +465,19 @@ impl LatticeEval for OrtLatticeEval {
 
     fn submit(&self, reqs: &[ExpandReq], states: &[&StepState]) -> Result<Pending> {
         let mut b = Batch::default();
+        let lv = self.lview;
+        b.slots = if lv { crate::lview::NET_SLOTS } else { SLOTS };
         // Tier-1 rows: the values asked for, then each turn start an
         // expansion needs a trunk for (once per turn start).
         let live: Vec<usize> = (0..states.len())
             .filter(|&i| !states[i].is_terminal())
             .collect();
         for &i in &live {
-            push_view(&states[i].view(), &mut b.ridx, &mut b.rscal);
+            if lv {
+                push_lview(states[i], &mut b.ridx, &mut b.rscal);
+            } else {
+                push_view(&states[i].view(), &mut b.ridx, &mut b.rscal);
+            }
             b.n1 += 1;
         }
         let mut root_row: HashMap<*const StepState, usize> = HashMap::new();
@@ -457,7 +492,11 @@ impl LatticeEval for OrtLatticeEval {
                     let row = *root_row
                         .entry(r.root as *const StepState)
                         .or_insert_with(|| {
-                            push_view(&r.root.view(), &mut b.ridx, &mut b.rscal);
+                            if lv {
+                                push_lview(r.root, &mut b.ridx, &mut b.rscal);
+                            } else {
+                                push_view(&r.root.view(), &mut b.ridx, &mut b.rscal);
+                            }
                             b.n1 += 1;
                             b.n1 - 1
                         });
@@ -466,13 +505,25 @@ impl LatticeEval for OrtLatticeEval {
                 }
             };
             b.trunk.push(src);
-            push_view(&t2_view(r.node), &mut b.nidx, &mut b.nscal);
-            b.kids.push(
-                r.slots
-                    .iter()
-                    .map(|&(c, s)| c as i32 * SLOTS as i32 + i32::from(s))
-                    .collect(),
-            );
+            if lv {
+                push_lview(r.node, &mut b.nidx, &mut b.nscal);
+                let st = r.node.stage;
+                let ns = crate::lview::NET_SLOTS as i32;
+                b.kids.push(
+                    r.slots
+                        .iter()
+                        .map(|&(c, s)| c as i32 * ns + i32::from(crate::lview::net_slot(st, s)))
+                        .collect(),
+                );
+            } else {
+                push_view(&t2_view(r.node), &mut b.nidx, &mut b.nscal);
+                b.kids.push(
+                    r.slots
+                        .iter()
+                        .map(|&(c, s)| c as i32 * SLOTS as i32 + i32::from(s))
+                        .collect(),
+                );
+            }
         }
         let rx = (b.rows() > 0).then(|| self.enqueue(b));
         let n_reqs = reqs.len();
@@ -593,6 +644,7 @@ mod tests {
             nidx: vec![SPARSE_DIM as i32; n2 * MAX_ACTIVE],
             nscal: vec![0.0; n2 * N_SCALARS],
             kids: (0..n2).map(|_| (0..k as i32).collect()).collect(),
+            slots: SLOTS,
         };
         let shapes: Vec<(usize, usize, usize)> = vec![
             (0, 60, 27),

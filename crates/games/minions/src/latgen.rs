@@ -108,6 +108,11 @@ pub struct GenConfig {
     /// [`Lattice::advance_sd`] at each node on the path to the chosen turn
     /// with this probability, instead of any other tier-2 records.
     pub sd_frac: f64,
+    /// Records in the lattice view (`crate::lview`: original position plus
+    /// decisions, per-kind output slots), and energy records (`t1e/`: each
+    /// turn start, then its tier-1 children's complete declarations with
+    /// their visits).
+    pub lview: bool,
     /// Groups of games per worker taking turns, so that the worker advances
     /// one group while another's net call is in flight (1 = no overlap).
     pub pipeline: usize,
@@ -215,6 +220,7 @@ pub struct GenCounters {
     pub turns: AtomicU64,
     pub t1_records: AtomicU64,
     pub t2_records: AtomicU64,
+    pub energy_groups: AtomicU64,
     pub expansions: AtomicU64,
     pub kids: AtomicU64,
     pub values: AtomicU64,
@@ -373,6 +379,38 @@ fn push_view(v: &View, out: &mut Vec<u8>) -> u8 {
     act.len().min(MAX_ACTIVE) as u8
 }
 
+/// A turn record (the steps record layout) with lattice-view features.
+fn encode_turn_lv(s: &StepState, target: f32, visits: u32, out: &mut Vec<u8>) {
+    let (mut act, mut sc) = (Vec::with_capacity(MAX_ACTIVE), [0f32; N_SCALARS]);
+    crate::lview::node_features(s, &mut act, &mut sc);
+    let start = out.len();
+    out.push(act.len().min(MAX_ACTIVE) as u8);
+    out.push(stage_code(s.stage));
+    out.extend_from_slice(&(visits.min(u16::MAX as u32) as u16).to_le_bytes());
+    out.extend_from_slice(&target.to_le_bytes());
+    out.extend_from_slice(&0f32.to_le_bytes());
+    out.extend_from_slice(&s.base.turn.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    crate::lview::push_features(&act, &sc, out);
+    debug_assert_eq!(out.len() - start, crate::stepsp::REC_BYTES);
+}
+
+/// An energy record: kind (0 = turn start, 1 = one of its tier-1 children,
+/// as its complete declaration), active count, 2 pad bytes, visits (f32),
+/// then the features.
+pub const E_REC_BYTES: usize = 8 + MAX_ACTIVE * 2 + N_SCALARS * 4;
+pub const E_VERSION: u32 = 1;
+
+/// Append one energy record's bytes (the caller counts the records).
+fn encode_energy(kind: u8, visits: f32, act: &[u16], sc: &[f32; N_SCALARS], buf: &mut Vec<u8>) {
+    let start = buf.len();
+    buf.extend_from_slice(&[kind, 0, 0, 0]);
+    buf.extend_from_slice(&visits.to_le_bytes());
+    let n = crate::lview::push_features(act, sc, buf);
+    buf[start + 1] = n;
+    debug_assert_eq!(buf.len() - start, E_REC_BYTES);
+}
+
 fn stage_code(s: Stage) -> u8 {
     match s {
         Stage::Fates => 0,
@@ -394,7 +432,7 @@ pub fn t2_view(s: &StepState) -> View {
 /// (-1 = no target). Older records (0) averaged every visit.
 const T2_SINK_TARGETS: u8 = 1;
 
-fn encode_t2(root: &StepState, r: &T2Record, w: &mut ChunkWriter) -> Result<()> {
+fn encode_t2(root: &StepState, r: &T2Record, w: &mut ChunkWriter, lview: bool) -> Result<()> {
     let start = w.buf.len();
     w.buf
         .extend_from_slice(&[0, 0, stage_code(r.node.stage), T2_SINK_TARGETS]);
@@ -404,14 +442,29 @@ fn encode_t2(root: &StepState, r: &T2Record, w: &mut ChunkWriter) -> Result<()> 
     w.buf.extend_from_slice(&r.n.to_le_bytes());
     w.buf.extend_from_slice(&r.q.to_le_bytes());
     let mut tmp = Vec::with_capacity(512);
-    let ra = push_view(&root.view(), &mut tmp);
-    let na = push_view(&t2_view(&r.node), &mut tmp);
+    let (ra, na) = if lview {
+        let (mut act, mut sc) = (Vec::with_capacity(MAX_ACTIVE), [0f32; N_SCALARS]);
+        crate::lview::node_features(root, &mut act, &mut sc);
+        let ra = crate::lview::push_features(&act, &sc, &mut tmp);
+        crate::lview::node_features(&r.node, &mut act, &mut sc);
+        (ra, crate::lview::push_features(&act, &sc, &mut tmp))
+    } else {
+        (
+            push_view(&root.view(), &mut tmp),
+            push_view(&t2_view(&r.node), &mut tmp),
+        )
+    };
     w.buf.extend_from_slice(&tmp);
     w.buf[start] = ra;
     w.buf[start + 1] = na;
     debug_assert_eq!(w.buf.len() - start, T2_REC_BYTES);
     let side = &mut w.side.as_mut().expect("kids file").1;
     for &(cell, slot, n, q, _) in &r.kids {
+        let slot = if lview {
+            crate::lview::net_slot(r.node.stage, slot)
+        } else {
+            slot
+        };
         side.extend_from_slice(&[cell, slot, 0, 0]);
         side.extend_from_slice(&n.to_le_bytes());
         side.extend_from_slice(&q.to_le_bytes());
@@ -449,6 +502,7 @@ struct Worker<'a> {
     bid: i16,
     t1w: ChunkWriter,
     t2w: ChunkWriter,
+    t1e: ChunkWriter,
     /// The opening phase: finished openings go here, not into searches.
     collect: Option<Vec<StepState>>,
     /// The search phase: games start from these.
@@ -621,7 +675,7 @@ impl Worker<'_> {
                     ));
                 }
                 for r in &walk.records {
-                    encode_t2(&lat.start, r, &mut self.t2w)?;
+                    encode_t2(&lat.start, r, &mut self.t2w, self.cfg.lview)?;
                     self.view_targets(r)?;
                 }
                 self.c
@@ -684,15 +738,37 @@ impl Worker<'_> {
         }
         self.c.turns.fetch_add(1, Relaxed);
         let mut rec = Vec::new();
-        crate::stepsp::encode_record(
-            &root.state.view(),
-            t1.root_value() as f32,
-            0.0,
-            root.n,
-            &mut rec,
-        );
+        if self.cfg.lview {
+            encode_turn_lv(&root.state, t1.root_value() as f32, root.n, &mut rec);
+        } else {
+            crate::stepsp::encode_record(
+                &root.state.view(),
+                t1.root_value() as f32,
+                0.0,
+                root.n,
+                &mut rec,
+            );
+        }
         self.t1w.buf.extend_from_slice(&rec);
         self.t1w.added()?;
+        if self.cfg.lview && root.children.len() > 1 {
+            // Energy targets: the root's children (complete turns) and
+            // their visits; a group never spans two chunks.
+            let (mut act, mut sc) = (Vec::with_capacity(MAX_ACTIVE), [0f32; N_SCALARS]);
+            crate::lview::node_features(&root.state, &mut act, &mut sc);
+            encode_energy(0, root.n as f32, &act, &sc, &mut self.t1e.buf);
+            for &c in &root.children {
+                let ch = &t1.nodes[c as usize];
+                crate::lview::decl_features(&root.state, &ch.state.done, &mut act, &mut sc);
+                encode_energy(1, ch.n as f32, &act, &sc, &mut self.t1e.buf);
+            }
+            // Whole groups per chunk: flush only between groups.
+            self.t1e.n += 1 + root.children.len();
+            if self.t1e.n >= self.t1e.per_chunk {
+                self.t1e.flush()?;
+            }
+            self.c.energy_groups.fetch_add(1, Relaxed);
+        }
         self.c.t1_records.fetch_add(1, Relaxed);
         // Interior turns searched deeply enough are value targets too: each
         // turn's tree is fresh, so they repeat nothing.
@@ -705,13 +781,17 @@ impl Worker<'_> {
                     continue;
                 }
                 rec.clear();
-                crate::stepsp::encode_record(
-                    &node.state.view(),
-                    node.q() as f32,
-                    0.0,
-                    node.n,
-                    &mut rec,
-                );
+                if self.cfg.lview {
+                    encode_turn_lv(&node.state, node.q() as f32, node.n, &mut rec);
+                } else {
+                    crate::stepsp::encode_record(
+                        &node.state.view(),
+                        node.q() as f32,
+                        0.0,
+                        node.n,
+                        &mut rec,
+                    );
+                }
                 self.t1w.buf.extend_from_slice(&rec);
                 self.t1w.added()?;
                 self.c.t1_records.fetch_add(1, Relaxed);
@@ -759,7 +839,7 @@ impl Worker<'_> {
                 let target = t1.nodes[pick as usize].sink;
                 let recs = lat.tier1_records(&turns, target, &mut self.rng)?;
                 for r in &recs {
-                    encode_t2(&lat.start, r, &mut self.t2w)?;
+                    encode_t2(&lat.start, r, &mut self.t2w, self.cfg.lview)?;
                 }
                 self.c.t2_records.fetch_add(recs.len() as u64, Relaxed);
             }
@@ -829,6 +909,7 @@ impl Worker<'_> {
             }
         }
         self.t1w.flush()?;
+        self.t1e.flush()?;
         self.t2w.flush()
     }
 
@@ -944,7 +1025,7 @@ impl Worker<'_> {
                     q: o.value,
                     ns: 1.0,
                 };
-                encode_t2(&l.start, &rec, &mut self.t2w)?;
+                encode_t2(&l.start, &rec, &mut self.t2w, self.cfg.lview)?;
                 self.c.t2_records.fetch_add(1, Relaxed);
             }
             match &mut tasks[ti] {
@@ -1054,6 +1135,14 @@ fn make_worker<'a>(
             x.side = Some((b"MLTK", Vec::new(), T2_KID_BYTES));
             x
         },
+        t1e: ChunkWriter::new(
+            t1_dir.with_file_name("t1e"),
+            w,
+            b"MLTE",
+            E_VERSION,
+            E_REC_BYTES,
+            cfg.chunk_records * 16,
+        ),
         collect: None,
         pool: None,
     }
@@ -1064,6 +1153,9 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
     let t2_dir = cfg.out.join("t2");
     std::fs::create_dir_all(&t1_dir)?;
     std::fs::create_dir_all(&t2_dir)?;
+    if cfg.lview {
+        std::fs::create_dir_all(cfg.out.join("t1e"))?;
+    }
     let bid = lattice_bid(eval.as_ref())?;
     eprintln!(
         "lattice-gen: bid {bid}, {} workers x {} games, n1 {}, n2 {}",
