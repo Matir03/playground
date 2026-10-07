@@ -2073,14 +2073,34 @@ impl Lattice {
                 }
                 let maxn = e.iter().map(|x| x.0).fold(0.0, f64::max);
                 let sigma = (p.cq_visit + maxn) * p.cq_scale;
-                // Per variable: softmax(logp + sigma * q), as weights.
-                let score: Vec<f64> = nd
+                // Per variable: softmax(logp + sigma * q), q the completed
+                // values min-max normalized over the variable's live kids
+                // (as Gumbel MuZero normalizes Q to [0, 1]; raw values here
+                // differ by ~0.02, which moved the logits by ~0.1).
+                let cq: Vec<f64> = nd
                     .kids
                     .iter()
                     .zip(&e)
-                    .map(|(k, &(kn, kw))| {
-                        let q = if kn > 0.0 { kw / kn } else { f64::from(k.v) };
-                        f64::from(k.logp) + sigma * q
+                    .map(|(k, &(kn, kw))| if kn > 0.0 { kw / kn } else { f64::from(k.v) })
+                    .collect();
+                let mut range: HashMap<u8, (f64, f64)> = HashMap::new();
+                for (k, &q) in nd.kids.iter().zip(&cq) {
+                    if !k.dead {
+                        let r = range
+                            .entry(k.var)
+                            .or_insert((f64::INFINITY, f64::NEG_INFINITY));
+                        r.0 = r.0.min(q);
+                        r.1 = r.1.max(q);
+                    }
+                }
+                let score: Vec<f64> = nd
+                    .kids
+                    .iter()
+                    .zip(&cq)
+                    .map(|(k, &q)| {
+                        let (lo, hi) = range.get(&k.var).copied().unwrap_or((0.0, 0.0));
+                        let qn = if hi > lo { (q - lo) / (hi - lo) } else { 0.5 };
+                        f64::from(k.logp) + sigma * qn
                     })
                     .collect();
                 let mut top: HashMap<u8, f64> = HashMap::new();
