@@ -33,6 +33,9 @@ serde.workspace = true
 serde_json.workspace = true
 # The CUDA runtime ORT already loaded, for uploads into the device h store.
 libloading = "0.8"
+# Exact SAT fallback for turn realizability (sat.rs): CaDiCaL, incremental
+# with assumptions.
+cadical = "0.1.16"
 # Opt-in global allocator (`--features mimalloc`); see main.rs.
 mimalloc = { version = "0.1", optional = true, default-features = false }
 

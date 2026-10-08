@@ -28,6 +28,7 @@ pub mod net_seat;
 pub mod nnue;
 pub mod ort_net;
 pub mod sampler;
+pub mod sat;
 pub mod search_config;
 pub mod selfplay;
 pub mod solver;

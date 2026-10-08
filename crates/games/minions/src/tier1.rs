@@ -89,6 +89,7 @@ pub struct T1Stats {
     pub t2_repeats: u64,
     pub widen_dropped: u64,
     pub widen_abandoned: u64,
+    pub widen_followed: u64,
 }
 
 /// One tier-1 visit in progress: the tier-1 path, and the widening under
@@ -333,7 +334,21 @@ impl Tier1 {
         }
         loop {
             if let Some((wt, cur, _)) = vis.widen.as_mut() {
-                // Not at a root without turns yet: a search must return one.
+                // Over budget: first follow witnesses (a guaranteed turn
+                // unless one is refuted), with a fresh budget.
+                if vis.work > self.params.widen_budget && !cur.follow {
+                    cur.follow = true;
+                    vis.work = 0;
+                    self.stats.widen_followed += 1;
+                    if std::env::var_os("STEPS_SLOW_TURN_SECS").is_some() {
+                        eprintln!(
+                            "widening over budget at tier-1 node {}: following witnesses",
+                            *wt
+                        );
+                    }
+                }
+                // Still over: give up -- but not at a root without turns
+                // yet (a search must return one).
                 if vis.work > self.params.widen_budget
                     && (*wt != 0 || !self.nodes[0].children.is_empty())
                 {
@@ -348,6 +363,9 @@ impl Tier1 {
                     nd.widening -= 1;
                     nd.widen_done = true;
                     self.stats.widen_abandoned += 1;
+                    if std::env::var_os("STEPS_SLOW_TURN_SECS").is_some() {
+                        eprintln!("widening still over budget at tier-1 node {wt}: abandoned");
+                    }
                 }
             }
             if let Some((wt, cur, tries)) = vis.widen.as_mut() {

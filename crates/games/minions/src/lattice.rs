@@ -373,6 +373,9 @@ pub struct LatticeStats {
     pub sinks: u64,
     pub descents: u64,
     pub dead: u64,
+    /// Follow-mode SAT checks and how many refuted their node.
+    pub sat_calls: u64,
+    pub sat_refuted: u64,
 }
 
 /// One descent in progress: where it is, the `(node, kid)` path from where
@@ -382,6 +385,10 @@ pub struct Cursor {
     pub at: u32,
     pub path: Vec<(u32, u16)>,
     pub lp: f64,
+    /// Follow each node's own (verified) witness instead of PUCT: the kid
+    /// agreeing with it keeps that witness, so the descent cannot dead-end.
+    /// The fallback for a descent lost among lazily refuted options.
+    pub follow: bool,
     /// The node holding this descent's virtual loss (`NONE`: none yet).
     vl: u32,
 }
@@ -392,6 +399,7 @@ impl Cursor {
             at: node,
             path: Vec::new(),
             lp,
+            follow: false,
             vl: NONE,
         }
     }
@@ -448,6 +456,12 @@ pub struct Lattice {
     /// The mover can kill the enemy necromancer: the turn is terminal with
     /// this value and has no lattice.
     pub terminal: Option<f32>,
+    /// The exact SAT check of this turn ([`crate::sat`]), built on first
+    /// use: the follow mode's fallback.
+    sat: Option<Box<crate::sat::TurnSat>>,
+    /// Follow mode always asks SAT, even past a verified own witness
+    /// (tests).
+    pub follow_sat_only: bool,
     pub stats: LatticeStats,
     /// The turn start's tier-1 trunk image, once known.
     pub trunk: Option<Trunk>,
@@ -539,6 +553,8 @@ impl Lattice {
             pool_seen: Default::default(),
             nogoods: Vec::new(),
             terminal: None,
+            sat: None,
+            follow_sat_only: false,
             stats: LatticeStats::default(),
             trunk: None,
         };
@@ -1246,7 +1262,11 @@ impl Lattice {
                     }
                     self.kill(n)?;
                 }
-                Kind::Inner => match self.select(n, c_puct) {
+                Kind::Inner => match if cur.follow {
+                    self.follow_kid(n, c_puct)
+                } else {
+                    self.select(n, c_puct)
+                } {
                     None => self.kill(n)?,
                     Some(k) => {
                         let c = self.child(n, k)?;
@@ -1258,6 +1278,61 @@ impl Lattice {
             }
         }
         bail!("lattice descent made no progress in 1e6 steps")
+    }
+
+    /// The live kid of expanded node `n` agreeing with declaration `w`.
+    fn agreeing_kid(&self, n: u32, w: &TurnSpec) -> Option<usize> {
+        let node = &self.nodes[n as usize];
+        node.kids.iter().position(|k| {
+            !k.dead
+                && match node.state.stage {
+                    Stage::Fates => w.targets[k.cell as usize] == k.choice,
+                    Stage::Moves => w.moves[k.cell as usize] == k.choice,
+                    _ => w.spawns[k.cell as usize] == k.choice,
+                }
+        })
+    }
+
+    /// The follow mode's step from expanded node `n`: the kid agreeing with
+    /// the node's own witness if verified, else with an exact SAT witness
+    /// of its decisions (which the kid then inherits); None: SAT refuted
+    /// the node. In the spawn phase (moves all decided), any kid by PUCT.
+    fn follow_kid(&mut self, n: u32, c_puct: f32) -> Option<usize> {
+        let st = &self.nodes[n as usize].state;
+        if matches!(st.stage, Stage::Spawns | Stage::Terminal) {
+            return self.select(n, c_puct);
+        }
+        let own = *st.witness();
+        if !self.follow_sat_only && !crate::steps::witness_is_pending(&own) {
+            if let Some(k) = self.agreeing_kid(n, &own) {
+                return Some(k);
+            }
+        }
+        let fixes = crate::sat::fixes_of(st);
+        let base = &self.start.base;
+        let sat = self
+            .sat
+            .get_or_insert_with(|| Box::new(crate::sat::TurnSat::new(base)));
+        self.stats.sat_calls += 1;
+        match sat.complete(&fixes) {
+            crate::sat::SatResult::Witness(w, _) => {
+                let Some(k) = self.agreeing_kid(n, &w) else {
+                    // The witness's choice is not among the kids (an option
+                    // refuted inexactly): any live kid.
+                    return self.select(n, c_puct);
+                };
+                let node = &mut self.nodes[n as usize];
+                match node.wit_ex.binary_search_by_key(&(k as u16), |x| x.0) {
+                    Ok(i) => node.wit_ex[i].1 = w,
+                    Err(i) => node.wit_ex.insert(i, (k as u16, w)),
+                }
+                Some(k)
+            }
+            crate::sat::SatResult::Refuted(_) => {
+                self.stats.sat_refuted += 1;
+                None
+            }
+        }
     }
 
     /// Record sink `n`'s energy (ignored unless finite).
@@ -2187,6 +2262,46 @@ pub(crate) mod tests {
     use rand::{Rng, SeedableRng};
 
     /// Deterministic pseudo-random logits and values from the node's view.
+    /// Follow-mode descents (SAT at every step) always reach a complete
+    /// turn, and the turn realizes.
+    #[test]
+    fn follow_descents_reach_sinks() {
+        use rand::SeedableRng;
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(23);
+        let mut sinks = 0;
+        for g in 0..30u64 {
+            let real = crate::selfplay::random_opening(22, 1.0884, &mut rng).0;
+            let start = StepState::begin(&real, g);
+            let mut l = Lattice::new(start).unwrap();
+            if l.terminal.is_some() {
+                continue;
+            }
+            l.follow_sat_only = true;
+            for _ in 0..8 {
+                let mut cur = Cursor::at(0, 0.0);
+                cur.follow = true;
+                let (sink, _, _) = l.descend(&HashLatticeEval, cur, 1.5).unwrap();
+                let s = &l.nodes[sink as usize];
+                assert_eq!(s.kind, Kind::Sink);
+                let base = &l.start.base;
+                let full = crate::steps::exact_realize(
+                    base,
+                    &s.state.done,
+                    base.side_bb(0),
+                    base.side_bb(1),
+                    5_000_000,
+                );
+                assert!(
+                    !matches!(full, crate::steps::Exact::Impossible),
+                    "a followed turn does not realize"
+                );
+                sinks += 1;
+            }
+            assert!(l.stats.sat_calls > 0);
+        }
+        assert!(sinks > 100);
+    }
+
     pub(crate) struct HashLatticeEval;
 
     fn h(v: &crate::steps::View, salt: u64) -> u64 {
