@@ -333,7 +333,10 @@ impl Tier1 {
         }
         loop {
             if let Some((wt, cur, _)) = vis.widen.as_mut() {
-                if vis.work > self.params.widen_budget {
+                // Not at a root without turns yet: a search must return one.
+                if vis.work > self.params.widen_budget
+                    && (*wt != 0 || !self.nodes[0].children.is_empty())
+                {
                     let wt = *wt;
                     self.nodes[wt as usize]
                         .lattice
