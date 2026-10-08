@@ -852,6 +852,35 @@ enum Cmd {
         /// Self-distillation: temperature of the per-cell softmax priors.
         #[arg(long, default_value_t = 0.02)]
         sd_tau: f64,
+        /// The separate tier-2 phase (overrides the other tier-2 record
+        /// modes): self-play queues each node on the path to each chosen turn
+        /// with this probability, and after --secs each queued node gets a
+        /// tier-2 search of its own rooted there, from scratch, ending at
+        /// complete turns valued by tier 1 (0 = off).
+        #[arg(long, default_value_t = 0.0)]
+        rooted_frac: f64,
+        /// Tier-2 phase: descents per node (--rooted-min from each live kid
+        /// first, the rest PUCT from the node).
+        #[arg(long, default_value_t = 128)]
+        rooted_n: u32,
+        #[arg(long, default_value_t = 1)]
+        rooted_min: u32,
+        /// Tier-2 phase: prior targets = per-cell softmax of the kids' best
+        /// complete turns at this temperature (0: their shares of the turns
+        /// found).
+        #[arg(long, default_value_t = 0.02)]
+        rooted_tau: f64,
+        /// Tier-2 phase: seconds (the nodes left are dropped), searches per
+        /// worker at a time, descents in flight per search, and expansions
+        /// per search before falling back to witness-following.
+        #[arg(long, default_value_t = 300.0)]
+        rooted_secs: f64,
+        #[arg(long, default_value_t = 16)]
+        rooted_tasks: usize,
+        #[arg(long, default_value_t = 8)]
+        rooted_inflight: usize,
+        #[arg(long, default_value_t = 4000)]
+        rooted_budget: u32,
         /// The walk's descents select on the lattice's accumulated statistics
         /// (the tier-1 search's included) instead of a fresh per-ply search.
         #[arg(long)]
@@ -1656,7 +1685,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::LatticeGen {
             out, onnx, ep, batcher, workers, games, n1, inflight, n2, c1, c2, pw_c, pw_alpha, retries,
             temp1, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, start_turn_mean, secs,
-            target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, sd_frac, sd_descents, sd_tau, walk_accumulated, sink_values, walk_inflight, walk_marginal, walk_cq, lview, energy_min_visits, teacher_view, energy_prior, energy_temp, value_prior_tau, pipeline, openings, open_workers, pool, refill_to,
+            target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, sd_frac, sd_descents, sd_tau, rooted_frac, rooted_n, rooted_min, rooted_tau, rooted_secs, rooted_tasks, rooted_inflight, rooted_budget, walk_accumulated, sink_values, walk_inflight, walk_marginal, walk_cq, lview, energy_min_visits, teacher_view, energy_prior, energy_temp, value_prior_tau, pipeline, openings, open_workers, pool, refill_to,
         } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
             // A directory is the lattice nets (tier1/tier2.onnx); a file a steps value net behind the bridge.
@@ -1717,6 +1746,17 @@ async fn main() -> anyhow::Result<()> {
                 openings,
                 pool,
                 refill_to,
+                rooted_frac,
+                rooted: minions_engine::lattice::RootedParams {
+                    n: rooted_n,
+                    min_per_kid: rooted_min,
+                    c2,
+                    inflight: rooted_inflight,
+                    tau: rooted_tau,
+                    budget: rooted_budget,
+                },
+                rooted_secs,
+                rooted_tasks,
                 open_workers: if open_workers > 0 { open_workers } else { std::thread::available_parallelism().map_or(8, |n| n.get()) },
             };
             minions_engine::latgen::generate(&cfg, bridge)?;

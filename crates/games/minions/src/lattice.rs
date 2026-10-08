@@ -1654,6 +1654,67 @@ impl Default for WalkParams {
     }
 }
 
+/// A from-scratch tier-2 search rooted at one node, for its tier-2 record
+/// (the generation's separate tier-2 phase, see [`Lattice::advance_rooted`]).
+#[derive(Clone, Debug)]
+pub struct RootedParams {
+    /// Descents in all, `min_per_kid` of them from each live kid first.
+    pub n: u32,
+    pub min_per_kid: u32,
+    pub c2: f32,
+    pub inflight: usize,
+    /// Prior targets: a per-cell softmax of the kids' best complete-turn
+    /// values at this temperature; 0: the kids' shares of the complete
+    /// turns found (visit counts).
+    pub tau: f64,
+    /// Expansions after which the descents follow witnesses (exact SAT
+    /// fallback), and after twice which they are abandoned.
+    pub budget: u32,
+}
+
+impl Default for RootedParams {
+    fn default() -> Self {
+        RootedParams {
+            n: 128,
+            min_per_kid: 1,
+            c2: 1.5,
+            inflight: 8,
+            tau: 0.02,
+            budget: 4000,
+        }
+    }
+}
+
+pub struct Rooted {
+    pub at: u32,
+    init: bool,
+    /// Forced first kids still to start, PUCT descents still to start.
+    todo: Vec<usize>,
+    left: u32,
+    curs: Vec<Cursor>,
+    /// The complete turns reached and their values for the lattice's mover.
+    sinks: Vec<(u32, f32)>,
+    expansions: u32,
+    pub abandoned: bool,
+    pub record: Option<T2Record>,
+}
+
+impl Rooted {
+    pub fn new(at: u32) -> Self {
+        Rooted {
+            at,
+            init: false,
+            todo: Vec::new(),
+            left: 0,
+            curs: Vec::new(),
+            sinks: Vec::new(),
+            expansions: 0,
+            abandoned: false,
+            record: None,
+        }
+    }
+}
+
 /// The generation's tier-2 search over a turn, as a resumable walk: from
 /// the root, `n2` descents, then lock one ply (a uniformly random variable,
 /// its choice by tempered visits plus Dirichlet noise) and re-root there,
@@ -2059,6 +2120,181 @@ impl Lattice {
             }
             w.sd_at = NONE;
         }
+    }
+
+    /// The node with commitments `key`, reached from the root one
+    /// commitment at a time (the nodes on the way are prepared, not
+    /// expanded). None: not reachable here (refuted on the way).
+    pub fn reach(&mut self, key: Key) -> Result<Option<u32>> {
+        let mut at = 0u32;
+        loop {
+            let nd = &self.nodes[at as usize];
+            if nd.key == key {
+                return Ok(Some(at));
+            }
+            if nd.kind != Kind::Inner || (!nd.prepared && !self.prepare(at)?) {
+                return Ok(None);
+            }
+            let Some(k) = self.nodes[at as usize].kids.iter().position(|k| {
+                !k.dead && key.mask & (1 << k.var) != 0 && key.get(k.var as usize) == k.choice
+            }) else {
+                return Ok(None);
+            };
+            at = self.child(at, k)?;
+        }
+    }
+
+    /// A from-scratch search rooted at `r.at` (in a lattice of its own, so
+    /// nothing but this search's descents is in its statistics):
+    /// `p.min_per_kid` descents from each live kid, then PUCT descents from
+    /// the node up to `p.n`, each ending at a complete turn valued by tier 1.
+    /// The record: per kid, the best complete turn found containing it
+    /// (value) and a per-cell softmax of those (prior; or its share of the
+    /// turns found, `p.tau` 0); the node's value is the best turn found.
+    /// Requests go to `out`; true once done (`r.record` is then set, unless
+    /// the node is dead or nothing was found).
+    pub fn advance_rooted(
+        &mut self,
+        r: &mut Rooted,
+        p: &RootedParams,
+        out: &mut Vec<Need>,
+    ) -> Result<bool> {
+        let at = r.at;
+        if !r.init {
+            r.init = true;
+            let nd = &self.nodes[at as usize];
+            if nd.kind != Kind::Inner || (!nd.prepared && !self.prepare(at)?) {
+                return Ok(true);
+            }
+            let nd = &self.nodes[at as usize];
+            r.todo = (0..nd.kids.len())
+                .filter(|&k| !nd.kids[k].dead)
+                .flat_map(|k| std::iter::repeat(k).take(p.min_per_kid as usize))
+                .collect();
+            r.todo.reverse();
+            r.left = p.n.saturating_sub(r.todo.len() as u32);
+        }
+        loop {
+            let over = r.expansions >= p.budget;
+            if r.expansions >= 2 * p.budget && !r.abandoned {
+                // Runaway descents (dead ends refuted one by one): keep what
+                // was found.
+                r.abandoned = true;
+                for c in &mut r.curs {
+                    self.abandon(c);
+                }
+                r.curs.clear();
+                r.todo.clear();
+                r.left = 0;
+            }
+            while r.curs.len() < p.inflight.max(1) {
+                let mut c = if let Some(k) = r.todo.pop() {
+                    if self.nodes[at as usize].kind != Kind::Inner
+                        || self.nodes[at as usize].kids[k].dead
+                    {
+                        continue;
+                    }
+                    Cursor::at(self.child(at, k)?, 0.0)
+                } else if r.left > 0 {
+                    r.left -= 1;
+                    Cursor::at(at, 0.0)
+                } else {
+                    break;
+                };
+                c.follow = over;
+                r.curs.push(c);
+            }
+            let mut progressed = false;
+            let mut i = 0;
+            while i < r.curs.len() {
+                if over {
+                    r.curs[i].follow = true;
+                }
+                match self.advance(&mut r.curs[i], p.c2)? {
+                    Need::Done { sink, value, .. } => {
+                        r.sinks.push((sink, value));
+                        r.curs.swap_remove(i);
+                        progressed = true;
+                    }
+                    Need::Dead => {
+                        r.curs.swap_remove(i);
+                        progressed = true;
+                    }
+                    Need::Wait => i += 1,
+                    need => {
+                        if matches!(need, Need::Expand(_)) {
+                            r.expansions += 1;
+                        }
+                        out.push(need);
+                        i += 1;
+                    }
+                }
+            }
+            if !r.curs.is_empty() || !r.todo.is_empty() || r.left > 0 {
+                if !progressed {
+                    return Ok(false);
+                }
+                continue;
+            }
+            r.record = self.rooted_record(r, p);
+            return Ok(true);
+        }
+    }
+
+    fn rooted_record(&self, r: &Rooted, p: &RootedParams) -> Option<T2Record> {
+        let nd = &self.nodes[r.at as usize];
+        if nd.kind != Kind::Inner || r.sinks.is_empty() {
+            return None;
+        }
+        let nk = nd.kids.len();
+        let (mut best, mut cnt) = (vec![f32::NEG_INFINITY; nk], vec![0f32; nk]);
+        for &(s, v) in &r.sinks {
+            let key = self.nodes[s as usize].key;
+            for (k, kid) in nd.kids.iter().enumerate() {
+                if key.mask & (1 << kid.var) != 0 && key.get(kid.var as usize) == kid.choice {
+                    best[k] = best[k].max(v);
+                    cnt[k] += 1.0;
+                }
+            }
+        }
+        let live: Vec<usize> = (0..nk)
+            .filter(|&k| !nd.kids[k].dead && cnt[k] > 0.0)
+            .collect();
+        if live.is_empty() {
+            return None;
+        }
+        let mut cell_best: HashMap<u8, f32> = HashMap::new();
+        for &k in &live {
+            let b = cell_best
+                .entry(nd.kids[k].cell)
+                .or_insert(f32::NEG_INFINITY);
+            *b = b.max(best[k]);
+        }
+        let kids = live
+            .iter()
+            .map(|&k| {
+                let kid = &nd.kids[k];
+                let wt = if p.tau > 0.0 {
+                    (f64::from(best[k] - cell_best[&kid.cell]) / p.tau).exp() as f32
+                } else {
+                    cnt[k]
+                };
+                (kid.cell, kid.choice, wt, best[k], cnt[k])
+            })
+            .collect();
+        let q = r
+            .sinks
+            .iter()
+            .map(|x| x.1)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let n = r.sinks.len() as f32;
+        Some(T2Record {
+            node: nd.state.clone(),
+            kids,
+            n,
+            q,
+            ns: n,
+        })
     }
 
     /// Run walk `w` until every descent in flight (up to `p.inflight` at a
@@ -2751,6 +2987,123 @@ pub(crate) mod tests {
                 total += w.records.len();
             }
             assert!(total > 10, "{total} records");
+        }
+    }
+
+    /// Serve one search's requests with the test evaluator.
+    fn serve(l: &mut Lattice, needs: &mut Vec<Need>) {
+        for need in needs.drain(..) {
+            match need {
+                Need::Expand(n) => {
+                    let (slots, node) = l.request(n);
+                    let req = ExpandReq {
+                        root: &l.start,
+                        node,
+                        slots: &slots,
+                        trunk: None,
+                    };
+                    let out = HashLatticeEval.expand(&[req]).unwrap().pop().unwrap();
+                    l.feed_expand(n, &out);
+                }
+                Need::Value(n) => {
+                    let o = HashLatticeEval
+                        .both(&[], &[&l.nodes[n as usize].state])
+                        .unwrap()
+                        .1
+                        .pop()
+                        .unwrap();
+                    l.feed_value(n, &o);
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    /// The tier-2 phase: nodes from one lattice are reached by key in a
+    /// fresh one of the same turn, and a search rooted there records every
+    /// kid it found a complete turn for, at the best such turn's value
+    /// (checked against the sinks below the kid), with a per-cell softmax
+    /// prior (or visit shares at tau 0).
+    #[test]
+    fn rooted_records() {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(5);
+        for (inflight, tau) in [(1, 0.02), (8, 0.02), (4, 0.0)] {
+            let p = RootedParams {
+                n: 40,
+                inflight,
+                tau,
+                ..RootedParams::default()
+            };
+            let (mut total, mut reached) = (0, 0);
+            for s in positions(4, 41) {
+                let mut l = Lattice::new(s.clone()).unwrap();
+                if l.terminal.is_some() {
+                    continue;
+                }
+                let (sink, _, _) = l
+                    .descend(&HashLatticeEval, Cursor::at(0, 0.0), 1.5)
+                    .unwrap();
+                for n in l.path_to(sink, &mut rng).unwrap() {
+                    let key = l.nodes[n as usize].key;
+                    let mut f = Lattice::new(s.clone()).unwrap();
+                    let at = f.reach(key).unwrap().expect("reachable in a fresh lattice");
+                    assert_eq!(f.nodes[at as usize].key, key);
+                    assert_eq!(
+                        f.nodes[at as usize].state.spec,
+                        l.nodes[n as usize].state.spec
+                    );
+                    reached += 1;
+                    let mut r = Rooted::new(at);
+                    let mut needs = Vec::new();
+                    while !f.advance_rooted(&mut r, &p, &mut needs).unwrap() {
+                        assert!(!needs.is_empty(), "stalled without requests");
+                        serve(&mut f, &mut needs);
+                    }
+                    let Some(rec) = r.record else { continue };
+                    assert!(r.sinks.len() as u32 >= p.n.min(1));
+                    let best = rec
+                        .kids
+                        .iter()
+                        .map(|k| k.3)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    assert_eq!(rec.q, best);
+                    let nd = &f.nodes[at as usize];
+                    for k in &rec.kids {
+                        assert!((0.0..=1.0).contains(&k.3) && k.2 > 0.0 && k.4 >= 1.0);
+                        let kid = nd
+                            .kids
+                            .iter()
+                            .find(|x| x.cell == k.0 && x.choice == k.1)
+                            .unwrap();
+                        // The best sink containing the kid.
+                        let b = r
+                            .sinks
+                            .iter()
+                            .filter(|&&(sn, _)| {
+                                let sk = f.nodes[sn as usize].key;
+                                sk.mask & (1 << kid.var) != 0
+                                    && sk.get(kid.var as usize) == kid.choice
+                            })
+                            .map(|x| x.1)
+                            .fold(f32::NEG_INFINITY, f32::max);
+                        assert_eq!(k.3, b);
+                        if tau > 0.0 {
+                            assert!(k.2 <= 1.0);
+                        } else {
+                            assert_eq!(k.2, k.4);
+                        }
+                    }
+                    // Every sink completes the node.
+                    for &(sn, _) in &r.sinks {
+                        assert!(f.nodes[sn as usize].key.includes(&key));
+                    }
+                    total += 1;
+                }
+            }
+            assert!(
+                total > 10 && reached >= total,
+                "{total} records, {reached} reached"
+            );
         }
     }
 

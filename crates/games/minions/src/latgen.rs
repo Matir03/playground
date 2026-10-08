@@ -46,7 +46,8 @@ use anyhow::Result;
 use rand::{Rng, SeedableRng};
 
 use crate::lattice::{
-    noisy_pick, ExpandReq, Kind, Lattice, LatticeEval, Need, T2Record, Walk, WalkParams, NONE,
+    noisy_pick, ExpandReq, Key, Kind, Lattice, LatticeEval, Need, Rooted, RootedParams, T2Record,
+    Walk, WalkParams, NONE,
 };
 use crate::steps::{Stage, StepState, View, MAX_ACTIVE, N_SCALARS};
 use crate::tier1::{Need1, T1Params, Tier1, Visit};
@@ -137,6 +138,17 @@ pub struct GenConfig {
     /// Refill mode: play openings until the pool holds this many, save it,
     /// and stop (no searches).
     pub refill_to: usize,
+    /// The separate tier-2 phase (if positive): self-play writes no tier-2
+    /// records; each searched turn hands the nodes on a path to its chosen
+    /// turn, each with this probability, to a second phase run after the
+    /// self-play one (`secs`), which records each node from a search of its
+    /// own rooted there ([`Lattice::advance_rooted`]) for up to
+    /// `rooted_secs` (nodes in random order: the ones left are dropped).
+    pub rooted_frac: f64,
+    pub rooted: RootedParams,
+    pub rooted_secs: f64,
+    /// Searches per worker at a time in that phase.
+    pub rooted_tasks: usize,
 }
 
 /// The continuation probability q of a geometric on 0..n (P(k) ∝ q^k)
@@ -238,6 +250,12 @@ pub struct GenCounters {
     pub pooled: AtomicU64,
     /// Tier-1 records on partial-turn views (`view_min_visits`).
     pub view_records: AtomicU64,
+    /// The tier-2 phase: nodes queued, searched, not reachable in a fresh
+    /// lattice, and searches abandoned over budget.
+    pub rooted_queued: AtomicU64,
+    pub rooted_done: AtomicU64,
+    pub rooted_unreached: AtomicU64,
+    pub rooted_abandoned: AtomicU64,
 }
 
 enum Task {
@@ -255,6 +273,11 @@ enum Task {
     Walk {
         lat: Lattice,
         walk: Walk,
+    },
+    /// The tier-2 phase: a search rooted at one node, in a fresh lattice.
+    Rooted {
+        lat: Lattice,
+        r: Rooted,
     },
 }
 
@@ -535,7 +558,7 @@ fn pick_ordinal(vals: &[f32], rng: &mut impl Rng) -> usize {
 fn lat_of(task: &Task, t1: u32) -> &Lattice {
     match task {
         Task::Search { t1: s, .. } => s.lattice(t1),
-        Task::Opening { lat, .. } | Task::Walk { lat, .. } => lat,
+        Task::Opening { lat, .. } | Task::Walk { lat, .. } | Task::Rooted { lat, .. } => lat,
     }
 }
 
@@ -551,6 +574,10 @@ struct Worker<'a> {
     collect: Option<Vec<StepState>>,
     /// The search phase: games start from these.
     pool: Option<&'a Mutex<Vec<StepState>>>,
+    /// The tier-2 phase's queue (turn start, node), and when it stops
+    /// starting searches.
+    rooted_q: Option<&'a Mutex<Vec<(StepState, Key)>>>,
+    deadline: Option<Instant>,
 }
 
 impl Worker<'_> {
@@ -727,7 +754,92 @@ impl Worker<'_> {
                     .fetch_add(walk.records.len() as u64, Relaxed);
                 Ok(Next::Replace(Vec::new()))
             }
+            Task::Rooted { lat, r } => {
+                let mut needs = Vec::new();
+                if !lat.advance_rooted(r, &self.cfg.rooted, &mut needs)? {
+                    return Ok(Next::Wait(
+                        needs
+                            .into_iter()
+                            .map(|n| match n {
+                                Need::Expand(n) => Req::Expand { t1: NONE, n },
+                                Need::Value(n) => Req::LatValue { n },
+                                _ => unreachable!("searches only hand out requests"),
+                            })
+                            .collect(),
+                    ));
+                }
+                self.c.rooted_done.fetch_add(1, Relaxed);
+                if r.abandoned {
+                    self.c.rooted_abandoned.fetch_add(1, Relaxed);
+                }
+                if let Some(rec) = r.record.take() {
+                    encode_t2(&lat.start, &rec, &mut self.t2w, self.cfg.lview)?;
+                    self.view_targets(&rec)?;
+                    self.c.t2_records.fetch_add(1, Relaxed);
+                }
+                Ok(Next::Replace(self.next_rooted()?.into_iter().collect()))
+            }
         }
+    }
+
+    /// The tier-2 phase's next search: the next queued node reachable in a
+    /// fresh lattice of its turn (None: the queue is empty or time is up).
+    fn next_rooted(&mut self) -> Result<Option<Task>> {
+        let Some(q) = self.rooted_q else {
+            return Ok(None);
+        };
+        loop {
+            if self.deadline.is_some_and(|d| Instant::now() >= d) {
+                return Ok(None);
+            }
+            let Some((s, key)) = q.lock().unwrap().pop() else {
+                return Ok(None);
+            };
+            let mut lat = Lattice::new(s)?;
+            if lat.terminal.is_some() {
+                continue;
+            }
+            match lat.reach(key)? {
+                Some(at) => {
+                    return Ok(Some(Task::Rooted {
+                        lat,
+                        r: Rooted::new(at),
+                    }))
+                }
+                None => {
+                    self.c.rooted_unreached.fetch_add(1, Relaxed);
+                }
+            }
+        }
+    }
+
+    /// The tier-2 phase: searches from the queue until it is empty or the
+    /// deadline passes (searches already started finish).
+    fn rooted_phase(&mut self, eval: &dyn LatticeEval) -> Result<()> {
+        let p = self.cfg.pipeline.max(1);
+        let mut groups: Vec<Group> = (0..p).map(|_| Group::default()).collect();
+        for i in 0..self.cfg.rooted_tasks.max(1) {
+            match self.next_rooted()? {
+                Some(t) => groups[i % p].tasks.push(t),
+                None => break,
+            }
+        }
+        let mut g = 0;
+        while groups
+            .iter()
+            .any(|x| !x.tasks.is_empty() || x.inflight.is_some())
+        {
+            let grp = &mut groups[g];
+            if let Some(f) = grp.inflight.take() {
+                self.feed(&mut grp.tasks, f)?;
+            }
+            if !grp.tasks.is_empty() {
+                grp.inflight = Some(self.submit_round(&mut grp.tasks, eval)?);
+            }
+            g = (g + 1) % p;
+        }
+        self.t1w.flush()?;
+        self.t2w.flush()
     }
 
     /// Partial-turn value targets from a tier-2 record (see
@@ -886,6 +998,18 @@ impl Worker<'_> {
         let mut out = Vec::with_capacity(2);
         if self.cfg.distill_tau > 0.0 {
             // Distilling: the expansions are the tier-2 records.
+        } else if self.cfg.rooted_frac > 0.0 {
+            if let (Some(mut lat), Some(q)) = (t1.nodes[0].lattice.take(), self.rooted_q) {
+                let target = t1.nodes[pick as usize].sink;
+                let mut nodes = lat.path_to(target, &mut self.rng)?;
+                let f = self.cfg.rooted_frac;
+                nodes.retain(|_| self.rng.gen::<f64>() < f);
+                self.c.rooted_queued.fetch_add(nodes.len() as u64, Relaxed);
+                let mut q = q.lock().unwrap();
+                for n in nodes {
+                    q.push((lat.start.clone(), lat.nodes[n as usize].key));
+                }
+            }
         } else if self.cfg.sd_frac > 0.0 {
             if let Some(mut lat) = t1.nodes[0].lattice.take() {
                 let target = t1.nodes[pick as usize].sink;
@@ -1076,7 +1200,9 @@ impl Worker<'_> {
                         &s.lattice(t1).nodes[n as usize].state
                     }
                 }
-                (Req::LatValue { n }, Task::Walk { lat, .. }) => &lat.nodes[n as usize].state,
+                (Req::LatValue { n }, Task::Walk { lat, .. } | Task::Rooted { lat, .. }) => {
+                    &lat.nodes[n as usize].state
+                }
                 _ => unreachable!("request and task disagree"),
             };
             states.push(s);
@@ -1136,7 +1262,9 @@ impl Worker<'_> {
             }
             match &mut tasks[ti] {
                 Task::Search { t1: s, .. } => s.feed_expand(t1, n, &outs[j]),
-                Task::Opening { lat, .. } | Task::Walk { lat, .. } => lat.feed_expand(n, &outs[j]),
+                Task::Opening { lat, .. } | Task::Walk { lat, .. } | Task::Rooted { lat, .. } => {
+                    lat.feed_expand(n, &outs[j])
+                }
             }
         }
         for (j, &k) in f.en_idx.iter().enumerate() {
@@ -1158,7 +1286,9 @@ impl Worker<'_> {
                         s.feed_sink_value(t1, n, &vals[j]);
                     }
                 }
-                (Req::LatValue { n }, Task::Walk { lat, .. }) => lat.feed_value(n, &vals[j]),
+                (Req::LatValue { n }, Task::Walk { lat, .. } | Task::Rooted { lat, .. }) => {
+                    lat.feed_value(n, &vals[j])
+                }
                 _ => unreachable!(),
             }
         }
@@ -1266,6 +1396,8 @@ fn make_worker<'a>(
         ),
         collect: None,
         pool: None,
+        rooted_q: None,
+        deadline: None,
     }
 }
 
@@ -1360,6 +1492,8 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
         return save(&pool.lock().unwrap());
     }
     let pool = &pool;
+    let rooted_q: Mutex<Vec<(StepState, Key)>> = Mutex::new(Vec::new());
+    let rooted_q = &rooted_q;
     let stop = Arc::new(AtomicBool::new(false));
     let t0 = Instant::now();
     let res: Vec<Result<()>> = std::thread::scope(|sc| {
@@ -1370,6 +1504,7 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
                 sc.spawn(move || {
                     let mut wk = make_worker(cfg, bid, w, &t1_dir, &t2_dir, &c);
                     wk.pool = Some(pool);
+                    wk.rooted_q = Some(rooted_q);
                     let r = wk.run(eval.as_ref(), &stop);
                     if r.is_err() {
                         stop.store(true, Relaxed);
@@ -1493,5 +1628,90 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
         r?;
     }
     let left = std::mem::take(&mut *pool.lock().unwrap());
-    save(&left)
+    save(&left)?;
+    if cfg.rooted_frac > 0.0 {
+        rooted_phase(cfg, bid, eval, &c, rooted_q, &t1_dir, &t2_dir)?;
+    }
+    Ok(())
+}
+
+/// The separate tier-2 phase: every queued node (in random order) gets a
+/// search of its own rooted there, until the queue is empty or
+/// `cfg.rooted_secs` pass.
+fn rooted_phase(
+    cfg: &GenConfig,
+    bid: i16,
+    eval: Arc<dyn LatticeEval>,
+    c: &GenCounters,
+    q: &Mutex<Vec<(StepState, Key)>>,
+    t1_dir: &Path,
+    t2_dir: &Path,
+) -> Result<()> {
+    use rand::seq::SliceRandom;
+    let n = {
+        let mut v = q.lock().unwrap();
+        v.shuffle(&mut rand_chacha::ChaCha8Rng::seed_from_u64(
+            cfg.seed ^ 0x7007,
+        ));
+        v.len()
+    };
+    let t0 = Instant::now();
+    let deadline = t0 + std::time::Duration::from_secs_f64(cfg.rooted_secs);
+    let (ex0, va0, t2_0) = (
+        c.expansions.load(Relaxed),
+        c.values.load(Relaxed),
+        c.t2_records.load(Relaxed),
+    );
+    eprintln!(
+        "  tier-2 phase: {n} nodes queued, {} searches per worker, n {} (min {} per kid), budget {:.0}s",
+        cfg.rooted_tasks, cfg.rooted.n, cfg.rooted.min_per_kid, cfg.rooted_secs
+    );
+    let res: Vec<Result<()>> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..cfg.workers)
+            .map(|w| {
+                let eval = eval.clone();
+                sc.spawn(move || {
+                    // Writer tags after the self-play workers' and openers'.
+                    let mut wk = make_worker(cfg, bid, 1000 + w, t1_dir, t2_dir, c);
+                    wk.rooted_q = Some(q);
+                    wk.deadline = Some(deadline);
+                    wk.rooted_phase(eval.as_ref())
+                })
+            })
+            .collect();
+        let mut last = Instant::now();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let done = hs.iter().all(|h| h.is_finished());
+            if last.elapsed().as_secs_f64() >= 10.0 || done {
+                last = Instant::now();
+                let el = t0.elapsed().as_secs_f64();
+                eprintln!(
+                    "  tier-2 phase {el:.0}s: {} searched ({:.1}/s), {} records, {} left, {} unreachable, {} abandoned; expansions {:.0}/s, values {:.0}/s",
+                    c.rooted_done.load(Relaxed),
+                    c.rooted_done.load(Relaxed) as f64 / el.max(1e-9),
+                    c.t2_records.load(Relaxed) - t2_0,
+                    q.lock().unwrap().len(),
+                    c.rooted_unreached.load(Relaxed),
+                    c.rooted_abandoned.load(Relaxed),
+                    (c.expansions.load(Relaxed) - ex0) as f64 / el.max(1e-9),
+                    (c.values.load(Relaxed) - va0) as f64 / el.max(1e-9),
+                );
+            }
+            if done {
+                break;
+            }
+        }
+        hs.into_iter()
+            .map(|h| h.join().expect("tier-2 phase worker panicked"))
+            .collect()
+    });
+    for r in res {
+        r?;
+    }
+    let dropped = q.lock().unwrap().len();
+    if dropped > 0 {
+        eprintln!("  tier-2 phase: time up, {dropped} nodes dropped");
+    }
+    Ok(())
 }
