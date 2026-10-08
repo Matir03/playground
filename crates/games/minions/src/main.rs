@@ -774,6 +774,11 @@ enum Cmd {
         energy_prior: bool,
         #[arg(long, default_value_t = 1.0)]
         energy_temp: f32,
+        /// Tier-1 priors softmax(child value / this); 100 is effectively
+        /// uniform, which beat the lattice-path prior 0.573 over 384 games
+        /// (gen408/418, n1 100/200). 0: the path prior.
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        value_prior_tau: f32,
         #[arg(long, default_value_t = 1.0)]
         temp1: f64,
         #[arg(long, default_value_t = 0.3)]
@@ -1024,17 +1029,22 @@ fn lattice_play(spec: &str, n1: u32, inflight: usize) -> anyhow::Result<(String,
         let play = minions_engine::stepsp::LatticePlay { eval, n1, inflight, params: Default::default() };
         return Ok((net.to_string(), Some(play)));
     }
-    // `energy:<lattice dir>`: tier-1 priors from the net's energies.
+    // `energy:<lattice dir>`: tier-1 priors from the net's energies;
+    // `vprior=<tau>:<lattice dir>`: from the children's static values.
     let (spec, energy) = match spec.strip_prefix("energy:") {
         Some(s) => (s, true),
         None => (spec, false),
+    };
+    let (spec, vtau) = match spec.strip_prefix("vprior=").and_then(|r| r.split_once(':')) {
+        Some((t, s)) => (s, t.parse::<f32>()?),
+        None => (spec, 0.0),
     };
     let dir = std::path::Path::new(spec);
     if !dir.join("tier1.onnx").is_file() {
         return Ok((spec.to_string(), None));
     }
     let eval = std::sync::Arc::new(minions_engine::lattice_ort::OrtLatticeEval::load(dir, "trt", true, 1)?);
-    let params = minions_engine::tier1::T1Params { energy_prior: energy, ..Default::default() };
+    let params = minions_engine::tier1::T1Params { energy_prior: energy, value_prior_tau: vtau, ..Default::default() };
     let play = minions_engine::stepsp::LatticePlay { eval, n1, inflight, params };
     Ok((dir.join("value_sparse.onnx").to_string_lossy().into_owned(), Some(play)))
 }
@@ -1646,7 +1656,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::LatticeGen {
             out, onnx, ep, batcher, workers, games, n1, inflight, n2, c1, c2, pw_c, pw_alpha, retries,
             temp1, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, start_turn_mean, secs,
-            target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, sd_frac, sd_descents, sd_tau, walk_accumulated, sink_values, walk_inflight, walk_marginal, walk_cq, lview, energy_min_visits, teacher_view, energy_prior, energy_temp, pipeline, openings, open_workers, pool, refill_to,
+            target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, sd_frac, sd_descents, sd_tau, walk_accumulated, sink_values, walk_inflight, walk_marginal, walk_cq, lview, energy_min_visits, teacher_view, energy_prior, energy_temp, value_prior_tau, pipeline, openings, open_workers, pool, refill_to,
         } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
             // A directory is the lattice nets (tier1/tier2.onnx); a file a steps value net behind the bridge.
@@ -1669,7 +1679,7 @@ async fn main() -> anyhow::Result<()> {
                 games,
                 n1,
                 inflight1: inflight,
-                t1: minions_engine::tier1::T1Params { c_puct: c1, pw_c, pw_alpha, retries, c2, energy_prior, energy_temp, ..Default::default() },
+                t1: minions_engine::tier1::T1Params { c_puct: c1, pw_c, pw_alpha, retries, c2, energy_prior, energy_temp, value_prior_tau, ..Default::default() },
                 walk: minions_engine::lattice::WalkParams {
                     n2,
                     c2,

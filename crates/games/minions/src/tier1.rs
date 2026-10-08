@@ -37,6 +37,11 @@ pub struct T1Params {
     /// net with an energy output; falls back while any child lacks one.
     pub energy_prior: bool,
     pub energy_temp: f32,
+    /// > 0: children's priors are softmax(static value / this) -- each
+    /// child's tier-1 value on creation, which ranks siblings far better
+    /// than the lattice paths' priors (prior_posterior_diag). Overrides the
+    /// energy prior.
+    pub value_prior_tau: f32,
 }
 
 impl Default for T1Params {
@@ -50,6 +55,7 @@ impl Default for T1Params {
             widen_budget: 1000,
             energy_prior: false,
             energy_temp: 1.0,
+            value_prior_tau: 0.0,
         }
     }
 }
@@ -221,7 +227,20 @@ impl Tier1 {
                         .collect(),
                 )
             });
-        let lp: Vec<f64> = en.unwrap_or_else(|| {
+        let vp: Option<Vec<f64>> = (self.params.value_prior_tau != 0.0)
+            .then(|| {
+                nd.children
+                    .iter()
+                    .map(|&c| l.nodes[self.nodes[c as usize].sink as usize].value)
+                    .collect::<Option<Vec<f32>>>()
+            })
+            .flatten()
+            .map(|v| {
+                v.into_iter()
+                    .map(|x| f64::from(x / self.params.value_prior_tau))
+                    .collect()
+            });
+        let lp: Vec<f64> = vp.or(en).unwrap_or_else(|| {
             nd.children
                 .iter()
                 .map(|&c| l.sink_logp(self.nodes[c as usize].sink))
