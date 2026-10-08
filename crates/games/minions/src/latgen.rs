@@ -416,16 +416,24 @@ fn encode_turn_lv(s: &StepState, target: f32, visits: u32, out: &mut Vec<u8>) {
 }
 
 /// An energy record: kind (0 = turn start, 1 = one of its tier-1 children,
-/// as its complete declaration), active count, 2 pad bytes, visits (f32),
-/// then the features.
-pub const E_REC_BYTES: usize = 8 + MAX_ACTIVE * 2 + N_SCALARS * 4;
-pub const E_VERSION: u32 = 1;
+/// as its complete declaration), active count, 2 pad bytes, visits, then
+/// (version 2) its searched value and static value for the turn start's
+/// mover (a turn start: its own, NaN) and its tier-1 prior (a turn start:
+/// 1), all f32, then the features.
+pub const E_REC_BYTES: usize = 20 + MAX_ACTIVE * 2 + N_SCALARS * 4;
+pub const E_VERSION: u32 = 2;
+
+/// One energy record's statistics: visits, searched value, static value,
+/// tier-1 prior.
+type EStats = [f32; 4];
 
 /// Append one energy record's bytes (the caller counts the records).
-fn encode_energy(kind: u8, visits: f32, act: &[u16], sc: &[f32; N_SCALARS], buf: &mut Vec<u8>) {
+fn encode_energy(kind: u8, st: EStats, act: &[u16], sc: &[f32; N_SCALARS], buf: &mut Vec<u8>) {
     let start = buf.len();
     buf.extend_from_slice(&[kind, 0, 0, 0]);
-    buf.extend_from_slice(&visits.to_le_bytes());
+    for x in st {
+        buf.extend_from_slice(&x.to_le_bytes());
+    }
     let n = crate::lview::push_features(act, sc, buf);
     buf[start + 1] = n;
     debug_assert_eq!(buf.len() - start, E_REC_BYTES);
@@ -807,11 +815,26 @@ impl Worker<'_> {
             }
             let (mut act, mut sc) = (Vec::with_capacity(MAX_ACTIVE), [0f32; N_SCALARS]);
             crate::lview::node_features(&nd.state, &mut act, &mut sc);
-            encode_energy(0, nd.n as f32, &act, &sc, &mut self.t1e.buf);
-            for &c in &nd.children {
+            encode_energy(
+                0,
+                [nd.n as f32, nd.q() as f32, f32::NAN, 1.0],
+                &act,
+                &sc,
+                &mut self.t1e.buf,
+            );
+            let pri = t1.priors(i as u32);
+            let lat = t1.lattice(i as u32);
+            for (k, &c) in nd.children.iter().enumerate() {
                 let ch = &t1.nodes[c as usize];
                 crate::lview::decl_features(&nd.state, &ch.state.done, &mut act, &mut sc);
-                encode_energy(1, ch.n as f32, &act, &sc, &mut self.t1e.buf);
+                let sv = lat.nodes[ch.sink as usize].value.unwrap_or(f32::NAN);
+                encode_energy(
+                    1,
+                    [ch.n as f32, (1.0 - ch.q()) as f32, sv, pri[k] as f32],
+                    &act,
+                    &sc,
+                    &mut self.t1e.buf,
+                );
             }
             // Whole groups per chunk: flush only between groups.
             self.t1e.n += 1 + nd.children.len();
@@ -1011,6 +1034,37 @@ impl Worker<'_> {
                 trunk: l.trunk.clone(),
             });
         }
+        // Energy priors: each tier-1 sink value request also asks for its
+        // declaration's energy (a kid-less tier-2 row).
+        let mut en_idx = Vec::new();
+        let mut decls = Vec::new();
+        if self.cfg.t1.energy_prior {
+            for &k in &val_idx {
+                let (ti, r) = reqs[k];
+                if let (Req::T1Value { t1, n }, Task::Search { t1: s, .. }) = (r, &tasks[ti]) {
+                    if n != NONE {
+                        let l = s.lattice(t1);
+                        decls.push(crate::lview::decl_state(
+                            &l.start,
+                            &l.nodes[n as usize].state.done,
+                        ));
+                        en_idx.push(k);
+                    }
+                }
+            }
+        }
+        for (&k, d) in en_idx.iter().zip(&decls) {
+            let (ti, Req::T1Value { t1, .. }) = reqs[k] else {
+                unreachable!()
+            };
+            let l = lat_of(&tasks[ti], t1);
+            ex_reqs.push(ExpandReq {
+                root: &l.start,
+                node: d,
+                slots: &[],
+                trunk: l.trunk.clone(),
+            });
+        }
         let mut states: Vec<&StepState> = Vec::with_capacity(val_idx.len());
         for &k in &val_idx {
             let (ti, r) = reqs[k];
@@ -1037,6 +1091,7 @@ impl Worker<'_> {
             reqs,
             ex_idx,
             val_idx,
+            en_idx,
             kids,
         })
     }
@@ -1084,6 +1139,15 @@ impl Worker<'_> {
                 Task::Opening { lat, .. } | Task::Walk { lat, .. } => lat.feed_expand(n, &outs[j]),
             }
         }
+        for (j, &k) in f.en_idx.iter().enumerate() {
+            let (ti, Req::T1Value { t1, n }) = reqs[k] else {
+                unreachable!()
+            };
+            if let Task::Search { t1: s, .. } = &mut tasks[ti] {
+                s.lattice_mut(t1)
+                    .feed_energy(n, outs[f.ex_idx.len() + j].energy);
+            }
+        }
         for (j, &k) in f.val_idx.iter().enumerate() {
             let (ti, r) = reqs[k];
             match (r, &mut tasks[ti]) {
@@ -1122,6 +1186,9 @@ struct InFlight {
     reqs: Vec<(usize, Req)>,
     ex_idx: Vec<usize>,
     val_idx: Vec<usize>,
+    /// Sink value requests that also asked for their declaration's energy
+    /// (outputs after the expansions').
+    en_idx: Vec<usize>,
     kids: usize,
 }
 

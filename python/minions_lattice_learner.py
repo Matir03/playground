@@ -62,12 +62,28 @@ SLOTS = 37
 # The lattice view (lview.rs, `--lview`): original position plus decisions,
 # and per-cell output slots in separate ranges per kind of variable.
 LV_FATE_OFF, LV_MOVE_OFF, LV_SPAWN_OFF, LV_SLOTS = 0, 3, 40, 46
-E_DTYPE = np.dtype(
+E_DTYPE_V1 = np.dtype(
     [
         ("kind", "u1"),  # 0: a turn start (opens a group), 1: one of its tier-1 children
         ("n_active", "u1"),
         ("pad", "<u2"),
         ("visits", "<f4"),
+        ("active", "<u2", (MAX_ACTIVE,)),
+        ("scalars", "<f4", (N_SCALARS,)),
+    ]
+)
+# Version 2 (2026-10-07): also each child's searched value and static value
+# for the turn start's mover, and its tier-1 prior (a turn start: its own
+# searched value, NaN, 1).
+E_DTYPE = np.dtype(
+    [
+        ("kind", "u1"),
+        ("n_active", "u1"),
+        ("pad", "<u2"),
+        ("visits", "<f4"),
+        ("q", "<f4"),
+        ("sv", "<f4"),
+        ("prior", "<f4"),
         ("active", "<u2", (MAX_ACTIVE,)),
         ("scalars", "<f4", (N_SCALARS,)),
     ]
@@ -556,7 +572,17 @@ def load_energy(dirs):
     rs = []
     for d in dirs:
         for p in sorted(glob.glob(os.path.join(d, "t1e", "chunk_*.bin"))):
-            rs.append(read_chunk(p, b"MLTE", E_DTYPE))
+            with open(p, "rb") as f:
+                rec = int(np.frombuffer(f.read(16)[12:16], "<u4")[0])
+            if rec == E_DTYPE.itemsize:
+                rs.append(read_chunk(p, b"MLTE", E_DTYPE))
+                continue
+            old = read_chunk(p, b"MLTE", E_DTYPE_V1)
+            r = np.zeros(len(old), E_DTYPE)
+            for k in E_DTYPE_V1.names:
+                r[k] = old[k]
+            r["q"] = r["sv"] = r["prior"] = np.nan
+            rs.append(r)
     return np.concatenate(rs) if rs else np.zeros(0, E_DTYPE)
 
 
@@ -574,6 +600,8 @@ class ESet:
         self.cnt = t(recs["n_active"])
         self.scal = t(recs["scalars"].astype(np.float32))
         self.visits = t(recs["visits"].astype(np.float32))
+        self.q = t(recs["q"].astype(np.float32))
+        self.prior = t(recs["prior"].astype(np.float32))
         self.root = t(start.astype(np.int64))
         # Children in CSR order per group.
         self.child = t(child.astype(np.int64))
@@ -587,9 +615,44 @@ class ESet:
         return dense(self.act[rows], self.cnt[rows], self.scal[rows])
 
 
+ENERGY_TARGET = {"kind": "visits", "tau": 0.02, "cq_visit": 50.0, "cq_scale": 0.1}
+
+
+def energy_targets(es, rows, grp, n_groups):
+    """Per child its target share in its group. `visits`: visit shares.
+    `value`: softmax of searched values / tau. `cq` (Gumbel MuZero's
+    completed-Q policy): softmax(log prior + (cq_visit + max visits) *
+    cq_scale * q), q min-max normalized per group. Groups from records
+    without values (version 1) fall back to visit shares."""
+    dev = rows.device
+    n = es.visits[rows]
+    tot = torch.zeros(n_groups, device=dev).index_add_(0, grp, n)
+    vis = n / tot[grp].clamp(min=1e-9)
+    kind = ENERGY_TARGET["kind"]
+    if kind == "visits":
+        return vis
+    q = es.q[rows]
+    bad = torch.zeros(n_groups, device=dev).index_add_(0, grp, torch.isnan(q).float()) > 0
+    q = torch.nan_to_num(q, nan=0.0)
+    if kind == "value":
+        score = q / ENERGY_TARGET["tau"]
+    else:
+        big = torch.full((n_groups,), -1e30, device=dev)
+        qmax = big.scatter_reduce(0, grp, q, "amax")
+        qmin = -big.scatter_reduce(0, grp, -q, "amax")
+        qn = (q - qmin[grp]) / (qmax - qmin).clamp(min=1e-6)[grp]
+        nmax = big.scatter_reduce(0, grp, n, "amax")
+        sigma = (ENERGY_TARGET["cq_visit"] + nmax[grp]) * ENERGY_TARGET["cq_scale"]
+        lp = torch.log(torch.nan_to_num(es.prior[rows], nan=1.0).clamp(min=1e-9))
+        score = lp + sigma * qn
+    t = torch.exp(group_log_softmax(score, grp, n_groups))
+    return torch.where(bad[grp], vis, t)
+
+
 def energy_loss(trunk, t2, es, g, grad_trunk=True):
     """Cross-entropy of the softmax over each group's children's energies
-    against their visit shares; and its floor (the targets' entropy)."""
+    against their targets (`energy_targets`); and its floor (the targets'
+    entropy)."""
     with torch.set_grad_enabled(grad_trunk and torch.is_grad_enabled()):
         h, _ = trunk(es.x(es.root[g]))
     cnt = es.nkids[g]
@@ -598,10 +661,8 @@ def energy_loss(trunk, t2, es, g, grad_trunk=True):
     rows = es.child[torch.repeat_interleave(es.off[g], cnt) + torch.arange(len(grp), device=g.device) - first]
     e = t2(h[grp], es.x(rows))[3][:, 1]
     lp = group_log_softmax(e, grp, len(g))
-    n = es.visits[rows]
-    tot = torch.zeros(len(g), device=g.device).index_add_(0, grp, n)
-    tgt = n / tot[grp].clamp(min=1e-9)
-    ng = (tot > 0).sum().clamp(min=1)
+    tgt = energy_targets(es, rows, grp, len(g))
+    ng = torch.tensor(len(g), device=g.device).clamp(min=1)
     ce = -(tgt * lp).sum() / ng
     hf = -(tgt * torch.log(tgt.clamp(min=1e-9))).sum() / ng
     return ce, hf
@@ -628,6 +689,8 @@ def main():
     ap.add_argument("--t1-node", action="store_true", help="--lview: export tier 1 as the node value at the root (as --t1-from-t2) instead of the position-value output")
     ap.add_argument("--teacher", help="an old-view lattice net dir (net.pt, t2.pt, meta.json): tier-2 targets are its outputs on the same nodes (records need --teacher-view .old files); the position value learns its tier-1 value")
     ap.add_argument("--energy-weight", type=float, default=1.0)
+    ap.add_argument("--energy-target", choices=["visits", "value", "cq"], default="visits", help="energy targets over a turn start's tier-1 children: visit shares, softmax(value / --energy-tau), or completed-Q (Gumbel)")
+    ap.add_argument("--energy-tau", type=float, default=0.02)
     ap.add_argument("--energy-batch", type=int, default=64, help="energy groups per step")
     ap.add_argument("--min-cell-support", type=int, default=1, help="prior targets only for cells where at least this many kids have visits")
     ap.add_argument("--value-weight", type=float, default=1.0, help="tier-2 child and node values")
@@ -642,6 +705,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     torch.manual_seed(args.seed)
+    ENERGY_TARGET.update(kind=args.energy_target, tau=args.energy_tau)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(args.out, exist_ok=True)
     net1 = build_t1(args.t1_arch).to(dev)

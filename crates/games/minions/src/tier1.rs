@@ -32,6 +32,11 @@ pub struct T1Params {
     /// options can otherwise wander dead ends without end (2026-10-07: one
     /// grew a lattice past 88k nodes inside a single descent; match hangs).
     pub widen_budget: u32,
+    /// Children's priors from their energies (softmax of energy / temp)
+    /// instead of their lattice paths' mean log prior. Needs a lattice-view
+    /// net with an energy output; falls back while any child lacks one.
+    pub energy_prior: bool,
+    pub energy_temp: f32,
 }
 
 impl Default for T1Params {
@@ -43,6 +48,8 @@ impl Default for T1Params {
             retries: 20,
             c2: 1.5,
             widen_budget: 1000,
+            energy_prior: false,
+            energy_temp: 1.0,
         }
     }
 }
@@ -191,11 +198,34 @@ impl Tier1 {
         let Some(l) = nd.lattice.as_ref() else {
             return Vec::new();
         };
-        let lp: Vec<f64> = nd
-            .children
-            .iter()
-            .map(|&c| l.sink_logp(self.nodes[c as usize].sink))
-            .collect();
+        let en: Option<Vec<f64>> = self
+            .params
+            .energy_prior
+            .then(|| {
+                nd.children
+                    .iter()
+                    .map(|&c| l.nodes[self.nodes[c as usize].sink as usize].energy)
+                    .collect::<Vec<Option<f32>>>()
+            })
+            .and_then(|e| {
+                // Children without one (terminal turns) get the known ones' mean.
+                let known: Vec<f32> = e.iter().flatten().copied().collect();
+                if known.is_empty() {
+                    return None;
+                }
+                let m = known.iter().sum::<f32>() / known.len() as f32;
+                Some(
+                    e.into_iter()
+                        .map(|x| f64::from(x.unwrap_or(m) / self.params.energy_temp))
+                        .collect(),
+                )
+            });
+        let lp: Vec<f64> = en.unwrap_or_else(|| {
+            nd.children
+                .iter()
+                .map(|&c| l.sink_logp(self.nodes[c as usize].sink))
+                .collect()
+        });
         let m = lp.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let e: Vec<f64> = lp.iter().map(|&x| (x - m).exp()).collect();
         let s: f64 = e.iter().sum();
@@ -536,6 +566,22 @@ impl Tier1 {
                     _ => None,
                 })
                 .collect();
+            // With energy priors, each sink value request also asks for its
+            // declaration's energy (a kid-less tier-2 row).
+            let decls: Vec<(u32, u32, StepState)> = if self.params.energy_prior {
+                reqs.iter()
+                    .filter_map(|r| match *r {
+                        R::Sink(t, n) => {
+                            let l = self.lattice(t);
+                            let s = &l.nodes[n as usize].state;
+                            Some((t, n, crate::lview::decl_state(&l.start, &s.done)))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let (outs, vals) = {
                 let mut ex = Vec::with_capacity(slots.len());
                 let mut states = Vec::new();
@@ -554,8 +600,21 @@ impl Tier1 {
                         R::Node(t) => states.push(&self.nodes[t as usize].state),
                     }
                 }
+                for (t, _, d) in &decls {
+                    let l = self.lattice(*t);
+                    ex.push(ExpandReq {
+                        root: &l.start,
+                        node: d,
+                        slots: &[],
+                        trunk: l.trunk.clone(),
+                    });
+                }
                 eval.both(&ex, &states)?
             };
+            let n_ex = outs.len() - decls.len();
+            for ((t, n, _), o) in decls.iter().zip(&outs[n_ex..]) {
+                self.lattice_mut(*t).feed_energy(*n, o.energy);
+            }
             let (mut e, mut v) = (outs.iter(), vals.iter());
             for r in reqs {
                 match r {

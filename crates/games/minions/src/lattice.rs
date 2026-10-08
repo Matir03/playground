@@ -190,6 +190,9 @@ pub struct ExpandOut {
     pub logits: Vec<f32>,
     pub values: Vec<f32>,
     pub value: f32,
+    /// The node's energy (lattice-view nets; NaN otherwise): a complete
+    /// declaration's tier-1 prior logit.
+    pub energy: f32,
     /// The turn start's trunk image, when the request had none.
     pub trunk: Option<Trunk>,
 }
@@ -300,6 +303,9 @@ pub struct LNode {
     /// tier-1 values the training targets average.
     pub ret_n: u32,
     pub ret_w: f64,
+    /// A sink's energy (its complete declaration's tier-1 prior logit),
+    /// once known.
+    pub energy: Option<f32>,
     parents: Vec<(u32, u16)>,
     /// A sink's trunk image (from its tier-1 value), for its own lattice.
     pub trunk: Option<Trunk>,
@@ -349,6 +355,7 @@ impl LNode {
             lp_n: 0,
             ret_n: 0,
             ret_w: 0.0,
+            energy: None,
             parents: Vec::new(),
             trunk: None,
         }
@@ -1253,6 +1260,13 @@ impl Lattice {
         bail!("lattice descent made no progress in 1e6 steps")
     }
 
+    /// Record sink `n`'s energy (ignored unless finite).
+    pub fn feed_energy(&mut self, n: u32, e: f32) {
+        if e.is_finite() {
+            self.nodes[n as usize].energy = Some(e);
+        }
+    }
+
     /// Give up descent `cur`: drop its virtual loss.
     pub fn abandon(&mut self, cur: &mut Cursor) {
         self.move_vl(cur, NONE);
@@ -1422,6 +1436,7 @@ impl LatticeEval for StepsBridge {
                 logits: vec![0.0; r.slots.len()],
                 values,
                 value,
+                energy: f32::NAN,
                 trunk: None,
             });
             i += 1 + r.slots.len();
@@ -2205,6 +2220,7 @@ pub(crate) mod tests {
                         logits: r.slots.iter().map(|s| 4.0 * f(s, 0x9E37_79B9)).collect(),
                         values: r.slots.iter().map(|s| f(s, 0x85EB_CA6B)).collect(),
                         value: unit(base),
+                        energy: f32::NAN,
                         trunk: None,
                     }
                 })

@@ -117,6 +117,8 @@ struct Outs {
     logit: Vec<Vec<f32>>,
     value: Vec<Vec<f32>>,
     v2: Vec<f32>,
+    /// Per tier-2 row (NaN when the net has no energy output).
+    energy: Vec<f32>,
 }
 
 struct Job {
@@ -270,6 +272,11 @@ fn run_batch(s1: &mut Session, s2: &mut Session, c: usize, gather: bool, b: Batc
                 })
                 .collect()
         };
+        out.energy = if outs.contains_key("energy") {
+            get("energy")?
+        } else {
+            vec![f32::NAN; v2.len()]
+        };
         out.logit = per(&logit);
         out.value = per(&value);
         out.v2 = v2;
@@ -358,6 +365,7 @@ fn runner(mut s1: Session, mut s2: Session, c: usize, gather: bool, q: &Queue) {
                 let mut lg = o.logit.into_iter();
                 let mut va = o.value.into_iter();
                 let mut v2 = o.v2.into_iter();
+                let mut en = o.energy.into_iter();
                 for (tx, &(m1, m2)) in txs.iter().zip(&sizes) {
                     let part = Outs {
                         v1: v1.by_ref().take(m1).collect(),
@@ -365,6 +373,7 @@ fn runner(mut s1: Session, mut s2: Session, c: usize, gather: bool, q: &Queue) {
                         logit: lg.by_ref().take(m2).collect(),
                         value: va.by_ref().take(m2).collect(),
                         v2: v2.by_ref().take(m2).collect(),
+                        energy: en.by_ref().take(m2).collect(),
                     };
                     let _ = tx.send(Ok(part));
                 }
@@ -570,6 +579,7 @@ fn unpack(
                     },
                     values,
                     value: o.v2[i],
+                    energy: o.energy.get(i).copied().unwrap_or(f32::NAN),
                     trunk: computed[i].map(|r| o.h[r].clone()),
                 }
             })
@@ -824,7 +834,8 @@ mod tests {
             }
             let mut l = crate::lattice::Lattice::new(start.clone()).unwrap();
             for _ in 0..40 {
-                l.descend(&ea, crate::lattice::Cursor::at(0, 0.0), 1.5).unwrap();
+                l.descend(&ea, crate::lattice::Cursor::at(0, 0.0), 1.5)
+                    .unwrap();
             }
             let (_, va) = ea.both(&[], &[&start]).unwrap();
             let (_, vb) = eb.both(&[], &[&start]).unwrap();
@@ -907,8 +918,14 @@ mod tests {
             eprintln!("set LATTICE_DIR");
             return;
         };
-        let n1: u32 = std::env::var("N1").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
-        let npos: usize = std::env::var("POSITIONS").ok().and_then(|v| v.parse().ok()).unwrap_or(48);
+        let n1: u32 = std::env::var("N1")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+        let npos: usize = std::env::var("POSITIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(48);
         use rand::SeedableRng;
         let le = OrtLatticeEval::load(Path::new(&lat), "trt", true, 1).unwrap();
         #[derive(Default)]
@@ -950,12 +967,26 @@ mod tests {
         let mut t1v = Acc::default();
         let mut t1c = Acc::default();
         let (mut t1kl, mut t1top, mut t1n, mut t1pm) = (0f64, 0usize, 0usize, 0f64);
+        // Same currency for policy and value: whose top pick is the search's?
+        // [prior, static value] x [most visited, best searched (n >= 5)].
+        let mut t1pick = [[0usize; 2]; 2];
+        let mut t1pick_n = [0usize; 2];
+        let (mut rho_p, mut rho_v, mut rho_n) = (0f64, 0f64, 0usize);
+        let (mut c2top_v, mut c2top_n) = (0usize, 0usize);
         let mut node_s: [Acc; 3] = Default::default();
         let mut node_d = Acc::default();
         let mut kid_s: [Acc; 3] = Default::default();
         let mut kid_d = Acc::default();
         let (mut cells, mut top, mut mass, mut chance) = (0usize, 0usize, 0f64, 0f64);
-        let bucket = |c: usize| if c <= 1 { 0 } else if c < 10 { 1 } else { 2 };
+        let bucket = |c: usize| {
+            if c <= 1 {
+                0
+            } else if c < 10 {
+                1
+            } else {
+                2
+            }
+        };
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(17);
         let mut done = 0;
         while done < npos {
@@ -1000,6 +1031,63 @@ mod tests {
                 t1n += 1;
                 t1top += usize::from(best_p == best_n);
                 t1pm += pri[best_n];
+                let sv: Vec<f64> = ch
+                    .iter()
+                    .map(|&c| {
+                        l.nodes[t.nodes[c as usize].sink as usize]
+                            .value
+                            .map_or(f64::MIN, f64::from)
+                    })
+                    .collect();
+                let best_v = (0..ch.len())
+                    .max_by(|&a, &b| sv[a].total_cmp(&sv[b]))
+                    .unwrap();
+                t1pick_n[0] += 1;
+                t1pick[0][0] += usize::from(best_p == best_n);
+                t1pick[1][0] += usize::from(best_v == best_n);
+                let srch: Vec<usize> = (0..ch.len())
+                    .filter(|&i| t.nodes[ch[i] as usize].n >= 5)
+                    .collect();
+                if srch.len() >= 2 {
+                    let q = |i: usize| 1.0 - t.nodes[ch[i] as usize].q();
+                    let best_s = *srch
+                        .iter()
+                        .max_by(|&&a, &&b| q(a).total_cmp(&q(b)))
+                        .unwrap();
+                    let bp = *srch
+                        .iter()
+                        .max_by(|&&a, &&b| pri[a].total_cmp(&pri[b]))
+                        .unwrap();
+                    let bv = *srch
+                        .iter()
+                        .max_by(|&&a, &&b| sv[a].total_cmp(&sv[b]))
+                        .unwrap();
+                    t1pick_n[1] += 1;
+                    t1pick[0][1] += usize::from(bp == best_s);
+                    t1pick[1][1] += usize::from(bv == best_s);
+                    if srch.len() >= 3 {
+                        let rank = |f: &dyn Fn(usize) -> f64| {
+                            let mut ix = srch.clone();
+                            ix.sort_by(|&a, &b| f(a).total_cmp(&f(b)));
+                            let mut r = vec![0f64; ch.len()];
+                            for (k, &i) in ix.iter().enumerate() {
+                                r[i] = k as f64;
+                            }
+                            r
+                        };
+                        let rq = rank(&|i| q(i));
+                        let rp = rank(&|i| pri[i]);
+                        let rv = rank(&|i| sv[i]);
+                        let sp = |a: &[f64], b: &[f64]| {
+                            let n = srch.len() as f64;
+                            let d: f64 = srch.iter().map(|&i| (a[i] - b[i]).powi(2)).sum();
+                            1.0 - 6.0 * d / (n * (n * n - 1.0))
+                        };
+                        rho_p += sp(&rp, &rq);
+                        rho_v += sp(&rv, &rq);
+                        rho_n += 1;
+                    }
+                }
             }
             // Tier 2: the root lattice's sinks.
             let sinks: Vec<(crate::lattice::Key, f64, f64)> = l
@@ -1062,6 +1150,13 @@ mod tests {
                             .filter(|&k| !x.kids[k].dead)
                             .max_by(|&a, &b| x.kids[a].logp.total_cmp(&x.kids[b].logp))
                             .unwrap();
+                        let pv = post
+                            .iter()
+                            .map(|&(k, _)| k)
+                            .max_by(|&a, &b| x.kids[a].v.total_cmp(&x.kids[b].v))
+                            .unwrap();
+                        c2top_v += usize::from(pv == pb);
+                        c2top_n += 1;
                         cells += 1;
                         top += usize::from(pa == pb);
                         mass += f64::from(x.kids[pb].logp).exp();
@@ -1081,6 +1176,20 @@ mod tests {
             t1top as f64 / t1n.max(1) as f64,
             t1pm / t1n.max(1) as f64
         );
+        eprintln!(
+            "  top pick = most visited ({} roots): prior {:.3}, static value {:.3}; = best searched child (n>=5, {} roots): prior {:.3}, static value {:.3}",
+            t1pick_n[0],
+            t1pick[0][0] as f64 / t1pick_n[0].max(1) as f64,
+            t1pick[1][0] as f64 / t1pick_n[0].max(1) as f64,
+            t1pick_n[1],
+            t1pick[0][1] as f64 / t1pick_n[1].max(1) as f64,
+            t1pick[1][1] as f64 / t1pick_n[1].max(1) as f64
+        );
+        eprintln!(
+            "  Spearman vs searched value over children n>=5 ({rho_n} roots): prior {:.3}, static value {:.3}",
+            rho_p / rho_n.max(1) as f64,
+            rho_v / rho_n.max(1) as f64
+        );
         eprintln!("tier 2, root lattice (posterior = best complete turn found below):");
         for (b, name) in ["1 turn", "2-9 turns", "10+ turns"].iter().enumerate() {
             node_s[b].show(&format!("node value vs best static, {name}"));
@@ -1091,8 +1200,9 @@ mod tests {
         }
         kid_d.show("kid value vs best deep, 10+ turns");
         eprintln!(
-            "  per-cell prior: top = best turn's choice {:.3} (uniform {:.3}), prior mass on it {:.3} ({cells} cells)",
+            "  per-cell top pick = best turn's choice: prior {:.3}, kid value {:.3} (uniform {:.3}), prior mass on it {:.3} ({cells} cells)",
             top as f64 / cells.max(1) as f64,
+            c2top_v as f64 / c2top_n.max(1) as f64,
             chance / cells.max(1) as f64,
             mass / cells.max(1) as f64
         );

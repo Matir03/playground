@@ -197,6 +197,21 @@ pub fn decl_features(
     encode(&start.base, &d, act, sc);
 }
 
+/// The turn starting at `start` with every variable decided as in `spec`
+/// (a complete declaration): its [`node_features`] are [`decl_features`],
+/// so an expansion request on it (no kids) reads the declaration's energy.
+pub fn decl_state(start: &StepState, spec: &TurnSpec) -> StepState {
+    let mut s = start.clone();
+    s.spec = *spec;
+    s.spawn_cells = (0..NUM_CELLS as u8)
+        .filter(|&c| spec.spawns[c as usize] != 0)
+        .collect();
+    s.stage = Stage::Terminal;
+    s.idx = 0;
+    s.post = None;
+    s
+}
+
 /// Sparse features as a record's bytes (`MAX_ACTIVE` u16 indices, then the
 /// scalars as f32): the active count.
 pub fn push_features(act: &[u16], sc: &[f32; N_SCALARS], out: &mut Vec<u8>) -> u8 {
