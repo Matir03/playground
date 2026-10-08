@@ -27,6 +27,11 @@ pub struct T1Params {
     pub retries: u32,
     /// Tier-2 PUCT constant.
     pub c2: f32,
+    /// Expansions one widening may request before it is abandoned (the node
+    /// then stops widening). A descent in a lattice of lazily-refuted
+    /// options can otherwise wander dead ends without end (2026-10-07: one
+    /// grew a lattice past 88k nodes inside a single descent; match hangs).
+    pub widen_budget: u32,
 }
 
 impl Default for T1Params {
@@ -37,6 +42,7 @@ impl Default for T1Params {
             pw_alpha: 0.5,
             retries: 20,
             c2: 1.5,
+            widen_budget: 1000,
         }
     }
 }
@@ -75,6 +81,7 @@ pub struct T1Stats {
     pub t2_descents: u64,
     pub t2_repeats: u64,
     pub widen_dropped: u64,
+    pub widen_abandoned: u64,
 }
 
 /// One tier-1 visit in progress: the tier-1 path, and the widening under
@@ -82,6 +89,8 @@ pub struct T1Stats {
 pub struct Visit {
     path: Vec<u32>,
     widen: Option<(u32, Cursor, u32)>,
+    /// Expansions the current widening has requested.
+    work: u32,
 }
 
 pub enum Need1 {
@@ -144,6 +153,7 @@ impl Tier1 {
         Visit {
             path: vec![0],
             widen: None,
+            work: 0,
         }
     }
 
@@ -292,12 +302,30 @@ impl Tier1 {
             return Ok(Need1::NodeValue { t: 0 });
         }
         loop {
+            if let Some((wt, cur, _)) = vis.widen.as_mut() {
+                if vis.work > self.params.widen_budget {
+                    let wt = *wt;
+                    self.nodes[wt as usize]
+                        .lattice
+                        .as_mut()
+                        .expect("lattice")
+                        .abandon(cur);
+                    vis.widen = None;
+                    let nd = &mut self.nodes[wt as usize];
+                    nd.widening -= 1;
+                    nd.widen_done = true;
+                    self.stats.widen_abandoned += 1;
+                }
+            }
             if let Some((wt, cur, tries)) = vis.widen.as_mut() {
                 let wt = *wt;
                 let c2 = self.params.c2;
                 let l = self.nodes[wt as usize].lattice.as_mut().expect("lattice");
                 match l.advance(cur, c2)? {
-                    Need::Expand(n) => return Ok(Need1::Expand { t: wt, n }),
+                    Need::Expand(n) => {
+                        vis.work += 1;
+                        return Ok(Need1::Expand { t: wt, n });
+                    }
                     Need::Value(n) => return Ok(Need1::SinkValue { t: wt, n }),
                     Need::Wait => return Ok(Need1::Wait),
                     Need::Dead => bail!("tier-1 node {wt}'s lattice root is a dead end"),
@@ -361,6 +389,7 @@ impl Tier1 {
                 self.stats.widenings += 1;
                 self.nodes[t as usize].widening += 1;
                 vis.widen = Some((t, Cursor::at(0, 0.0), 0));
+                vis.work = 0;
                 continue;
             }
             match self.select(t) {
@@ -370,6 +399,16 @@ impl Tier1 {
                 }
                 // Its first turns are still being found by other visits.
                 None if self.nodes[t as usize].widening > 0 => return Ok(Need1::Wait),
+                // Its widening was abandoned before any turn was found: a
+                // leaf, worth its own value again.
+                None if self.nodes[t as usize].n > 0 => {
+                    let v = self.nodes[t as usize].q();
+                    self.end_visit(vis);
+                    let p = vis.path.clone();
+                    self.backup(&p, v);
+                    self.stats.visits += 1;
+                    return Ok(Need1::Done);
+                }
                 None => bail!("tier-1 node {t} has no children and stopped widening"),
             }
         }
@@ -427,9 +466,34 @@ impl Tier1 {
         }
         let mut vis: Vec<Visit> = Vec::new();
         let mut started = 0;
+        // STEPS_SLOW_TURN_SECS: progress reports while a search runs long.
+        let slow = std::env::var("STEPS_SLOW_TURN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok());
+        let t0 = std::time::Instant::now();
+        let mut next = slow.unwrap_or(f64::MAX);
         loop {
             if self.nodes[0].terminal.is_some() || (started >= visits && vis.is_empty()) {
                 return Ok(());
+            }
+            if t0.elapsed().as_secs_f64() > next {
+                next += slow.unwrap_or(f64::MAX);
+                let sizes: Vec<usize> = self
+                    .nodes
+                    .iter()
+                    .filter_map(|n| n.lattice.as_ref().map(|l| l.nodes.len()))
+                    .collect();
+                eprintln!(
+                    "slow search {:.0}s: started {started} in flight {} root n {} children {}; stats {:?}; {} lattices, largest {} nodes, root lattice {} nodes",
+                    t0.elapsed().as_secs_f64(),
+                    vis.len(),
+                    self.nodes[0].n,
+                    self.nodes[0].children.len(),
+                    self.stats,
+                    sizes.len(),
+                    sizes.iter().max().unwrap_or(&0),
+                    sizes.first().unwrap_or(&0)
+                );
             }
             // Advance every visit until none finishes; the rest wait on a
             // request (handed in once: a busy node makes the next pass Wait).

@@ -1253,6 +1253,11 @@ impl Lattice {
         bail!("lattice descent made no progress in 1e6 steps")
     }
 
+    /// Give up descent `cur`: drop its virtual loss.
+    pub fn abandon(&mut self, cur: &mut Cursor) {
+        self.move_vl(cur, NONE);
+    }
+
     /// Move `cur`'s virtual loss to node `to` (`NONE`: drop it).
     fn move_vl(&mut self, cur: &mut Cursor, to: u32) {
         if cur.vl != NONE {

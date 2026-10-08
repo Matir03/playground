@@ -894,6 +894,210 @@ mod tests {
         );
     }
 
+    /// Priors vs posteriors at both tiers (`LATTICE_DIR`, `N1`, `POSITIONS`):
+    /// tier 1's static value / child values / child priors against its
+    /// search; tier 2's head node and kid values against the best complete
+    /// turn found below them in the root lattice (static: the turn's tier-1
+    /// value; deep: its searched value where searched >= 5 times), and the
+    /// per-cell prior against the choice of the best turn found.
+    #[test]
+    #[ignore]
+    fn prior_posterior_diag() {
+        let Ok(lat) = std::env::var("LATTICE_DIR") else {
+            eprintln!("set LATTICE_DIR");
+            return;
+        };
+        let n1: u32 = std::env::var("N1").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
+        let npos: usize = std::env::var("POSITIONS").ok().and_then(|v| v.parse().ok()).unwrap_or(48);
+        use rand::SeedableRng;
+        let le = OrtLatticeEval::load(Path::new(&lat), "trt", true, 1).unwrap();
+        #[derive(Default)]
+        struct Acc {
+            x: Vec<f64>,
+            y: Vec<f64>,
+        }
+        impl Acc {
+            fn add(&mut self, x: f64, y: f64) {
+                self.x.push(x);
+                self.y.push(y);
+            }
+            fn show(&self, name: &str) {
+                let n = self.x.len() as f64;
+                if n < 2.0 {
+                    eprintln!("  {name:44} n {n}");
+                    return;
+                }
+                let mx = self.x.iter().sum::<f64>() / n;
+                let my = self.y.iter().sum::<f64>() / n;
+                let (mut sxy, mut sxx, mut syy, mut mae) = (0.0, 0.0, 0.0, 0.0);
+                for (a, b) in self.x.iter().zip(&self.y) {
+                    sxy += (a - mx) * (b - my);
+                    sxx += (a - mx) * (a - mx);
+                    syy += (b - my) * (b - my);
+                    mae += (a - b).abs();
+                }
+                eprintln!(
+                    "  {name:44} n {:6}  MAE {:.3}  bias(prior-post) {:+.3}  corr {:.3}  sd prior {:.3} post {:.3}",
+                    n as usize,
+                    mae / n,
+                    mx - my,
+                    sxy / (sxx * syy).sqrt().max(1e-12),
+                    (sxx / n).sqrt(),
+                    (syy / n).sqrt()
+                );
+            }
+        }
+        let mut t1v = Acc::default();
+        let mut t1c = Acc::default();
+        let (mut t1kl, mut t1top, mut t1n, mut t1pm) = (0f64, 0usize, 0usize, 0f64);
+        let mut node_s: [Acc; 3] = Default::default();
+        let mut node_d = Acc::default();
+        let mut kid_s: [Acc; 3] = Default::default();
+        let mut kid_d = Acc::default();
+        let (mut cells, mut top, mut mass, mut chance) = (0usize, 0usize, 0f64, 0f64);
+        let bucket = |c: usize| if c <= 1 { 0 } else if c < 10 { 1 } else { 2 };
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(17);
+        let mut done = 0;
+        while done < npos {
+            let real = crate::selfplay::random_opening(22, 1.0884, &mut rng).0;
+            let start = StepState::begin(&real, done as u64);
+            if start.is_terminal() || crate::lattice::necro_kill(&start).is_ok() {
+                continue;
+            }
+            done += 1;
+            let (_, v0) = le.both(&[], &[&start]).unwrap();
+            let mut t = crate::tier1::Tier1::new(start.clone(), Default::default());
+            t.run_inflight(&le, n1, 16).unwrap();
+            t1v.add(f64::from(v0[0].v), t.root_value());
+            let l = t.lattice(0);
+            // Tier 1: children.
+            let pri = t.priors(0);
+            let ch = &t.nodes[0].children;
+            let tot: f64 = ch.iter().map(|&c| f64::from(t.nodes[c as usize].n)).sum();
+            let mut deep: HashMap<u32, f64> = HashMap::new();
+            let (mut best_p, mut best_n) = (0usize, 0usize);
+            for (i, &c) in ch.iter().enumerate() {
+                let nd = &t.nodes[c as usize];
+                let sv = l.nodes[nd.sink as usize].value.map(f64::from);
+                if nd.n >= 5 {
+                    deep.insert(nd.sink, 1.0 - nd.q());
+                    if let Some(sv) = sv {
+                        t1c.add(sv, 1.0 - nd.q());
+                    }
+                }
+                if pri[i] > pri[best_p] {
+                    best_p = i;
+                }
+                if nd.n > t.nodes[ch[best_n] as usize].n {
+                    best_n = i;
+                }
+                let q = f64::from(nd.n) / tot.max(1.0);
+                if q > 0.0 {
+                    t1kl += q * (q / pri[i].max(1e-12)).ln();
+                }
+            }
+            if !ch.is_empty() {
+                t1n += 1;
+                t1top += usize::from(best_p == best_n);
+                t1pm += pri[best_n];
+            }
+            // Tier 2: the root lattice's sinks.
+            let sinks: Vec<(crate::lattice::Key, f64, f64)> = l
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.kind == crate::lattice::Kind::Sink)
+                .filter_map(|(i, n)| {
+                    n.value.map(|v| {
+                        let v = f64::from(v);
+                        (n.key, v, deep.get(&(i as u32)).copied().unwrap_or(v))
+                    })
+                })
+                .collect();
+            let best = |k: &crate::lattice::Key| {
+                let (mut c, mut bs, mut bd) = (0usize, f64::MIN, f64::MIN);
+                for (sk, sv, dv) in &sinks {
+                    if sk.includes(k) {
+                        c += 1;
+                        bs = bs.max(*sv);
+                        bd = bd.max(*dv);
+                    }
+                }
+                (c, bs, bd)
+            };
+            for x in &l.nodes {
+                if x.kind != crate::lattice::Kind::Inner || !x.expanded || x.n == 0 {
+                    continue;
+                }
+                let (c, bs, bd) = best(&x.key);
+                if c > 0 {
+                    let hv = x.w / f64::from(x.n);
+                    node_s[bucket(c)].add(hv, bs);
+                    if c >= 10 {
+                        node_d.add(hv, bd);
+                    }
+                }
+                let mut i = 0;
+                while i < x.kids.len() {
+                    let var = x.kids[i].var;
+                    let j = i + x.kids[i..].iter().take_while(|k| k.var == var).count();
+                    let mut post: Vec<(usize, f64)> = Vec::new();
+                    for k in i..j {
+                        let kd = &x.kids[k];
+                        if kd.dead {
+                            continue;
+                        }
+                        let (c, bs, bd) = best(&x.key.with(kd.var as usize, kd.choice));
+                        if c > 0 {
+                            kid_s[bucket(c)].add(f64::from(kd.v), bs);
+                            if c >= 10 {
+                                kid_d.add(f64::from(kd.v), bd);
+                            }
+                            post.push((k, bs));
+                        }
+                    }
+                    if post.len() >= 2 {
+                        let pb = post.iter().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0;
+                        let pa = (i..j)
+                            .filter(|&k| !x.kids[k].dead)
+                            .max_by(|&a, &b| x.kids[a].logp.total_cmp(&x.kids[b].logp))
+                            .unwrap();
+                        cells += 1;
+                        top += usize::from(pa == pb);
+                        mass += f64::from(x.kids[pb].logp).exp();
+                        chance += 1.0 / (i..j).filter(|&k| !x.kids[k].dead).count() as f64;
+                    }
+                    i = j;
+                }
+            }
+        }
+        eprintln!("prior vs posterior, {npos} positions, n1 {n1}, net {lat}");
+        eprintln!("tier 1 (values for the mover):");
+        t1v.show("root: net value vs search value");
+        t1c.show("children n>=5: net value vs searched");
+        eprintln!(
+            "  children policy: KL(visits || prior) {:.3}, prior top = most visited {:.3}, prior mass on most visited {:.3} ({t1n} roots)",
+            t1kl / t1n.max(1) as f64,
+            t1top as f64 / t1n.max(1) as f64,
+            t1pm / t1n.max(1) as f64
+        );
+        eprintln!("tier 2, root lattice (posterior = best complete turn found below):");
+        for (b, name) in ["1 turn", "2-9 turns", "10+ turns"].iter().enumerate() {
+            node_s[b].show(&format!("node value vs best static, {name}"));
+        }
+        node_d.show("node value vs best deep, 10+ turns");
+        for (b, name) in ["1 turn", "2-9 turns", "10+ turns"].iter().enumerate() {
+            kid_s[b].show(&format!("kid value vs best static, {name}"));
+        }
+        kid_d.show("kid value vs best deep, 10+ turns");
+        eprintln!(
+            "  per-cell prior: top = best turn's choice {:.3} (uniform {:.3}), prior mass on it {:.3} ({cells} cells)",
+            top as f64 / cells.max(1) as f64,
+            chance / cells.max(1) as f64,
+            mass / cells.max(1) as f64
+        );
+    }
+
     #[test]
     #[ignore]
     fn lattice_onnx_parity() {

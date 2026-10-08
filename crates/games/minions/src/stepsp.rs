@@ -1345,7 +1345,23 @@ pub fn lattice_turn(
         }
     }
     let mut t = crate::tier1::Tier1::new(start, lp.params.clone());
+    let t0 = std::time::Instant::now();
     t.run_inflight(lp.eval.as_ref(), lp.n1, lp.inflight)?;
+    // STEPS_SLOW_TURN_SECS: report turns slower than that (match hangs).
+    if let Some(lim) = std::env::var("STEPS_SLOW_TURN_SECS").ok().and_then(|v| v.parse::<f64>().ok()) {
+        let el = t0.elapsed().as_secs_f64();
+        if el > lim {
+            let nodes: usize = t.nodes.iter().filter_map(|n| n.lattice.as_ref()).map(|l| l.nodes.len()).sum();
+            eprintln!(
+                "slow turn: {el:.1}s, turn {}, {} tier-1 nodes, {} root children, {nodes} lattice nodes; lazy {:?}\n{}",
+                real.turn,
+                t.nodes.len(),
+                t.nodes[0].children.len(),
+                crate::steps::LAZY_STATS.iter().map(|x| x.load(std::sync::atomic::Ordering::Relaxed)).collect::<Vec<_>>(),
+                real.render()
+            );
+        }
+    }
     let b = t
         .best_child()
         .ok_or_else(|| anyhow::anyhow!("no turn found\n{}", real.render()))?;

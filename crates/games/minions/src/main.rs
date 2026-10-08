@@ -1657,7 +1657,7 @@ async fn main() -> anyhow::Result<()> {
                 games,
                 n1,
                 inflight1: inflight,
-                t1: minions_engine::tier1::T1Params { c_puct: c1, pw_c, pw_alpha, retries, c2 },
+                t1: minions_engine::tier1::T1Params { c_puct: c1, pw_c, pw_alpha, retries, c2, ..Default::default() },
                 walk: minions_engine::lattice::WalkParams {
                     n2,
                     c2,
