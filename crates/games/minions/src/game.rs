@@ -1290,6 +1290,33 @@ mod tests {
         assert!(!s.can_move_piece(at), "an exhausted unit cannot move this turn");
     }
 
+    /// Spawn chaining is illegal: a zombie spawned this turn opens no new
+    /// spawn cells, so a cell next to it alone is not a legal spawn target.
+    #[test]
+    fn spawned_units_do_not_chain_spawn() {
+        let mut s = after_opening();
+        s.phase = PHASE_SPAWN;
+        s.reinforcements[1][Unit::Zombie.reinforcement_slot().unwrap()] = 2;
+        let before = s.spawn_bb(1);
+        // A spawn cell with an empty neighbour outside the current spawn zone.
+        let (at, beyond) = s
+            .spawn_cells(1)
+            .into_iter()
+            .find_map(|c| {
+                NEIGHBORS[c as usize]
+                    .iter()
+                    .find(|&&n| n != NO_CELL && s.cells[n as usize] == 0 && before & crate::bitboard::bit(n) == 0)
+                    .map(|&n| (c, n))
+            })
+            .expect("a spawn cell with an empty cell beyond the zone");
+        let s = play(&s, &[MinionsMove::Spawn { unit: Unit::Zombie, at }]);
+        assert!(!s.spawn_cells(1).contains(&beyond), "the new zombie opened {beyond}");
+        assert!(
+            !Minions::legal_moves(&s).contains(&MinionsMove::Spawn { unit: Unit::Zombie, at: beyond }),
+            "chained spawn at {beyond} is legal"
+        );
+    }
+
     #[test]
     fn spawning_needs_a_spawner_and_an_empty_neighbour() {
         let mut s = after_opening();

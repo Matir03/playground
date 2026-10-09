@@ -215,7 +215,9 @@ function spawnCells(d: Decoded, side: number): number[] {
   const out: number[] = [];
   for (let i = 0; i < CELLS; i++) {
     const c = d.cells[i];
-    if (c === 0 || pieceSide(c) !== side || !UNITS[pieceUnit(c)].spawn) continue;
+    // A unit spawned this turn (exhausted) is no spawner until next turn:
+    // spawn chaining is illegal (game.rs `spawn_bb`).
+    if (c === 0 || pieceSide(c) !== side || !UNITS[pieceUnit(c)].spawn || isExhausted(d.pstate[i])) continue;
     for (const n of NEIGHBORS[i]) {
       if (d.cells[n] === 0 && !seen[n]) {
         seen[n] = true;
