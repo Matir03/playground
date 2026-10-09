@@ -109,7 +109,7 @@ pub const UNIT_STATS: [UnitStats; NUM_UNITS] = [
     },
     UnitStats {
         name: "skeleton",
-        ch: 'S',
+        ch: 'K',
         attack: Attack::Damage(5),
         defense: 2,
         speed: 1,
@@ -124,7 +124,7 @@ pub const UNIT_STATS: [UnitStats; NUM_UNITS] = [
     },
     UnitStats {
         name: "serpent",
-        ch: 'P',
+        ch: 'R',
         attack: Attack::Damage(3),
         defense: 1,
         speed: 2,

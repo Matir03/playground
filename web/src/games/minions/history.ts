@@ -275,11 +275,12 @@ export function cellName(i: number): string {
   return `${FILES[i % 7]}${Math.floor(i / 7) + 1}`;
 }
 
-/** Named from the shared table rather than a copy of it. The first copy of
- *  this list invented a unit and shifted every index above zombie by one,
- *  which the record then displayed as fact. */
-function unitName(u: number): string {
-  return UNITS[u]?.name ?? `unit${u}`;
+/** A unit's one-letter symbol (Z, S, P, W, G, N), from the shared table
+ *  rather than a copy of it: the first copy of this list invented a unit and
+ *  shifted every index above zombie by one, which the record then displayed
+ *  as fact. */
+function unitCh(u: number): string {
+  return UNITS[u]?.ch ?? `?${u}`;
 }
 
 /** A move as it should read in the record. Mirrors `MinionsMove` in game.rs;
@@ -294,9 +295,9 @@ export function moveLabel(m: Uint8Array | null, n?: HNode): string {
     case 1:
       return `${cellName(m[1])}×${cellName(m[2])}`;
     case 2:
-      return `buy ${unitName(m[1])}`;
+      return `+${unitCh(m[1])}`;
     case 3:
-      return `+${unitName(m[1])} ${cellName(m[2])}`;
+      return `${unitCh(m[1])}@${cellName(m[2])}`;
     case 4:
       return "end";
     default:

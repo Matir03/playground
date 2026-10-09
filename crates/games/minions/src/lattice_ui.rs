@@ -143,14 +143,14 @@ fn board_hex(s: &MinionsState) -> String {
 }
 
 /// A complete turn from `from` (a turn start) to `to`, compactly: moves
-/// `Zc0→d1`, attacks `d1✕e2`, buys `$Z`, spawns `+Z b1`.
+/// `Zc0→d1`, attacks `d1✕e2`, buys `+Z`, spawns `Z@b1`.
 fn turn_label(from: &StepState, to: &StepState) -> String {
     use crate::map::cell_name;
     let real = from.real_base();
     let Ok(actions) = crate::steps::turn_actions(&real, &to.done) else {
         return "?".to_string();
     };
-    let letter = |u: crate::units::Unit| u.stats().name.chars().next().unwrap_or('?').to_ascii_uppercase();
+    let letter = |u: crate::units::Unit| u.stats().ch.to_ascii_uppercase();
     let mut s = real.clone();
     let mut out = Vec::new();
     for m in &actions {
@@ -160,8 +160,8 @@ fn turn_label(from: &StepState, to: &StepState) -> String {
                 format!("{u}{}→{}", cell_name(from), cell_name(to))
             }
             MinionsMove::Attack { from, to } => format!("{}✕{}", cell_name(from), cell_name(to)),
-            MinionsMove::Buy(u) => format!("${}", letter(u)),
-            MinionsMove::Spawn { unit, at } => format!("+{} {}", letter(unit), cell_name(at)),
+            MinionsMove::Buy(u) => format!("+{}", letter(u)),
+            MinionsMove::Spawn { unit, at } => format!("{}@{}", letter(unit), cell_name(at)),
             MinionsMove::EndPhase => String::new(),
         };
         if !t.is_empty() {

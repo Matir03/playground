@@ -155,8 +155,10 @@ function Crumbs({ items, onPick }: { items: string[]; onPick: (i: number) => voi
 
 // ── the panel ────────────────────────────────────────────────────────────────
 
-export function LatticePanel({ state }: { state: GameState | null }) {
-  const [follow, setFollow] = useState(true);
+/** `auto` (analysis): search `state` whenever it changes, instead of
+ *  following the net's moves. */
+export function LatticePanel({ state, auto = false }: { state: GameState | null; auto?: boolean }) {
+  const [follow, setFollow] = useState(!auto);
   const [n1, setN1] = useState(400);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -222,6 +224,16 @@ export function LatticePanel({ state }: { state: GameState | null }) {
       setBusy(false);
     }
   }, [state, n1]);
+
+  // Analysis: search each position put on the board (once per position).
+  const [autoDone, setAutoDone] = useState<string | null>(null);
+  useEffect(() => {
+    if (!auto || !state || busy) return;
+    const hex = toHex(state.payload);
+    if (hex === autoDone) return;
+    setAutoDone(hex);
+    void analyse();
+  }, [auto, state, busy, autoDone, analyse]);
 
   // The tier-1 node shown, and its lattice from the root.
   const t1Id = t1Path.length ? t1Path[t1Path.length - 1].t : null;

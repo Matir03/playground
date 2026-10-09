@@ -356,8 +356,16 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
   // game — the engine applies it to a copy and the board just renders what
   // comes back.
   const [analysisOn, setAnalysisOn] = useState(false);
-  // The lattice player's searches (engine started with --lattice-net).
-  const [latticeOn, setLatticeOn] = useState(false);
+  // The lattice player's searches (engine started with --lattice-net): shown
+  // whenever that engine answers, unless hidden.
+  const [latticeAvail, setLatticeAvail] = useState(false);
+  const [latticeHidden, setLatticeHidden] = useState(false);
+  useEffect(() => {
+    fetch("/latapi/last")
+      .then((r) => setLatticeAvail(r.ok))
+      .catch(() => setLatticeAvail(false));
+  }, []);
+  const latticeOn = latticeAvail && !latticeHidden;
   // Which of self-play's two searches to analyse with. Both run under the
   // engine's search config (the panel in the analysis view), which starts as
   // self-play's recorded search.
@@ -915,6 +923,35 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
   const canAct = compose ? boardLive && !busy : humanTurn && !walk;
   const act = (payload: Uint8Array) => void (compose ? composeMove(payload) : sendMove(payload));
 
+  /** Take back the last action of the turn being played -- never past the
+   *  turn's start, so only before "end turn" hands it over. The action leaves
+   *  the record; the server is re-synced by replay on the next move. */
+  const curNode = hist ? H.node(hist, hist.current) : undefined;
+  const canUndo =
+    !!hist && !!curNode && curNode.parent !== null && curNode.kind === "move" && atTip && !busy && !compose &&
+    !H.isBoundary(hist, hist.current, turnInfo) && state != null && seatToMove(state) === "human";
+  const undo = useCallback(() => {
+    if (!hist || !canUndo || !curNode || curNode.parent === null) return;
+    const p = H.node(hist, curNode.parent);
+    if (!p) return;
+    setHist(H.drop(hist, curNode.id));
+    setState(p.state);
+    setSelected(null);
+    setSpawnUnit(null);
+  }, [hist, canUndo, curNode]);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === "z") {
+        const t = e.target as HTMLElement | null;
+        if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+        undo();
+        e.preventDefault();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [undo]);
+
   // Highlights for the current selection.
   const moveSet = useMemo(
     () => new Set(d && selected != null && d.phase === PHASE_ATTACK && canMovePiece(d, selected) ? moveTargets(d, selected) : []),
@@ -972,6 +1009,11 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
         <SeatPicker label={SIDE_NAME[1]} seat={secondSeat} onChange={setSecondSeat} />
         <button onClick={() => void newGame()} disabled={busy}>New game</button>
         {boardLive && <button onClick={endPhase} disabled={!canAct}>{endLabel}</button>}
+        {boardLive && (
+          <button onClick={undo} disabled={!canUndo} title="take back the last action of this turn (Ctrl+Z)">
+            ↶ undo
+          </button>
+        )}
         {hist && (
           <span style={{ display: "flex", gap: 2, alignItems: "center" }} title="move through the record">
             <button onClick={() => goto(hist.root)} disabled={!canBack} title="start">⏮</button>
@@ -1015,12 +1057,14 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
         >
           {analysisOn ? "exit analysis" : "analysis"}
         </button>
-        <button
-          onClick={() => setLatticeOn((v) => !v)}
-          title="the lattice player's tier-1 and tier-2 searches (engine: serve --lattice-net)"
-        >
-          {latticeOn ? "hide lattice search" : "lattice search"}
-        </button>
+        {latticeAvail && (
+          <button
+            onClick={() => setLatticeHidden((v) => !v)}
+            title="the lattice player's tier-1 and tier-2 searches (engine: serve --lattice-net)"
+          >
+            {latticeOn ? "hide lattice search" : "lattice search"}
+          </button>
+        )}
       </div>
 
       {state != null && d != null && !inProgress && (
@@ -1308,7 +1352,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
             </div>
           </div>
 
-          {analysisOn && (
+          {analysisOn && !latticeOn && (
             <div style={{ flex: "1 1 520px", minWidth: 460, fontSize: "0.85rem" }}>
               <div
                 style={{
@@ -1599,7 +1643,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
       )}
 
       {error && <p style={{ color: "crimson", marginTop: "0.75rem" }}>Error: {error}</p>}
-      {latticeOn && <LatticePanel state={state} />}
+      {latticeOn && (analysisOn ? <LatticePanel state={canAnalyse && !compose ? shownState : null} auto /> : <LatticePanel state={state} />)}
     </section>
   );
 }

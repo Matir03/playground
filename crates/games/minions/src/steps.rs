@@ -426,7 +426,7 @@ impl StepState {
             Stage::Spawns => {
                 let at = self.spawn_cells[self.idx];
                 match Unit::from_index(v) {
-                    Some(u) if v != 0 => format!("spawn {} {}", u.stats().name, cell(at)),
+                    Some(u) if v != 0 => format!("{}@{}", u.stats().ch.to_ascii_uppercase(), cell(at)),
                     _ => format!("no spawn {}", cell(at)),
                 }
             }
