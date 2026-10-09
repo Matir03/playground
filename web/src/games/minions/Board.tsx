@@ -14,6 +14,7 @@
  *   (offsets shown for N=7; the constants below derive them from `CELLS`)
  *   Move.payload = [0,from,to] move · [1,from,to] attack · [2,unit] buy
  *                  [3,unit,at] spawn · [4] end phase
+ *                  [5,c0,c1,...] cyclic move (c0's unit to c1, ..., last to c0)
  *
  * A *turn* is a sequence of moves, not one move: attack phase (walk and strike
  * with each piece), then spawn phase (buy units, place them next to a
@@ -189,6 +190,34 @@ function moveTargets(d: Decoded, from: number): number[] {
         if (occ !== 0 && !u.flying && pieceSide(occ) !== side) continue;
         seen[n] = true;
         if (occ === 0) out.push(n);
+        next.push(n);
+      }
+    }
+    frontier = next;
+  }
+  return out;
+}
+
+/** Friendly pieces free to move that the piece on `from` can reach within
+ *  its speed (friends are passable): the next steps of a cyclic move. */
+function ringTargets(d: Decoded, from: number): number[] {
+  const c = d.cells[from];
+  if (c === 0 || !canMovePiece(d, from)) return [];
+  const side = pieceSide(c);
+  const u = UNITS[pieceUnit(c)];
+  const seen = new Array<boolean>(CELLS).fill(false);
+  seen[from] = true;
+  let frontier = [from];
+  const out: number[] = [];
+  for (let step = 0; step < u.speed && frontier.length; step++) {
+    const next: number[] = [];
+    for (const cur of frontier) {
+      for (const n of NEIGHBORS[cur]) {
+        if (seen[n]) continue;
+        const occ = d.cells[n];
+        if (occ !== 0 && !u.flying && pieceSide(occ) !== side) continue;
+        seen[n] = true;
+        if (occ !== 0 && pieceSide(occ) === side && canMovePiece(d, n)) out.push(n);
         next.push(n);
       }
     }
@@ -386,6 +415,10 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
 
   /** Attack phase: the selected piece. Spawn phase: the unit picked to place. */
   const [selected, setSelected] = useState<number | null>(null);
+  // Cyclic-move mode: the units picked so far, in ring order (each moves to
+  // the next one's cell, the last to the first's).
+  const [ringMode, setRingMode] = useState(false);
+  const [ring, setRing] = useState<number[]>([]);
   const [spawnUnit, setSpawnUnit] = useState<number | null>(null);
 
   const engineTurnRef = useRef<string | null>(null);
@@ -979,6 +1012,16 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
 
   const onCell = (i: number) => {
     if (!canAct || !d) return;
+    if (d.phase === PHASE_ATTACK && ringMode) {
+      if (!ringNext.has(i)) return;
+      if (ring.length >= 2 && i === ring[0]) {
+        act(new Uint8Array([5, ...ring]));
+        leaveRing();
+        return;
+      }
+      setRing([...ring, i]);
+      return;
+    }
     if (d.phase === PHASE_ATTACK) {
       if (moveSet.has(i) && selected != null) {
         act(new Uint8Array([0, selected, i]));
@@ -996,6 +1039,37 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
   };
 
   const endPhase = () => act(new Uint8Array([4]));
+
+  /** The cells that extend (or close) the ring being built. */
+  const ringNext = useMemo(() => {
+    if (!d || !ringMode || d.phase !== PHASE_ATTACK) return new Set<number>();
+    if (ring.length === 0) {
+      return new Set(Array.from({ length: CELLS }, (_, i) => i).filter((i) => d.cells[i] !== 0 && pieceSide(d.cells[i]) === d.side && canMovePiece(d, i)));
+    }
+    const nx = ringTargets(d, ring[ring.length - 1]).filter((i) => !ring.includes(i) || (i === ring[0] && ring.length >= 2));
+    return new Set(nx);
+  }, [d, ringMode, ring]);
+  const leaveRing = () => {
+    setRingMode(false);
+    setRing([]);
+  };
+  useEffect(() => {
+    // A position change (a move played, undone, or browsed) ends the ring.
+    setRing([]);
+  }, [state]);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT")) return;
+      if (e.key === "Escape") leaveRing();
+      else if ((e.key === "c" || e.key === "C") && !e.ctrlKey && !e.metaKey) {
+        setRing([]);
+        setRingMode((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
   const buy = (u: number) => act(new Uint8Array([2, u]));
 
   const me = d?.side ?? 0;
@@ -1012,6 +1086,16 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
         {boardLive && (
           <button onClick={undo} disabled={!canUndo} title="take back the last action of this turn (Ctrl+Z)">
             ↶ undo
+          </button>
+        )}
+        {boardLive && (
+          <button
+            onClick={() => (ringMode ? leaveRing() : (setRing([]), setRingMode(true)))}
+            disabled={!canAct || d?.phase !== PHASE_ATTACK}
+            style={ringMode ? { background: "#e6dcff", borderColor: "#8a6fd8" } : undefined}
+            title="cyclic move: click your units in ring order, then the first again (C; Esc cancels)"
+          >
+            ⟲ cycle
           </button>
         )}
         {hist && (
@@ -1144,8 +1228,10 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
             <svg width={SVG_W} height={SVG_H} style={{ background: "#20242b", borderRadius: 8, flex: "0 0 auto" }}>
               {Array.from({ length: CELLS }, (_, i) => {
                 const c = d.cells[i];
-                const isMove = moveSet.has(i);
-                const isAttack = attackSet.has(i);
+                const isMove = !ringMode && moveSet.has(i);
+                const isAttack = !ringMode && attackSet.has(i);
+                const ringAt = ringMode ? ring.indexOf(i) : -1;
+                const isRingNext = ringMode && ringNext.has(i);
                 const isSpawn = spawnSet.has(i);
                 const isSel = selected === i;
                 const grave = IS_GRAVEYARD[i];
@@ -1192,6 +1278,13 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                     )}
                     {c !== 0 && <Piece cell={c} pstate={d.pstate[i]} />}
                     {isMove && <circle r={5} fill="rgba(120,220,140,0.85)" style={{ pointerEvents: "none" }} />}
+                    {ringAt >= 0 && (
+                      <>
+                        <polygon points={HEX_POINTS} fill="none" stroke="#b49cff" strokeWidth={3} style={{ pointerEvents: "none" }} />
+                        <text x={13} y={-11} fontSize={11} fontWeight={700} fill="#d9ccff" style={{ pointerEvents: "none" }}>{ringAt + 1}</text>
+                      </>
+                    )}
+                    {isRingNext && <circle cx={13} cy={11} r={5} fill={ring.length >= 2 && i === ring[0] ? "#ffd166" : "#b49cff"} style={{ pointerEvents: "none" }} />}
                     {isSpawn && <circle r={5} fill="rgba(150,230,170,0.9)" style={{ pointerEvents: "none" }} />}
                     {canAct && (
                       <polygon points={HEX_POINTS} fill="transparent" style={{ cursor: "pointer" }} onClick={() => onCell(i)} />
@@ -1270,12 +1363,26 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
 
               {boardLive && d.phase === PHASE_ATTACK && (
                 <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: "0.5rem 0.65rem", color: "#666" }}>
-                  <strong style={{ color: "#222" }}>Attack phase</strong>
-                  <div style={{ marginTop: 2 }}>
-                    Click one of your pieces, then a green dot to walk or a red-edged
-                    hex to strike. Each piece moves once and attacks once; lumbering
-                    pieces cannot do both.
-                  </div>
+                  <strong style={{ color: "#222" }}>{ringMode ? "Cyclic move" : "Attack phase"}</strong>
+                  {ringMode ? (
+                    <div style={{ marginTop: 2 }}>
+                      Click your units in ring order (purple dots): each moves to the next
+                      one's cell, the last to the first's, all at once.{" "}
+                      {ring.length >= 2 ? "Click the first unit (gold dot) to play it. " : ""}
+                      Esc cancels.
+                      {ring.length > 0 && (
+                        <div style={{ marginTop: 2, fontFamily: "monospace", color: "#5b3fc4" }}>
+                          {ring.map(H.cellName).join(" → ")} → {H.cellName(ring[0])}
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div style={{ marginTop: 2 }}>
+                      Click one of your pieces, then a green dot to walk or a red-edged
+                      hex to strike. Each piece moves once and attacks once; lumbering
+                      pieces cannot do both. To have units trade cells, use ⟲ cycle.
+                    </div>
+                  )}
                   {selected != null && d.cells[selected] !== 0 && (
                     <UnitCard cell={d.cells[selected]} pstate={d.pstate[selected]} at={selected} />
                   )}

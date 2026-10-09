@@ -159,6 +159,14 @@ fn turn_label(from: &StepState, to: &StepState) -> String {
                 let u = s.piece_at(from).map_or('?', |(_, u)| letter(u));
                 format!("{u}{}→{}", cell_name(from), cell_name(to))
             }
+            MinionsMove::Cycle { .. } => m
+                .relocations()
+                .map(|(from, to)| {
+                    let u = s.piece_at(from).map_or('?', |(_, u)| letter(u));
+                    format!("{u}{}→{}", cell_name(from), cell_name(to))
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
             MinionsMove::Attack { from, to } => format!("{}✕{}", cell_name(from), cell_name(to)),
             MinionsMove::Buy(u) => format!("+{}", letter(u)),
             MinionsMove::Spawn { unit, at } => format!("{}@{}", letter(unit), cell_name(at)),

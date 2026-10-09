@@ -7,8 +7,9 @@
 //! `ghost`. Everything past `ghost` is out of scope, and so is the techline
 //! itself: all five buyable units are unlocked from move one.
 //!
-//! One deliberate change from the reference: the warg costs 3 and rebates 1,
-//! not 4 and 2.
+//! Two deliberate changes from the reference: the warg costs 3 and rebates 1,
+//! not 4 and 2 (2026-09-13), and the ghost rebates nothing, not 1
+//! (2026-10-08).
 //!
 //! Two stats from the full game are omitted because no unit here uses them:
 //! `num_attacks` (every unit below attacks once) and `blink`. `Deathtouch`
@@ -160,7 +161,7 @@ pub const UNIT_STATS: [UnitStats; NUM_UNITS] = [
         speed: 1,
         range: 1,
         cost: 3,
-        rebate: 1,
+        rebate: 0,
         necromancer: false,
         lumbering: false,
         flying: true,

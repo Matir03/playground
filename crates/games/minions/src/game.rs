@@ -21,13 +21,15 @@
 //! - **All land** — see [`crate::map`].
 //!
 //! Also dropped, because they only make the action space bigger without
-//! changing what the game is about: cyclic (swap) moves, blink, spell casting,
-//! and resignation.
+//! changing what the game is about: blink, spell casting, and resignation.
 //!
 //! ## What is kept, faithfully
 //!
-//! Unit stats and keywords (except the warg's price: cost 3, rebate 1, where
-//! the full game has 4 and 2); the attack/spawn phase split; damage that
+//! Unit stats and keywords (except two prices: the warg costs 3 and rebates 1,
+//! where the full game has 4 and 2, and the ghost rebates nothing, where the
+//! full game rebates 1); cyclic moves (a set of friendly units that each step
+//! into the next one's cell at once, [`MinionsMove::Cycle`]); the attack/spawn
+//! phase split; damage that
 //! accumulates within a turn and clears at end of turn; `lumbering` barring
 //! move-then-attack; `flying` moving through enemies; `persistent` converting
 //! `Unsummon` into 1 damage; unsummoned units bouncing to reinforcements;
@@ -551,6 +553,77 @@ impl MinionsState {
         crate::bitboard::reachable(crate::bitboard::bit(from), stats.speed, pass) & empty
     }
 
+    /// For each of `side`'s units free to move: the cells of the *other* such
+    /// units it can reach within its speed (the edges of a cyclic move).
+    pub fn cycle_edges(&self, side: u8) -> Vec<(u8, crate::bitboard::Bb)> {
+        let enemies = self.side_bb(1 - side);
+        let movable: crate::bitboard::Bb = crate::bitboard::cells(self.side_bb(side))
+            .filter(|&i| self.can_move_piece(i))
+            .fold(0, |b, i| b | crate::bitboard::bit(i));
+        crate::bitboard::cells(movable)
+            .map(|i| {
+                let st = self.piece_at(i).expect("own unit").1.stats();
+                let pass = if st.flying { crate::bitboard::FULL } else { !enemies };
+                let r = crate::bitboard::reachable(crate::bitboard::bit(i), st.speed, pass);
+                (i, r & movable & !crate::bitboard::bit(i))
+            })
+            .collect()
+    }
+
+    /// Append the cyclic moves of two and three units, each cycle once
+    /// (starting from its lowest cell; a 3-cycle in both directions).
+    fn push_short_cycles(&self, out: &mut Vec<MinionsMove>) {
+        use crate::bitboard::{cells, has};
+        let edges = self.cycle_edges(self.side);
+        let mut reach = [0 as crate::bitboard::Bb; NUM_CELLS];
+        for &(i, r) in &edges {
+            reach[i as usize] = r;
+        }
+        for &(u, ru) in &edges {
+            for v in cells(ru).filter(|&v| v > u) {
+                let rv = reach[v as usize];
+                if has(rv, u) {
+                    out.push(MinionsMove::cycle(&[u, v]));
+                }
+                for w in cells(rv).filter(|&w| w > u && w != v) {
+                    if has(reach[w as usize], u) {
+                        out.push(MinionsMove::cycle(&[u, v, w]));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether the cyclic move through `cyc` is legal for the side to move
+    /// (phase aside): 2..=[`MAX_CYCLE`] distinct cells, each holding a unit of
+    /// the mover's that is free to move and reaches the next cell.
+    pub fn cycle_ok(&self, cyc: &[u8]) -> bool {
+        use crate::bitboard::{bit, has, reachable, FULL};
+        let n = cyc.len();
+        if !(2..=MAX_CYCLE).contains(&n) {
+            return false;
+        }
+        let mut seen: crate::bitboard::Bb = 0;
+        let enemies = self.side_bb(1 - self.side);
+        for i in 0..n {
+            let (c, to) = (cyc[i], cyc[(i + 1) % n]);
+            if c as usize >= NUM_CELLS || has(seen, c) {
+                return false;
+            }
+            seen |= bit(c);
+            let Some((sd, unit)) = self.piece_at(c) else { return false };
+            if sd != self.side || !self.can_move_piece(c) {
+                return false;
+            }
+            let st = unit.stats();
+            let pass = if st.flying { FULL } else { !enemies };
+            if !has(reachable(bit(c), st.speed, pass), to) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Damage a piece has taken so far this turn.
     #[inline]
     pub fn damage_on(&self, i: u8) -> u8 {
@@ -645,10 +718,23 @@ impl MinionsState {
 
 // ── Moves ─────────────────────────────────────────────────────────────────────
 
+/// Longest cyclic move. The rules have no limit; this one only sizes
+/// [`MinionsMove::Cycle`] (a ring of more than 16 friendly units, each
+/// stepping into the next one's cell, does not happen on a 7x7 board).
+pub const MAX_CYCLE: usize = 16;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MinionsMove {
     /// Attack phase: walk a piece to an empty cell within its speed.
     Move { from: u8, to: u8 },
+    /// Attack phase: the cyclic move. The unit on `cells[i]` moves to
+    /// `cells[i + 1]`, the last one to `cells[0]`, all at once (two cells: a
+    /// swap). Each must be the mover's own, free to move, and able to reach
+    /// its destination within its speed (friends are passable, as always).
+    /// [`Minions::legal_moves`] lists cycles of two and three units only (the
+    /// number of longer ones grows exponentially); [`Minions::is_legal`] and
+    /// `apply` take any length up to [`MAX_CYCLE`].
+    Cycle { cells: [u8; MAX_CYCLE], len: u8 },
     /// Attack phase: strike an enemy within range.
     Attack { from: u8, to: u8 },
     /// Spawn phase: pay a unit's cost to put it in reinforcements.
@@ -661,10 +747,44 @@ pub enum MinionsMove {
 }
 
 impl MinionsMove {
+    /// The cyclic move through `cells` (2..=[`MAX_CYCLE`] of them).
+    pub fn cycle(cells: &[u8]) -> Self {
+        assert!((2..=MAX_CYCLE).contains(&cells.len()), "cycle of {} cells", cells.len());
+        let mut c = [0u8; MAX_CYCLE];
+        c[..cells.len()].copy_from_slice(cells);
+        MinionsMove::Cycle { cells: c, len: cells.len() as u8 }
+    }
+
+    /// A cyclic move's cells, in order (empty for any other move).
+    pub fn cycle_cells(&self) -> &[u8] {
+        match self {
+            MinionsMove::Cycle { cells, len } => &cells[..*len as usize],
+            _ => &[],
+        }
+    }
+
+    /// Every (origin, destination) this action moves a unit along: one for a
+    /// move, one per member for a cycle, none otherwise.
+    pub fn relocations(&self) -> impl Iterator<Item = (u8, u8)> + '_ {
+        let (single, cyc): (Option<(u8, u8)>, &[u8]) = match self {
+            MinionsMove::Move { from, to } => (Some((*from, *to)), &[]),
+            _ => (None, self.cycle_cells()),
+        };
+        single
+            .into_iter()
+            .chain((0..cyc.len()).map(move |i| (cyc[i], cyc[(i + 1) % cyc.len()])))
+    }
+
     /// The same action on the board rotated 180° ([`MinionsState::rotated`]).
     pub fn rotated(&self) -> Self {
         let r = |c: u8| crate::map::rot(c as usize) as u8;
         match *self {
+            MinionsMove::Cycle { mut cells, len } => {
+                for c in &mut cells[..len as usize] {
+                    *c = r(*c);
+                }
+                MinionsMove::Cycle { cells, len }
+            }
             MinionsMove::Move { from, to } => MinionsMove::Move { from: r(from), to: r(to) },
             MinionsMove::Attack { from, to } => MinionsMove::Attack { from: r(from), to: r(to) },
             MinionsMove::Spawn { unit, at } => MinionsMove::Spawn { unit, at: r(at) },
@@ -678,6 +798,13 @@ impl std::fmt::Display for MinionsMove {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MinionsMove::Move { from, to } => write!(f, "move {}{}", cell_name(*from), cell_name(*to)),
+            MinionsMove::Cycle { .. } => {
+                write!(f, "cycle")?;
+                for &c in self.cycle_cells() {
+                    write!(f, " {}", cell_name(c))?;
+                }
+                Ok(())
+            }
             MinionsMove::Attack { from, to } => write!(f, "attack {}{}", cell_name(*from), cell_name(*to)),
             MinionsMove::Buy(u) => write!(f, "buy {}", u.stats().name),
             MinionsMove::Spawn { unit, at } => write!(f, "spawn {} {}", unit.stats().name, cell_name(*at)),
@@ -821,6 +948,7 @@ impl Game for Minions {
                     }
                 }
             }
+            state.push_short_cycles(&mut out);
         } else {
             for unit in BUYABLE {
                 if state.money[side as usize] >= unit.stats().cost {
@@ -846,9 +974,30 @@ impl Game for Minions {
         out
     }
 
+    fn is_legal(state: &Self::State, mv: &Self::Move) -> bool {
+        match mv {
+            MinionsMove::Cycle { .. } => {
+                !Self::outcome(state).is_terminal()
+                    && state.phase == PHASE_ATTACK
+                    && state.cycle_ok(mv.cycle_cells())
+            }
+            _ => Self::legal_moves(state).contains(mv),
+        }
+    }
+
     fn apply(state: &Self::State, mv: &Self::Move) -> Self::State {
         let mut next = state.clone();
         match *mv {
+            MinionsMove::Cycle { .. } => {
+                let cyc = mv.cycle_cells();
+                let n = cyc.len();
+                let units: Vec<(u8, u8)> = cyc.iter().map(|&c| (next.cells[c as usize], next.pstate[c as usize])).collect();
+                for i in 0..n {
+                    let to = cyc[(i + 1) % n] as usize;
+                    next.cells[to] = units[i].0;
+                    next.pstate[to] = units[i].1 | MOVED;
+                }
+            }
             MinionsMove::Move { from, to } => {
                 next.cells[to as usize] = next.cells[from as usize];
                 next.pstate[to as usize] = next.pstate[from as usize] | MOVED;
@@ -998,6 +1147,11 @@ impl Game for Minions {
     fn encode_move(mv: &Self::Move) -> Vec<u8> {
         match *mv {
             MinionsMove::Move { from, to } => vec![0, from, to],
+            MinionsMove::Cycle { .. } => {
+                let mut v = vec![5];
+                v.extend_from_slice(mv.cycle_cells());
+                v
+            }
             MinionsMove::Attack { from, to } => vec![1, from, to],
             MinionsMove::Buy(u) => vec![2, u as u8],
             MinionsMove::Spawn { unit, at } => vec![3, unit as u8, at],
@@ -1013,6 +1167,7 @@ impl Game for Minions {
             [2, u] => MinionsMove::Buy(unit(u)?),
             [3, u, at] => MinionsMove::Spawn { unit: unit(u)?, at },
             [4] => MinionsMove::EndPhase,
+            [5, ref cells @ ..] if (2..=MAX_CYCLE).contains(&cells.len()) => MinionsMove::cycle(cells),
             _ => anyhow::bail!("invalid minions move bytes (len={})", bytes.len()),
         })
     }
@@ -1055,7 +1210,7 @@ mod tests {
         let mut s = state.clone();
         for mv in mvs {
             assert!(
-                Minions::legal_moves(&s).contains(mv),
+                Minions::is_legal(&s, mv),
                 "illegal move {mv} in\n{}",
                 s.render()
             );
@@ -1290,6 +1445,100 @@ mod tests {
         assert!(!s.can_move_piece(at), "an exhausted unit cannot move this turn");
     }
 
+    /// The two necromancers only; the first player to move, attack phase.
+    fn bare() -> MinionsState {
+        let mut s = Minions::initial_state();
+        for i in 0..NUM_CELLS {
+            if s.piece_at(i as u8).is_some_and(|(_, u)| u != Unit::Necromancer) {
+                s.cells[i] = 0;
+            }
+        }
+        s
+    }
+
+    /// Empty cells forming a ring of `n` (each adjacent to the next).
+    fn empty_ring(s: &MinionsState, n: usize) -> Vec<u8> {
+        fn grow(s: &MinionsState, n: usize, ring: &mut Vec<u8>) -> bool {
+            let last = *ring.last().unwrap();
+            if ring.len() == n {
+                return dist(last, ring[0]) == 1;
+            }
+            for c in 0..NUM_CELLS as u8 {
+                if s.cells[c as usize] == 0 && dist(last, c) == 1 && !ring.contains(&c) {
+                    ring.push(c);
+                    if grow(s, n, ring) {
+                        return true;
+                    }
+                    ring.pop();
+                }
+            }
+            false
+        }
+        for c in 0..NUM_CELLS as u8 {
+            let mut ring = vec![c];
+            if s.cells[c as usize] == 0 && grow(s, n, &mut ring) {
+                return ring;
+            }
+        }
+        panic!("no empty ring of {n}")
+    }
+
+    #[test]
+    fn cyclic_moves_trade_cells_at_once() {
+        let mut s = bare();
+        let r = empty_ring(&s, 3);
+        let (a, b, c) = (r[0], r[1], r[2]);
+        s.cells[a as usize] = encode_cell(0, Unit::Zombie);
+        s.cells[b as usize] = encode_cell(0, Unit::Warg);
+        s.cells[c as usize] = encode_cell(0, Unit::Serpent);
+        let legal = Minions::legal_moves(&s);
+        let (lo, hi) = (a.min(b), a.max(b));
+        let swap = MinionsMove::cycle(&[lo, hi]);
+        assert!(legal.contains(&swap), "a swap is listed");
+        let threes = legal
+            .iter()
+            .filter(|m| m.cycle_cells().len() == 3 && m.cycle_cells().iter().all(|x| r.contains(x)))
+            .count();
+        assert_eq!(threes, 2, "the ring's 3-cycle, listed once in each direction");
+        let t = Minions::apply(&s, &MinionsMove::cycle(&[a, b, c]));
+        assert_eq!(t.piece_at(b), Some((0, Unit::Zombie)));
+        assert_eq!(t.piece_at(c), Some((0, Unit::Warg)));
+        assert_eq!(t.piece_at(a), Some((0, Unit::Serpent)));
+        for x in [a, b, c] {
+            assert!(!t.can_move_piece(x), "every member has moved");
+        }
+        assert!(!Minions::is_legal(&t, &MinionsMove::cycle(&[a, b])), "no second move");
+        // Wire format and rotation.
+        let m = MinionsMove::cycle(&[a, b, c]);
+        assert_eq!(Minions::decode_move(&Minions::encode_move(&m)).unwrap(), m);
+        assert_eq!(m.rotated().rotated(), m);
+        // A unit that attacked, or an enemy in the ring, breaks it.
+        let mut u = s.clone();
+        u.pstate[a as usize] |= ATTACKED;
+        assert!(!Minions::is_legal(&u, &m));
+        let mut u = s.clone();
+        u.cells[c as usize] = encode_cell(1, Unit::Serpent);
+        assert!(!Minions::is_legal(&u, &m));
+        // The spawn phase has none.
+        let mut u = s.clone();
+        u.phase = PHASE_SPAWN;
+        assert!(!Minions::is_legal(&u, &m));
+    }
+
+    #[test]
+    fn long_cycles_are_legal_but_not_listed() {
+        let mut s = bare();
+        let r = empty_ring(&s, 4);
+        for &c in &r {
+            s.cells[c as usize] = encode_cell(0, Unit::Ghost);
+        }
+        let m = MinionsMove::cycle(&r);
+        assert!(Minions::is_legal(&s, &m));
+        assert!(!Minions::legal_moves(&s).contains(&m));
+        let t = Minions::apply(&s, &m);
+        assert!(r.iter().all(|&c| t.piece_at(c) == Some((0, Unit::Ghost)) && !t.can_move_piece(c)));
+    }
+
     /// Spawn chaining is illegal: a zombie spawned this turn opens no new
     /// spawn cells, so a cell next to it alone is not a legal spawn target.
     #[test]
@@ -1312,7 +1561,7 @@ mod tests {
         let s = play(&s, &[MinionsMove::Spawn { unit: Unit::Zombie, at }]);
         assert!(!s.spawn_cells(1).contains(&beyond), "the new zombie opened {beyond}");
         assert!(
-            !Minions::legal_moves(&s).contains(&MinionsMove::Spawn { unit: Unit::Zombie, at: beyond }),
+            !Minions::is_legal(&s, &MinionsMove::Spawn { unit: Unit::Zombie, at: beyond }),
             "chained spawn at {beyond} is legal"
         );
     }
@@ -1555,7 +1804,7 @@ mod tests {
         let mut plies = 0;
         while Minions::outcome(&s) == Outcome::InProgress {
             let mv = Minions::choose_move(&s).best_move;
-            assert!(Minions::legal_moves(&s).contains(&mv), "solver played {mv} illegally");
+            assert!(Minions::is_legal(&s, &mv), "solver played {mv} illegally");
             s = Minions::apply(&s, &mv);
             plies += 1;
             assert!(plies < 200_000, "greedy self-play failed to terminate");

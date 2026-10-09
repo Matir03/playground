@@ -613,12 +613,10 @@ mod tests {
                 Some(Err(e)) => panic!("net seat failed: {e}"),
                 None => panic!("net seat reported unconfigured after configure()"),
             };
-            let legal = Minions::legal_moves(&state);
             assert!(
-                legal.contains(&out.best_move),
-                "net seat returned an illegal move {:?}; legal = {} moves",
+                Minions::is_legal(&state, &out.best_move),
+                "net seat returned an illegal move {:?}",
                 out.best_move,
-                legal.len()
             );
             if out.nodes > 0 {
                 planned_value = Some(out.value);
@@ -700,7 +698,7 @@ mod tests {
             .expect("configured")
             .expect("ok");
         assert!(
-            Minions::legal_moves(&fresh).contains(&out.best_move),
+            Minions::is_legal(&fresh, &out.best_move),
             "after a desync the seat must re-plan and return a move legal *here*"
         );
     }
@@ -1077,10 +1075,7 @@ fn turn_from_moves(
             "action {} comes after the turn has ended",
             i + 1
         );
-        let legal = Minions::legal_moves(&cur)
-            .iter()
-            .any(|m| Minions::encode_move(m) == Minions::encode_move(mv));
-        anyhow::ensure!(legal, "action {} ({mv}) is not legal there", i + 1);
+        anyhow::ensure!(Minions::is_legal(&cur, mv), "action {} ({mv}) is not legal there", i + 1);
         cur = Minions::apply(&cur, mv);
     }
     anyhow::ensure!(

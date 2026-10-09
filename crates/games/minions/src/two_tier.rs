@@ -456,7 +456,9 @@ mod tests {
     fn invariants(params: TwoTierParams) {
         let s = StepState::begin(&MinionsState::with_bid(0), 7);
         let mut t = TwoTier::new(s, params, &HashEval).unwrap();
-        t.run(&HashEval, 3000).unwrap();
+        // (12k: since cyclic moves, the opening's zombies have enough distinct
+        // turns that 3k found no repeat.)
+        t.run(&HashEval, 12000).unwrap();
         assert!(t.stats.descents > 1, "{:?}", t.stats);
         assert!(
             t.stats.t2_repeats > 0,
@@ -492,7 +494,7 @@ mod tests {
         ends.sort_unstable();
         ends.dedup();
         assert_eq!(ends.len(), len, "a turn was found twice");
-        assert!(t.stats.expansions < 3000 + 200, "{:?}", t.stats);
+        assert!(t.stats.expansions < 12000 + 200, "{:?}", t.stats);
         // The best turn's end is a real position after the root's turn.
         let b = t.best_child().unwrap();
         let fin = t.end_state(b);

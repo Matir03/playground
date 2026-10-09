@@ -418,3 +418,35 @@ visits. `lattice_search_diag` shows why: the best root child's static
 value is 0.46/0.64/0.73/0.47 on four positions, vs 0.52/0.63/0.82/0.59 for
 the greedy turn. Tier-1 search ranks the turns it is given well, but PW
 gives it only sqrt(n) of them, all proposed by tier 2.
+
+## Rules change: cyclic moves, ghost rebate (2026-10-08)
+
+Two rules changed from gen 546's gate on (earlier data and nets come from the
+old rules, as with the warg price on 2026-09-13):
+
+- **Cyclic moves** (in the reference game, dropped here by mistake): friendly
+  units that each step into the next one's cell, all at once
+  (`MinionsMove::Cycle`; a swap is a cycle of two). Every member must be
+  free to move and reach its destination within its speed. A `TurnSpec` already
+  holds any permutation of destinations, so the action space and the records
+  are unchanged. What changed is which declarations realize:
+  - the realizer plays a ring of pending moves as one cycle once nothing else
+    moves;
+  - the exact search adds the declared rings;
+  - the SAT check has a `tie` variable per pair of friends where one may enter
+    the other's cell: the two moves are unordered with each other and ordered
+    alike against every other event, and a tied group plays as its rings and
+    chains;
+  - the steps filter that rejected cycles is gone.
+
+  `legal_moves` lists cycles of two and three units only (the count of longer
+  ones grows exponentially); `is_legal` and `apply` take any length up to 16.
+  The greedy bot never cycles.
+- **Ghost rebate 0** (was 1; the reference has 1).
+
+A cycle of identical units ends on the same board as everyone staying, so the
+lattice holds such duplicate turns. Pruning them in the move options made the
+lattice inconsistent: a witness may use a same-unit swap, and its own choice is
+offered unfiltered. So tier 1 merges instead: a turn that reaches a position
+one of the node's children already holds is a repeat, not a new child. This also
+merges the older duplicates, where identical units only traded roles in a chain.

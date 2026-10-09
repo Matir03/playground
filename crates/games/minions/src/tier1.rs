@@ -405,11 +405,14 @@ impl Tier1 {
                         // lattice adopted from the previous turn's search
                         // already knows the sinks it reached there (with few
                         // distinct turns, all of them -- and the root then
-                        // never got a child).
-                        let fresh = !self.nodes[wt as usize]
-                            .children
-                            .iter()
-                            .any(|&c| self.nodes[c as usize].sink == sink);
+                        // never got a child). Nor a known position: turns that
+                        // differ only in which of two identical units went
+                        // where (a cyclic move of zombies, say) are one child.
+                        let to = &self.lattice(wt).nodes[sink as usize].state;
+                        let fresh = !self.nodes[wt as usize].children.iter().any(|&c| {
+                            let cn = &self.nodes[c as usize];
+                            cn.sink == sink || (cn.state.flipped == to.flipped && cn.state.base == to.base)
+                        });
                         if fresh {
                             vis.widen = None;
                             self.nodes[wt as usize].widening -= 1;

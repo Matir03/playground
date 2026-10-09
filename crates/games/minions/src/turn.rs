@@ -352,14 +352,19 @@ impl TurnSpec {
             }
             let Some(mv) = choose(&cur) else { break };
             match mv {
-                MinionsMove::Move { from, to } => {
-                    let o = origin[from as usize];
-                    if o != NO_CELL {
-                        if let Some(k) = offset_index(o, to) {
-                            spec.moves[o as usize] = k;
+                MinionsMove::Move { .. } | MinionsMove::Cycle { .. } => {
+                    // All at once: a cycle's members trade cells.
+                    let moved: Vec<(u8, u8)> = mv.relocations().map(|(f, t)| (origin[f as usize], t)).collect();
+                    for (f, _) in mv.relocations() {
+                        origin[f as usize] = NO_CELL;
+                    }
+                    for (o, to) in moved {
+                        if o != NO_CELL {
+                            if let Some(k) = offset_index(o, to) {
+                                spec.moves[o as usize] = k;
+                            }
                         }
                         origin[to as usize] = o;
-                        origin[from as usize] = NO_CELL;
                     }
                 }
                 MinionsMove::Attack { from, to } => {
@@ -888,6 +893,21 @@ fn realize_canonical_to(state: &MinionsState, spec: &TurnSpec, stop_at_spawn: bo
         // ── A: every declared kill/unsummon that can now be completed.
         progress |= attack_pass(&mut s, spec, &mut out, &mut actions, &mut fid, &want, me);
 
+        // ── C: when nothing else moves, the declared cycles (each unit's
+        // destination the origin of the next, still standing there).
+        if !progress && s.winner == 0 {
+            for mv in declared_cycles(&s, &want, me) {
+                s = Minions::apply(&s, &mv);
+                actions.push(mv);
+                for (o, _) in mv.relocations() {
+                    out.moves[o as usize] = spec.moves[o as usize];
+                    want[o as usize] = NO_CELL;
+                    fid.done_moves += 1;
+                }
+                progress = true;
+            }
+        }
+
         if !progress || s.winner != 0 {
             break;
         }
@@ -935,6 +955,34 @@ fn realize_canonical_to(state: &MinionsState, spec: &TurnSpec, stop_at_spawn: bo
     }
 
     Realized { actions, next: s, spec: out, fidelity: fid }
+}
+
+/// The cyclic moves among the pending declared moves `want` (by origin;
+/// units that have not moved stand on their origins) that are legal now.
+pub(crate) fn declared_cycles(s: &MinionsState, want: &[u8; NUM_CELLS], me: u8) -> Vec<MinionsMove> {
+    let mut out = Vec::new();
+    let mut done: Bb = 0;
+    for o in 0..NUM_CELLS as u8 {
+        if want[o as usize] == NO_CELL || has(done, o) {
+            continue;
+        }
+        let mut cyc = vec![o];
+        let mut x = want[o as usize];
+        while x != o && cyc.len() <= crate::game::MAX_CYCLE {
+            if want[x as usize] == NO_CELL || has(done, x) || cyc.contains(&x) {
+                break;
+            }
+            cyc.push(x);
+            x = want[x as usize];
+        }
+        if x == o && cyc.len() >= 2 && s.side == me && s.cycle_ok(&cyc) {
+            for &c in &cyc {
+                done |= bit(c);
+            }
+            out.push(MinionsMove::cycle(&cyc));
+        }
+    }
+    out
 }
 
 #[inline]
@@ -1089,7 +1137,7 @@ fn find_necromancer(s: &MinionsState, side: u8) -> Option<u8> {
 
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::map::{idx, NEIGHBORS};
     use playground_core::Outcome;
@@ -1104,15 +1152,70 @@ mod tests {
     fn assert_all_legal(state: &MinionsState, r: &Realized) {
         let mut s = state.clone();
         for mv in &r.actions {
-            let legal = Minions::legal_moves(&s);
             assert!(
-                legal.contains(mv),
+                Minions::is_legal(&s, mv),
                 "illegal action {mv} in\n{}",
                 s.render()
             );
             s = Minions::apply(&s, mv);
         }
         assert_eq!(Minions::encode_state(&s), Minions::encode_state(&r.next));
+    }
+
+    /// The two necromancers only, and a ring of `n` empty cells (each
+    /// adjacent to the next).
+    pub(crate) fn bare_with_ring(n: usize) -> (MinionsState, Vec<u8>) {
+        let mut s = Minions::initial_state();
+        for i in 0..NUM_CELLS {
+            if s.piece_at(i as u8).is_some_and(|(_, u)| u != Unit::Necromancer) {
+                s.cells[i] = 0;
+            }
+        }
+        fn grow(s: &MinionsState, n: usize, ring: &mut Vec<u8>) -> bool {
+            let last = *ring.last().unwrap();
+            if ring.len() == n {
+                return crate::map::dist(last, ring[0]) == 1;
+            }
+            for c in 0..NUM_CELLS as u8 {
+                if s.cells[c as usize] == 0 && crate::map::dist(last, c) == 1 && !ring.contains(&c) {
+                    ring.push(c);
+                    if grow(s, n, ring) {
+                        return true;
+                    }
+                    ring.pop();
+                }
+            }
+            false
+        }
+        for c in 0..NUM_CELLS as u8 {
+            let mut ring = vec![c];
+            if s.cells[c as usize] == 0 && grow(&s, n, &mut ring) {
+                return (s, ring);
+            }
+        }
+        panic!("no empty ring of {n}")
+    }
+
+    /// A declared ring of moves (each unit to the next one's cell) is played
+    /// as one cyclic move, whatever its length.
+    #[test]
+    fn declared_cycles_realize() {
+        let units = [Unit::Zombie, Unit::Warg, Unit::Serpent, Unit::Ghost];
+        for n in [2, 3, 4] {
+            let (mut s, ring) = bare_with_ring(n);
+            let mut spec = TurnSpec::empty();
+            for i in 0..n {
+                s.cells[ring[i] as usize] = 1 + units[i] as u8;
+                spec.moves[ring[i] as usize] = offset_index(ring[i], ring[(i + 1) % n]).unwrap();
+            }
+            let r = realize(&s, &spec);
+            assert_all_legal(&s, &r);
+            assert_eq!((r.fidelity.declared_moves, r.fidelity.done_moves), (n as u32, n as u32));
+            assert!(r.actions.iter().any(|m| m.cycle_cells().len() == n), "{:?}", r.actions);
+            for i in 0..n {
+                assert_eq!(r.next.piece_at(ring[(i + 1) % n]), Some((0, units[i])));
+            }
+        }
     }
 
     #[test]
@@ -1495,7 +1598,7 @@ mod turn_game_tests {
                     // The actions are the turn: legal in sequence, ending at `next`.
                     let mut s = st.clone();
                     for a in &r.actions {
-                        assert!(crate::game::Minions::legal_moves(&s).contains(a), "illegal {a}");
+                        assert!(crate::game::Minions::is_legal(&s, a), "illegal {a}");
                         s = crate::game::Minions::apply(&s, a);
                     }
                     assert_eq!(key(&s), key(&r.next));
@@ -1716,7 +1819,7 @@ mod turn_game_tests {
             let mut check = s.clone();
             for mv in &realized.actions {
                 assert!(
-                    Minions::legal_moves(&check).contains(mv),
+                    Minions::is_legal(&check, mv),
                     "search played an illegal action {mv}"
                 );
                 check = Minions::apply(&check, mv);

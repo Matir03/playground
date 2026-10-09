@@ -909,7 +909,7 @@ impl StepState {
                     cand_log::add(k, cand_log::CHEAP, tc);
                     continue; // someone is moving onto this unit's origin
                 }
-            } else if has(blocked, d) || self.closes_cycle(c, d) {
+            } else if has(blocked, d) {
                 cand_log::add(k, cand_log::CHEAP, tc);
                 continue;
             }
@@ -1115,7 +1115,7 @@ impl StepState {
 
     #[cfg(test)]
     fn reject_reasons(&self) -> [usize; 6] {
-        // [unreachable/blocked/cycle, flow, relaxed, lookahead, last-realize, ok]
+        // [unreachable/blocked, flow, relaxed, lookahead, last-realize, ok]
         let c = self.friends[self.idx];
         let (_, u) = self.base.piece_at(c).expect("friend");
         let st = u.stats();
@@ -1146,7 +1146,7 @@ impl StepState {
                 continue;
             }
             if (k == 0 && has(self.claimed, c))
-                || (k != 0 && (has(blocked, d) || self.closes_cycle(c, d)))
+                || (k != 0 && has(blocked, d))
             {
                 r[0] += 1;
                 continue;
@@ -1174,26 +1174,6 @@ impl StepState {
             r[5] += 1;
         }
         r
-    }
-
-    /// Whether moving `c` to `d` closes a cycle of decided moves (a0->b0 with
-    /// b0->a0 already declared): units only move onto empty hexes, so a cycle
-    /// can never be carried out.
-    fn closes_cycle(&self, c: u8, mut d: u8) -> bool {
-        for _ in 0..self.friends.len() {
-            if d == c {
-                return true;
-            }
-            let Some(&f) = self.friends[..self.idx].iter().find(|&&f| f == d) else {
-                return false;
-            };
-            let k = self.spec.moves[f as usize];
-            if k == 0 {
-                return false;
-            }
-            d = MOVE_DEST[f as usize][k as usize];
-        }
-        false
     }
 
     // ── Spawns ───────────────────────────────────────────────────────────────
@@ -1846,7 +1826,7 @@ pub mod prof {
 pub mod cand_log {
     use std::cell::{Cell, RefCell};
 
-    /// Rejected by the cheap filters (reach, claims, cycles).
+    /// Rejected by the cheap filters (reach, claims).
     pub const CHEAP: u8 = 0;
     /// The current witness's own choice.
     pub const OWN: u8 = 1;
@@ -2490,7 +2470,7 @@ pub(crate) fn replay_check(base: &MinionsState, w: &TurnSpec) -> Result<(), Stri
     };
     let mut s = base.clone();
     for mv in &acts {
-        if !Minions::legal_moves(&s).contains(mv) {
+        if !Minions::is_legal(&s, mv) {
             return Err(format!("illegal {mv:?}"));
         }
         s = Minions::apply(&s, mv);
@@ -2962,11 +2942,53 @@ pub fn exact_realize(
         for t in bitboard::cells(open_targets) {
             rings |= bitboard::reachable(bit(t), rmax, FULL) & !bit(t);
         }
-        let legal = Minions::legal_moves(&st.s);
+        let mut legal = Minions::legal_moves(&st.s);
+        // The declared cycles of any length (legal_moves lists two and three
+        // units only): decided units still on their origins whose
+        // destinations close a ring.
+        {
+            let mut want_at = [NO_CELL; NUM_CELLS];
+            for o in bitboard::cells(c.decided) {
+                let d = dest_of(c.spec, o);
+                if d != o && st.origin_at[o as usize] == o && st.s.can_move_piece(o) {
+                    want_at[o as usize] = d;
+                }
+            }
+            for mv in crate::turn::declared_cycles(&st.s, &want_at, 0) {
+                if mv.cycle_cells().len() > 3 {
+                    legal.push(mv);
+                }
+            }
+        }
         let mut attacks = Vec::with_capacity(legal.len());
         let mut moves = Vec::with_capacity(legal.len());
         for mv in legal {
             match mv {
+                MinionsMove::Cycle { .. } => {
+                    // Decided members must go where they are declared to.
+                    let mut all_decided = true;
+                    let mut ok = true;
+                    let mut vacates = false;
+                    for (from, to) in mv.relocations() {
+                        let o = st.origin_at[from as usize];
+                        if has(c.decided, o) {
+                            ok &= dest_of(c.spec, o) == to;
+                        } else {
+                            all_decided = false;
+                            vacates |= has(want | rings, from);
+                        }
+                    }
+                    if !ok {
+                        continue;
+                    }
+                    if all_decided {
+                        moves.push((0u8, mv));
+                    } else if vacates {
+                        moves.push((2, mv));
+                    } else if full_moves() {
+                        moves.push((4, mv));
+                    }
+                }
                 MinionsMove::Attack { from, to } => {
                     if !has(open_targets, to) {
                         continue;
@@ -3013,9 +3035,13 @@ pub fn exact_realize(
             let mut nx = st.clone();
             nx.s = Minions::apply(&st.s, &mv);
             match mv {
-                MinionsMove::Move { from, to } => {
-                    nx.origin_at[to as usize] = st.origin_at[from as usize];
-                    nx.origin_at[from as usize] = NO_CELL;
+                MinionsMove::Move { .. } | MinionsMove::Cycle { .. } => {
+                    for (from, _) in mv.relocations() {
+                        nx.origin_at[from as usize] = NO_CELL;
+                    }
+                    for (from, to) in mv.relocations() {
+                        nx.origin_at[to as usize] = st.origin_at[from as usize];
+                    }
                 }
                 MinionsMove::Attack { from, to } => {
                     if nx.s.piece_at(to).is_none() {
@@ -3252,6 +3278,20 @@ fn realize_sequential(
                 want[o as usize] = NO_CELL;
                 pending &= !bit(o);
                 moved = true;
+            }
+            if !moved {
+                // Declared cycles, once single moves stall.
+                for mv in crate::turn::declared_cycles(&s, &want, me) {
+                    s = Minions::apply(&s, &mv);
+                    if let Some(l) = log.as_deref_mut() {
+                        l.push(mv);
+                    }
+                    for (o, _) in mv.relocations() {
+                        want[o as usize] = NO_CELL;
+                        pending &= !bit(o);
+                    }
+                    moved = true;
+                }
             }
         }
         if s.winner != 0 {
@@ -3910,9 +3950,9 @@ mod tests {
                                             relaxed_feasible(&s.base, &sp2, &dec, 0)
                                         );
                                         eprintln!(
-                                            "DROP move c {c} k {v} d {d}: claimed {} stay_enemy {} stayer {} cycle {} can_move {} last {} witness_k {}",
+                                            "DROP move c {c} k {v} d {d}: claimed {} stay_enemy {} stayer {} can_move {} last {} witness_k {}",
                                             has(s.claimed, d), has(stay_e, d), has(stayers, d),
-                                            v != 0 && s.closes_cycle(c, d), s.base.can_move_piece(c),
+                                            s.base.can_move_piece(c),
                                             s.idx + 1 == s.friends.len(), s.witness.moves[c as usize],
                                         );
                                     }
@@ -4023,7 +4063,7 @@ mod tests {
                     let mut r = real.clone();
                     for a in &acts {
                         assert!(
-                            Minions::legal_moves(&r).contains(a),
+                            Minions::is_legal(&r, a),
                             "illegal {a:?} in turn {turns}"
                         );
                         r = Minions::apply(&r, a);

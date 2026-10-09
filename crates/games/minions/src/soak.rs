@@ -350,7 +350,7 @@ fn play_one(seed: u64, verify: bool, oracle: bool) -> Stats {
         if verify {
             let mut check = s.clone();
             for mv in &r.actions {
-                if !Minions::legal_moves(&check).contains(mv) {
+                if !Minions::is_legal(&check, mv) {
                     st.illegal += 1;
                     st.failures
                         .push(format!("illegal {mv} @seed={seed} turn={}", check.turn));

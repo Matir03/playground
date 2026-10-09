@@ -21,7 +21,11 @@
 //! only after that enemy's removal (that friend's move), a non-flying path
 //! through an enemy's cell only after its removal -- and a sequence exists
 //! iff those precedences are acyclic (`before` variables, transitive and
-//! antisymmetric). Overkill is harmless: attacks are not part of the
+//! antisymmetric). The one exception is the cyclic move: a destination held
+//! by a friend may instead be entered *at once* with that friend's move, a
+//! `tie` (the two moves unordered with each other and ordered alike against
+//! every other event). A tied group is played as its rings, each one
+//! [`MinionsMove::Cycle`], and its chains, in order. Overkill is harmless: attacks are not part of the
 //! declaration, and one landing on a dead unit is simply not made.
 //! [`verify`] replays a witness's schedule through the game rules.
 
@@ -82,6 +86,8 @@ pub struct TurnSat {
     /// While encoding: (destination variable, friend there, its move event,
     /// the mover's move event) -- tied once every friend has its variables.
     pending_vacate: Vec<(i32, usize, usize, usize)>,
+    /// The `tie` variables of pairs of friends' moves (indices, lower first).
+    ties: Vec<(usize, usize, i32)>,
     pub calls: u64,
 }
 
@@ -120,6 +126,7 @@ impl TurnSat {
             before: Vec::new(),
             n_ev: 0,
             pending_vacate: Vec::new(),
+            ties: Vec::new(),
             calls: 0,
         };
         let mut enemy_at = [usize::MAX; NUM_CELLS];
@@ -299,12 +306,14 @@ impl TurnSat {
             }
             t.amo(&avars);
         }
-        // Destinations held by friends: that friend moves first.
+        // Destinations held by friends: that friend moves first, or at once
+        // (a tie: part of a cyclic move).
         for (x, v, ev_v, ev_m) in std::mem::take(&mut t.pending_vacate) {
             let vstay = t.friends[v].dest[0].1;
             let bb = t.b(ev_v, ev_m);
+            let tie = t.tie(ev_m / 2, v);
             t.clause(&[-x, -vstay]);
-            t.clause(&[-x, bb]);
+            t.clause(&[-x, bb, tie]);
         }
         // One unit per final cell; a staying enemy holds its cell.
         for c in 0..NUM_CELLS as u8 {
@@ -376,6 +385,33 @@ impl TurnSat {
                         }
                     }
                 }
+            }
+        }
+        t
+    }
+
+    /// The tie variable of friends `u` and `v`'s moves, made on first use:
+    /// neither before the other, and alike against every other event.
+    fn tie(&mut self, u: usize, v: usize) -> i32 {
+        let (u, v) = (u.min(v), u.max(v));
+        if let Some(&(_, _, t)) = self.ties.iter().find(|&&(a, b, _)| a == u && b == v) {
+            return t;
+        }
+        let t = self.var();
+        self.ties.push((u, v, t));
+        let (mu, mv) = (self.friends[u].ev_move, self.friends[v].ev_move);
+        let (a, b) = (self.b(mu, mv), self.b(mv, mu));
+        self.clause(&[-t, -a]);
+        self.clause(&[-t, -b]);
+        for z in 0..self.n_ev {
+            if z == mu || z == mv {
+                continue;
+            }
+            for (x, y) in [(mu, mv), (mv, mu)] {
+                let (zx, zy) = (self.b(z, x), self.b(z, y));
+                self.clause(&[-t, -zx, zy]);
+                let (xz, yz) = (self.b(x, z), self.b(y, z));
+                self.clause(&[-t, -xz, yz]);
             }
         }
         t
@@ -493,17 +529,35 @@ impl TurnSat {
                 .expect("one fate");
             spec.targets[e.cell as usize] = [TARGET_STAY, TARGET_KILL, TARGET_UNSUMMON][t];
         }
-        // Events that happen, ordered by how many others precede them.
+        // Tied moves (union-find over the true ties): one event per group.
+        let nf = self.friends.len();
+        let mut root: Vec<usize> = (0..nf).collect();
+        fn find(r: &mut [usize], mut x: usize) -> usize {
+            while r[x] != x {
+                r[x] = r[r[x]];
+                x = r[x];
+            }
+            x
+        }
+        for &(u, v, t) in &self.ties {
+            if self.val(t) {
+                let (a, b) = (find(&mut root, u), find(&mut root, v));
+                root[a] = b;
+            }
+        }
+        // Events that happen, ordered by how many others precede them (a
+        // tied group's members all have the same count).
         let mut evs: Vec<(usize, MinionsMove)> = Vec::new();
         for (i, f) in self.friends.iter().enumerate() {
-            if fdest[i] != f.cell {
-                evs.push((
-                    f.ev_move,
-                    MinionsMove::Move {
-                        from: f.cell,
-                        to: fdest[i],
-                    },
-                ));
+            if fdest[i] == f.cell || find(&mut root, i) != i {
+                // A tied group is played from its root, below.
+            } else {
+                let group: Vec<usize> = (0..nf)
+                    .filter(|&j| fdest[j] != self.friends[j].cell && find(&mut root, j) == i)
+                    .collect();
+                for m in group_moves(&group.iter().map(|&j| (self.friends[j].cell, fdest[j])).collect::<Vec<_>>()) {
+                    evs.push((f.ev_move, m));
+                }
             }
             if let Some(&(e, _)) = f.att.iter().find(|&&(_, a)| self.val(a)) {
                 evs.push((
@@ -513,6 +567,25 @@ impl TurnSat {
                         to: self.enemies[e].cell,
                     },
                 ));
+            }
+        }
+        // A group whose root stays: play it from its first mover.
+        for i in 0..nf {
+            let r = find(&mut root, i);
+            if r == i || fdest[r] != self.friends[r].cell || fdest[i] == self.friends[i].cell {
+                continue;
+            }
+            let first = (0..nf)
+                .find(|&j| find(&mut root, j) == r && fdest[j] != self.friends[j].cell)
+                .expect("a mover");
+            if first != i {
+                continue;
+            }
+            let group: Vec<usize> = (0..nf)
+                .filter(|&j| fdest[j] != self.friends[j].cell && find(&mut root, j) == r)
+                .collect();
+            for m in group_moves(&group.iter().map(|&j| (self.friends[j].cell, fdest[j])).collect::<Vec<_>>()) {
+                evs.push((self.friends[i].ev_move, m));
             }
         }
         let mut keyed: Vec<(usize, MinionsMove)> = evs
@@ -531,6 +604,32 @@ impl TurnSat {
     pub fn base(&self) -> &MinionsState {
         &self.base
     }
+}
+
+/// Simultaneous moves `(origin, destination)` as legal actions: each one
+/// whose destination no other member still stands on, in turn, then the
+/// rings left as cyclic moves.
+fn group_moves(group: &[(u8, u8)]) -> Vec<MinionsMove> {
+    let mut left: Vec<(u8, u8)> = group.to_vec();
+    let mut out = Vec::with_capacity(left.len());
+    loop {
+        let Some(i) = left.iter().position(|&(_, d)| !left.iter().any(|&(o, _)| o == d)) else {
+            break;
+        };
+        let (from, to) = left.remove(i);
+        out.push(MinionsMove::Move { from, to });
+    }
+    while let Some(&(o, _)) = left.first() {
+        let mut ring = vec![o];
+        let mut x = left.iter().find(|&&(a, _)| a == o).unwrap().1;
+        while x != o {
+            ring.push(x);
+            x = left.iter().find(|&&(a, _)| a == x).expect("a ring").1;
+        }
+        left.retain(|&(a, _)| !ring.contains(&a));
+        out.push(MinionsMove::cycle(&ring));
+    }
+    out
 }
 
 /// The decided variables of a turn under construction (a lattice node):
@@ -612,7 +711,7 @@ pub fn verify(base: &MinionsState, spec: &TurnSpec, order: &[MinionsMove]) -> Re
                 continue;
             }
         }
-        if !Minions::legal_moves(&s).contains(&m) {
+        if !Minions::is_legal(&s, &m) {
             return Err(format!("illegal {m:?}"));
         }
         s = Minions::apply(&s, &m);
@@ -680,12 +779,13 @@ mod tests {
                 break;
             }
             let m = ms[rng.gen_range(0..ms.len())];
-            if let MinionsMove::Move { from, to } = m {
-                for x in at.iter_mut() {
-                    if x.1 == from {
-                        x.1 = to;
-                    }
-                }
+            // All at once: a cycle's members trade cells.
+            let moved: Vec<(usize, u8)> = m
+                .relocations()
+                .filter_map(|(from, to)| at.iter().position(|x| x.1 == from).map(|i| (i, to)))
+                .collect();
+            for (i, to) in moved {
+                at[i].1 = to;
             }
             played.push(m);
             let mut fate = None;
@@ -804,6 +904,34 @@ mod tests {
     /// Played declarations (and random subsets of them) are satisfiable and
     /// every witness replays; perturbed ones agree with the exact search
     /// wherever it concludes.
+    /// A declared ring of moves completes, as one cyclic move; a unit may
+    /// still not enter the cell of a friend who stays.
+    #[test]
+    fn sat_completes_cyclic_moves() {
+        let units = [Unit::Zombie, Unit::Warg, Unit::Serpent, Unit::Ghost];
+        for n in [2, 3, 4] {
+            let (mut base, ring) = crate::turn::tests::bare_with_ring(n);
+            let mut fixes = Vec::new();
+            for i in 0..n {
+                base.cells[ring[i] as usize] = 1 + units[i] as u8;
+                let k = offset_index(ring[i], ring[(i + 1) % n]).unwrap();
+                fixes.push(Fix::Move { cell: ring[i], k });
+            }
+            let mut sat = TurnSat::new(&base);
+            match sat.complete(&fixes) {
+                SatResult::Witness(spec, order) => {
+                    verify(&base, &spec, &order).unwrap();
+                    assert!(order.iter().any(|m| m.cycle_cells().len() == n), "{order:?}");
+                }
+                SatResult::Refuted(f) => panic!("ring of {n} refuted: {f:?}"),
+            }
+            // The last unit stays instead: nobody can enter its cell.
+            let mut stuck = fixes.clone();
+            stuck[n - 1] = Fix::Move { cell: ring[n - 1], k: 0 };
+            assert!(matches!(sat.complete(&stuck), SatResult::Refuted(_)), "ring of {n}");
+        }
+    }
+
     #[test]
     fn sat_agrees_with_exact_search() {
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(11);

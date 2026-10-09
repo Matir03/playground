@@ -3030,7 +3030,7 @@ mod tests {
                 let r = realize(st, &spec);
                 let mut check = st.clone();
                 for mv in &r.actions {
-                    assert!(Minions::legal_moves(&check).contains(mv), "illegal {mv}");
+                    assert!(Minions::is_legal(&check, mv), "illegal {mv}");
                     check = Minions::apply(&check, mv);
                 }
             }
@@ -3073,7 +3073,7 @@ mod tests {
             let r = realize(&s, spec);
             let mut check = s.clone();
             for mv in &r.actions {
-                assert!(Minions::legal_moves(&check).contains(mv), "illegal {mv}");
+                assert!(Minions::is_legal(&check, mv), "illegal {mv}");
                 check = Minions::apply(&check, mv);
             }
             // No threshold on realization *rate* here: these are the fixture's
@@ -3152,7 +3152,7 @@ mod tests {
             let r = realize(&s, &spec);
             let mut check = s.clone();
             for mv in &r.actions {
-                assert!(Minions::legal_moves(&check).contains(mv), "illegal {mv}");
+                assert!(Minions::is_legal(&check, mv), "illegal {mv}");
                 check = Minions::apply(&check, mv);
             }
             s = realize(&s, &TurnSpec::random_playout(&s, &mut rng)).next;
@@ -3205,7 +3205,7 @@ mod tests {
             let r = realize(&s, spec);
             let mut check = s.clone();
             for mv in &r.actions {
-                assert!(Minions::legal_moves(&check).contains(mv));
+                assert!(Minions::is_legal(&check, mv));
                 check = Minions::apply(&check, mv);
             }
         }

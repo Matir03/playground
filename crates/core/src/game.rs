@@ -60,6 +60,14 @@ pub trait Game: Send + Sync + 'static {
     fn outcome(state: &Self::State) -> Outcome;
 
     fn legal_moves(state: &Self::State) -> Vec<Self::Move>;
+
+    /// Whether `mv` is legal in `state`. The default looks it up in
+    /// [`Self::legal_moves`]; a game whose legal set is too large to list
+    /// in full (Minions' cyclic moves) overrides it with a direct check.
+    fn is_legal(state: &Self::State, mv: &Self::Move) -> bool {
+        let want = Self::encode_move(mv);
+        Self::legal_moves(state).iter().any(|m| Self::encode_move(m) == want)
+    }
     fn apply(state: &Self::State, mv: &Self::Move) -> Self::State;
 
     /// Monotonic ply counter (matches `GameState.ply` in the proto).

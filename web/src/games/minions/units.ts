@@ -30,7 +30,7 @@ export const UNITS: UnitDef[] = [
   { name: "skeleton", ch: "K", attack: "5", damage: 5, defense: 2, speed: 1, range: 1, cost: 4, rebate: 2, flying: true, persistent: true },
   { name: "serpent", ch: "R", attack: "3", damage: 3, defense: 1, speed: 2, range: 1, cost: 4, rebate: 2 },
   { name: "warg", ch: "W", attack: "1", damage: 1, defense: 1, speed: 3, range: 1, cost: 3, rebate: 1 },
-  { name: "ghost", ch: "G", attack: "1", damage: 1, defense: 4, speed: 1, range: 1, cost: 3, rebate: 1, flying: true, persistent: true },
+  { name: "ghost", ch: "G", attack: "1", damage: 1, defense: 4, speed: 1, range: 1, cost: 3, rebate: 0, flying: true, persistent: true },
 ];
 /** Buyable units, as unit indices (everything but the necromancer). */
 export const BUYABLE = [1, 2, 3, 4, 5];

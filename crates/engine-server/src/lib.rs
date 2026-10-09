@@ -455,11 +455,7 @@ where
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         // Validate legality.
-        let legal = G::legal_moves(&state);
-        let is_legal = legal
-            .iter()
-            .any(|m| G::encode_move(m) == G::encode_move(&mv));
-        if !is_legal {
+        if !G::is_legal(&state, &mv) {
             return Err(Status::invalid_argument("move is not legal"));
         }
 

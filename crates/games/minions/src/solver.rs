@@ -73,6 +73,10 @@ fn score(state: &MinionsState, mv: &MinionsMove) -> i32 {
     match *mv {
         MinionsMove::EndPhase => 0,
 
+        // The greedy bot never cycles (its scores are per unit), so it plays
+        // as it did before cyclic moves existed.
+        MinionsMove::Cycle { .. } => -1,
+
         MinionsMove::Attack { from, to } => {
             let (_, att) = state.piece_at(from).expect("attacker exists");
             let (_, def) = state.piece_at(to).expect("target exists");

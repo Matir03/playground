@@ -300,6 +300,9 @@ export function moveLabel(m: Uint8Array | null, n?: HNode): string {
       return `${unitCh(m[1])}@${cellName(m[2])}`;
     case 4:
       return "end";
+    case 5:
+      // A cyclic move: each unit to the next one's cell, in cycle notation.
+      return `(${Array.from(m.subarray(1)).map(cellName).join(" ")})`;
     default:
       return `[${Array.from(m).join(" ")}]`;
   }
