@@ -58,6 +58,17 @@ enum Cmd {
         steps_secs: f64,
         #[arg(long, default_value_t = 32)]
         steps_heads: usize,
+        /// Play the "net" seat with the lattice player instead: a lattice
+        /// net dir or player spec as steps-match takes it (`vprior=100:<dir>`
+        /// for the uniform tier-1 prior), at --lattice-n1 tier-1 visits a
+        /// turn (the UI's max_visits overrides it).
+        #[arg(long)]
+        lattice_net: Option<String>,
+        #[arg(long, default_value_t = 400)]
+        lattice_n1: u32,
+        /// Where the lattice panel's JSON is served (web: /latapi).
+        #[arg(long, default_value = "127.0.0.1:7107")]
+        lattice_http: String,
     },
     SelfPlay {
         #[arg(long, default_value = "127.0.0.1:7105")]
@@ -1098,8 +1109,23 @@ async fn main() -> anyhow::Result<()> {
             steps_net,
             steps_secs,
             steps_heads,
+            lattice_net,
+            lattice_n1,
+            lattice_http,
         } => {
-            if let Some(spec) = steps_net {
+            if let Some(spec) = lattice_net {
+                minions_engine::steps::LAZY_WITNESS.store(true, std::sync::atomic::Ordering::Relaxed);
+                let (name, play) = lattice_play(&spec, lattice_n1, 64)?;
+                let play = play.ok_or_else(|| anyhow::anyhow!("{spec}: not a lattice player"))?;
+                eprintln!("net seat: lattice player {name}, n1 {lattice_n1}");
+                minions_engine::lattice_ui::configure(play);
+                let addr = lattice_http.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = minions_engine::lattice_ui::serve_http(&addr) {
+                        eprintln!("lattice panel http: {e}");
+                    }
+                });
+            } else if let Some(spec) = steps_net {
                 eprintln!("net seat: step search with {spec}, {steps_secs}s per turn, {steps_heads} heads");
                 minions_engine::net_seat::configure_steps(minions_engine::net_seat::StepsSeat {
                     eval: load_step_eval(&spec, &ep)?,

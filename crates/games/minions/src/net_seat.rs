@@ -192,7 +192,7 @@ fn set_search(json: Option<&str>) -> anyhow::Result<playground_core::SearchConfi
 }
 
 pub fn is_configured() -> bool {
-    CONFIG.lock().unwrap().is_some() || STEPS.lock().unwrap().is_some()
+    CONFIG.lock().unwrap().is_some() || STEPS.lock().unwrap().is_some() || crate::lattice_ui::is_configured()
 }
 
 /// Plan a whole turn with the step search, then return its first action.
@@ -241,6 +241,27 @@ fn plan_turn(
     let steps = STEPS.lock().unwrap().clone();
     if let Some(seat) = steps {
         return plan_steps_turn(state, budget, seat);
+    }
+    if crate::lattice_ui::is_configured() {
+        // The lattice player (`serve --lattice-net`): tier-1 search over
+        // turns, tier 2 over each turn's lattice; the UI's max_visits
+        // overrides its tier-1 visits.
+        let (actions, value) = crate::lattice_ui::plan(state, budget.max_visits)?;
+        let mut actions: VecDeque<MinionsMove> = actions.into();
+        let first = actions
+            .pop_front()
+            .ok_or_else(|| anyhow::anyhow!("the searched turn was empty"))?;
+        let next_state = Minions::apply(state, &first);
+        *PLAN.lock().unwrap() = Some(Plan {
+            expect: Minions::encode_state(&next_state),
+            actions,
+            value,
+        });
+        return Ok(SearchOutcome {
+            best_move: first,
+            value,
+            nodes: 0,
+        });
     }
     let cfg = CONFIG
         .lock()

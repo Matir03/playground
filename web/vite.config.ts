@@ -42,6 +42,12 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (p) => p.replace(/^\/treeapi/, ""),
       },
+      // The lattice seat's searches (`minions-engine serve --lattice-net`).
+      "/latapi": {
+        target: "http://127.0.0.1:7107",
+        changeOrigin: true,
+        rewrite: (p) => p.replace(/^\/latapi/, ""),
+      },
     },
   },
 });

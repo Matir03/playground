@@ -25,6 +25,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as H from "./history";
 import { UNITS, BUYABLE } from "./units";
 import { MoveList } from "./MoveList";
+import { LatticePanel } from "./LatticePanel";
 import { create } from "@bufbuild/protobuf";
 import type { Client } from "@connectrpc/connect";
 import { ConnectError } from "@connectrpc/connect";
@@ -353,6 +354,8 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
   // game — the engine applies it to a copy and the board just renders what
   // comes back.
   const [analysisOn, setAnalysisOn] = useState(false);
+  // The lattice player's searches (engine started with --lattice-net).
+  const [latticeOn, setLatticeOn] = useState(false);
   // Which of self-play's two searches to analyse with. Both run under the
   // engine's search config (the panel in the analysis view), which starts as
   // self-play's recorded search.
@@ -1010,6 +1013,12 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
         >
           {analysisOn ? "exit analysis" : "analysis"}
         </button>
+        <button
+          onClick={() => setLatticeOn((v) => !v)}
+          title="the lattice player's tier-1 and tier-2 searches (engine: serve --lattice-net)"
+        >
+          {latticeOn ? "hide lattice search" : "lattice search"}
+        </button>
       </div>
 
       {state != null && d != null && !inProgress && (
@@ -1588,6 +1597,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
       )}
 
       {error && <p style={{ color: "crimson", marginTop: "0.75rem" }}>Error: {error}</p>}
+      {latticeOn && <LatticePanel state={state} />}
     </section>
   );
 }
