@@ -421,7 +421,7 @@ gives it only sqrt(n) of them, all proposed by tier 2.
 
 ## Rules change: cyclic moves, ghost rebate (2026-10-08)
 
-Two rules changed from gen 546's gate on (earlier data and nets come from the
+Two rules changed from gen 547's self-play on (earlier data and nets come from the
 old rules, as with the warg price on 2026-09-13):
 
 - **Cyclic moves** (in the reference game, dropped here by mistake): friendly
