@@ -503,6 +503,24 @@ def losses(trunk, t2, ds, idx, grad_trunk=False, counts=False):
     ng = len(idx) * CELLS
     lp = group_log_softmax(lg, group, ng)
     teach = getattr(ds, "teacher", None)
+    if teach is not None and getattr(ds, "teacher_lview", False):
+        # A lattice-view teacher (growing a net by function matching): its
+        # outputs on the very same inputs are the targets.
+        tt, tt2 = teach
+        with torch.no_grad():
+            th, _ = tt(rx)
+            tlog, tvlog, tv, _ = tt2(th, dense(ds.nact[idx], ds.nn[idx], ds.nscal[idx]))
+            tp = torch.exp(group_log_softmax(tlog[rec_of, flat], group, ng))
+            tkv = torch.sigmoid(tvlog[rec_of, flat])
+            tnv = torch.sigmoid(tv)
+        n_cells = (torch.zeros(ng, device=lg.device).index_add_(0, group, torch.ones_like(tp)) > 0).sum().clamp(min=1)
+        h_t = -(tp * torch.log(tp.clamp(min=1e-9))).sum() / n_cells
+        l_prior = -(tp * lp).sum() / n_cells
+        l_val = F.binary_cross_entropy_with_logits(vl, tkv)
+        l_node = F.binary_cross_entropy_with_logits(v, tnv)
+        if counts:
+            return l_prior, l_val, l_node, h_t, len(kid), len(idx)
+        return l_prior, l_val, l_node, h_t
     if teach is not None:
         # An old-view teacher's outputs on the same nodes are the targets:
         # per-cell prior softmax over the offered kids, kid and node values,
@@ -739,15 +757,28 @@ def main():
         print(f"exported to {args.out}")
         return
     t0 = time.time()
-    if args.teacher:
+    tm = json.load(open(os.path.join(args.teacher, "meta.json"))) if args.teacher else {}
+    lv_teacher = bool(tm.get("lview"))
+    if args.teacher and not lv_teacher:
         recs, kids, old = load_t2(args.data, old=True)
     else:
         recs, kids = load_t2(args.data)
     ds = T2Set(recs, kids, dev, args.all_visit_targets, t2.slots)
-    if args.teacher:
+    tv1 = None
+    if lv_teacher:
+        # Same view: no side files. Tier 1 (turn-start values, the t1
+        # records) matches the teacher's tier 1 too.
+        tn1 = build_t1(tm["t1_arch"]).to(dev)
+        tn1.load_state_dict(torch.load(os.path.join(args.teacher, "net.pt"), map_location=dev))
+        tch, tbl = (int(v) for v in tm["arch"].split("x"))
+        tt2 = T2Net(tn1.stem[0].out_channels, tch, tbl, True).to(dev)
+        tt2.load_state_dict(torch.load(os.path.join(args.teacher, "t2.pt"), map_location=dev))
+        ds.teacher = (Trunk(tn1).eval(), tt2.eval())
+        ds.teacher_lview = True
+        tv1 = RootValue(ds.teacher[0], tt2, args.t1_node).eval()
+    elif args.teacher:
         ds.set_old(old, dev)
         del old
-        tm = json.load(open(os.path.join(args.teacher, "meta.json")))
         tn1 = build_t1(tm["t1_arch"]).to(dev)
         tn1.load_state_dict(torch.load(os.path.join(args.teacher, "net.pt"), map_location=dev))
         tch, tbl = (int(v) for v in tm["arch"].split("x"))
@@ -844,7 +875,15 @@ def main():
     for step in range(steps):
         idx = tr[torch.randint(len(tr), (args.batch,), device=dev)]
         lp, lv, ln, _ = losses(trunk, t2, ds, idx, grad_trunk=not (args.freeze_trunk or args.t2_detach))
-        if args.teacher:
+        if tv1 is not None:
+            b1 = tr1[torch.randint(len(tr1), (args.t1_batch,), device=dev)]
+            x1 = xs1.dense(b1)
+            with torch.no_grad():
+                y1 = torch.sigmoid(tv1(x1))
+            l1 = F.binary_cross_entropy_with_logits(v1net(x1), y1)
+            if pvnet is not None:
+                l1 = l1 + F.binary_cross_entropy_with_logits(pvnet(x1), y1)
+        elif args.teacher:
             l1 = ds.last_root
         elif args.freeze_trunk:
             l1 = torch.zeros((), device=dev)
