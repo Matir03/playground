@@ -796,6 +796,10 @@ enum Cmd {
         /// time, a full search at each (latgen::GenConfig::stepwise).
         #[arg(long)]
         stepwise: bool,
+        /// Stepwise with a full search at each commitment (else: one search a
+        /// turn, then commitments sampled from its marginals).
+        #[arg(long)]
+        step_search: bool,
         /// Root visits for each search after a turn's first (0: n1).
         #[arg(long, default_value_t = 0)]
         step_n1: u32,
@@ -1723,7 +1727,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::LatticeGen {
             out, onnx, ep, batcher, workers, games, n1, inflight, n2, c1, c2, pw_c, pw_alpha, retries,
-            temp1, stepwise, step_n1, step_temp, step_dir_alpha, step_dir_frac, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, start_turn_mean, secs,
+            temp1, stepwise, step_search, step_n1, step_temp, step_dir_alpha, step_dir_frac, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, start_turn_mean, secs,
             target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, sd_frac, sd_descents, sd_tau, rooted_frac, rooted_n, rooted_min, rooted_tau, rooted_secs, rooted_tasks, rooted_inflight, rooted_budget, walk_accumulated, sink_values, walk_inflight, walk_marginal, walk_cq, lview, energy_min_visits, teacher_view, energy_prior, energy_temp, value_prior_tau, pipeline, openings, open_workers, pool, refill_to,
         } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
@@ -1787,6 +1791,7 @@ async fn main() -> anyhow::Result<()> {
                 refill_to,
                 rooted_frac,
                 stepwise,
+                step_search,
                 step_n1,
                 step_temp,
                 step_dir_alpha,

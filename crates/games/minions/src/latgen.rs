@@ -155,6 +155,13 @@ pub struct GenConfig {
     /// search is restricted to the turns below. Forced variables are
     /// committed without a search. Replaces the walks and the rooted phase.
     pub stepwise: bool,
+    /// Stepwise with a search at each commitment (above). Off (the default
+    /// since 2026-10-10, user): one search a turn, then the turn is chosen
+    /// by stepping down its lattice, each commitment sampled from the
+    /// search's tier-1 marginals (the tier-2 prior where no searched turn
+    /// lies below) with the same noise; no stepwise tier-2 records, and the
+    /// rooted phase (`rooted_frac`) samples its nodes from that path.
+    pub step_search: bool,
     /// Root visits for each search after a turn's first (visits kept from
     /// the previous search count; 0: `n1`).
     pub step_n1: u32,
@@ -290,6 +297,10 @@ enum Task {
         vis: Vec<Visit>,
         step: u32,
         recorded: u32,
+        /// Stepwise without searches: the lattice node reached and the path
+        /// to it (node, whether a sampled commitment was made there).
+        cur: u32,
+        trail: Vec<(u32, bool)>,
     },
     Walk {
         lat: Lattice,
@@ -664,6 +675,8 @@ impl Worker<'_> {
             vis: Vec::new(),
             step: 0,
             recorded: NONE,
+            cur: 0,
+            trail: Vec::new(),
         }
     }
 
@@ -720,6 +733,8 @@ impl Worker<'_> {
                 vis,
                 step,
                 recorded,
+                cur,
+                trail,
             } => {
                 // Visits that already handed in a request wait on it (the
                 // node is busy) when advanced again, so passes repeat until
@@ -737,6 +752,13 @@ impl Worker<'_> {
                     if *started >= budget && vis.is_empty() {
                         if !self.cfg.stepwise {
                             return self.finish_turn(t1);
+                        }
+                        if !self.cfg.step_search {
+                            if *recorded == NONE {
+                                self.record_turn(t1)?;
+                                *recorded = NONE - 1;
+                            }
+                            return self.step_pick(t1, cur, trail);
                         }
                         if let Some(next) = self.step(t1, started, step, recorded)? {
                             return Ok(next);
@@ -1125,6 +1147,129 @@ impl Worker<'_> {
                 return Ok(None);
             }
         }
+    }
+
+    /// Stepwise without searches ([`GenConfig::step_search`] off): from the
+    /// lattice node `cur`, commit variables one at a time, each sampled from
+    /// the search's tier-1 marginals (the tier-2 prior where no searched
+    /// turn lies below; the net expands such nodes first) with the step
+    /// noise, down to a complete turn, which is played.
+    fn step_pick(&mut self, t1: &mut Tier1, cur: &mut u32, trail: &mut Vec<(u32, bool)>) -> Result<Next> {
+        let turns: Vec<(u32, f64, f64)> = t1.nodes[0]
+            .children
+            .iter()
+            .map(|&c| {
+                let ch = &t1.nodes[c as usize];
+                (ch.sink, f64::from(ch.n), f64::from(ch.n) - ch.w)
+            })
+            .collect();
+        loop {
+            let at = *cur;
+            let lat = t1.nodes[0].lattice.as_mut().expect("the root's lattice");
+            if lat.nodes[at as usize].kind == Kind::Sink {
+                return self.pick_done(t1, at, trail);
+            }
+            let Some(rec) = lat.marginal_record(at, &turns)? else {
+                // A dead end (refuted after it was offered): back up.
+                let Some((p, _)) = trail.pop() else {
+                    anyhow::bail!("a turn start that no turn completes");
+                };
+                *cur = p;
+                continue;
+            };
+            let unseen = rec.kids.iter().all(|k| k.2 <= 0.0);
+            if unseen {
+                if let Some(Need::Expand(e)) = lat.ensure_expanded(at)? {
+                    return Ok(Next::Wait(vec![Req::Expand { t1: 0, n: e }]));
+                }
+                if !lat.nodes[at as usize].expanded {
+                    continue; // killed by its preparation: backed up above
+                }
+            }
+            let nd = &lat.nodes[at as usize];
+            let live: Vec<usize> = (0..nd.kids.len()).filter(|&i| !nd.kids[i].dead).collect();
+            let mut vars: Vec<u8> = live.iter().map(|&i| nd.kids[i].var).collect();
+            vars.sort_unstable();
+            vars.dedup();
+            let open: Vec<u8> = vars
+                .iter()
+                .copied()
+                .filter(|&v| live.iter().filter(|&&i| nd.kids[i].var == v).count() > 1)
+                .collect();
+            let var = if open.is_empty() {
+                vars[0]
+            } else {
+                open[self.rng.gen_range(0..open.len())]
+            };
+            // `rec.kids` are the live kids, in order.
+            let pick: Vec<(usize, f64)> = live
+                .iter()
+                .zip(&rec.kids)
+                .filter(|(&i, _)| nd.kids[i].var == var)
+                .map(|(&i, k)| {
+                    let w = if unseen {
+                        f64::from(nd.kids[i].logp).exp()
+                    } else {
+                        f64::from(k.2)
+                    };
+                    (i, w)
+                })
+                .collect();
+            let k = if pick.len() == 1 {
+                pick[0].0
+            } else {
+                self.c.steps.fetch_add(1, Relaxed);
+                let w: Vec<f64> = pick.iter().map(|x| x.1).collect();
+                pick[noisy_pick(
+                    &w,
+                    self.cfg.step_temp,
+                    self.cfg.step_dir_alpha,
+                    self.cfg.step_dir_frac,
+                    &mut self.rng,
+                )]
+                .0
+            };
+            if let Some(c) = lat.step_to(at, k)? {
+                trail.push((at, pick.len() > 1));
+                *cur = c;
+            }
+        }
+    }
+
+    /// The stepwise turn ends at sink `at`: queue the rooted phase's nodes
+    /// from its path and play it.
+    fn pick_done(&mut self, t1: &mut Tier1, at: u32, trail: &[(u32, bool)]) -> Result<Next> {
+        let lat = t1.nodes[0].lattice.as_ref().expect("the root's lattice");
+        if let (true, Some(q)) = (self.cfg.rooted_frac > 0.0, self.rooted_q) {
+            let f = self.cfg.rooted_frac;
+            let nodes: Vec<u32> = trail
+                .iter()
+                .filter(|&&(_, d)| d && self.rng.gen::<f64>() < f)
+                .map(|&(n, _)| n)
+                .collect();
+            self.c.rooted_queued.fetch_add(nodes.len() as u64, Relaxed);
+            let mut q = q.lock().unwrap();
+            for n in nodes {
+                q.push((lat.start.clone(), lat.nodes[n as usize].key));
+            }
+        }
+        if let Some(c) = t1.nodes[0]
+            .children
+            .iter()
+            .copied()
+            .find(|&c| t1.nodes[c as usize].sink == at)
+        {
+            return self.play_turn(t1, c);
+        }
+        // A turn the search never visited.
+        let sn = &lat.nodes[at as usize];
+        let next = if sn.terminal || sn.state.is_terminal() {
+            self.new_game()?
+        } else {
+            let s = sn.state.clone();
+            self.search(s, None)
+        };
+        Ok(Next::Replace(vec![next]))
     }
 
     /// Root visits for a search after a turn's first.
