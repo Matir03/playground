@@ -66,6 +66,12 @@ enum Cmd {
         lattice_net: Option<String>,
         #[arg(long, default_value_t = 400)]
         lattice_n1: u32,
+        /// Tier-1 visits in flight per search of the lattice seat. More
+        /// than 1 races progressive widening: visits pile onto the first
+        /// turns found whatever their value (2026-10-10: 64 put 79 of 400
+        /// visits on turns with Q < 0.3, 1 put 6).
+        #[arg(long, default_value_t = 1)]
+        lattice_inflight: usize,
         /// Where the lattice panel's JSON is served (web: /latapi).
         #[arg(long, default_value = "127.0.0.1:7107")]
         lattice_http: String,
@@ -652,7 +658,7 @@ enum Cmd {
         /// B's tier-1 visits, if different from A's.
         #[arg(long)]
         n1_b: Option<u32>,
-        #[arg(long, default_value_t = 16)]
+        #[arg(long, default_value_t = 1)]
         lattice_inflight: usize,
         /// Check every candidate option eagerly in the lattices (self-play,
         /// lattice-gen, defers them: `steps::LAZY_WITNESS`). Eager checks gave
@@ -699,7 +705,7 @@ enum Cmd {
         /// `a` as a lattice net directory: tier-1 visits per turn, in flight.
         #[arg(long, default_value_t = 200)]
         n1: u32,
-        #[arg(long, default_value_t = 16)]
+        #[arg(long, default_value_t = 1)]
         lattice_inflight: usize,
     },
     /// Check a step-trained MLP's CPU evaluator against its ONNX graph on
@@ -805,6 +811,10 @@ enum Cmd {
         /// --pool is ignored and left as it is).
         #[arg(long)]
         from_start: bool,
+        /// Each worker starts its games spread over this many seconds (0:
+        /// all at once), so searches peak in memory at different times.
+        #[arg(long, default_value_t = 0.0)]
+        ramp_secs: f64,
         /// Stepwise with a full search at each commitment (else: one search a
         /// turn, then commitments sampled from its marginals).
         #[arg(long)]
@@ -1137,11 +1147,12 @@ async fn main() -> anyhow::Result<()> {
             steps_heads,
             lattice_net,
             lattice_n1,
+            lattice_inflight,
             lattice_http,
         } => {
             if let Some(spec) = lattice_net {
                 minions_engine::steps::LAZY_WITNESS.store(true, std::sync::atomic::Ordering::Relaxed);
-                let (name, play) = lattice_play(&spec, lattice_n1, 64)?;
+                let (name, play) = lattice_play(&spec, lattice_n1, lattice_inflight)?;
                 let play = play.ok_or_else(|| anyhow::anyhow!("{spec}: not a lattice player"))?;
                 eprintln!("net seat: lattice player {name}, n1 {lattice_n1}");
                 minions_engine::lattice_ui::configure(play);
@@ -1736,7 +1747,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::LatticeGen {
             out, onnx, ep, batcher, workers, games, n1, inflight, n2, c1, c2, pw_c, pw_alpha, retries,
-            temp1, anchor, from_start, stepwise, step_search, step_n1, step_temp, step_dir_alpha, step_dir_frac, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, start_turn_mean, secs,
+            temp1, anchor, from_start, ramp_secs, stepwise, step_search, step_n1, step_temp, step_dir_alpha, step_dir_frac, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, start_turn_mean, secs,
             target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, sd_frac, sd_descents, sd_tau, rooted_frac, rooted_n, rooted_min, rooted_tau, rooted_secs, rooted_tasks, rooted_inflight, rooted_budget, walk_accumulated, sink_values, walk_inflight, walk_marginal, walk_cq, lview, energy_min_visits, teacher_view, energy_prior, energy_temp, value_prior_tau, pipeline, openings, open_workers, pool, refill_to,
         } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
@@ -1801,6 +1812,7 @@ async fn main() -> anyhow::Result<()> {
                 rooted_frac,
                 anchor,
                 from_start,
+                ramp_secs,
                 stepwise,
                 step_search,
                 step_n1,

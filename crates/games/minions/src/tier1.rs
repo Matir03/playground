@@ -262,6 +262,22 @@ impl Tier1 {
         }
     }
 
+    /// Bytes this search holds (see [`crate::lattice::MEM_NAMES`]); tier-1
+    /// node structs count as "nodes".
+    pub fn mem(&self, out: &mut [f64; 12]) {
+        out[0] += (self.nodes.capacity() * std::mem::size_of::<T1Node>()) as f64;
+        for n in &self.nodes {
+            out[0] += (n.children.capacity() * 4) as f64;
+            let (v, o) = n.state.heap_bytes();
+            out[1] += v as f64;
+            out[2] += o as f64;
+            if let Some(l) = &n.lattice {
+                l.mem(out);
+            }
+            out[7] += n.trunk.as_ref().map_or(0.0, |a| (a.len() * 2) as f64 / std::sync::Arc::strong_count(a) as f64);
+        }
+    }
+
     /// Node `t`'s turns for [`crate::lattice::Lattice::turn_marginals`]:
     /// (sink, visits, summed value for `t`'s mover) per child.
     pub fn turns(&self, t: u32) -> Vec<(u32, f64, f64)> {
@@ -377,6 +393,17 @@ impl Tier1 {
         let p = &self.params;
         let k = (f64::from(p.pw_c) * f64::from(nd.n.max(1)).powf(f64::from(p.pw_alpha))).ceil();
         !nd.widen_done && ((nd.children.len() + nd.widening as usize) as f64) < k
+    }
+
+    /// Widenings are in flight and the node has fewer children than its
+    /// visits call for: choosing among those it has would pile parallel
+    /// visits onto the first turns found, whatever their value (64 visits
+    /// in flight put 79 of 400 on turns with Q < 0.3; 1 put 6).
+    fn short_of_turns(&self, t: u32) -> bool {
+        let nd = &self.nodes[t as usize];
+        let p = &self.params;
+        let k = (f64::from(p.pw_c) * f64::from(nd.n.max(1)).powf(f64::from(p.pw_alpha))).ceil();
+        nd.widening > 0 && !nd.widen_done && (nd.children.len() as f64) < k
     }
 
     /// Visits in flight weigh on their path: each node below the root
@@ -566,6 +593,11 @@ impl Tier1 {
                 vis.widen = Some((t, Cursor::at(start, 0.0), 0));
                 vis.work = 0;
                 continue;
+            }
+            if self.short_of_turns(t) {
+                // A serial search would have the turn that widening is
+                // finding: wait for it rather than choose among fewer.
+                return Ok(Need1::Wait);
             }
             match self.select(t) {
                 Some(c) => {

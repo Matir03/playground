@@ -1271,7 +1271,7 @@ pub fn search_turn(
             let fin = tree.state_of(ch);
             return Ok(SearchedTurn {
                 next: fin.real_base(),
-                done: fin.done,
+                done: *fin.done,
                 value: tree.nodes[0].value,
                 expansions: tree.stats.expansions,
             });
@@ -1297,7 +1297,7 @@ pub fn two_tier_turn(
     let fin = s.end_state(b);
     Ok(SearchedTurn {
         next: fin.real_base(),
-        done: fin.done,
+        done: *fin.done,
         value: s.root_value(),
         expansions: s.stats.expansions,
     })

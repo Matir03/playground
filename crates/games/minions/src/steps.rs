@@ -71,7 +71,8 @@ pub struct StepState {
     /// The complete declaration of the turn that led to this one, in that
     /// turn's canonical frame (empty at a tree's start): what
     /// [`turn_actions`] turns back into atomic moves.
-    pub done: TurnSpec,
+    /// Shared: every state of a turn has the same one.
+    pub done: std::sync::Arc<TurnSpec>,
     pub enemies: Vec<u8>,
     pub friends: Vec<u8>,
     pub spawn_cells: Vec<u8>,
@@ -80,13 +81,13 @@ pub struct StepState {
     /// Destinations claimed by decided friendly moves.
     pub claimed: Bb,
     /// During `Spawns`: the spawn-phase position with the spawns so far applied.
-    pub post: Option<MinionsState>,
+    pub post: Option<Box<MinionsState>>,
     /// Turn-order salt; the same salt and position give the same orders.
     pub salt: u64,
     /// The current step's options and, parallel, a witness for each: a
     /// complete fates+moves declaration that extends the decisions with that
     /// option and realizes in full. Computed once, cached.
-    opts: Option<(Vec<u8>, Vec<TurnSpec>)>,
+    opts: Option<Box<(Vec<u8>, Vec<TurnSpec>)>>,
     /// A realizable completion of the decisions so far (see `opts`). Every
     /// option offered has one, so the step tree has no dead ends.
     witness: TurnSpec,
@@ -210,7 +211,7 @@ impl StepState {
             base,
             flipped,
             spec: TurnSpec::empty(),
-            done: TurnSpec::empty(),
+            done: std::sync::Arc::new(TurnSpec::empty()),
             enemies: Vec::new(),
             friends: Vec::new(),
             spawn_cells: Vec::new(),
@@ -291,7 +292,7 @@ impl StepState {
                 }
                 Stage::Spawns if self.idx >= self.spawn_cells.len() => {
                     let post = self.post.take().expect("spawn phase state");
-                    let next = Minions::apply(&post, &MinionsMove::EndPhase);
+                    let next = Minions::apply(&*post, &MinionsMove::EndPhase);
                     self.next_turn(next);
                 }
                 _ => return,
@@ -304,7 +305,7 @@ impl StepState {
         let real = if self.flipped { next.rotated() } else { next };
         let done = self.spec;
         *self = StepState::begin(&real, self.salt);
-        self.done = done;
+        self.done = std::sync::Arc::new(done);
     }
 
     /// Realize the fates and moves. On success moves to `Spawns` (or on to the
@@ -319,7 +320,7 @@ impl StepState {
                 let real = if self.flipped { post.rotated() } else { post };
                 let done = self.spec;
                 *self = StepState::begin(&real, self.salt);
-                self.done = done;
+                self.done = std::sync::Arc::new(done);
             } else {
                 self.next_turn(post);
             }
@@ -328,7 +329,7 @@ impl StepState {
         let mut cells: Vec<u8> = bitboard::cells(post.spawn_bb(0)).collect();
         cells.shuffle(&mut self.rng(2));
         self.spawn_cells = cells;
-        self.post = Some(post);
+        self.post = Some(Box::new(post));
         self.stage = Stage::Spawns;
         self.idx = 0;
         true
@@ -358,6 +359,15 @@ impl StepState {
         }
     }
 
+    /// Heap bytes this state owns: its vectors, and the cached options and
+    /// their witnesses (the second number, separately).
+    pub fn heap_bytes(&self) -> (usize, usize) {
+        let v = self.enemies.capacity() + self.friends.capacity() + self.spawn_cells.capacity()
+            + self.post.as_ref().map_or(0, |_| std::mem::size_of::<MinionsState>());
+        let o = self.opts.as_ref().map_or(0, |x| x.0.capacity() + x.1.capacity() * std::mem::size_of::<TurnSpec>());
+        (v, o)
+    }
+
     /// Forget the cached options and their witnesses (a node whose children
     /// exist no longer needs them).
     pub fn drop_options(&mut self) {
@@ -367,7 +377,7 @@ impl StepState {
     /// Options for the current step, computed once and cached.
     pub fn options(&mut self) -> Vec<u8> {
         if self.opts.is_none() {
-            self.opts = Some(self.compute_options());
+            self.opts = Some(Box::new(self.compute_options()));
         }
         self.opts.as_ref().map(|o| o.0.clone()).unwrap_or_default()
     }
@@ -558,7 +568,7 @@ impl StepState {
             base: self.base.clone(),
             flipped: self.flipped,
             spec: self.spec,
-            done: self.done,
+            done: self.done.clone(),
             enemies: self.enemies.clone(),
             friends: self.friends.clone(),
             spawn_cells: self.spawn_cells.clone(),
@@ -612,7 +622,7 @@ impl StepState {
         // The option's witness becomes the new one; compute the options if a
         // caller applied without asking for them.
         let (o, w) = match self.opts.take() {
-            Some(x) => x,
+            Some(x) => *x,
             None => self.compute_options(),
         };
         if let Some(i) = o.iter().position(|&x| x == v) {
@@ -625,7 +635,7 @@ impl StepState {
     /// not copy this state's option cache (up to 37 witnesses per clone).
     pub fn child(&self, v: u8) -> StepState {
         let witness = match &self.opts {
-            Some((o, w)) => o.iter().position(|&x| x == v).map(|i| w[i]),
+            Some(x) => x.0.iter().position(|&y| y == v).map(|i| x.1[i]),
             None => {
                 let (o, w) = self.compute_options();
                 o.iter().position(|&x| x == v).map(|i| w[i])
@@ -647,7 +657,7 @@ impl StepState {
             base: self.base.clone(),
             flipped: self.flipped,
             spec: self.spec,
-            done: self.done,
+            done: self.done.clone(),
             enemies: self.enemies.clone(),
             friends: self.friends.clone(),
             spawn_cells: self.spawn_cells.clone(),
@@ -685,7 +695,7 @@ impl StepState {
                             let real = if self.flipped { post.rotated() } else { post };
                             let done = self.witness;
                             *self = StepState::begin(&real, self.salt);
-                            self.done = done;
+                            self.done = std::sync::Arc::new(done);
                         }
                     }
                 }
@@ -703,9 +713,9 @@ impl StepState {
                     let unit = Unit::from_index(v).expect("spawn code");
                     let slot = unit.reinforcement_slot().expect("buyable");
                     if post.reinforcements[0][slot] == 0 {
-                        *post = Minions::apply(post, &MinionsMove::Buy(unit));
+                        **post = Minions::apply(post, &MinionsMove::Buy(unit));
                     }
-                    *post = Minions::apply(post, &MinionsMove::Spawn { unit, at });
+                    **post = Minions::apply(post, &MinionsMove::Spawn { unit, at });
                     self.spec.spawns[at as usize] = v;
                 }
                 self.idx += 1;
@@ -1277,7 +1287,7 @@ impl StepState {
             }
             Stage::Spawns => {
                 let post = self.post.as_ref().expect("spawn phase state");
-                v.board = post.clone();
+                v.board = (**post).clone();
                 v.dec_friend = side_bb(post, 0);
                 v.dec_enemy = side_bb(post, 1);
                 for &at in &self.spawn_cells[..self.idx] {

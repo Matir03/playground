@@ -165,6 +165,8 @@ pub struct GenConfig {
     pub anchor: bool,
     /// Every game starts at the initial position (no openings, no pool).
     pub from_start: bool,
+    /// Each worker starts its games spread over this many seconds.
+    pub ramp_secs: f64,
     /// Stepwise with a search at each commitment (above). Off (the default
     /// since 2026-10-10, user): one search a turn, then the turn is chosen
     /// by stepping down its lattice, each commitment sampled from the
@@ -1509,16 +1511,55 @@ impl Worker<'_> {
         // in flight, the worker advances the next group.
         let n = self.cfg.pipeline.max(1);
         let mut groups: Vec<Group> = (0..n).map(|_| Group::default()).collect();
-        for i in 0..self.cfg.games {
-            groups[i % n].tasks.push(self.new_game()?);
-        }
+        // Games start spread over `ramp_secs`: started together, every
+        // search would reach its full size (memory) at the same moment, and
+        // the games would stay in step.
+        let t0 = Instant::now();
+        let ramp = self.cfg.ramp_secs.max(0.0);
+        let mut started = 0usize;
         let mut g = 0;
+        let mut scanned = Instant::now();
+        let mut mine = [0f64; 12];
         while !stop.load(Relaxed) {
+            while started < self.cfg.games
+                && (ramp == 0.0
+                    || t0.elapsed().as_secs_f64() >= ramp * started as f64 / self.cfg.games as f64)
+            {
+                groups[started % n].tasks.push(self.new_game()?);
+                started += 1;
+            }
+            if std::env::var_os("LATGEN_MEM").is_some() && scanned.elapsed().as_secs_f64() > 10.0 {
+                // Memory accounting: this worker's live searches, by category.
+                scanned = Instant::now();
+                let mut m = [0f64; 12];
+                for grp in &groups {
+                    for t in &grp.tasks {
+                        match t {
+                            Task::Search { t1, .. } => t1.mem(&mut m),
+                            Task::Opening { lat, .. }
+                            | Task::Walk { lat, .. }
+                            | Task::Rooted { lat, .. }
+                            | Task::Anchor { lat, .. } => lat.mem(&mut m),
+                        }
+                    }
+                }
+                for i in 0..12 {
+                    let (new, old) = (m[i] as i64, mine[i] as i64);
+                    if new >= old {
+                        crate::lattice::MEM[i].fetch_add((new - old) as u64, Relaxed);
+                    } else {
+                        crate::lattice::MEM[i].fetch_sub((old - new) as u64, Relaxed);
+                    }
+                }
+                mine = m;
+            }
             let grp = &mut groups[g];
             if let Some(f) = grp.inflight.take() {
                 self.feed(&mut grp.tasks, f)?;
             }
-            grp.inflight = Some(self.submit_round(&mut grp.tasks, eval)?);
+            if !grp.tasks.is_empty() {
+                grp.inflight = Some(self.submit_round(&mut grp.tasks, eval)?);
+            }
             g = (g + 1) % n;
         }
         for grp in &mut groups {
@@ -1989,6 +2030,15 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
                     crate::lattice::LIVE[2].load(Relaxed),
                     crate::lattice::LIVE[3].load(Relaxed),
                 );
+                if std::env::var_os("LATGEN_MEM").is_some() {
+                    let m: Vec<String> = crate::lattice::MEM
+                        .iter()
+                        .zip(crate::lattice::MEM_NAMES)
+                        .map(|(x, n)| format!("{n} {:.2}", x.load(Relaxed) as f64 / 1e9))
+                        .collect();
+                    let tot: f64 = crate::lattice::MEM.iter().map(|x| x.load(Relaxed) as f64).sum();
+                    eprintln!("    memory (GB): {} = {:.2} accounted", m.join(", "), tot / 1e9);
+                }
                 {
                     use crate::lattice::{WIT_CLASS, WIT_INHERIT, WIT_RESOLVE};
                     use crate::steps::cand_log::NAMES;

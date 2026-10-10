@@ -81,6 +81,70 @@ pub struct Key {
     pub packed: [u64; WORDS],
 }
 
+impl Key {
+    /// A 64-bit mix of the key (wyhash-style multiply-folds).
+    fn hash64(&self) -> u64 {
+        let mut h = self.mask ^ 0x9e37_79b9_7f4a_7c15;
+        for &w in &self.packed {
+            let m = u128::from(h ^ w) * 0xa076_1d64_78bd_642f;
+            h = (m as u64) ^ ((m >> 64) as u64);
+        }
+        h
+    }
+}
+
+/// Hashes as their own hash (they already are one).
+#[derive(Default, Clone, Copy)]
+struct Prehashed(u64);
+
+impl std::hash::Hasher for Prehashed {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("only u64 keys")
+    }
+    fn write_u64(&mut self, x: u64) {
+        self.0 = x;
+    }
+}
+
+/// Lattice node ids by key: a map from the key's hash (the node holds the
+/// key itself), plus the keys whose hash another key took first.
+#[derive(Default)]
+struct KeyIndex {
+    by_hash: HashMap<u64, u32, std::hash::BuildHasherDefault<Prehashed>>,
+    collided: HashMap<Key, u32>,
+}
+
+impl KeyIndex {
+    fn get(&self, nodes: &[LNode], k: &Key) -> Option<u32> {
+        let id = *self.by_hash.get(&k.hash64())?;
+        if nodes[id as usize].key == *k {
+            return Some(id);
+        }
+        self.collided.get(k).copied()
+    }
+
+    /// `nodes[id]` is (or is about to be) the node of `k`.
+    fn insert(&mut self, nodes: &[LNode], k: Key, id: u32) {
+        match self.by_hash.entry(k.hash64()) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(id);
+            }
+            std::collections::hash_map::Entry::Occupied(e) => {
+                if nodes[*e.get() as usize].key != k {
+                    self.collided.insert(k, id);
+                }
+            }
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        self.by_hash.capacity() * 13 + self.collided.capacity() * (std::mem::size_of::<Key>() + 5)
+    }
+}
+
 /// For each 10-bit group of a variable mask, the 6-bit fields it covers.
 const FIELD: [u64; 1024] = build_field();
 
@@ -284,8 +348,12 @@ pub struct LNode {
     /// Sorted by `(var, choice)`.
     pub kids: Vec<Kid>,
     /// The kids whose witness is not this node's own with the kid's choice
-    /// swapped in (see [`swapped`]), by kid index.
-    wit_ex: Vec<(u16, TurnSpec)>,
+    /// swapped in (see [`swapped`]), by kid index: (kid, diff length, diff
+    /// start in `wit_diff`).
+    wit_ex: Vec<(u16, u16, u32)>,
+    /// The exceptions' differences from that base: (spec byte, value) pairs
+    /// ([`spec_diff`]).
+    wit_diff: Vec<u8>,
     /// The live kids' direct visits from this node's expansion.
     kid_n: u32,
     kid_w: f64,
@@ -323,14 +391,55 @@ fn swapped(own: &TurnSpec, stage: Stage, cell: u8, v: u8) -> TurnSpec {
     w
 }
 
-impl LNode {
-    fn kid_witness(&self, k: usize) -> TurnSpec {
-        match self.wit_ex.binary_search_by_key(&(k as u16), |x| x.0) {
-            Ok(i) => self.wit_ex[i].1,
-            Err(_) => {
-                let kid = &self.kids[k];
-                swapped(self.state.witness(), self.state.stage, kid.cell, kid.choice)
+/// `w`'s bytes that differ from `base`, as (index into the spec's three
+/// arrays, value) pairs, appended to `out`.
+fn spec_diff(base: &TurnSpec, w: &TurnSpec, out: &mut Vec<u8>) {
+    let arrs = |t: &TurnSpec| [t.moves, t.targets, t.spawns];
+    let (b, x) = (arrs(base), arrs(w));
+    for a in 0..3 {
+        for c in 0..NUM_CELLS {
+            if b[a][c] != x[a][c] {
+                out.push((a * NUM_CELLS + c) as u8);
+                out.push(x[a][c]);
             }
+        }
+    }
+}
+
+fn spec_patch(base: &mut TurnSpec, d: &[u8]) {
+    for p in d.chunks_exact(2) {
+        let (a, c) = (p[0] as usize / NUM_CELLS, p[0] as usize % NUM_CELLS);
+        match a {
+            0 => base.moves[c] = p[1],
+            1 => base.targets[c] = p[1],
+            _ => base.spawns[c] = p[1],
+        }
+    }
+}
+
+impl LNode {
+    fn kid_base(&self, k: usize) -> TurnSpec {
+        let kid = &self.kids[k];
+        swapped(self.state.witness(), self.state.stage, kid.cell, kid.choice)
+    }
+
+    fn kid_witness(&self, k: usize) -> TurnSpec {
+        let mut w = self.kid_base(k);
+        if let Ok(i) = self.wit_ex.binary_search_by_key(&(k as u16), |x| x.0) {
+            let (_, len, at) = self.wit_ex[i];
+            spec_patch(&mut w, &self.wit_diff[at as usize..at as usize + len as usize]);
+        }
+        w
+    }
+
+    /// Kid `k`'s witness is `w`.
+    fn set_kid_witness(&mut self, k: usize, w: &TurnSpec) {
+        let at = self.wit_diff.len();
+        spec_diff(&self.kid_base(k), w, &mut self.wit_diff);
+        let e = (k as u16, (self.wit_diff.len() - at) as u16, at as u32);
+        match self.wit_ex.binary_search_by_key(&(k as u16), |x| x.0) {
+            Ok(i) => self.wit_ex[i] = e,
+            Err(i) => self.wit_ex.insert(i, e),
         }
     }
 
@@ -345,6 +454,7 @@ impl LNode {
             ever: false,
             kids: Vec::new(),
             wit_ex: Vec::new(),
+            wit_diff: Vec::new(),
             kid_n: 0,
             kid_w: 0.0,
             n: 0,
@@ -437,7 +547,9 @@ pub struct Lattice {
     /// The turn's start as it was begun (the tier-1 position).
     pub start: StepState,
     pub nodes: Vec<LNode>,
-    index: HashMap<Key, u32>,
+    /// Node by its key's 64-bit hash (12 bytes an entry, not the key's 64),
+    /// and the rare node whose hash another key already took.
+    index: KeyIndex,
     /// Nodes with direct visits.
     touched: Vec<u32>,
     var_of: [u8; NUM_CELLS],
@@ -449,7 +561,10 @@ pub struct Lattice {
     wit0: TurnSpec,
     /// Known witnesses (keys over every fate and move variable) and their
     /// hashes, to keep them distinct.
-    pool: Vec<Key>,
+    /// Packed: each key's mask, then its first `pool_words` words (the
+    /// fate and move variables'; the rest are zero).
+    pool: Vec<u64>,
+    pool_words: usize,
     pool_seen: std::collections::HashSet<u64>,
     /// Known infeasible commitment sets: every node including one is dead.
     nogoods: Vec<Key>,
@@ -535,7 +650,41 @@ impl Drop for Lattice {
     }
 }
 
+/// Memory accounting categories ([`Lattice::mem`]): node structs, state
+/// heap vectors, cached options, kids, witness exceptions, parent lists,
+/// index and lattice-level lists, trunk images (shared ones split).
+pub const MEM_NAMES: [&str; 12] = ["nodes", "state-vecs", "opts", "kids", "wit-ex", "parents", "index", "trunks", "node-slack", "pool", "nogoods", "touched"];
+
+/// Live bytes per category, summed by the workers' periodic scans.
+pub static MEM: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+
+fn trunk_bytes(t: &Option<Trunk>) -> f64 {
+    t.as_ref().map_or(0.0, |a| {
+        (a.len() * 2) as f64 / std::sync::Arc::strong_count(a) as f64
+    })
+}
+
 impl Lattice {
+    /// Bytes this lattice holds, by [`MEM_NAMES`] category, added to `out`.
+    pub fn mem(&self, out: &mut [f64; 12]) {
+        out[0] += (self.nodes.len() * std::mem::size_of::<LNode>()) as f64;
+        out[8] += ((self.nodes.capacity() - self.nodes.len()) * std::mem::size_of::<LNode>()) as f64;
+        for n in &self.nodes {
+            let (v, o) = n.state.heap_bytes();
+            out[1] += v as f64;
+            out[2] += o as f64;
+            out[3] += (n.kids.capacity() * std::mem::size_of::<Kid>()) as f64;
+            out[4] += (n.wit_ex.capacity() * std::mem::size_of::<(u16, u16, u32)>() + n.wit_diff.capacity()) as f64;
+            out[5] += (n.parents.capacity() * std::mem::size_of::<(u32, u16)>()) as f64;
+            out[7] += trunk_bytes(&n.trunk);
+        }
+        out[6] += self.index.bytes() as f64;
+        out[9] += (self.pool.capacity() * 8 + self.pool_seen.capacity() * 9) as f64;
+        out[10] += (self.nogoods.capacity() * std::mem::size_of::<Key>()) as f64;
+        out[11] += (self.touched.capacity() * 4) as f64;
+        out[7] += trunk_bytes(&self.trunk);
+    }
+
     /// The lattice of the turn starting at `start` (a fresh
     /// [`StepState::begin`]).
     pub fn new(start: StepState) -> Result<Self> {
@@ -543,13 +692,14 @@ impl Lattice {
         let mut l = Lattice {
             start: start.clone(),
             nodes: Vec::new(),
-            index: HashMap::new(),
+            index: KeyIndex::default(),
             touched: Vec::new(),
             var_of: [u8::MAX; NUM_CELLS],
             n_fm: 0,
             n_f: 0,
             wit0: TurnSpec::default(),
             pool: Vec::new(),
+            pool_words: WORDS,
             pool_seen: Default::default(),
             nogoods: Vec::new(),
             terminal: None,
@@ -581,6 +731,7 @@ impl Lattice {
             l.var_of[c as usize] = i as u8;
         }
         l.n_fm = fates.len() + friends.len();
+        l.pool_words = l.n_fm.div_ceil(PER_WORD).max(1);
         l.n_f = fates.len();
         l.wit0 = *root.witness();
         if l.n_fm >= MAX_VARS {
@@ -591,9 +742,9 @@ impl Lattice {
         if kind == Kind::Sink {
             l.sink_value(&mut node);
         }
-        l.nodes.push(node);
+        l.push_node(node);
         LIVE[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        l.index.insert(Key::default(), 0);
+        l.index.insert(&l.nodes, Key::default(), 0);
         Ok(l)
     }
 
@@ -634,15 +785,40 @@ impl Lattice {
         w
     }
 
+    /// Nodes are big (~800 bytes): grow by a quarter, not double.
+    fn push_node(&mut self, node: LNode) {
+        if self.nodes.len() == self.nodes.capacity() {
+            self.nodes.reserve_exact(self.nodes.len() / 4 + 8);
+        }
+        self.nodes.push(node);
+    }
+
+    fn pool_len(&self) -> usize {
+        self.pool.len() / (1 + self.pool_words)
+    }
+
+    fn pool_key(&self, i: usize) -> Key {
+        let st = 1 + self.pool_words;
+        let r = &self.pool[i * st..(i + 1) * st];
+        let mut k = Key {
+            mask: r[0],
+            ..Key::default()
+        };
+        k.packed[..self.pool_words].copy_from_slice(&r[1..]);
+        k
+    }
+
     fn pool_add(&mut self, k: Key) {
-        if self.pool.len() >= pool_cap() {
+        if self.pool_len() >= pool_cap() {
             return;
         }
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         k.hash(&mut h);
         if self.pool_seen.insert(h.finish()) {
-            self.pool.push(k);
+            debug_assert!(k.packed[self.pool_words..].iter().all(|&w| w == 0));
+            self.pool.push(k.mask);
+            self.pool.extend_from_slice(&k.packed[..self.pool_words]);
         }
     }
 
@@ -704,8 +880,8 @@ impl Lattice {
             key = key.with(v, 0);
             st = st.with_next(c).lattice_child(0, w[0]);
         }
-        let id = match self.index.get(&key) {
-            Some(&id) => id,
+        let id = match self.index.get(&self.nodes, &key) {
+            Some(id) => id,
             None => {
                 let kind = self.classify(&st);
                 let mut node = LNode::new(key, st, kind);
@@ -714,9 +890,9 @@ impl Lattice {
                     self.stats.sinks += 1;
                 }
                 let id = self.nodes.len() as u32;
-                self.nodes.push(node);
+                self.push_node(node);
                 LIVE[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                self.index.insert(key, id);
+                self.index.insert(&self.nodes, key, id);
                 id
             }
         };
@@ -765,11 +941,9 @@ impl Lattice {
                     refuted.push((v as u8, g.get(v)));
                 }
             }
-            hits = self
-                .pool
-                .iter()
+            hits = (0..self.pool_len())
+                .map(|i| self.pool_key(i))
                 .filter(|w| w.includes(&xk))
-                .copied()
                 .collect();
         }
         let pool_wit = hits.first().map(|w| self.key_witness(w));
@@ -881,12 +1055,18 @@ impl Lattice {
         LIVE[2].fetch_add(kids.len() as i64, std::sync::atomic::Ordering::Relaxed);
         let own = *node.state.witness();
         let stage = node.state.stage;
-        node.wit_ex = kids
-            .iter()
-            .enumerate()
-            .filter(|(_, (k, w))| *w != swapped(&own, stage, k.cell, k.choice))
-            .map(|(i, (_, w))| (i as u16, *w))
-            .collect();
+        let mut ex = Vec::new();
+        let mut diff = Vec::new();
+        for (i, (k, w)) in kids.iter().enumerate() {
+            let base = swapped(&own, stage, k.cell, k.choice);
+            if *w != base {
+                let at = diff.len();
+                spec_diff(&base, w, &mut diff);
+                ex.push((i as u16, (diff.len() - at) as u16, at as u32));
+            }
+        }
+        node.wit_ex = ex;
+        node.wit_diff = diff;
         LIVE[3].fetch_add(
             node.wit_ex.len() as i64,
             std::sync::atomic::Ordering::Relaxed,
@@ -1321,11 +1501,7 @@ impl Lattice {
                     // refuted inexactly): any live kid.
                     return self.select(n, c_puct);
                 };
-                let node = &mut self.nodes[n as usize];
-                match node.wit_ex.binary_search_by_key(&(k as u16), |x| x.0) {
-                    Ok(i) => node.wit_ex[i].1 = w,
-                    Err(i) => node.wit_ex.insert(i, (k as u16, w)),
-                }
+                self.nodes[n as usize].set_kid_witness(k, &w);
                 Some(k)
             }
             crate::sat::SatResult::Refuted(_) => {
@@ -2957,7 +3133,7 @@ pub(crate) mod tests {
                     }
                 }
             }
-            assert!(l.pool.len() > 1, "the pool stayed empty");
+            assert!(l.pool_len() > 1, "the pool stayed empty");
         }
         assert!(
             witnesses > 100 && certified > 100,
