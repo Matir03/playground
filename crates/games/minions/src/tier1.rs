@@ -262,6 +262,19 @@ impl Tier1 {
         }
     }
 
+    /// Node `t`'s turns for [`crate::lattice::Lattice::turn_marginals`]:
+    /// (sink, visits, summed value for `t`'s mover) per child.
+    pub fn turns(&self, t: u32) -> Vec<(u32, f64, f64)> {
+        self.nodes[t as usize]
+            .children
+            .iter()
+            .map(|&c| {
+                let ch = &self.nodes[c as usize];
+                (ch.sink, f64::from(ch.n), f64::from(ch.n) - ch.w)
+            })
+            .collect()
+    }
+
     pub fn feed_expand(&mut self, t: u32, n: u32, out: &crate::lattice::ExpandOut) {
         self.lattice_mut(t).feed_expand(n, out);
     }

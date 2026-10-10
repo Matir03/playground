@@ -472,7 +472,7 @@ export function LatticePanel({ state, auto = false }: { state: GameState | null;
                             <th style={th}>{g.ks[0].cell}</th>
                             <th style={th} title="visit share in this variable (blue) over the prior (gold)">prior / visits</th>
                             <th style={th} title="tier-2 search value: the mean of the values backed up through this commitment (the net's partial-turn values included), 0 = loss .. 1 = win for the side to move">Q</th>
-                            <th style={th} title="the mean value of the complete turns found that contain this commitment (the training target), and how many">turns</th>
+                            <th style={th} title="the tier-1 turns through this commitment: their visit-weighted mean value and visits (one hex's options split the node's visits); computed as generation computes tier-1 marginals">turns</th>
                             <th style={th} title="the net's own value of the partial turn with this commitment added (no search)">net</th>
                           </tr>
                         </thead>

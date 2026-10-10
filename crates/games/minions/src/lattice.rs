@@ -1859,6 +1859,30 @@ impl Lattice {
         Ok(out)
     }
 
+    /// Tier-1 turn marginals at node `at`: the visits and summed value of
+    /// the turns `turns` (sink, visits, summed value for the turn's mover)
+    /// that include `at`'s commitments, and per kid (dead ones too) those
+    /// that also include the kid's. Every turn decides every variable, so
+    /// one variable's kids split the node's visits.
+    pub fn turn_marginals(&self, at: u32, turns: &[(u32, f64, f64)]) -> ((f64, f64), Vec<(f64, f64)>) {
+        let keys: Vec<(Key, f64, f64)> = turns
+            .iter()
+            .map(|&(s, n, w)| (self.nodes[s as usize].key, n, w))
+            .collect();
+        let sum = |k: &Key| {
+            keys.iter()
+                .filter(|t| t.0.includes(k))
+                .fold((0.0, 0.0), |a, t| (a.0 + t.1, a.1 + t.2))
+        };
+        let nd = &self.nodes[at as usize];
+        let per = nd
+            .kids
+            .iter()
+            .map(|k| sum(&nd.key.with(k.var as usize, k.choice)))
+            .collect();
+        (sum(&nd.key), per)
+    }
+
     /// Inner node `at`'s tier-2 record from tier-1 turns `turns` (sink,
     /// visits, summed value for the turn's mover, as in
     /// [`Self::tier1_records`]): each live kid's visits and value summed over
@@ -1871,28 +1895,17 @@ impl Lattice {
             self.kill(at)?;
             return Ok(None);
         }
-        let keys: Vec<(Key, f64, f64)> = turns
-            .iter()
-            .map(|&(s, n, w)| (self.nodes[s as usize].key, n, w))
-            .collect();
-        let sum = |k: &Key| {
-            keys.iter()
-                .filter(|t| t.0.includes(k))
-                .fold((0.0, 0.0), |a, t| (a.0 + t.1, a.1 + t.2))
-        };
         let nd = &self.nodes[at as usize];
         if nd.kind != Kind::Inner || nd.kids.iter().all(|k| k.dead) {
             return Ok(None);
         }
-        let (n, w) = sum(&nd.key);
+        let ((n, w), per) = self.turn_marginals(at, turns);
         let kids: Vec<(u8, u8, f32, f32, f32)> = nd
             .kids
             .iter()
-            .filter(|k| !k.dead)
-            .map(|k| {
-                let (kn, kw) = sum(&nd.key.with(k.var as usize, k.choice));
-                (k.cell, k.choice, kn as f32, ret_mean(kn, kw), kn as f32)
-            })
+            .zip(per)
+            .filter(|(k, _)| !k.dead)
+            .map(|(k, (kn, kw))| (k.cell, k.choice, kn as f32, ret_mean(kn, kw), kn as f32))
             .collect();
         Ok(Some(T2Record {
             node: nd.state.clone(),

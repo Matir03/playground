@@ -1140,14 +1140,7 @@ impl Worker<'_> {
                 *recorded = t1.root_at;
             }
             let at = t1.root_at;
-            let turns: Vec<(u32, f64, f64)> = t1.nodes[0]
-                .children
-                .iter()
-                .map(|&c| {
-                    let ch = &t1.nodes[c as usize];
-                    (ch.sink, f64::from(ch.n), f64::from(ch.n) - ch.w)
-                })
-                .collect();
+            let turns = t1.turns(0);
             let lat = t1.nodes[0].lattice.as_mut().expect("the root's lattice");
             if lat.nodes[at as usize].kind == Kind::Sink {
                 let found = t1.nodes[0]
@@ -1226,14 +1219,7 @@ impl Worker<'_> {
     /// turn lies below; the net expands such nodes first) with the step
     /// noise, down to a complete turn, which is played.
     fn step_pick(&mut self, t1: &mut Tier1, cur: &mut u32, trail: &mut Vec<(u32, bool)>) -> Result<Next> {
-        let turns: Vec<(u32, f64, f64)> = t1.nodes[0]
-            .children
-            .iter()
-            .map(|&c| {
-                let ch = &t1.nodes[c as usize];
-                (ch.sink, f64::from(ch.n), f64::from(ch.n) - ch.w)
-            })
-            .collect();
+        let turns = t1.turns(0);
         loop {
             let at = *cur;
             let lat = t1.nodes[0].lattice.as_mut().expect("the root's lattice");
@@ -1467,15 +1453,7 @@ impl Worker<'_> {
             }
         } else if self.cfg.t2_from_t1 {
             if let Some(mut lat) = t1.nodes[0].lattice.take() {
-                let turns: Vec<(u32, f64, f64)> = t1.nodes[0]
-                    .children
-                    .iter()
-                    .map(|&c| {
-                        let ch = &t1.nodes[c as usize];
-                        // The child's value is its own mover's.
-                        (ch.sink, f64::from(ch.n), f64::from(ch.n) - ch.w)
-                    })
-                    .collect();
+                let turns = t1.turns(0);
                 let target = t1.nodes[pick as usize].sink;
                 let recs = lat.tier1_records(&turns, target, &mut self.rng)?;
                 for r in &recs {

@@ -269,10 +269,9 @@ fn lat_node(s: &mut Search, tn: u32, n: u32) -> anyhow::Result<Value> {
     let t =
         s.t.as_mut()
             .ok_or_else(|| anyhow::anyhow!("no tier-1 search"))?;
-    let nd = t
-        .nodes
-        .get_mut(tn as usize)
-        .ok_or_else(|| anyhow::anyhow!("no tier-1 node {tn}"))?;
+    anyhow::ensure!((tn as usize) < t.nodes.len(), "no tier-1 node {tn}");
+    let turns = t.turns(tn);
+    let nd = &mut t.nodes[tn as usize];
     let l = nd
         .lattice
         .as_mut()
@@ -282,13 +281,16 @@ fn lat_node(s: &mut Search, tn: u32, n: u32) -> anyhow::Result<Value> {
     let st = inner.then(|| l.stats(n));
     let node = &l.nodes[n as usize];
     let state = &node.state;
+    // "turns": the tier-1 turns through each commitment, as generation
+    // computes them (Lattice::turn_marginals).
+    let ((mn, mw), marg) = l.turn_marginals(n, &turns);
     let kids: Vec<Value> = node
         .kids
         .iter()
         .enumerate()
         .map(|(k, kid)| {
             let (kn, kw) = st.as_ref().map_or((0.0, 0.0), |s| s.kids[k]);
-            let (sn, sw) = st.as_ref().map_or((0.0, 0.0), |s| s.skids[k]);
+            let (sn, sw) = marg[k];
             json!({
                 "k": k,
                 "var": kid.var,
@@ -321,8 +323,8 @@ fn lat_node(s: &mut Search, tn: u32, n: u32) -> anyhow::Result<Value> {
         "decided": node.key.mask.count_ones(),
         "n": st.as_ref().map(|s| s.n),
         "q": st.as_ref().and_then(|s| (s.n > 0.0).then(|| s.w / s.n)),
-        "sn": st.as_ref().map(|s| s.sn),
-        "sq": st.as_ref().and_then(|s| (s.sn > 0.0).then(|| s.sw / s.sn)),
+        "sn": mn,
+        "sq": (mn > 0.0).then(|| mw / mn),
         "value": node.value,
         "board": board_hex(&board_of(state, false)),
         "kids": kids,
