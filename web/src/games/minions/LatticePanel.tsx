@@ -109,6 +109,8 @@ const boardState = (hex: string): GameState =>
 // ── bits ─────────────────────────────────────────────────────────────────────
 
 const pct = (v: number | null | undefined) => (v == null ? "–" : `${(100 * v).toFixed(1)}%`);
+/** A value: the expected result for the side to move, 0 (loss) to 1 (win). */
+const val = (v: number | null | undefined) => (v == null ? "–" : v.toFixed(3));
 
 /** A value cell: the number, hued from red (0) through amber to green (1). */
 function Val({ v, title }: { v: number | null | undefined; title?: string }) {
@@ -118,7 +120,7 @@ function Val({ v, title }: { v: number | null | undefined; title?: string }) {
   const h = 120 * Math.max(0, Math.min(1, (t - 0.3) / 0.4));
   return (
     <span style={{ color: `hsl(${h}, 70%, 34%)`, fontVariantNumeric: "tabular-nums", fontWeight: 500 }} title={title}>
-      {pct(v)}
+      {val(v)}
     </span>
   );
 }
@@ -369,8 +371,8 @@ export function LatticePanel({ state, auto = false }: { state: GameState | null;
                   <tr>
                     <th style={th}>turn</th>
                     <th style={th} title="visit share (blue) over prior (gold)">visits</th>
-                    <th style={th} title="search value for this node's mover">Q</th>
-                    <th style={th} title="the turn's static (net) value">net</th>
+                    <th style={th} title="search value: the mean of every value backed up through this turn, 0 = loss .. 1 = win for the side choosing it">Q</th>
+                    <th style={th} title="the net's own value of the position after this turn (no search), 0 = loss .. 1 = win for the side choosing it">net</th>
                     <th style={th}></th>
                   </tr>
                 </thead>
@@ -469,9 +471,9 @@ export function LatticePanel({ state, auto = false }: { state: GameState | null;
                           <tr>
                             <th style={th}>{g.ks[0].cell}</th>
                             <th style={th} title="visit share in this variable (blue) over the prior (gold)">prior / visits</th>
-                            <th style={th} title="search value (intermediate values included)">Q</th>
-                            <th style={th} title="mean of the complete turns found containing it (the training target), and how many">turns</th>
-                            <th style={th} title="the net's own value for it">net</th>
+                            <th style={th} title="tier-2 search value: the mean of the values backed up through this commitment (the net's partial-turn values included), 0 = loss .. 1 = win for the side to move">Q</th>
+                            <th style={th} title="the mean value of the complete turns found that contain this commitment (the training target), and how many">turns</th>
+                            <th style={th} title="the net's own value of the partial turn with this commitment added (no search)">net</th>
                           </tr>
                         </thead>
                         <tbody>

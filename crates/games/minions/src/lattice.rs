@@ -1700,6 +1700,22 @@ pub struct Rooted {
 }
 
 impl Rooted {
+    /// The complete turns its descents reached: (sink, descents, mean value
+    /// for the lattice's mover), in order of first arrival.
+    pub fn reached(&self) -> Vec<(u32, u32, f64)> {
+        let mut out: Vec<(u32, u32, f64)> = Vec::new();
+        for &(s, v) in &self.sinks {
+            match out.iter_mut().find(|x| x.0 == s) {
+                Some(x) => {
+                    x.2 = (x.2 * f64::from(x.1) + f64::from(v)) / f64::from(x.1 + 1);
+                    x.1 += 1;
+                }
+                None => out.push((s, 1, f64::from(v))),
+            }
+        }
+        out
+    }
+
     pub fn new(at: u32) -> Self {
         Rooted {
             at,

@@ -796,6 +796,15 @@ enum Cmd {
         /// time, a full search at each (latgen::GenConfig::stepwise).
         #[arg(long)]
         stepwise: bool,
+        /// Anchored turn choice: the played turn is drawn from a rooted
+        /// search at a random node on the path to the picked turn
+        /// (latgen::GenConfig::anchor).
+        #[arg(long)]
+        anchor: bool,
+        /// Every game starts at the initial position (no openings; any
+        /// --pool is ignored and left as it is).
+        #[arg(long)]
+        from_start: bool,
         /// Stepwise with a full search at each commitment (else: one search a
         /// turn, then commitments sampled from its marginals).
         #[arg(long)]
@@ -1727,7 +1736,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::LatticeGen {
             out, onnx, ep, batcher, workers, games, n1, inflight, n2, c1, c2, pw_c, pw_alpha, retries,
-            temp1, stepwise, step_search, step_n1, step_temp, step_dir_alpha, step_dir_frac, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, start_turn_mean, secs,
+            temp1, anchor, from_start, stepwise, step_search, step_n1, step_temp, step_dir_alpha, step_dir_frac, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, start_turn_mean, secs,
             target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, sd_frac, sd_descents, sd_tau, rooted_frac, rooted_n, rooted_min, rooted_tau, rooted_secs, rooted_tasks, rooted_inflight, rooted_budget, walk_accumulated, sink_values, walk_inflight, walk_marginal, walk_cq, lview, energy_min_visits, teacher_view, energy_prior, energy_temp, value_prior_tau, pipeline, openings, open_workers, pool, refill_to,
         } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
@@ -1787,9 +1796,11 @@ async fn main() -> anyhow::Result<()> {
                 teacher_view,
                 pipeline,
                 openings,
-                pool,
+                pool: if from_start { None } else { pool },
                 refill_to,
                 rooted_frac,
+                anchor,
+                from_start,
                 stepwise,
                 step_search,
                 step_n1,

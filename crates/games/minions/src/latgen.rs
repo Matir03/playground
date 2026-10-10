@@ -155,6 +155,16 @@ pub struct GenConfig {
     /// search is restricted to the turns below. Forced variables are
     /// committed without a search. Replaces the walks and the rooted phase.
     pub stepwise: bool,
+    /// Anchored turn choice (the user's design, 2026-10-10): after the
+    /// search, a turn is picked as usual (visits, temp1, Dirichlet) and
+    /// one node of a random path to it in the searched lattice is the
+    /// anchor. A rooted search runs there (its record a tier-2 target),
+    /// and the played turn is drawn from the complete turns it reached
+    /// (descents, temp1, Dirichlet). The path's other nodes go to the
+    /// rooted phase with probability `rooted_frac`, as before.
+    pub anchor: bool,
+    /// Every game starts at the initial position (no openings, no pool).
+    pub from_start: bool,
     /// Stepwise with a search at each commitment (above). Off (the default
     /// since 2026-10-10, user): one search a turn, then the turn is chosen
     /// by stepping down its lattice, each commitment sampled from the
@@ -279,6 +289,8 @@ pub struct GenCounters {
     pub rooted_done: AtomicU64,
     /// Stepwise self-play: commitments sampled (forced ones not counted).
     pub steps: AtomicU64,
+    /// Anchored turn choice: rooted searches the played turn came from.
+    pub anchors: AtomicU64,
     pub rooted_unreached: AtomicU64,
     pub rooted_abandoned: AtomicU64,
 }
@@ -310,6 +322,14 @@ enum Task {
     Rooted {
         lat: Lattice,
         r: Rooted,
+    },
+    /// Anchored turn choice: the rooted search whose turns the played turn
+    /// is drawn from; `fallback` (the turn picked from the full search,
+    /// and whether it ends the game) if it reaches none.
+    Anchor {
+        lat: Lattice,
+        r: Rooted,
+        fallback: (StepState, bool),
     },
 }
 
@@ -590,7 +610,10 @@ fn pick_ordinal(vals: &[f32], rng: &mut impl Rng) -> usize {
 fn lat_of(task: &Task, t1: u32) -> &Lattice {
     match task {
         Task::Search { t1: s, .. } => s.lattice(t1),
-        Task::Opening { lat, .. } | Task::Walk { lat, .. } | Task::Rooted { lat, .. } => lat,
+        Task::Opening { lat, .. }
+        | Task::Walk { lat, .. }
+        | Task::Rooted { lat, .. }
+        | Task::Anchor { lat, .. } => lat,
     }
 }
 
@@ -614,6 +637,12 @@ struct Worker<'a> {
 
 impl Worker<'_> {
     fn new_game(&mut self) -> Result<Task> {
+        if self.cfg.from_start && self.collect.is_none() {
+            self.c.games.fetch_add(1, Relaxed);
+            let salt: u64 = self.rng.gen();
+            let s = StepState::begin(&crate::game::MinionsState::with_bid(self.bid), salt);
+            return self.start(s, 0);
+        }
         if self.collect.is_none() {
             self.c.games.fetch_add(1, Relaxed);
             if let Some(s) = self.pool.and_then(|p| p.lock().unwrap().pop()) {
@@ -817,6 +846,48 @@ impl Worker<'_> {
                     .t2_records
                     .fetch_add(walk.records.len() as u64, Relaxed);
                 Ok(Next::Replace(Vec::new()))
+            }
+            Task::Anchor { lat, r, fallback } => {
+                let mut needs = Vec::new();
+                if !lat.advance_rooted(r, &self.cfg.rooted, &mut needs)? {
+                    return Ok(Next::Wait(
+                        needs
+                            .into_iter()
+                            .map(|n| match n {
+                                Need::Expand(n) => Req::Expand { t1: NONE, n },
+                                Need::Value(n) => Req::LatValue { n },
+                                _ => unreachable!("searches only hand out requests"),
+                            })
+                            .collect(),
+                    ));
+                }
+                if let Some(rec) = r.record.take() {
+                    encode_t2(&lat.start, &rec, &mut self.t2w, self.cfg.lview)?;
+                    self.view_targets(&rec)?;
+                    self.c.t2_records.fetch_add(1, Relaxed);
+                    self.c.anchors.fetch_add(1, Relaxed);
+                }
+                let reached = r.reached();
+                let (s, end) = if reached.is_empty() {
+                    fallback.clone()
+                } else {
+                    let w: Vec<f64> = reached.iter().map(|x| f64::from(x.1)).collect();
+                    let i = noisy_pick(
+                        &w,
+                        self.cfg.temp1,
+                        self.cfg.dir1_alpha,
+                        self.cfg.dir1_frac,
+                        &mut self.rng,
+                    );
+                    let sn = &lat.nodes[reached[i].0 as usize];
+                    (sn.state.clone(), sn.terminal)
+                };
+                let next = if end || s.is_terminal() {
+                    self.new_game()?
+                } else {
+                    self.search(s, None)
+                };
+                Ok(Next::Replace(vec![next]))
             }
             Task::Rooted { lat, r } => {
                 let mut needs = Vec::new();
@@ -1272,6 +1343,52 @@ impl Worker<'_> {
         Ok(Next::Replace(vec![next]))
     }
 
+    /// Anchored turn choice ([`GenConfig::anchor`]): the rooted search at a
+    /// random node of a random path to the picked turn `pick` (the path's
+    /// other nodes queued for the rooted phase). None: no such path.
+    fn anchor_task(&mut self, t1: &mut Tier1, pick: u32) -> Result<Option<Task>> {
+        let ch = &t1.nodes[pick as usize];
+        let fallback = (ch.state.clone(), ch.terminal.is_some());
+        let target = ch.sink;
+        let Some(mut lat) = t1.nodes[0].lattice.take() else {
+            return Ok(None);
+        };
+        let nodes = lat.path_to(target, &mut self.rng)?;
+        if nodes.is_empty() {
+            return Ok(None);
+        }
+        let a = self.rng.gen_range(0..nodes.len());
+        let key = lat.nodes[nodes[a] as usize].key;
+        if let (true, Some(q)) = (self.cfg.rooted_frac > 0.0, self.rooted_q) {
+            let f = self.cfg.rooted_frac;
+            let rest: Vec<u32> = nodes
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i != a && self.rng.gen::<f64>() < f)
+                .map(|(_, &n)| n)
+                .collect();
+            self.c.rooted_queued.fetch_add(rest.len() as u64, Relaxed);
+            let mut q = q.lock().unwrap();
+            for n in rest {
+                q.push((lat.start.clone(), lat.nodes[n as usize].key));
+            }
+        }
+        // From scratch, as the rooted phase searches.
+        let mut fresh = Lattice::new(lat.start.clone())?;
+        if fresh.terminal.is_some() {
+            return Ok(None);
+        }
+        let Some(at) = fresh.reach(key)? else {
+            self.c.rooted_unreached.fetch_add(1, Relaxed);
+            return Ok(None);
+        };
+        Ok(Some(Task::Anchor {
+            lat: fresh,
+            r: Rooted::new(at),
+            fallback,
+        }))
+    }
+
     /// Root visits for a search after a turn's first.
     fn step_budget(&self) -> u32 {
         if self.cfg.step_n1 > 0 {
@@ -1316,7 +1433,12 @@ impl Worker<'_> {
             &mut self.rng,
         )];
         let mut out = Vec::with_capacity(2);
-        if self.cfg.distill_tau > 0.0 {
+        if self.cfg.anchor {
+            if let Some(task) = self.anchor_task(t1, pick)? {
+                return Ok(Next::Replace(vec![task]));
+            }
+            // No path to the picked turn: play it.
+        } else if self.cfg.distill_tau > 0.0 {
             // Distilling: the expansions are the tier-2 records.
         } else if self.cfg.rooted_frac > 0.0 {
             if let (Some(mut lat), Some(q)) = (t1.nodes[0].lattice.take(), self.rooted_q) {
@@ -1520,7 +1642,7 @@ impl Worker<'_> {
                         &s.lattice(t1).nodes[n as usize].state
                     }
                 }
-                (Req::LatValue { n }, Task::Walk { lat, .. } | Task::Rooted { lat, .. }) => {
+                (Req::LatValue { n }, Task::Walk { lat, .. } | Task::Rooted { lat, .. } | Task::Anchor { lat, .. }) => {
                     &lat.nodes[n as usize].state
                 }
                 _ => unreachable!("request and task disagree"),
@@ -1582,7 +1704,10 @@ impl Worker<'_> {
             }
             match &mut tasks[ti] {
                 Task::Search { t1: s, .. } => s.feed_expand(t1, n, &outs[j]),
-                Task::Opening { lat, .. } | Task::Walk { lat, .. } | Task::Rooted { lat, .. } => {
+                Task::Opening { lat, .. }
+                | Task::Walk { lat, .. }
+                | Task::Rooted { lat, .. }
+                | Task::Anchor { lat, .. } => {
                     lat.feed_expand(n, &outs[j])
                 }
             }
@@ -1606,7 +1731,7 @@ impl Worker<'_> {
                         s.feed_sink_value(t1, n, &vals[j]);
                     }
                 }
-                (Req::LatValue { n }, Task::Walk { lat, .. } | Task::Rooted { lat, .. }) => {
+                (Req::LatValue { n }, Task::Walk { lat, .. } | Task::Rooted { lat, .. } | Task::Anchor { lat, .. }) => {
                     lat.feed_value(n, &vals[j])
                 }
                 _ => unreachable!(),
@@ -1741,7 +1866,9 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
         Some(p) => load_pool(p)?,
         None => Vec::new(),
     };
-    let n_open = if cfg.refill_to > 0 {
+    let n_open = if cfg.from_start {
+        0
+    } else if cfg.refill_to > 0 {
         cfg.refill_to.saturating_sub(loaded.len())
     } else if cfg.pool.is_some() {
         0
@@ -1850,12 +1977,13 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
                 let ev = c.eval_ns.load(Relaxed) as f64;
                 let cpu = c.cpu_ns.load(Relaxed) as f64;
                 eprintln!(
-                    "  {el:.0}s: games {} ({} pooled) turns {} (+{} opening, {} steps), t1 {} ({} views) t2 {} ({:.0}/s), expansions {:.0}/s ({:.1} kids), values {:.0}/s, eval share {:.0}%, rounds {}",
+                    "  {el:.0}s: games {} ({} pooled) turns {} (+{} opening, {} steps, {} anchors), t1 {} ({} views) t2 {} ({:.0}/s), expansions {:.0}/s ({:.1} kids), values {:.0}/s, eval share {:.0}%, rounds {}",
                     c.games.load(Relaxed),
                     c.pooled.load(Relaxed),
                     c.turns.load(Relaxed),
                     c.opening_turns.load(Relaxed),
                     c.steps.load(Relaxed),
+                    c.anchors.load(Relaxed),
                     c.t1_records.load(Relaxed),
                     c.view_records.load(Relaxed),
                     t2r,
