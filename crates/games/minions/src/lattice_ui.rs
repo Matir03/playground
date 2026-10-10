@@ -42,6 +42,8 @@ static SEAT: Mutex<Option<Arc<LatticePlay>>> = Mutex::new(None);
 static KEPT: Mutex<VecDeque<Arc<Mutex<Search>>>> = Mutex::new(VecDeque::new());
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static LAST_SEAT: AtomicU64 = AtomicU64::new(0);
+/// The search in progress (or the last one), as `/live` serves it.
+static LIVE: Mutex<Option<Value>> = Mutex::new(None);
 const KEEP: usize = 8;
 
 pub struct Search {
@@ -95,8 +97,21 @@ pub fn search(real: &MinionsState, n1: u32) -> anyhow::Result<Arc<Mutex<Search>>
         s.kill = Some(end);
     } else {
         let mut t = Tier1::new(start, play.params.clone());
-        t.run_inflight(play.eval.as_ref(), n1, play.inflight)?;
+        // In chunks, publishing the search as it goes (`/live`).
+        let chunk = (8 * play.inflight.max(1) as u32).max(16);
+        let (mut done, mut shown) = (0u32, std::time::Instant::now());
+        *LIVE.lock().unwrap() = Some(live_json(&t, &s, 0, true, t0));
+        while done < n1 && t.nodes[0].terminal.is_none() {
+            let k = chunk.min(n1 - done);
+            t.run_inflight(play.eval.as_ref(), k, play.inflight)?;
+            done += k;
+            if shown.elapsed().as_millis() >= 150 {
+                shown = std::time::Instant::now();
+                *LIVE.lock().unwrap() = Some(live_json(&t, &s, done, true, t0));
+            }
+        }
         s.chosen = t.best_child();
+        *LIVE.lock().unwrap() = Some(live_json(&t, &s, done, false, t0));
         s.t = Some(t);
     }
     s.ms = t0.elapsed().as_millis() as u64;
@@ -127,6 +142,58 @@ pub fn plan(
         .ok_or_else(|| anyhow::anyhow!("no turn found\n{}", real.render()))?;
     let actions = crate::steps::turn_actions(real, &t.nodes[c as usize].state.done)?;
     Ok((actions, 2.0 * t.root_value() - 1.0))
+}
+
+/// A search in progress: visits so far, the root's turns (most visited
+/// first) and the latest visits' paths, turn by turn.
+fn live_json(t: &Tier1, s: &Search, done: u32, running: bool, t0: std::time::Instant) -> Value {
+    let root = &t.nodes[0];
+    let pri = t.priors(0);
+    let mut kids: Vec<(usize, u32)> = root.children.iter().copied().enumerate().collect();
+    kids.sort_by_key(|&(_, c)| std::cmp::Reverse(t.nodes[c as usize].n));
+    let label = |c: u32| {
+        let ch = &t.nodes[c as usize];
+        turn_label(&t.nodes[ch.parent as usize].state, &ch.state)
+    };
+    let children: Vec<Value> = kids
+        .iter()
+        .take(24)
+        .map(|&(i, c)| {
+            let ch = &t.nodes[c as usize];
+            json!({
+                "t": c,
+                "label": label(c),
+                "n": ch.n,
+                "q": (ch.n > 0).then(|| 1.0 - ch.q()),
+                "prior": pri.get(i),
+            })
+        })
+        .collect();
+    let recent: Vec<Value> = t
+        .recent
+        .iter()
+        .rev()
+        .map(|(path, v)| {
+            json!({
+                "path": path[1..].iter().map(|&c| label(c)).collect::<Vec<_>>(),
+                "value": v,
+            })
+        })
+        .collect();
+    json!({
+        "id": s.id,
+        "running": running,
+        "visits": done,
+        "n1": s.n1,
+        "ms": t0.elapsed().as_millis() as u64,
+        "turn": s.real.turn,
+        "side": s.real.side,
+        "q": (root.n > 0).then(|| t.root_value()),
+        "turns": root.children.len(),
+        "t1_nodes": t.nodes.len(),
+        "children": children,
+        "recent": recent,
+    })
 }
 
 fn find(id: u64) -> anyhow::Result<Arc<Mutex<Search>>> {
@@ -340,6 +407,7 @@ fn handle(path: &str, q: &HashMap<String, String>) -> anyhow::Result<Value> {
     };
     match path {
         "/last" => Ok(json!({ "id": LAST_SEAT.load(Relaxed) })),
+        "/live" => Ok(LIVE.lock().unwrap().clone().unwrap_or(Value::Null)),
         "/analyze" => {
             let real = Minions::decode_state(&unhex(q.get("state").map_or("", |s| s.as_str()))?)?;
             let n1 = q

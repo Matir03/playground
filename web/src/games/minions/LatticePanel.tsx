@@ -155,6 +155,102 @@ function Crumbs({ items, onPick }: { items: string[]; onPick: (i: number) => voi
   );
 }
 
+// ── the live view ────────────────────────────────────────────────────────────
+
+interface Live {
+  id: number;
+  running: boolean;
+  visits: number;
+  n1: number;
+  ms: number;
+  turn: number;
+  side: number;
+  q: number | null;
+  turns: number;
+  t1_nodes: number;
+  children: { t: number; label: string; n: number; q: number | null; prior: number | null }[];
+  /** Newest first: each visit's turns from the root, and its value for the
+   *  root's mover. */
+  recent: { path: string[]; value: number }[];
+}
+
+/** The search in progress (the net's move or an analysis), polled while it
+ *  runs: the root's turns as their visits grow, and the latest visits' paths
+ *  down the tree, turn by turn. */
+function LiveSearch() {
+  const [live, setLive] = useState<Live | null>(null);
+  useEffect(() => {
+    let stop = false;
+    const tick = async () => {
+      try {
+        const l = await api<Live | null>("/live");
+        if (!stop) setLive(l);
+      } catch {
+        // Not serving: nothing to show.
+      }
+    };
+    void tick();
+    const h = setInterval(() => void tick(), 300);
+    return () => {
+      stop = true;
+      clearInterval(h);
+    };
+  }, []);
+  if (!live || !live.running) return null;
+  const top = Math.max(1, ...live.children.map((c) => c.n));
+  return (
+    <div style={{ border: "1px solid #c7d2fe", background: "#f5f7ff", borderRadius: 8, padding: "0.5rem 0.75rem", marginBottom: 10 }}>
+      <div style={{ fontSize: 13, marginBottom: 6 }}>
+        <strong>Searching</strong> turn {live.turn},{" "}
+        <span style={{ color: SIDE_FILL[live.side], fontWeight: 600 }}>{live.side === 0 ? "yellow" : "blue"}</span> to move ·{" "}
+        {live.visits} / {live.n1} visits · {(live.ms / 1000).toFixed(1)} s · value <Val v={live.q} /> · {live.turns} turns found,{" "}
+        {live.t1_nodes} searched
+      </div>
+      <Bar share={live.visits / Math.max(1, live.n1)} width={300} color="#6366f1" />
+      <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", marginTop: 8 }}>
+        <table style={{ borderCollapse: "collapse", fontSize: 12, flex: "1 1 340px" }}>
+          <thead>
+            <tr>
+              <th style={th}>turn</th>
+              <th style={th}>visits</th>
+              <th style={th} title="search value, 0 = loss .. 1 = win for the side to move">Q</th>
+            </tr>
+          </thead>
+          <tbody>
+            {live.children.slice(0, 12).map((c) => (
+              <tr key={c.t}>
+                <td style={{ ...td, whiteSpace: "normal", maxWidth: 260 }}>{c.label}</td>
+                <td style={td}>
+                  <Bar share={c.n / top} ghost={c.prior} width={70} /> {c.n}
+                </td>
+                <td style={td}>
+                  <Val v={c.q} />
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <div style={{ flex: "1 1 300px", fontSize: 12 }}>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>latest visits (newest first)</div>
+          {live.recent.slice(0, 10).map((r, i) => (
+            <div key={i} style={{ marginBottom: 3, opacity: 1 - i * 0.06 }}>
+              <Val v={r.value} />{" "}
+              {r.path.map((p, d) => (
+                <span key={d}>
+                  {d > 0 && <span style={{ color: "#999" }}> › </span>}
+                  <span style={{ color: d % 2 === 0 ? SIDE_FILL[live.side] : SIDE_FILL[1 - live.side], fontWeight: d === r.path.length - 1 ? 600 : 400 }}>
+                    {p.length > 48 ? p.slice(0, 48) + "…" : p}
+                  </span>
+                </span>
+              ))}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── the panel ────────────────────────────────────────────────────────────────
 
 /** `auto` (analysis): search `state` whenever it changes, instead of
@@ -343,6 +439,7 @@ export function LatticePanel({ state, auto = false }: { state: GameState | null;
           </span>
         )}
       </div>
+      <LiveSearch />
       {error && <div style={{ color: "#b03030", fontSize: 13, marginBottom: 6 }}>{error}</div>}
       {!summary && !error && (
         <div style={{ fontSize: 13, color: "#777" }}>

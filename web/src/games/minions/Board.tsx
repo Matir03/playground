@@ -638,7 +638,10 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                   maxMillis: mover === "net" ? 20000 : 1000,
                 }),
               }),
-              { signal: AbortSignal.any([ac.signal, AbortSignal.timeout(30000)]) },
+              // The lattice seat searches a fixed visit count, however long
+              // that takes (minutes at large counts): only a hung engine
+              // should time out.
+              { signal: AbortSignal.any([ac.signal, AbortSignal.timeout(mover === "net" ? 1800000 : 30000)]) },
             )) {
               if (prog.kind.case === "stats") {
                 const st = prog.kind.value;

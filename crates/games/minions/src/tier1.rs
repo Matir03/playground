@@ -102,6 +102,8 @@ pub struct T1Stats {
 /// way (node, tier-2 descent, retries used).
 pub struct Visit {
     path: Vec<u32>,
+    /// Counted in [`Tier1::root_inflight`].
+    counted: bool,
     widen: Option<(u32, Cursor, u32)>,
     /// Expansions the current widening has requested.
     work: u32,
@@ -140,6 +142,12 @@ pub struct Tier1 {
     pub root_dead: bool,
     /// Per restriction: the previous `root_at`, children, n and w.
     stash: Vec<(u32, Vec<u32>, u32, f64)>,
+    /// Visits in flight. Below the root a node's visits count the ones in
+    /// flight through it (virtual loss); the root's widening counts these.
+    root_inflight: u32,
+    /// The latest visits backed up: their paths and values for the root's
+    /// mover (newest last; the UI's live view).
+    pub recent: std::collections::VecDeque<(Vec<u32>, f64)>,
 }
 
 impl Tier1 {
@@ -166,6 +174,8 @@ impl Tier1 {
             root_at: 0,
             root_dead: false,
             stash: Vec::new(),
+            root_inflight: 0,
+            recent: Default::default(),
         }
     }
 
@@ -245,6 +255,7 @@ impl Tier1 {
     pub fn visit(&self) -> Visit {
         Visit {
             path: vec![0],
+            counted: false,
             widen: None,
             work: 0,
         }
@@ -386,12 +397,28 @@ impl Tier1 {
             nd.w += v;
             v = 1.0 - v;
         }
+        if self.recent.len() >= 16 {
+            self.recent.pop_front();
+        }
+        self.recent.push_back((path.to_vec(), 1.0 - v));
+    }
+
+    /// The visits node `t`'s widening threshold counts: its own, which
+    /// below the root include those in flight through it, and at the root
+    /// the other visits in flight (a serial search would have finished them).
+    fn pw_visits(&self, t: u32) -> u32 {
+        let n = self.nodes[t as usize].n;
+        if t == 0 {
+            n + self.root_inflight.saturating_sub(1)
+        } else {
+            n
+        }
     }
 
     fn wants_widen(&self, t: u32) -> bool {
         let nd = &self.nodes[t as usize];
         let p = &self.params;
-        let k = (f64::from(p.pw_c) * f64::from(nd.n.max(1)).powf(f64::from(p.pw_alpha))).ceil();
+        let k = (f64::from(p.pw_c) * f64::from(self.pw_visits(t).max(1)).powf(f64::from(p.pw_alpha))).ceil();
         !nd.widen_done && ((nd.children.len() + nd.widening as usize) as f64) < k
     }
 
@@ -402,7 +429,7 @@ impl Tier1 {
     fn short_of_turns(&self, t: u32) -> bool {
         let nd = &self.nodes[t as usize];
         let p = &self.params;
-        let k = (f64::from(p.pw_c) * f64::from(nd.n.max(1)).powf(f64::from(p.pw_alpha))).ceil();
+        let k = (f64::from(p.pw_c) * f64::from(self.pw_visits(t).max(1)).powf(f64::from(p.pw_alpha))).ceil();
         nd.widening > 0 && !nd.widen_done && (nd.children.len() as f64) < k
     }
 
@@ -420,6 +447,9 @@ impl Tier1 {
     }
 
     fn end_visit(&mut self, vis: &Visit) {
+        if vis.counted {
+            self.root_inflight -= 1;
+        }
         for &t in &vis.path[1..] {
             self.virtual_loss(t, -1.0);
         }
@@ -469,6 +499,10 @@ impl Tier1 {
             }
             self.root_pending = true;
             return Ok(Need1::NodeValue { t: 0 });
+        }
+        if !vis.counted {
+            vis.counted = true;
+            self.root_inflight += 1;
         }
         loop {
             if let Some((wt, cur, _)) = vis.widen.as_mut() {

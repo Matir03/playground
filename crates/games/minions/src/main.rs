@@ -66,11 +66,11 @@ enum Cmd {
         lattice_net: Option<String>,
         #[arg(long, default_value_t = 400)]
         lattice_n1: u32,
-        /// Tier-1 visits in flight per search of the lattice seat. More
-        /// than 1 races progressive widening: visits pile onto the first
-        /// turns found whatever their value (2026-10-10: 64 put 79 of 400
-        /// visits on turns with Q < 0.3, 1 put 6).
-        #[arg(long, default_value_t = 1)]
+        /// Tier-1 visits in flight per search of the lattice seat. Before
+        /// the widening fix (visits wait for a pending widening; the root
+        /// counts its visits in flight) 64 put 79 of 400 visits on turns
+        /// with Q < 0.3 (serial: 6); with it, 16 put 8 and 64 put 19.
+        #[arg(long, default_value_t = 32)]
         lattice_inflight: usize,
         /// Where the lattice panel's JSON is served (web: /latapi).
         #[arg(long, default_value = "127.0.0.1:7107")]
@@ -658,7 +658,7 @@ enum Cmd {
         /// B's tier-1 visits, if different from A's.
         #[arg(long)]
         n1_b: Option<u32>,
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 16)]
         lattice_inflight: usize,
         /// Check every candidate option eagerly in the lattices (self-play,
         /// lattice-gen, defers them: `steps::LAZY_WITNESS`). Eager checks gave
@@ -705,7 +705,7 @@ enum Cmd {
         /// `a` as a lattice net directory: tier-1 visits per turn, in flight.
         #[arg(long, default_value_t = 200)]
         n1: u32,
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 16)]
         lattice_inflight: usize,
     },
     /// Check a step-trained MLP's CPU evaluator against its ONNX graph on
