@@ -18,6 +18,12 @@
 //!   (commitments) with prior, net value, visits, search value and the
 //!   complete turns' mean below each.
 //!
+//! - `/live`: the search in progress (or the last): visits, the root's
+//!   turns, the latest visits' paths.
+//! - `/config?n1=&secs=&inflight=`: the seat's budget (visits, or secs > 0
+//!   per move) and tier-1 visits in flight, for the net's moves and
+//!   `/analyze`'s defaults; answers the budget.
+//!
 //! Values are win probabilities in [0, 1] for the mover of the node shown.
 
 use std::collections::{HashMap, VecDeque};
@@ -44,6 +50,30 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static LAST_SEAT: AtomicU64 = AtomicU64::new(0);
 /// The search in progress (or the last one), as `/live` serves it.
 static LIVE: Mutex<Option<Value>> = Mutex::new(None);
+
+/// How the seat searches, set from the panel (`/config`): visits, or (secs
+/// > 0) a time per move, and tier-1 visits in flight. None: the command
+/// line's.
+#[derive(Clone, Copy)]
+pub struct Budget {
+    pub n1: u32,
+    pub secs: f64,
+    pub inflight: usize,
+}
+
+static BUDGET: Mutex<Option<Budget>> = Mutex::new(None);
+
+fn budget() -> anyhow::Result<Budget> {
+    if let Some(b) = *BUDGET.lock().unwrap() {
+        return Ok(b);
+    }
+    let p = seat()?;
+    Ok(Budget {
+        n1: p.n1,
+        secs: 0.0,
+        inflight: p.inflight,
+    })
+}
 const KEEP: usize = 8;
 
 pub struct Search {
@@ -73,8 +103,10 @@ fn seat() -> anyhow::Result<Arc<LatticePlay>> {
         .ok_or_else(|| anyhow::anyhow!("no lattice net configured"))
 }
 
-/// Search `real` with `n1` tier-1 visits and keep the search.
-pub fn search(real: &MinionsState, n1: u32) -> anyhow::Result<Arc<Mutex<Search>>> {
+/// Search `real` with budget `b` and keep the search.
+pub fn search(real: &MinionsState, b: Budget) -> anyhow::Result<Arc<Mutex<Search>>> {
+    // A time budget runs until the clock (visits capped high).
+    let n1 = if b.secs > 0.0 { 10_000_000 } else { b.n1 };
     let play = seat()?;
     let salt = NEXT_ID.load(Relaxed);
     let start = StepState::begin(real, salt);
@@ -98,20 +130,25 @@ pub fn search(real: &MinionsState, n1: u32) -> anyhow::Result<Arc<Mutex<Search>>
     } else {
         let mut t = Tier1::new(start, play.params.clone());
         // In chunks, publishing the search as it goes (`/live`).
-        let chunk = (8 * play.inflight.max(1) as u32).max(16);
+        let inflight = b.inflight.max(1);
+        let chunk = (4 * inflight as u32).max(8);
         let (mut done, mut shown) = (0u32, std::time::Instant::now());
-        *LIVE.lock().unwrap() = Some(live_json(&t, &s, 0, true, t0));
-        while done < n1 && t.nodes[0].terminal.is_none() {
+        *LIVE.lock().unwrap() = Some(live_json(&t, &s, 0, true, t0, b));
+        while done < n1
+            && t.nodes[0].terminal.is_none()
+            && (b.secs <= 0.0 || t0.elapsed().as_secs_f64() < b.secs)
+        {
             let k = chunk.min(n1 - done);
-            t.run_inflight(play.eval.as_ref(), k, play.inflight)?;
+            t.run_inflight(play.eval.as_ref(), k, inflight)?;
             done += k;
             if shown.elapsed().as_millis() >= 150 {
                 shown = std::time::Instant::now();
-                *LIVE.lock().unwrap() = Some(live_json(&t, &s, done, true, t0));
+                *LIVE.lock().unwrap() = Some(live_json(&t, &s, done, true, t0, b));
             }
         }
+        s.n1 = done;
         s.chosen = t.best_child();
-        *LIVE.lock().unwrap() = Some(live_json(&t, &s, done, false, t0));
+        *LIVE.lock().unwrap() = Some(live_json(&t, &s, done, false, t0, b));
         s.t = Some(t);
     }
     s.ms = t0.elapsed().as_millis() as u64;
@@ -129,8 +166,14 @@ pub fn plan(
     real: &MinionsState,
     max_visits: Option<u32>,
 ) -> anyhow::Result<(Vec<MinionsMove>, f64)> {
-    let n1 = max_visits.unwrap_or(seat()?.n1);
-    let s = search(real, n1)?;
+    // The panel's budget when set; else the UI's visits, else the seat's.
+    let mut b = budget()?;
+    if BUDGET.lock().unwrap().is_none() {
+        if let Some(v) = max_visits {
+            b.n1 = v;
+        }
+    }
+    let s = search(real, b)?;
     let s = s.lock().unwrap();
     LAST_SEAT.store(s.id, Relaxed);
     if let Some(end) = &s.kill {
@@ -146,7 +189,7 @@ pub fn plan(
 
 /// A search in progress: visits so far, the root's turns (most visited
 /// first) and the latest visits' paths, turn by turn.
-fn live_json(t: &Tier1, s: &Search, done: u32, running: bool, t0: std::time::Instant) -> Value {
+fn live_json(t: &Tier1, s: &Search, done: u32, running: bool, t0: std::time::Instant, b: Budget) -> Value {
     let root = &t.nodes[0];
     let pri = t.priors(0);
     let mut kids: Vec<(usize, u32)> = root.children.iter().copied().enumerate().collect();
@@ -184,7 +227,9 @@ fn live_json(t: &Tier1, s: &Search, done: u32, running: bool, t0: std::time::Ins
         "id": s.id,
         "running": running,
         "visits": done,
-        "n1": s.n1,
+        "n1": b.n1,
+        "secs": b.secs,
+        "inflight": b.inflight,
         "ms": t0.elapsed().as_millis() as u64,
         "turn": s.real.turn,
         "side": s.real.side,
@@ -408,13 +453,40 @@ fn handle(path: &str, q: &HashMap<String, String>) -> anyhow::Result<Value> {
     match path {
         "/last" => Ok(json!({ "id": LAST_SEAT.load(Relaxed) })),
         "/live" => Ok(LIVE.lock().unwrap().clone().unwrap_or(Value::Null)),
+        "/config" => {
+            // Set any of n1, secs (0: visits), inflight; answer the budget.
+            let mut b = budget()?;
+            let mut set = false;
+            if let Some(v) = q.get("n1").and_then(|v| v.parse::<u32>().ok()) {
+                b.n1 = v.max(1);
+                set = true;
+            }
+            if let Some(v) = q.get("secs").and_then(|v| v.parse::<f64>().ok()) {
+                b.secs = v.max(0.0);
+                set = true;
+            }
+            if let Some(v) = q.get("inflight").and_then(|v| v.parse::<usize>().ok()) {
+                b.inflight = v.clamp(1, 256);
+                set = true;
+            }
+            if set {
+                *BUDGET.lock().unwrap() = Some(b);
+            }
+            Ok(json!({ "n1": b.n1, "secs": b.secs, "inflight": b.inflight }))
+        }
         "/analyze" => {
             let real = Minions::decode_state(&unhex(q.get("state").map_or("", |s| s.as_str()))?)?;
-            let n1 = q
-                .get("n1")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(seat()?.n1);
-            let s = search(&real, n1)?;
+            let mut b = budget()?;
+            if let Some(v) = q.get("n1").and_then(|v| v.parse().ok()) {
+                b.n1 = v;
+            }
+            if let Some(v) = q.get("secs").and_then(|v| v.parse().ok()) {
+                b.secs = v;
+            }
+            if let Some(v) = q.get("inflight").and_then(|v| v.parse().ok()) {
+                b.inflight = v;
+            }
+            let s = search(&real, b)?;
             let s = s.lock().unwrap();
             Ok(summary(&s))
         }

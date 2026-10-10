@@ -172,6 +172,8 @@ interface Live {
   /** Newest first: each visit's turns from the root, and its value for the
    *  root's mover. */
   recent: { path: string[]; value: number }[];
+  secs: number;
+  inflight: number;
 }
 
 /** The search in progress (the net's move or an analysis), polled while it
@@ -203,10 +205,12 @@ function LiveSearch() {
       <div style={{ fontSize: 13, marginBottom: 6 }}>
         <strong>Searching</strong> turn {live.turn},{" "}
         <span style={{ color: SIDE_FILL[live.side], fontWeight: 600 }}>{live.side === 0 ? "yellow" : "blue"}</span> to move ·{" "}
-        {live.visits} / {live.n1} visits · {(live.ms / 1000).toFixed(1)} s · value <Val v={live.q} /> · {live.turns} turns found,{" "}
+        {live.secs > 0 ? `${live.visits} visits` : `${live.visits} / ${live.n1} visits`} ·{" "}
+        {(live.ms / 1000).toFixed(1)}
+        {live.secs > 0 ? ` / ${live.secs}` : ""} s · {live.inflight} in flight · value <Val v={live.q} /> · {live.turns} turns found,{" "}
         {live.t1_nodes} searched
       </div>
-      <Bar share={live.visits / Math.max(1, live.n1)} width={300} color="#6366f1" />
+      <Bar share={live.secs > 0 ? live.ms / 1000 / live.secs : live.visits / Math.max(1, live.n1)} width={300} color="#6366f1" />
       <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", marginTop: 8 }}>
         <table style={{ borderCollapse: "collapse", fontSize: 12, flex: "1 1 340px" }}>
           <thead>
@@ -258,6 +262,32 @@ function LiveSearch() {
 export function LatticePanel({ state, auto = false }: { state: GameState | null; auto?: boolean }) {
   const [follow, setFollow] = useState(!auto);
   const [n1, setN1] = useState(400);
+  /** "visits": n1 tier-1 visits; "time": `secs` per move. */
+  const [mode, setMode] = useState<"visits" | "time">("visits");
+  const [secs, setSecs] = useState(10);
+  const [inflight, setInflight] = useState(32);
+  const [cfgLoaded, setCfgLoaded] = useState(false);
+  // The seat's budget (also the net's moves): read once, then pushed on edit.
+  useEffect(() => {
+    api<{ n1: number; secs: number; inflight: number }>("/config")
+      .then((c) => {
+        setN1(c.n1);
+        setInflight(c.inflight);
+        if (c.secs > 0) {
+          setSecs(c.secs);
+          setMode("time");
+        }
+        setCfgLoaded(true);
+      })
+      .catch(() => {});
+  }, []);
+  useEffect(() => {
+    if (!cfgLoaded) return;
+    const h = setTimeout(() => {
+      void api(`/config?n1=${n1}&secs=${mode === "time" ? secs : 0}&inflight=${inflight}`).catch(() => {});
+    }, 300);
+    return () => clearTimeout(h);
+  }, [cfgLoaded, n1, secs, mode, inflight]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [summary, setSummary] = useState<Summary | null>(null);
@@ -312,7 +342,9 @@ export function LatticePanel({ state, auto = false }: { state: GameState | null;
     setError(null);
     setFollow(false);
     try {
-      const s = await api<Summary>(`/analyze?n1=${n1}&state=${toHex(state.payload)}`);
+      const s = await api<Summary>(
+        `/analyze?n1=${n1}&secs=${mode === "time" ? secs : 0}&inflight=${inflight}&state=${toHex(state.payload)}`,
+      );
       setSummary(s);
       setT1Path(s.root == null ? [] : [{ t: 0, label: `turn ${s.turn}` }]);
       setPreview(null);
@@ -321,7 +353,7 @@ export function LatticePanel({ state, auto = false }: { state: GameState | null;
     } finally {
       setBusy(false);
     }
-  }, [state, n1]);
+  }, [state, n1, secs, mode, inflight]);
 
   // Analysis: search each position put on the board (once per position).
   const [autoDone, setAutoDone] = useState<string | null>(null);
@@ -424,9 +456,26 @@ export function LatticePanel({ state, auto = false }: { state: GameState | null;
         <label style={{ fontSize: 13 }}>
           <input type="checkbox" checked={follow} onChange={(e) => setFollow(e.target.checked)} /> follow the net's moves
         </label>
-        <span style={{ fontSize: 13 }}>
-          tier-1 visits{" "}
-          <input type="number" value={n1} min={10} step={50} onChange={(e) => setN1(Number(e.target.value))} style={{ width: 70 }} />
+        <span style={{ fontSize: 13 }} title="the net's moves and this panel's searches both use these">
+          <select value={mode} onChange={(e) => setMode(e.target.value as "visits" | "time")} style={{ fontSize: 13 }}>
+            <option value="visits">visits</option>
+            <option value="time">seconds</option>
+          </select>{" "}
+          {mode === "visits" ? (
+            <input type="number" value={n1} min={10} step={100} onChange={(e) => setN1(Math.max(1, Number(e.target.value)))} style={{ width: 75 }} />
+          ) : (
+            <input type="number" value={secs} min={0.5} step={1} onChange={(e) => setSecs(Math.max(0.1, Number(e.target.value)))} style={{ width: 60 }} />
+          )}{" "}
+          in flight{" "}
+          <input
+            type="number"
+            value={inflight}
+            min={1}
+            max={256}
+            onChange={(e) => setInflight(Math.min(256, Math.max(1, Number(e.target.value))))}
+            style={{ width: 50 }}
+            title="tier-1 visits searched at once: faster, slightly less serial-like (1 = serial)"
+          />
         </span>
         <button onClick={() => void analyse()} disabled={busy || !state}>
           {busy ? "searching…" : "search this position"}
