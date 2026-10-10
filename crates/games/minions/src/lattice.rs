@@ -1843,6 +1843,69 @@ impl Lattice {
         Ok(out)
     }
 
+    /// Inner node `at`'s tier-2 record from tier-1 turns `turns` (sink,
+    /// visits, summed value for the turn's mover, as in
+    /// [`Self::tier1_records`]): each live kid's visits and value summed over
+    /// the turns including its commitment. None: `at` is a dead end.
+    pub fn marginal_record(&mut self, at: u32, turns: &[(u32, f64, f64)]) -> Result<Option<T2Record>> {
+        if self.nodes[at as usize].kind != Kind::Inner {
+            return Ok(None);
+        }
+        if !self.nodes[at as usize].prepared && !self.prepare(at)? {
+            self.kill(at)?;
+            return Ok(None);
+        }
+        let keys: Vec<(Key, f64, f64)> = turns
+            .iter()
+            .map(|&(s, n, w)| (self.nodes[s as usize].key, n, w))
+            .collect();
+        let sum = |k: &Key| {
+            keys.iter()
+                .filter(|t| t.0.includes(k))
+                .fold((0.0, 0.0), |a, t| (a.0 + t.1, a.1 + t.2))
+        };
+        let nd = &self.nodes[at as usize];
+        if nd.kind != Kind::Inner || nd.kids.iter().all(|k| k.dead) {
+            return Ok(None);
+        }
+        let (n, w) = sum(&nd.key);
+        let kids: Vec<(u8, u8, f32, f32, f32)> = nd
+            .kids
+            .iter()
+            .filter(|k| !k.dead)
+            .map(|k| {
+                let (kn, kw) = sum(&nd.key.with(k.var as usize, k.choice));
+                (k.cell, k.choice, kn as f32, ret_mean(kn, kw), kn as f32)
+            })
+            .collect();
+        Ok(Some(T2Record {
+            node: nd.state.clone(),
+            kids,
+            n: n as f32,
+            q: ret_mean(n, w),
+            ns: n as f32,
+        }))
+    }
+
+    /// Commit kid `k` of `at`: the child node, prepared. None: it is a dead
+    /// end (then killed, and the kid with it).
+    pub fn step_to(&mut self, at: u32, k: usize) -> Result<Option<u32>> {
+        let c = self.child(at, k)?;
+        let nd = &self.nodes[c as usize];
+        let ok = match nd.kind {
+            Kind::Dead => false,
+            Kind::Sink => true,
+            Kind::Inner => nd.prepared || self.prepare(c)?,
+        };
+        if !ok {
+            if self.nodes[c as usize].kind != Kind::Dead {
+                self.kill(c)?;
+            }
+            return Ok(None);
+        }
+        Ok(Some(c))
+    }
+
     /// The nodes along a path from the root to `target` (each step commits
     /// one of the target's variables, picked uniformly at random), the root
     /// included and the target not. Nodes are prepared, not expanded.

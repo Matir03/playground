@@ -145,6 +145,22 @@ pub struct GenConfig {
     /// own rooted there ([`Lattice::advance_rooted`]) for up to
     /// `rooted_secs` (nodes in random order: the ones left are dropped).
     pub rooted_frac: f64,
+    /// Stepwise self-play (the user's design, 2026-10-09): a turn is played
+    /// one lattice commitment at a time. After each full tier-1 + tier-2
+    /// search (`n1` root visits, the subtree below the chosen commitment
+    /// kept), the node is a tier-2 record (each kid's tier-1 marginal
+    /// visits and value), one open variable (at random) is committed by
+    /// sampling its kids' marginal visits at `step_temp` with
+    /// Dirichlet(`step_dir_alpha`) noise at weight `step_dir_frac`, and the
+    /// search is restricted to the turns below. Forced variables are
+    /// committed without a search. Replaces the walks and the rooted phase.
+    pub stepwise: bool,
+    /// Root visits for each search after a turn's first (visits kept from
+    /// the previous search count; 0: `n1`).
+    pub step_n1: u32,
+    pub step_temp: f64,
+    pub step_dir_alpha: f64,
+    pub step_dir_frac: f64,
     pub rooted: RootedParams,
     pub rooted_secs: f64,
     /// Searches per worker at a time in that phase.
@@ -254,6 +270,8 @@ pub struct GenCounters {
     /// lattice, and searches abandoned over budget.
     pub rooted_queued: AtomicU64,
     pub rooted_done: AtomicU64,
+    /// Stepwise self-play: commitments sampled (forced ones not counted).
+    pub steps: AtomicU64,
     pub rooted_unreached: AtomicU64,
     pub rooted_abandoned: AtomicU64,
 }
@@ -264,11 +282,14 @@ enum Task {
         at: u32,
         left: u32,
     },
-    /// `started` of `n1` visits begun; `vis` those in flight.
+    /// `started` of `n1` visits begun; `vis` those in flight. Stepwise:
+    /// `step` commitments made, `recorded` the lattice node last recorded.
     Search {
         t1: Tier1,
         started: u32,
         vis: Vec<Visit>,
+        step: u32,
+        recorded: u32,
     },
     Walk {
         lat: Lattice,
@@ -641,6 +662,8 @@ impl Worker<'_> {
             t1,
             started: 0,
             vis: Vec::new(),
+            step: 0,
+            recorded: NONE,
         }
     }
 
@@ -691,17 +714,36 @@ impl Worker<'_> {
                     }
                 }
             },
-            Task::Search { t1, started, vis } => {
+            Task::Search {
+                t1,
+                started,
+                vis,
+                step,
+                recorded,
+            } => {
                 // Visits that already handed in a request wait on it (the
                 // node is busy) when advanced again, so passes repeat until
                 // none finishes and every request is collected once.
                 let mut reqs = Vec::new();
                 loop {
-                    if t1.nodes[0].terminal.is_some() || (*started >= self.cfg.n1 && vis.is_empty())
-                    {
+                    if t1.nodes[0].terminal.is_some() {
                         return self.finish_turn(t1);
                     }
-                    while *started < self.cfg.n1 && vis.len() < self.cfg.inflight1.max(1) {
+                    let budget = if *step > 0 && self.cfg.step_n1 > 0 {
+                        self.cfg.step_n1
+                    } else {
+                        self.cfg.n1
+                    };
+                    if *started >= budget && vis.is_empty() {
+                        if !self.cfg.stepwise {
+                            return self.finish_turn(t1);
+                        }
+                        if let Some(next) = self.step(t1, started, step, recorded)? {
+                            return Ok(next);
+                        }
+                        continue;
+                    }
+                    while *started < budget && vis.len() < self.cfg.inflight1.max(1) {
                         vis.push(t1.visit());
                         *started += 1;
                     }
@@ -884,14 +926,10 @@ impl Worker<'_> {
         Ok(())
     }
 
-    /// Record the searched turn, pick the next one, and hand the root's
-    /// lattice to a walk.
-    fn finish_turn(&mut self, t1: &mut Tier1) -> Result<Next> {
+    /// A searched turn's tier-1 records: the root's value, energy groups,
+    /// and interior turns searched deeply enough.
+    fn record_turn(&mut self, t1: &mut Tier1) -> Result<()> {
         let root = &t1.nodes[0];
-        if root.terminal.is_some() {
-            // The mover kills the necromancer: the game ends here.
-            return Ok(Next::Replace(vec![self.new_game()?]));
-        }
         self.c.turns.fetch_add(1, Relaxed);
         let mut rec = Vec::new();
         if self.cfg.lview {
@@ -983,6 +1021,143 @@ impl Worker<'_> {
                 self.c.t1_records.fetch_add(1, Relaxed);
             }
         }
+        Ok(())
+    }
+
+    /// Stepwise self-play ([`GenConfig::stepwise`]), after the search at
+    /// `t1.root_at`: record it, commit one variable, and restrict the search
+    /// below it. Some: the turn is over (the next task); None: search on.
+    fn step(
+        &mut self,
+        t1: &mut Tier1,
+        started: &mut u32,
+        step: &mut u32,
+        recorded: &mut u32,
+    ) -> Result<Option<Next>> {
+        if *step == 0 && t1.root_at == 0 && *recorded == NONE {
+            // The whole turn's search: the records a plain search writes.
+            self.record_turn(t1)?;
+            *recorded = NONE - 1;
+        }
+        loop {
+            if t1.root_dead {
+                // The last commitment no turn completes (refuted after it
+                // was offered): back up and choose again there.
+                t1.unrestrict();
+                *recorded = t1.root_at;
+            }
+            let at = t1.root_at;
+            let turns: Vec<(u32, f64, f64)> = t1.nodes[0]
+                .children
+                .iter()
+                .map(|&c| {
+                    let ch = &t1.nodes[c as usize];
+                    (ch.sink, f64::from(ch.n), f64::from(ch.n) - ch.w)
+                })
+                .collect();
+            let lat = t1.nodes[0].lattice.as_mut().expect("the root's lattice");
+            if lat.nodes[at as usize].kind == Kind::Sink {
+                let found = t1.nodes[0]
+                    .children
+                    .iter()
+                    .copied()
+                    .find(|&c| t1.nodes[c as usize].sink == at);
+                if let Some(c) = found {
+                    return self.play_turn(t1, c).map(Some);
+                }
+                // Not a turn of the search yet: one more visit finds it.
+                *started = self.step_budget().saturating_sub(1);
+                return Ok(None);
+            }
+            let Some(rec) = lat.marginal_record(at, &turns)? else {
+                anyhow::ensure!(at != 0, "a turn start that no turn completes");
+                t1.root_dead = true;
+                continue;
+            };
+            let nd = &lat.nodes[at as usize];
+            let live: Vec<usize> = (0..nd.kids.len()).filter(|&i| !nd.kids[i].dead).collect();
+            let mut vars: Vec<u8> = live.iter().map(|&i| nd.kids[i].var).collect();
+            vars.sort_unstable();
+            vars.dedup();
+            let open: Vec<u8> = vars
+                .iter()
+                .copied()
+                .filter(|&v| live.iter().filter(|&&i| nd.kids[i].var == v).count() > 1)
+                .collect();
+            if !open.is_empty() && *recorded != at {
+                encode_t2(&lat.start, &rec, &mut self.t2w, self.cfg.lview)?;
+                self.c.t2_records.fetch_add(1, Relaxed);
+                *recorded = at;
+            }
+            let var = if open.is_empty() {
+                vars[0]
+            } else {
+                open[self.rng.gen_range(0..open.len())]
+            };
+            // `rec.kids` are the live kids, in order.
+            let pick: Vec<(usize, f64)> = live
+                .iter()
+                .zip(&rec.kids)
+                .filter(|(&i, _)| nd.kids[i].var == var)
+                .map(|(&i, k)| (i, f64::from(k.2)))
+                .collect();
+            let k = if pick.len() == 1 {
+                pick[0].0
+            } else {
+                self.c.steps.fetch_add(1, Relaxed);
+                let w: Vec<f64> = pick.iter().map(|x| x.1).collect();
+                pick[noisy_pick(
+                    &w,
+                    self.cfg.step_temp,
+                    self.cfg.step_dir_alpha,
+                    self.cfg.step_dir_frac,
+                    &mut self.rng,
+                )]
+                .0
+            };
+            let Some(c) = lat.step_to(at, k)? else {
+                continue; // a dead end: choose again here
+            };
+            t1.restrict_root(c);
+            *step += 1;
+            *started = t1.nodes[0].n.saturating_sub(1);
+            if *started < self.step_budget() {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Root visits for a search after a turn's first.
+    fn step_budget(&self) -> u32 {
+        if self.cfg.step_n1 > 0 {
+            self.cfg.step_n1
+        } else {
+            self.cfg.n1
+        }
+    }
+
+    /// Play the turn of root child `pick`: the next search, or a new game.
+    fn play_turn(&mut self, t1: &mut Tier1, pick: u32) -> Result<Next> {
+        let child = &mut t1.nodes[pick as usize];
+        let next = if child.terminal.is_some() || child.state.is_terminal() {
+            self.new_game()?
+        } else {
+            let s = child.state.clone();
+            let lat = child.lattice.take();
+            self.search(s, lat)
+        };
+        Ok(Next::Replace(vec![next]))
+    }
+
+    /// Record the searched turn, pick the next one, and hand the root's
+    /// lattice to a walk.
+    fn finish_turn(&mut self, t1: &mut Tier1) -> Result<Next> {
+        if t1.nodes[0].terminal.is_some() {
+            // The mover kills the necromancer: the game ends here.
+            return Ok(Next::Replace(vec![self.new_game()?]));
+        }
+        self.record_turn(t1)?;
+        let root = &t1.nodes[0];
         let visits: Vec<f64> = root
             .children
             .iter()
@@ -1530,11 +1705,12 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
                 let ev = c.eval_ns.load(Relaxed) as f64;
                 let cpu = c.cpu_ns.load(Relaxed) as f64;
                 eprintln!(
-                    "  {el:.0}s: games {} ({} pooled) turns {} (+{} opening), t1 {} ({} views) t2 {} ({:.0}/s), expansions {:.0}/s ({:.1} kids), values {:.0}/s, eval share {:.0}%, rounds {}",
+                    "  {el:.0}s: games {} ({} pooled) turns {} (+{} opening, {} steps), t1 {} ({} views) t2 {} ({:.0}/s), expansions {:.0}/s ({:.1} kids), values {:.0}/s, eval share {:.0}%, rounds {}",
                     c.games.load(Relaxed),
                     c.pooled.load(Relaxed),
                     c.turns.load(Relaxed),
                     c.opening_turns.load(Relaxed),
+                    c.steps.load(Relaxed),
                     c.t1_records.load(Relaxed),
                     c.view_records.load(Relaxed),
                     t2r,

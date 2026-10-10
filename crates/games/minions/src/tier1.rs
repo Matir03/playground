@@ -133,6 +133,13 @@ pub struct Tier1 {
     pub stats: T1Stats,
     /// The root's value request is in flight.
     root_pending: bool,
+    /// The lattice node the root's widenings descend from: its turns are
+    /// the complete turns below it ([`Self::restrict_root`]; 0: all).
+    pub root_at: u32,
+    /// `root_at` turned out a dead end (no turn completes it).
+    pub root_dead: bool,
+    /// Per restriction: the previous `root_at`, children, n and w.
+    stash: Vec<(u32, Vec<u32>, u32, f64)>,
 }
 
 impl Tier1 {
@@ -156,7 +163,79 @@ impl Tier1 {
             params,
             stats: T1Stats::default(),
             root_pending: false,
+            root_at: 0,
+            root_dead: false,
+            stash: Vec::new(),
         }
+    }
+
+    /// Restrict the root's turns to those below its lattice's node `at`
+    /// (a descendant of the current `root_at`): children whose turns do not
+    /// include `at`'s commitments are dropped (their visits leave the root's
+    /// statistics), the rest keep their subtrees, and new turns are searched
+    /// below `at`. No visits may be in flight.
+    pub fn restrict_root(&mut self, at: u32) {
+        let key = self.lattice(0).nodes[at as usize].key;
+        let old = self.nodes[0].children.clone();
+        let (rn, rw) = (self.nodes[0].n, self.nodes[0].w);
+        self.stash.push((self.root_at, old.clone(), rn, rw));
+        // The root's own value visit: what its children do not account for.
+        let side = |t: &Tier1, c: u32| {
+            let cn = &t.nodes[c as usize];
+            (f64::from(cn.n), f64::from(cn.n) - cn.w)
+        };
+        let (mut n, mut w) = (f64::from(rn), rw);
+        for &c in &old {
+            let (cn, cw) = side(self, c);
+            n -= cn;
+            w -= cw;
+        }
+        let keep: Vec<u32> = old
+            .into_iter()
+            .filter(|&c| {
+                let sink = self.nodes[c as usize].sink;
+                self.lattice(0).nodes[sink as usize].key.includes(&key)
+            })
+            .collect();
+        for &c in &keep {
+            let (cn, cw) = side(self, c);
+            n += cn;
+            w += cw;
+        }
+        // Dropped turns keep their own statistics (for `unrestrict`) but
+        // not their searches: lattices and subtrees are freed.
+        let mut stack: Vec<u32> = self.nodes[0]
+            .children
+            .iter()
+            .copied()
+            .filter(|c| !keep.contains(c))
+            .collect();
+        while let Some(x) = stack.pop() {
+            let nd = &mut self.nodes[x as usize];
+            nd.lattice = None;
+            nd.trunk = None;
+            nd.widen_done = false;
+            stack.append(&mut nd.children);
+        }
+        let root = &mut self.nodes[0];
+        root.children = keep;
+        root.n = n.round().max(1.0) as u32;
+        root.w = w;
+        root.widen_done = false;
+        self.root_at = at;
+        self.root_dead = false;
+    }
+
+    /// Undo the last [`Self::restrict_root`].
+    pub fn unrestrict(&mut self) {
+        let (at, children, n, w) = self.stash.pop().expect("a restriction to undo");
+        let root = &mut self.nodes[0];
+        root.children = children;
+        root.n = n;
+        root.w = w;
+        root.widen_done = false;
+        self.root_at = at;
+        self.root_dead = false;
     }
 
     pub fn root_value(&self) -> f64 {
@@ -398,6 +477,15 @@ impl Tier1 {
                     }
                     Need::Value(n) => return Ok(Need1::SinkValue { t: wt, n }),
                     Need::Wait => return Ok(Need1::Wait),
+                    Need::Dead if wt == 0 && self.root_at != 0 => {
+                        // A restricted root whose commitments no turn
+                        // completes: flag it (the caller steps back).
+                        self.root_dead = true;
+                        vis.widen = None;
+                        self.nodes[0].widening -= 1;
+                        self.end_visit(vis);
+                        return Ok(Need1::Done);
+                    }
                     Need::Dead => bail!("tier-1 node {wt}'s lattice root is a dead end"),
                     Need::Done { sink, value, .. } => {
                         self.stats.t2_descents += 1;
@@ -426,7 +514,7 @@ impl Tier1 {
                         self.stats.t2_repeats += 1;
                         *tries += 1;
                         if *tries < self.params.retries {
-                            *cur = Cursor::at(0, 0.0);
+                            *cur = Cursor::at(if wt == 0 { self.root_at } else { 0 }, 0.0);
                             continue;
                         }
                         vis.widen = None;
@@ -461,7 +549,8 @@ impl Tier1 {
             if self.wants_widen(t) {
                 self.stats.widenings += 1;
                 self.nodes[t as usize].widening += 1;
-                vis.widen = Some((t, Cursor::at(0, 0.0), 0));
+                let start = if t == 0 { self.root_at } else { 0 };
+                vis.widen = Some((t, Cursor::at(start, 0.0), 0));
                 vis.work = 0;
                 continue;
             }
@@ -726,6 +815,67 @@ mod tests {
         let pri = t.priors(0);
         assert!((pri.iter().sum::<f64>() - 1.0).abs() < 1e-9);
         eprintln!("{:?} root q {:.3}", t.stats, t.root_value());
+    }
+
+    /// Restricting the root to a lattice node below it keeps exactly the
+    /// turns including that node's commitments (with their statistics), and
+    /// later visits find only such turns; `unrestrict` undoes it.
+    #[test]
+    fn tier1_restrict_root() {
+        let s = StepState::begin(&MinionsState::with_bid(0), 7);
+        let mut t = Tier1::new(s, T1Params::default());
+        t.run(&HashLatticeEval, 200).unwrap();
+        let before = t.nodes[0].children.len();
+        // Walk down the root's lattice through commitments every root turn
+        // includes, to the first live kid that some but not all include.
+        let keys: Vec<crate::lattice::Key> = {
+            let lat = t.nodes[0].lattice.as_ref().unwrap();
+            t.nodes[0]
+                .children
+                .iter()
+                .map(|&ch| lat.nodes[t.nodes[ch as usize].sink as usize].key)
+                .collect()
+        };
+        let lat = t.nodes[0].lattice.as_mut().unwrap();
+        let mut at = 0u32;
+        let c = loop {
+            let nd = &lat.nodes[at as usize];
+            let m = |kd: &crate::lattice::Kid| {
+                let kk = nd.key.with(kd.var as usize, kd.choice);
+                keys.iter().filter(|x| x.includes(&kk)).count()
+            };
+            if let Some(k) = nd.kids.iter().position(|kd| !kd.dead && m(kd) > 0 && m(kd) < keys.len()) {
+                break lat.step_to(at, k).unwrap().expect("live");
+            }
+            let k = nd
+                .kids
+                .iter()
+                .position(|kd| !kd.dead && m(kd) == keys.len())
+                .expect("a commitment of every turn");
+            at = lat.step_to(at, k).unwrap().expect("live");
+        };
+        t.restrict_root(c);
+        let check = |t: &Tier1| {
+            let lat = t.nodes[0].lattice.as_ref().unwrap();
+            let key = lat.nodes[c as usize].key;
+            let root = &t.nodes[0];
+            for &ch in &root.children {
+                assert!(lat.nodes[t.nodes[ch as usize].sink as usize].key.includes(&key));
+            }
+            let kids: u32 = root.children.iter().map(|&ch| t.nodes[ch as usize].n).sum();
+            assert_eq!(root.n, 1 + kids, "root visits");
+            assert!((0.0..=1.0).contains(&root.q()));
+        };
+        let kept = t.nodes[0].children.len();
+        assert!(kept > 0 && kept < before, "{kept} of {before} turns kept");
+        check(&t);
+        t.run(&HashLatticeEval, 100).unwrap();
+        check(&t);
+        assert!(t.nodes[0].children.len() > kept, "no new turns below the node");
+        t.unrestrict();
+        assert_eq!(t.nodes[0].children.len(), before);
+        assert_eq!(t.nodes[0].n, 201);
+        assert_eq!(t.root_at, 0);
     }
 
     /// Several visits in flight, fed in rounds: the same invariants hold,

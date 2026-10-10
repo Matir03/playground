@@ -710,6 +710,8 @@ def main():
     ap.add_argument("--energy-target", choices=["visits", "value", "cq"], default="visits", help="energy targets over a turn start's tier-1 children: visit shares, softmax(value / --energy-tau), or completed-Q (Gumbel)")
     ap.add_argument("--energy-tau", type=float, default=0.02)
     ap.add_argument("--energy-batch", type=int, default=64, help="energy groups per step")
+    ap.add_argument("--t1-min-visits", type=int, default=0, help="train tier 1 only on value targets searched at least this deep (the holdout keeps them all)")
+    ap.add_argument("--t1-root-visits", type=int, default=600, help="holdout also reports tier 1 on targets at least this deep (searched roots)")
     ap.add_argument("--min-cell-support", type=int, default=1, help="prior targets only for cells where at least this many kids have visits")
     ap.add_argument("--value-weight", type=float, default=1.0, help="tier-2 child and node values")
     ap.add_argument("--freeze-trunk", action="store_true", help="train tier 2 only, on a fixed tier 1")
@@ -803,6 +805,11 @@ def main():
     ys1 = torch.from_numpy(r1["target"].astype(np.float32)).to(dev)
     i1 = torch.arange(len(r1), device=dev)
     ho1, tr1 = i1[i1 % args.holdout_every == 0], i1[i1 % args.holdout_every != 0]
+    vis1 = torch.from_numpy(r1["visits"].astype(np.float32)).to(dev)
+    if args.t1_min_visits:
+        tr1 = tr1[vis1[tr1] >= args.t1_min_visits]
+        print(f"t1: training on {len(tr1)} targets with at least {args.t1_min_visits} visits")
+    ho1r = ho1[vis1[ho1] >= args.t1_root_visits]
     print(
         f"t2: {ds.n} records ({len(kids)} kids, {len(kids) / max(ds.n, 1):.1f}/record), {len(tr)} train; "
         f"t1: {len(r1)} records ({nf1} chunks, visits median {int(np.median(r1['visits'])) if len(r1) else 0}), "
@@ -839,13 +846,19 @@ def main():
             y = ys1[ho1].clamp(1e-6, 1 - 1e-6)
             h1 = -(y * y.log() + (1 - y) * (1 - y).log()).mean().item() if len(ho1) else 0.0
             ex = {}
+            if len(ho1r):
+                # The same on the deepest targets alone (searched roots).
+                lr = sum(t1_loss(v1net, xs1, ys1, ho1r[i : i + 8192]).item() * len(ho1r[i : i + 8192]) for i in range(0, len(ho1r), 8192))
+                yr = ys1[ho1r].clamp(1e-6, 1 - 1e-6)
+                hr = -(yr * yr.log() + (1 - yr) * (1 - yr).log()).mean().item()
+                ex["t1_root_bce_excess"] = lr / len(ho1r) - hr
             if es is not None and len(hoe):
                 ce = hf = 0.0
                 for i in range(0, len(hoe), 512):
                     c_, h_ = energy_loss(trunk, t2, es, hoe[i : i + 512])
                     ce += c_.item() * len(hoe[i : i + 512])
                     hf += h_.item() * len(hoe[i : i + 512])
-                ex = {"energy": ce / len(hoe), "energy_excess": (ce - hf) / len(hoe)}
+                ex |= {"energy": ce / len(hoe), "energy_excess": (ce - hf) / len(hoe)}
         trunk.train()
         t2.train()
         o = out
