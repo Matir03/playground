@@ -100,6 +100,12 @@ pub struct T1Stats {
     pub widen_dropped: u64,
     pub widen_abandoned: u64,
     pub widen_followed: u64,
+    /// Net calls made by `run_until`, their rows (tier-2 expansions; tier-1
+    /// values of sinks and nodes) and the time inside them.
+    pub eval_calls: u64,
+    pub expand_rows: u64,
+    pub value_rows: u64,
+    pub eval_ns: u64,
 }
 
 /// One tier-1 visit in progress: the tier-1 path, and the widening under
@@ -821,7 +827,7 @@ impl Tier1 {
             } else {
                 Vec::new()
             };
-            let (outs, vals) = {
+            let ((outs, vals), n_rows0, n_rows1, t_eval) = {
                 let mut ex = Vec::with_capacity(slots.len());
                 let mut states = Vec::new();
                 for r in &reqs {
@@ -848,8 +854,14 @@ impl Tier1 {
                         trunk: l.trunk.clone(),
                     });
                 }
-                eval.both(&ex, &states)?
+                let te = std::time::Instant::now();
+                let r = eval.both(&ex, &states)?;
+                (r, ex.len(), states.len(), te.elapsed())
             };
+            self.stats.eval_calls += 1;
+            self.stats.expand_rows += n_rows0 as u64;
+            self.stats.value_rows += n_rows1 as u64;
+            self.stats.eval_ns += t_eval.as_nanos() as u64;
             let n_ex = outs.len() - decls.len();
             for ((t, n, _), o) in decls.iter().zip(&outs[n_ex..]) {
                 self.lattice_mut(*t).feed_energy(*n, o.energy);

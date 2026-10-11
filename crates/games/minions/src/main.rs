@@ -1182,9 +1182,22 @@ fn lattice_play(spec: &str, n1: u32, inflight: usize) -> anyhow::Result<(String,
     if let Some(net) = spec.strip_prefix("bridge:") {
         let eval: std::sync::Arc<dyn minions_engine::lattice::LatticeEval> =
             std::sync::Arc::new(minions_engine::lattice::StepsBridge { eval: load_step_eval_runners(net, "trt", 1)? });
-        let play = minions_engine::stepsp::LatticePlay { eval, n1, inflight, params: Default::default() };
+        let play = minions_engine::stepsp::LatticePlay { eval, n1, inflight, params: Default::default(), secs: 0.0 };
         return Ok((net.to_string(), Some(play)));
     }
+    // `secs=<s>:<spec>`: search s seconds a turn instead of n1 visits;
+    // `pw=<c>,<alpha>:<spec>`: tier-1 widening k(N) = ceil(c * N^alpha).
+    let (spec, secs) = match spec.strip_prefix("secs=").and_then(|r| r.split_once(':')) {
+        Some((t, s)) => (s, t.parse::<f64>()?),
+        None => (spec, 0.0),
+    };
+    let (spec, pw) = match spec.strip_prefix("pw=").and_then(|r| r.split_once(':')) {
+        Some((t, s)) => {
+            let (c, a) = t.split_once(',').ok_or_else(|| anyhow::anyhow!("pw=<c>,<alpha>"))?;
+            (s, Some((c.parse::<f32>()?, a.parse::<f32>()?)))
+        }
+        None => (spec, None),
+    };
     // `rorder:<spec>`: tier-2 lattices over a random variable order (an
     // ablation of the order-free lattice), combinable with the prefixes below.
     let (spec, random_order) = match spec.strip_prefix("rorder:") {
@@ -1206,8 +1219,12 @@ fn lattice_play(spec: &str, n1: u32, inflight: usize) -> anyhow::Result<(String,
         return Ok((spec.to_string(), None));
     }
     let eval = std::sync::Arc::new(minions_engine::lattice_ort::OrtLatticeEval::load(dir, "trt", true, 1)?);
-    let params = minions_engine::tier1::T1Params { energy_prior: energy, value_prior_tau: vtau, random_order, ..Default::default() };
-    let play = minions_engine::stepsp::LatticePlay { eval, n1, inflight, params };
+    let mut params = minions_engine::tier1::T1Params { energy_prior: energy, value_prior_tau: vtau, random_order, ..Default::default() };
+    if let Some((c, a)) = pw {
+        params.pw_c = c;
+        params.pw_alpha = a;
+    }
+    let play = minions_engine::stepsp::LatticePlay { eval, n1, inflight, params, secs };
     Ok((dir.join("value_sparse.onnx").to_string_lossy().into_owned(), Some(play)))
 }
 
@@ -1737,27 +1754,55 @@ async fn main() -> anyhow::Result<()> {
                     pos.push(minions_engine::stepsp::sampled_opening(n, 3, lp.eval.as_ref(), &mut rng)?);
                 }
             }
-            // Seconds for --n1 visits, or with --secs the visits in that time.
-            let run = |s: &minions_engine::game::MinionsState, k: usize, salt: u64| -> anyhow::Result<f64> {
+            // Seconds for --n1 visits, or with --secs the visits in that time;
+            // the profile (per in-flight value, summed over searches): wall s,
+            // net s, prepare/stats/child s, net calls, expansion rows, value
+            // rows, visits, widenings.
+            let prof = std::cell::RefCell::new(vec![[0f64; 12]; ks.len()]);
+            let run = |s: &minions_engine::game::MinionsState, k: usize, salt: u64, i: usize| -> anyhow::Result<f64> {
+                use std::sync::atomic::Ordering::Relaxed;
                 let start = minions_engine::steps::StepState::begin(s, salt);
                 let mut t = minions_engine::tier1::Tier1::new(start, lp.params.clone());
+                let p0: Vec<u64> = minions_engine::lattice::PROF.iter().map(|x| x.load(Relaxed)).collect();
                 let t0 = std::time::Instant::now();
-                if tsecs > 0.0 {
+                let (out, visits) = if tsecs > 0.0 {
                     let dl = t0 + std::time::Duration::from_secs_f64(tsecs);
-                    return Ok(f64::from(t.run_until(lp.eval.as_ref(), u32::MAX, k, Some(dl))?));
+                    let v = t.run_until(lp.eval.as_ref(), u32::MAX, k, Some(dl))?;
+                    (f64::from(v), f64::from(v))
+                } else {
+                    t.run_inflight(lp.eval.as_ref(), n1, k)?;
+                    (t0.elapsed().as_secs_f64(), f64::from(n1))
+                };
+                let wall = t0.elapsed().as_secs_f64();
+                let pd: Vec<f64> = minions_engine::lattice::PROF.iter().zip(&p0).map(|(x, a)| (x.load(Relaxed) - a) as f64 * 1e-9).collect();
+                let st = &t.stats;
+                let row = [wall, st.eval_ns as f64 * 1e-9, pd[0], pd[1], pd[2], st.eval_calls as f64, st.expand_rows as f64, st.value_rows as f64, visits, st.widenings as f64, st.t2_descents as f64, st.t2_repeats as f64];
+                for (a, b) in prof.borrow_mut()[i].iter_mut().zip(row) {
+                    *a += b;
                 }
-                t.run_inflight(lp.eval.as_ref(), n1, k)?;
-                Ok(t0.elapsed().as_secs_f64())
+                Ok(out)
             };
-            run(&pos[0], 32, 0)?; // engine warm-up
+            run(&pos[0], 32, 0, 0)?; // engine warm-up
+            prof.borrow_mut()[0] = [0f64; 12];
             let mut secs = vec![0f64; ks.len()];
             let order: Vec<usize> = (0..ks.len()).chain((0..ks.len()).rev()).collect();
             for (r, &i) in order.iter().enumerate() {
                 for (j, s) in pos.iter().enumerate() {
-                    secs[i] += run(s, ks[i], (r * 1000 + j) as u64)?;
+                    secs[i] += run(s, ks[i], (r * 1000 + j) as u64, i)?;
                 }
             }
             let searches = 2.0 * pos.len() as f64;
+            println!("time breakdown (share of wall): net, CPU in lattice prepare (options + witnesses) / stats scans / child creation, other CPU; per tier-1 visit: tier-2 expansions, net calls");
+            for (i, k) in ks.iter().enumerate() {
+                let p = prof.borrow()[i];
+                let w = p[0].max(1e-9);
+                println!(
+                    "  in flight {k:>4}: net {:3.0}%  prepare {:3.0}%  stats {:3.0}%  child {:3.0}%  other {:3.0}%;  {:.1} expansions + {:.2} values per visit, {:.2} net calls per visit ({:.0} rows/call), {:.2} widenings per visit, {:.2} tier-2 descents per widening ({:.2} repeats)",
+                    100.0 * p[1] / w, 100.0 * p[2] / w, 100.0 * p[3] / w, 100.0 * p[4] / w,
+                    100.0 * (w - p[1] - p[2] - p[3] - p[4]) / w,
+                    p[6] / p[8].max(1.0), p[7] / p[8].max(1.0), p[5] / p[8].max(1.0), (p[6] + p[7]) / p[5].max(1.0), p[9] / p[8].max(1.0), p[10] / p[9].max(1.0), p[11] / p[9].max(1.0)
+                );
+            }
             if tsecs > 0.0 {
                 println!("tier-1 visits in {tsecs} s, {} positions, each in flight up and back down:", pos.len());
                 for (i, k) in ks.iter().enumerate() {
