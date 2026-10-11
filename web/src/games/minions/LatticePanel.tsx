@@ -125,6 +125,16 @@ function Val({ v, title }: { v: number | null | undefined; title?: string }) {
   );
 }
 
+/** Visits and prior as shares of their group (each summing to 1), on one
+ *  scale -- the largest share of either is a full bar -- so the blue and gold
+ *  bars compare directly. */
+function shareScale(ns: number[], priors: (number | null | undefined)[]) {
+  const sn = ns.reduce((a, b) => a + b, 0) || 1;
+  const sp = priors.reduce<number>((a, b) => a + (b ?? 0), 0) || 1;
+  const top = Math.max(1e-9, ...ns.map((n) => n / sn), ...priors.map((p) => (p ?? 0) / sp));
+  return { v: (n: number) => n / sn / top, p: (p: number | null | undefined) => (p ?? 0) / sp / top };
+}
+
 /** A horizontal bar for a share in [0, 1], with an optional second (ghost)
  *  share drawn underneath: prior under visits, say. */
 function Bar({ share, ghost, color = "#5b8def", width = 90 }: { share: number; ghost?: number | null; color?: string; width?: number }) {
@@ -199,7 +209,6 @@ function LiveSearch() {
     };
   }, []);
   if (!live || !live.running) return null;
-  const top = Math.max(1, ...live.children.map((c) => c.n));
   return (
     <div style={{ border: "1px solid #c7d2fe", background: "#f5f7ff", borderRadius: 8, padding: "0.5rem 0.75rem", marginBottom: 10 }}>
       <div style={{ fontSize: 13, marginBottom: 6 }}>
@@ -221,17 +230,17 @@ function LiveSearch() {
             </tr>
           </thead>
           <tbody>
-            {live.children.slice(0, 12).map((c) => (
+            {(() => { const sc = shareScale(live.children.map((c) => c.n), live.children.map((c) => c.prior)); return live.children.slice(0, 12).map((c) => (
               <tr key={c.t}>
                 <td style={{ ...td, whiteSpace: "normal", maxWidth: 260 }}>{c.label}</td>
                 <td style={td}>
-                  <Bar share={c.n / top} ghost={c.prior} width={70} /> {c.n}
+                  <Bar share={sc.v(c.n)} ghost={sc.p(c.prior)} width={70} /> {c.n}
                 </td>
                 <td style={td}>
                   <Val v={c.q} />
                 </td>
               </tr>
-            ))}
+            )); })()}
           </tbody>
         </table>
         <div style={{ flex: "1 1 300px", fontSize: 12 }}>
@@ -423,8 +432,7 @@ export function LatticePanel({ state, auto = false }: { state: GameState | null;
     }
   }, [summary, t1Id, latPath]);
 
-  const t1Max = useMemo(() => (t1 ? Math.max(1, ...t1.children.map((c) => c.n)) : 1), [t1]);
-  const t1PriorMax = useMemo(() => (t1 ? Math.max(1e-9, ...t1.children.map((c) => c.prior ?? 0)) : 1), [t1]);
+  const t1Sc = useMemo(() => shareScale(t1 ? t1.children.map((c) => c.n) : [], t1 ? t1.children.map((c) => c.prior) : []), [t1]);
 
   /** The lattice node's kids, one group per variable (a unit, an enemy or a
    *  spawn cell), each most likely first. */
@@ -541,7 +549,7 @@ export function LatticePanel({ state, auto = false }: { state: GameState | null;
                           {c.terminal && <span style={{ color: "#b05" }}> (ends game)</span>}
                         </td>
                         <td style={td}>
-                          <Bar share={c.n / t1Max} ghost={(c.prior ?? 0) / t1PriorMax} /> <span style={{ fontSize: 12 }}>{c.n}</span>
+                          <Bar share={t1Sc.v(c.n)} ghost={t1Sc.p(c.prior)} /> <span style={{ fontSize: 12 }}>{c.n}</span>
                         </td>
                         <td style={td}><Val v={c.q} /></td>
                         <td style={td}><Val v={c.sv} /></td>
@@ -640,7 +648,7 @@ export function LatticePanel({ state, auto = false }: { state: GameState | null;
                                 {k.label}
                               </td>
                               <td style={td}>
-                                <Bar share={k.n / Math.max(1, ...g.ks.map((x) => x.n))} ghost={k.prior} width={80} /> <span style={{ fontSize: 11, color: "#666" }}>{pct(k.prior)}</span>
+                                <Bar share={shareScale(g.ks.map((x) => x.n), g.ks.map((x) => x.prior)).v(k.n)} ghost={shareScale(g.ks.map((x) => x.n), g.ks.map((x) => x.prior)).p(k.prior)} width={80} /> <span style={{ fontSize: 11, color: "#666" }}>{pct(k.prior)}</span>
                               </td>
                               <td style={td}><Val v={k.q} /></td>
                               <td style={td}>
