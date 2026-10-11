@@ -617,6 +617,10 @@ enum Cmd {
         positions: u32,
         #[arg(long, default_value_t = 1)]
         seed: u64,
+        /// > 0: search this many seconds per position instead (--n1 is
+        /// ignored) and report the visits done.
+        #[arg(long, default_value_t = 0.0)]
+        secs: f64,
     },
     /// How a lattice net values money (`stepsp::money_probe`): its curve of
     /// yellow's value against extra dollars after sampled openings, and the
@@ -1709,7 +1713,7 @@ async fn main() -> anyhow::Result<()> {
             )?;
         }
         Cmd::NnueBench { active, reps } => minions_engine::nnue::bench_sweep(active, reps),
-        Cmd::LatticeSpeed { net, n1, inflight, positions, seed } => {
+        Cmd::LatticeSpeed { net, n1, inflight, positions, seed, secs: tsecs } => {
             use rand::SeedableRng;
             let (_, lat) = lattice_play(&format!("vprior=100:{net}"), n1, 1)?;
             let lp = lat.ok_or_else(|| anyhow::anyhow!("{net}: not a lattice net dir"))?;
@@ -1721,10 +1725,15 @@ async fn main() -> anyhow::Result<()> {
                     pos.push(minions_engine::stepsp::sampled_opening(n, 3, lp.eval.as_ref(), &mut rng)?);
                 }
             }
+            // Seconds for --n1 visits, or with --secs the visits in that time.
             let run = |s: &minions_engine::game::MinionsState, k: usize, salt: u64| -> anyhow::Result<f64> {
                 let start = minions_engine::steps::StepState::begin(s, salt);
                 let mut t = minions_engine::tier1::Tier1::new(start, lp.params.clone());
                 let t0 = std::time::Instant::now();
+                if tsecs > 0.0 {
+                    let dl = t0 + std::time::Duration::from_secs_f64(tsecs);
+                    return Ok(f64::from(t.run_until(lp.eval.as_ref(), u32::MAX, k, Some(dl))?));
+                }
                 t.run_inflight(lp.eval.as_ref(), n1, k)?;
                 Ok(t0.elapsed().as_secs_f64())
             };
@@ -1737,6 +1746,14 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             let searches = 2.0 * pos.len() as f64;
+            if tsecs > 0.0 {
+                println!("tier-1 visits in {tsecs} s, {} positions, each in flight up and back down:", pos.len());
+                for (i, k) in ks.iter().enumerate() {
+                    let v = secs[i] / searches;
+                    println!("  in flight {k:>4}: {v:7.0} visits, x{:.1} vs {}", secs[i] / secs[0], ks[0]);
+                }
+                return Ok(());
+            }
             println!("tier-1 search speed, {n1} visits, {} positions, each in flight up and back down:", pos.len());
             for (i, k) in ks.iter().enumerate() {
                 let per = secs[i] / searches;
