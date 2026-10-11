@@ -713,6 +713,18 @@ impl Tier1 {
         visits: u32,
         inflight: usize,
     ) -> Result<()> {
+        self.run_until(eval, visits, inflight, None).map(|_| ())
+    }
+
+    /// [`Self::run_inflight`], starting no visit after `deadline` (the ones
+    /// in flight then finish); returns the visits started.
+    pub fn run_until(
+        &mut self,
+        eval: &dyn LatticeEval,
+        visits: u32,
+        inflight: usize,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<u32> {
         enum R {
             Expand(u32, u32),
             Sink(u32, u32),
@@ -726,9 +738,12 @@ impl Tier1 {
             .and_then(|v| v.parse::<f64>().ok());
         let t0 = std::time::Instant::now();
         let mut next = slow.unwrap_or(f64::MAX);
+        let open = |started: u32| {
+            started < visits && deadline.map_or(true, |d| std::time::Instant::now() < d)
+        };
         loop {
-            if self.nodes[0].terminal.is_some() || (started >= visits && vis.is_empty()) {
-                return Ok(());
+            if self.nodes[0].terminal.is_some() || (!open(started) && vis.is_empty()) {
+                return Ok(started);
             }
             if t0.elapsed().as_secs_f64() > next {
                 next += slow.unwrap_or(f64::MAX);
@@ -753,7 +768,7 @@ impl Tier1 {
             // request (handed in once: a busy node makes the next pass Wait).
             let mut reqs = Vec::new();
             loop {
-                while started < visits && vis.len() < inflight.max(1) {
+                while vis.len() < inflight.max(1) && open(started) {
                     vis.push(self.visit());
                     started += 1;
                 }

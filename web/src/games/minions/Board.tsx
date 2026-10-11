@@ -65,6 +65,7 @@ import {
   type SortKey,
 } from "./Analysis";
 import { SearchConfigPanel } from "./SearchConfig";
+import { DEFAULT_TC, TimeControlBar, type ClockView, type SideTC } from "./TimeControl";
 
 /** Whose turn a position is in, which is what the record's turn boundaries
  *  are made of. Module level, so every render shares one function. */
@@ -440,6 +441,49 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
   const engineAbort = useRef<AbortController | null>(null);
   const [syncing, setSyncing] = useState(false);
 
+  // ── Timed match ───────────────────────────────────────────────────────────
+  //
+  // A fixed time per turn for each side. The turn on the clock is the one
+  // whose number is on the board at the tip; each side's first turn is
+  // untimed (the net plays it at the warm-up visit count). The clock lives in
+  // a ref (it ticks outside React); `setTick` re-renders the faces.
+  const [tcOn, setTcOn] = useState(false);
+  const [tc, setTc] = useState<[SideTC, SideTC]>([DEFAULT_TC, DEFAULT_TC]);
+  const [warmup, setWarmup] = useState(800);
+  const [, setTick] = useState(0);
+  const clock = useRef({
+    key: null as string | null,
+    side: null as number | null,
+    timed: false,
+    used: 0,
+    since: null as number | null,
+    /** The human's turn was already ended for running out of time. */
+    expired: false,
+  });
+  const netCfgKey = useRef<string | null>(null);
+  const savedCfg = useRef<{ n1: number; secs: number; inflight: number } | null>(null);
+  const tcRef = useRef({ on: tcOn, tc, warmup });
+  tcRef.current = { on: tcOn, tc, warmup };
+  const resetClock = useCallback(() => {
+    clock.current = { key: null, side: null, timed: false, used: 0, since: null, expired: false };
+    netCfgKey.current = null;
+  }, []);
+  /** On: remember the panel's search budget (each net turn then sets its
+   *  own); off: put it back. */
+  const toggleTc = useCallback(
+    async (on: boolean) => {
+      if (on) {
+        savedCfg.current = await fetch("/latapi/config").then((r) => (r.ok ? r.json() : null)).catch(() => null);
+        resetClock();
+      } else if (savedCfg.current) {
+        const b = savedCfg.current;
+        await fetch(`/latapi/config?n1=${b.n1}&secs=${b.secs}&inflight=${b.inflight}`).catch(() => null);
+      }
+      setTcOn(on);
+    },
+    [resetClock],
+  );
+
   const newGame = useCallback(async () => {
     setError(null);
     setBusy(true);
@@ -626,6 +670,25 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
       const ac = new AbortController();
       engineAbort.current = ac;
       await new Promise((r) => setTimeout(r, 60));
+      // Timed match: the net's budget for this turn, set once at its start
+      // (the seat searches at the turn's first action and queues the rest).
+      if (tcRef.current.on && mover === "net") {
+        const d0 = decode(state.payload);
+        const key = String(d0.turn);
+        if (netCfgKey.current !== key) {
+          netCfgKey.current = key;
+          const t = tcRef.current.tc[d0.side];
+          const c = clock.current;
+          let q: string;
+          if (d0.turn < 2) q = `n1=${tcRef.current.warmup}&secs=0`;
+          else if (t.mode === "visits") q = `n1=${t.visits}&secs=0`;
+          else {
+            const used = c.used + (c.since !== null ? Date.now() - c.since : 0);
+            q = `secs=${Math.max(0.2, t.secs - used / 1000).toFixed(2)}`;
+          }
+          await fetch(`/latapi/config?${q}&inflight=${t.inflight}`).catch(() => null);
+        }
+      }
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
           let chosen: Move | undefined;
@@ -689,6 +752,85 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
     // the position the game is actually in, and without the dependency the
     // effect would not re-run until something else changed.
   }, [handle, state, firstSeat, secondSeat, client, analysisOn, paused, hist]);
+
+  // A new turn number puts that turn on the clock.
+  const tipLive = !!state && state.outcome === Outcome.IN_PROGRESS && !!hist && hist.current === H.tipOf(hist, hist.current);
+  useEffect(() => {
+    if (!tcOn || !state || !tipLive) return;
+    const d0 = decode(state.payload);
+    const key = String(d0.turn);
+    const c = clock.current;
+    if (c.key === key) return;
+    const seat = d0.side === 0 ? firstSeat : secondSeat;
+    c.key = key;
+    c.side = d0.side;
+    c.used = 0;
+    c.since = null;
+    c.expired = false;
+    c.timed = d0.turn >= 2 && !(seat === "net" && tc[d0.side].mode === "visits");
+  }, [tcOn, state, tipLive, tc, firstSeat, secondSeat]);
+  // The clock runs only while the game is being played at its tip.
+  const clockRunning = tcOn && !paused && !analysisOn && tipLive;
+  useEffect(() => {
+    const c = clock.current;
+    if (clockRunning && c.since === null) c.since = Date.now();
+    if (!clockRunning && c.since !== null) {
+      c.used += Date.now() - c.since;
+      c.since = null;
+    }
+  }, [clockRunning, state]);
+  /** A human out of time: end the turn as it stands (end phase until the
+   *  side to move changes). */
+  const endTurnNow = useCallback(async () => {
+    if (!hist || !state) return;
+    const side0 = decode(state.payload).side;
+    const h = await ensureAt(hist.current);
+    if (!h) return;
+    let cur = state;
+    setSelected(null);
+    setSpawnUnit(null);
+    for (let i = 0; i < 3 && cur.outcome === Outcome.IN_PROGRESS && decode(cur.payload).side === side0; i++) {
+      const payload = new Uint8Array([4]);
+      const next = await client.applyMove(
+        create(ApplyMoveRequestSchema, { handle: h, move: create(MoveSchema, { gameId: GameId.MINIONS, payload }) }),
+      );
+      cur = next;
+      setState(next);
+      setHist((hh) => {
+        if (!hh) return hh;
+        const after = H.push(hh, payload, next);
+        handleAt.current = after.current;
+        return after;
+      });
+    }
+  }, [client, hist, state, ensureAt]);
+  const endTurnRef = useRef(endTurnNow);
+  endTurnRef.current = endTurnNow;
+  useEffect(() => {
+    if (!tcOn) return;
+    const id = setInterval(() => {
+      const c = clock.current;
+      if (c.side !== null && c.timed && !c.expired && c.since !== null) {
+        const seat = c.side === 0 ? firstSeat : secondSeat;
+        const left = tcRef.current.tc[c.side].secs * 1000 - c.used - (Date.now() - c.since);
+        if (left <= 0 && seat === "human") {
+          c.expired = true;
+          void endTurnRef.current();
+        }
+      }
+      setTick((x) => x + 1);
+    }, 200);
+    return () => clearInterval(id);
+  }, [tcOn, firstSeat, secondSeat]);
+  const clockView = ((): ClockView => {
+    const c = clock.current;
+    const left: [number, number] = [tc[0].secs * 1000, tc[1].secs * 1000];
+    if (c.side !== null && c.timed) left[c.side] -= c.used + (c.since !== null ? Date.now() - c.since : 0);
+    const turn = state ? decode(state.payload).turn : 0;
+    const visits = (s: number) => (s === 0 ? firstSeat : secondSeat) === "net" && tc[s].mode === "visits";
+    const timed = (s: number) => (c.side === s ? c.timed : turn + 1 >= 2 && !visits(s));
+    return { left, running: clockRunning ? c.side : null, timed: [timed(0), timed(1)] };
+  })();
 
   // The board shows the variation when one is being walked, and the game
   // otherwise. Rendering the walked position rather than overlaying arrows on
@@ -1120,7 +1262,10 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
       <div style={{ display: "flex", gap: "1.5rem", marginBottom: "0.75rem", flexWrap: "wrap", alignItems: "flex-end" }}>
         <SeatPicker label={SIDE_NAME[0]} seat={firstSeat} onChange={setFirstSeat} />
         <SeatPicker label={SIDE_NAME[1]} seat={secondSeat} onChange={setSecondSeat} />
-        <button onClick={() => void newGame()} disabled={busy}>New game</button>
+        <button onClick={() => {
+            if (tcOn) resetClock();
+            void newGame();
+          }} disabled={busy}>New game</button>
         {boardLive && <button onClick={endPhase} disabled={!canAct}>{endLabel}</button>}
         {hist && (
           <button onClick={takeBack} disabled={takeBackTarget === null} title="take back to the start of your turn (or your previous turn, with the engine's reply)">
@@ -1195,6 +1340,17 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
         )}
       </div>
 
+      <TimeControlBar
+        on={tcOn}
+        setOn={(v) => void toggleTc(v)}
+        tc={tc}
+        setTc={setTc}
+        warmup={warmup}
+        setWarmup={setWarmup}
+        netSide={[firstSeat === "net", secondSeat === "net"]}
+        names={SIDE_NAME}
+        view={clockView}
+      />
       {state != null && d != null && !inProgress && (
         <div
           style={{
@@ -1210,7 +1366,10 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
             </div>
             <div style={{ fontSize: "0.85rem", opacity: 0.85 }}>{endReason(d, state.outcome)}</div>
           </div>
-          <button onClick={() => void newGame()} disabled={busy} style={{ font: "inherit", padding: "0.4rem 0.9rem" }}>
+          <button onClick={() => {
+            if (tcOn) resetClock();
+            void newGame();
+          }} disabled={busy} style={{ font: "inherit", padding: "0.4rem 0.9rem" }}>
             New game
           </button>
         </div>
@@ -1320,7 +1479,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                     {grave && c === 0 && !isMove && !isSpawn && (
                       <text textAnchor="middle" dy="0.35em" fontSize={15} fill="#9a8f74" style={{ pointerEvents: "none" }}>†</text>
                     )}
-                    {c !== 0 && <Piece cell={c} pstate={d.pstate[i]} />}
+                    {c !== 0 && <Piece cell={c} pstate={d.pstate[i]} grave={grave} />}
                     {isMove && <circle r={5} fill="rgba(120,220,140,0.85)" style={{ pointerEvents: "none" }} />}
                     {ringAt >= 0 && (
                       <>
@@ -1357,7 +1516,7 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
                     <span style={{ color: "#666" }}>${d.money[side]}</span>
                   </div>
                   <div style={{ color: "#666", marginTop: 2 }}>
-                    graveyards {graveyardsHeld(d, side)}/10 (win at {GRAVEYARDS_TO_WIN}) · income{" "}
+                    graveyards {graveyardsHeld(d, side)}/6 (win at {GRAVEYARDS_TO_WIN}) · income{" "}
                     ${graveyardsHeld(d, side) + 3}/turn
                   </div>
                   <div style={{ color: "#666", marginTop: 2 }}>
@@ -1799,7 +1958,10 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
   );
 }
 
-export function Piece({ cell, pstate }: { cell: number; pstate: number }) {
+/** A unit: a disc a size smaller than the cell, so a graveyard's ring stays
+ *  visible around it; a gold "$" badge top right when it stands on a
+ *  graveyard, damage bottom right. */
+export function Piece({ cell, pstate, grave = false }: { cell: number; pstate: number; grave?: boolean }) {
   const side = pieceSide(cell);
   const def = UNITS[pieceUnit(cell)];
   const dmg = damageOf(pstate);
@@ -1807,18 +1969,26 @@ export function Piece({ cell, pstate }: { cell: number; pstate: number }) {
   return (
     <g style={{ pointerEvents: "none", opacity: spent ? 0.55 : 1 }}>
       <circle
-        r={R - 5}
+        r={R - 8}
         fill={SIDE_FILL[side]}
         stroke={def.necromancer ? "#fff" : "rgba(0,0,0,0.35)"}
         strokeWidth={def.necromancer ? 2.5 : 1}
       />
-      <text textAnchor="middle" dy="0.35em" fontSize={15} fontWeight={700} fill={SIDE_INK[side]}>
+      <text textAnchor="middle" dy="0.35em" fontSize={12} fontWeight={700} fill={SIDE_INK[side]}>
         {def.ch}
       </text>
+      {grave && (
+        <>
+          <circle cx={R - 10} cy={-(R - 11)} r={5.5} fill="#c8b06a" stroke="#4a4438" strokeWidth={1} />
+          <text x={R - 10} y={-(R - 11)} textAnchor="middle" dy="0.35em" fontSize={8} fontWeight={700} fill="#2a2418">
+            $
+          </text>
+        </>
+      )}
       {dmg > 0 && (
         <>
-          <circle cx={R - 7} cy={-(R - 8)} r={7} fill="#c0392b" />
-          <text x={R - 7} y={-(R - 8)} textAnchor="middle" dy="0.35em" fontSize={9} fontWeight={700} fill="#fff">
+          <circle cx={R - 10} cy={R - 11} r={6} fill="#c0392b" />
+          <text x={R - 10} y={R - 11} textAnchor="middle" dy="0.35em" fontSize={8} fontWeight={700} fill="#fff">
             {dmg}
           </text>
         </>

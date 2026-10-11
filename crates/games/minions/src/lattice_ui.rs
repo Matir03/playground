@@ -133,14 +133,16 @@ pub fn search(real: &MinionsState, b: Budget) -> anyhow::Result<Arc<Mutex<Search
         let inflight = b.inflight.max(1);
         let chunk = (4 * inflight as u32).max(8);
         let (mut done, mut shown) = (0u32, std::time::Instant::now());
+        // A time budget stops starting visits at the deadline (the visits in
+        // flight then finish), not at the next chunk's end.
+        let deadline = (b.secs > 0.0).then(|| t0 + std::time::Duration::from_secs_f64(b.secs));
         *LIVE.lock().unwrap() = Some(live_json(&t, &s, 0, true, t0, b));
         while done < n1
             && t.nodes[0].terminal.is_none()
             && (b.secs <= 0.0 || t0.elapsed().as_secs_f64() < b.secs)
         {
             let k = chunk.min(n1 - done);
-            t.run_inflight(play.eval.as_ref(), k, inflight)?;
-            done += k;
+            done += t.run_until(play.eval.as_ref(), k, inflight, deadline)?;
             if shown.elapsed().as_millis() >= 150 {
                 shown = std::time::Instant::now();
                 *LIVE.lock().unwrap() = Some(live_json(&t, &s, done, true, t0, b));
@@ -189,7 +191,14 @@ pub fn plan(
 
 /// A search in progress: visits so far, the root's turns (most visited
 /// first) and the latest visits' paths, turn by turn.
-fn live_json(t: &Tier1, s: &Search, done: u32, running: bool, t0: std::time::Instant, b: Budget) -> Value {
+fn live_json(
+    t: &Tier1,
+    s: &Search,
+    done: u32,
+    running: bool,
+    t0: std::time::Instant,
+    b: Budget,
+) -> Value {
     let root = &t.nodes[0];
     let pri = t.priors(0);
     let mut kids: Vec<(usize, u32)> = root.children.iter().copied().enumerate().collect();

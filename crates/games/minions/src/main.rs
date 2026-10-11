@@ -602,6 +602,22 @@ enum Cmd {
     /// option, take the best). Evaluators: `old:<dir>`, `<path>.onnx`, or an
     /// MLP's `<path>.bin` (CPU). `--b` may list several, comma-separated: one
     /// match against each, in turn.
+    /// Tier-1 search speed against visits in flight: one search of --n1
+    /// visits per position (net-sampled openings of 2, 8 and 14 turns at
+    /// handicap 3), for each --inflight value up the list and back down.
+    LatticeSpeed {
+        #[arg(long)]
+        net: String,
+        #[arg(long, default_value_t = 800)]
+        n1: u32,
+        #[arg(long, default_value = "1,2,4,8,16,32,64,128,256")]
+        inflight: String,
+        /// Positions per opening length.
+        #[arg(long, default_value_t = 2)]
+        positions: u32,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+    },
     /// How a lattice net values money (`stepsp::money_probe`): its curve of
     /// yellow's value against extra dollars after sampled openings, and the
     /// even bids, to tell when matches can use --even-bid.
@@ -1693,6 +1709,40 @@ async fn main() -> anyhow::Result<()> {
             )?;
         }
         Cmd::NnueBench { active, reps } => minions_engine::nnue::bench_sweep(active, reps),
+        Cmd::LatticeSpeed { net, n1, inflight, positions, seed } => {
+            use rand::SeedableRng;
+            let (_, lat) = lattice_play(&format!("vprior=100:{net}"), n1, 1)?;
+            let lp = lat.ok_or_else(|| anyhow::anyhow!("{net}: not a lattice net dir"))?;
+            let ks: Vec<usize> = inflight.split(',').map(|x| x.trim().parse()).collect::<Result<_, _>>()?;
+            let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+            let mut pos = Vec::new();
+            for n in [2u32, 8, 14] {
+                for _ in 0..positions {
+                    pos.push(minions_engine::stepsp::sampled_opening(n, 3, lp.eval.as_ref(), &mut rng)?);
+                }
+            }
+            let run = |s: &minions_engine::game::MinionsState, k: usize, salt: u64| -> anyhow::Result<f64> {
+                let start = minions_engine::steps::StepState::begin(s, salt);
+                let mut t = minions_engine::tier1::Tier1::new(start, lp.params.clone());
+                let t0 = std::time::Instant::now();
+                t.run_inflight(lp.eval.as_ref(), n1, k)?;
+                Ok(t0.elapsed().as_secs_f64())
+            };
+            run(&pos[0], 32, 0)?; // engine warm-up
+            let mut secs = vec![0f64; ks.len()];
+            let order: Vec<usize> = (0..ks.len()).chain((0..ks.len()).rev()).collect();
+            for (r, &i) in order.iter().enumerate() {
+                for (j, s) in pos.iter().enumerate() {
+                    secs[i] += run(s, ks[i], (r * 1000 + j) as u64)?;
+                }
+            }
+            let searches = 2.0 * pos.len() as f64;
+            println!("tier-1 search speed, {n1} visits, {} positions, each in flight up and back down:", pos.len());
+            for (i, k) in ks.iter().enumerate() {
+                let per = secs[i] / searches;
+                println!("  in flight {k:>4}: {per:6.2} s per search, {:7.0} visits/s, x{:.1} vs {}", f64::from(n1) / per, secs[0] / secs[i], ks[0]);
+            }
+        }
         Cmd::MoneyProbe { net, positions, opening_turns, handicap, seed, ep } => {
             let (vspec, lat) = lattice_play(&net, 1, 1)?;
             let lat = lat.ok_or_else(|| anyhow::anyhow!("{net}: not a lattice net dir"))?;

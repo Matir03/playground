@@ -269,7 +269,7 @@ export function Position({ state }: { state: GameState }) {
           {IS_GRAVEYARD[i] && d.cells[i] === 0 && (
             <text textAnchor="middle" dy="0.35em" fontSize={15} fill="#9a8f74">†</text>
           )}
-          {d.cells[i] !== 0 && <Piece cell={d.cells[i]} pstate={d.pstate[i]} />}
+          {d.cells[i] !== 0 && <Piece cell={d.cells[i]} pstate={d.pstate[i]} grave={IS_GRAVEYARD[i]} />}
         </g>
       ))}
     </svg>
