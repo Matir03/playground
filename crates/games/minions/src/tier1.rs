@@ -42,6 +42,9 @@ pub struct T1Params {
     /// than the lattice paths' priors (prior_posterior_diag). Overrides the
     /// energy prior.
     pub value_prior_tau: f32,
+    /// Lattices over a random variable order instead of order-free
+    /// (`Lattice::random_order`; an ablation).
+    pub random_order: bool,
 }
 
 impl Default for T1Params {
@@ -56,6 +59,7 @@ impl Default for T1Params {
             energy_prior: false,
             energy_temp: 1.0,
             value_prior_tau: 0.0,
+            random_order: false,
         }
     }
 }
@@ -285,7 +289,9 @@ impl Tier1 {
             if let Some(l) = &n.lattice {
                 l.mem(out);
             }
-            out[7] += n.trunk.as_ref().map_or(0.0, |a| (a.len() * 2) as f64 / std::sync::Arc::strong_count(a) as f64);
+            out[7] += n.trunk.as_ref().map_or(0.0, |a| {
+                (a.len() * 2) as f64 / std::sync::Arc::strong_count(a) as f64
+            });
         }
     }
 
@@ -418,7 +424,9 @@ impl Tier1 {
     fn wants_widen(&self, t: u32) -> bool {
         let nd = &self.nodes[t as usize];
         let p = &self.params;
-        let k = (f64::from(p.pw_c) * f64::from(self.pw_visits(t).max(1)).powf(f64::from(p.pw_alpha))).ceil();
+        let k = (f64::from(p.pw_c)
+            * f64::from(self.pw_visits(t).max(1)).powf(f64::from(p.pw_alpha)))
+        .ceil();
         !nd.widen_done && ((nd.children.len() + nd.widening as usize) as f64) < k
     }
 
@@ -429,7 +437,9 @@ impl Tier1 {
     fn short_of_turns(&self, t: u32) -> bool {
         let nd = &self.nodes[t as usize];
         let p = &self.params;
-        let k = (f64::from(p.pw_c) * f64::from(self.pw_visits(t).max(1)).powf(f64::from(p.pw_alpha))).ceil();
+        let k = (f64::from(p.pw_c)
+            * f64::from(self.pw_visits(t).max(1)).powf(f64::from(p.pw_alpha)))
+        .ceil();
         nd.widening > 0 && !nd.widen_done && (nd.children.len() as f64) < k
     }
 
@@ -484,7 +494,8 @@ impl Tier1 {
     /// them apart).
     pub fn advance(&mut self, vis: &mut Visit) -> Result<Need1> {
         if self.nodes[0].lattice.is_none() {
-            let l = Lattice::new(self.nodes[0].state.clone())?;
+            let mut l = Lattice::new(self.nodes[0].state.clone())?;
+            l.random_order = self.params.random_order;
             let root = &mut self.nodes[0];
             if let Some(v) = l.terminal {
                 root.terminal = Some(v);
@@ -573,7 +584,8 @@ impl Tier1 {
                         let to = &self.lattice(wt).nodes[sink as usize].state;
                         let fresh = !self.nodes[wt as usize].children.iter().any(|&c| {
                             let cn = &self.nodes[c as usize];
-                            cn.sink == sink || (cn.state.flipped == to.flipped && cn.state.base == to.base)
+                            cn.sink == sink
+                                || (cn.state.flipped == to.flipped && cn.state.base == to.base)
                         });
                         if fresh {
                             vis.widen = None;
@@ -612,6 +624,7 @@ impl Tier1 {
             }
             if nd.lattice.is_none() {
                 let mut l = Lattice::new(nd.state.clone())?;
+                l.random_order = self.params.random_order;
                 if l.terminal.is_some() {
                     // The parent's lattice scores such turns itself, so a
                     // child is never a necromancer kill it missed.
@@ -923,7 +936,11 @@ mod tests {
                 let kk = nd.key.with(kd.var as usize, kd.choice);
                 keys.iter().filter(|x| x.includes(&kk)).count()
             };
-            if let Some(k) = nd.kids.iter().position(|kd| !kd.dead && m(kd) > 0 && m(kd) < keys.len()) {
+            if let Some(k) = nd
+                .kids
+                .iter()
+                .position(|kd| !kd.dead && m(kd) > 0 && m(kd) < keys.len())
+            {
                 break lat.step_to(at, k).unwrap().expect("live");
             }
             let k = nd
@@ -939,7 +956,9 @@ mod tests {
             let key = lat.nodes[c as usize].key;
             let root = &t.nodes[0];
             for &ch in &root.children {
-                assert!(lat.nodes[t.nodes[ch as usize].sink as usize].key.includes(&key));
+                assert!(lat.nodes[t.nodes[ch as usize].sink as usize]
+                    .key
+                    .includes(&key));
             }
             let kids: u32 = root.children.iter().map(|&ch| t.nodes[ch as usize].n).sum();
             assert_eq!(root.n, 1 + kids, "root visits");
@@ -950,7 +969,10 @@ mod tests {
         check(&t);
         t.run(&HashLatticeEval, 100).unwrap();
         check(&t);
-        assert!(t.nodes[0].children.len() > kept, "no new turns below the node");
+        assert!(
+            t.nodes[0].children.len() > kept,
+            "no new turns below the node"
+        );
         t.unrestrict();
         assert_eq!(t.nodes[0].children.len(), before);
         assert_eq!(t.nodes[0].n, 201);

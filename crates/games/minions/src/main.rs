@@ -1153,6 +1153,12 @@ fn lattice_play(spec: &str, n1: u32, inflight: usize) -> anyhow::Result<(String,
         let play = minions_engine::stepsp::LatticePlay { eval, n1, inflight, params: Default::default() };
         return Ok((net.to_string(), Some(play)));
     }
+    // `rorder:<spec>`: tier-2 lattices over a random variable order (an
+    // ablation of the order-free lattice), combinable with the prefixes below.
+    let (spec, random_order) = match spec.strip_prefix("rorder:") {
+        Some(s) => (s, true),
+        None => (spec, false),
+    };
     // `energy:<lattice dir>`: tier-1 priors from the net's energies;
     // `vprior=<tau>:<lattice dir>`: from the children's static values.
     let (spec, energy) = match spec.strip_prefix("energy:") {
@@ -1168,7 +1174,7 @@ fn lattice_play(spec: &str, n1: u32, inflight: usize) -> anyhow::Result<(String,
         return Ok((spec.to_string(), None));
     }
     let eval = std::sync::Arc::new(minions_engine::lattice_ort::OrtLatticeEval::load(dir, "trt", true, 1)?);
-    let params = minions_engine::tier1::T1Params { energy_prior: energy, value_prior_tau: vtau, ..Default::default() };
+    let params = minions_engine::tier1::T1Params { energy_prior: energy, value_prior_tau: vtau, random_order, ..Default::default() };
     let play = minions_engine::stepsp::LatticePlay { eval, n1, inflight, params };
     Ok((dir.join("value_sparse.onnx").to_string_lossy().into_owned(), Some(play)))
 }

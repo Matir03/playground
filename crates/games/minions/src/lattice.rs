@@ -581,6 +581,11 @@ pub struct Lattice {
     /// (tests).
     pub follow_sat_only: bool,
     pub stats: LatticeStats,
+    /// Ablation of the order-free lattice: each node offers the choices of
+    /// ONE undecided variable of its phase, the first in a random order
+    /// fixed per lattice (by the start's salt), so the lattice is a tree
+    /// over a random variable order.
+    pub random_order: bool,
     /// The turn start's tier-1 trunk image, once known.
     pub trunk: Option<Trunk>,
 }
@@ -725,6 +730,7 @@ impl Lattice {
             sat: None,
             follow_sat_only: false,
             stats: LatticeStats::default(),
+            random_order: false,
             trunk: None,
         };
         if start.is_terminal() {
@@ -992,6 +998,19 @@ impl Lattice {
             .filter(|&p| self.nodes[p as usize].state.stage == self.nodes[n as usize].state.stage);
         let node = &self.nodes[n as usize];
         let st = &node.state;
+        // `random_order`: the one variable this node decides.
+        let only: Option<u8> = self.random_order.then(|| {
+            let salt = self.start.salt;
+            *st.undecided()
+                .iter()
+                .min_by_key(|&&c| {
+                    let mut z = salt ^ u64::from(c).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                    z ^ (z >> 31)
+                })
+                .expect("an inner node has an undecided variable")
+        });
         let mut kids: Vec<(Kid, TurnSpec)> = Vec::new();
         let mut new_nogoods: Vec<Key> = Vec::new();
         let kid = |var: usize, choice: u8, cell: u8| Kid {
@@ -1008,7 +1027,11 @@ impl Lattice {
                 crate::steps::cand_log::on(true);
                 let mut cls = [[0u64; 2]; crate::steps::cand_log::N];
                 let mut inh = [0u64; 3];
-                for &c in st.undecided() {
+                for &c in st
+                    .undecided()
+                    .iter()
+                    .filter(|&&c| only.map_or(true, |o| o == c))
+                {
                     let v = var_of[c as usize] as usize;
                     let oracle = |choice: u8| -> crate::steps::Known {
                         if refuted.contains(&(v as u8, choice)) {
@@ -1059,7 +1082,11 @@ impl Lattice {
             Stage::Spawns => {
                 // The same options at every cell: they depend on money only.
                 let (o, w) = st.lattice_options();
-                for &c in st.undecided() {
+                for &c in st
+                    .undecided()
+                    .iter()
+                    .filter(|&&c| only.map_or(true, |o| o == c))
+                {
                     let v = var_index(&var_of, n_fm, st, c);
                     if v >= MAX_VARS {
                         bail!("spawn variable {v}");
@@ -3450,6 +3477,38 @@ pub(crate) mod tests {
                 "{total} records, {reached} reached"
             );
         }
+    }
+
+    /// `random_order`: every prepared node offers one variable's choices,
+    /// descents still end at complete turns, and the lattice is a tree (one
+    /// parent per node).
+    #[test]
+    fn random_order_is_a_tree() {
+        let (mut sinks, mut nodes) = (0, 0);
+        for s in positions(6, 77) {
+            let mut l = Lattice::new(s).unwrap();
+            if l.terminal.is_some() {
+                continue;
+            }
+            l.random_order = true;
+            for _ in 0..12 {
+                let (sink, _, _) = l
+                    .descend(&HashLatticeEval, Cursor::at(0, 0.0), 1.5)
+                    .unwrap();
+                assert_eq!(l.nodes[sink as usize].kind, Kind::Sink);
+                sinks += 1;
+            }
+            for nd in &l.nodes {
+                assert!(nd.parents.len() <= 1, "{} parents", nd.parents.len());
+                if nd.prepared && nd.kind == Kind::Inner {
+                    let mut vars: Vec<u8> = nd.kids.iter().map(|k| k.var).collect();
+                    vars.dedup();
+                    assert_eq!(vars.len(), 1, "kids over {vars:?}");
+                    nodes += 1;
+                }
+            }
+        }
+        assert!(sinks > 20 && nodes > 20, "{sinks} sinks, {nodes} nodes");
     }
 
     #[test]
