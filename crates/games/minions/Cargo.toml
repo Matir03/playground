@@ -56,6 +56,9 @@ half = "2"
 foldhash = "0.2"
 
 [features]
+# mimalloc by default since 2026-10-11: lattice self-play spent ~28% of its
+# CPU in glibc malloc/free; mimalloc cut its CPU ~15% (ABBA, 90 s runs).
+default = ["mimalloc"]
 # Build candle with CUDA kernels for GPU self-play (needs nvcc at build time).
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
 # mimalloc as the global allocator, for the self-play malloc churn.

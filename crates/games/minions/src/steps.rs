@@ -827,7 +827,7 @@ impl StepState {
                 cand_log::add(v, cand_log::RELAXED, tc);
                 continue; // necessary even with the unfated enemies removable
             }
-            if relaxed_feasible(&self.base, &spec, &[], 0) {
+            if !(skip_build() && lazy_witness() && !t.stats().necromancer) && relaxed_feasible(&self.base, &spec, &[], 0) {
                 if let Some(w) = build_witness(&self.base, &spec, &[]) {
                     out.push(v);
                     ws.push(w);
@@ -891,7 +891,8 @@ impl StepState {
         };
         let blocked = self.claimed | staying_enemies | stayers;
         let last = self.idx + 1 == self.friends.len();
-        let decided: Vec<u8> = self.friends[..self.idx].to_vec();
+        // The decided units with this one: the same for every candidate.
+        let dec: Vec<u8> = self.friends[..=self.idx].to_vec();
         let (mut out, mut ws) = (Vec::new(), Vec::new());
         let wk = match wit.moves[c as usize] {
             NO_MOVE => 0,
@@ -957,8 +958,6 @@ impl StepState {
                 cand_log::add(k, cand_log::FAST, tc);
                 continue;
             }
-            let mut dec = decided.clone();
-            dec.push(c);
             // A necessary condition here: every enemy is fated by now, so
             // the relaxation's "undecided enemies stay" is vacuous.
             // (`witness_drop_rate` checks it.)
@@ -969,7 +968,7 @@ impl StepState {
             // Not necessary (it routes evacuating units on vertex-disjoint
             // paths, but friends pass through friends), so it only gates the
             // cheap constructor; the exact search decides.
-            if self.movers_completable(&spec, self.claimed | bit(d), c, k) {
+            if !(skip_build() && lazy_witness()) && self.movers_completable(&spec, self.claimed | bit(d), c, k) {
                 if let Some(w) = build_witness(&self.base, &spec, &dec) {
                     out.push(k);
                     ws.push(w);
@@ -1772,6 +1771,17 @@ pub static LAZY_STATS: [std::sync::atomic::AtomicU64; 3] =
 
 fn lazy_witness() -> bool {
     LAZY_WITNESS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// With lazy witnesses, an option the fast realizer cannot certify goes
+/// straight to the deferred exact search instead of the witness constructor:
+/// the constructor's cost was paid for every such candidate, the deferred
+/// search is paid only for the children ever expanded. The offered options
+/// are the same (the constructor only certifies feasible ones); self-play
+/// CPU -8% (2026-10-11, ABBA). STEPS_BUILD=1 restores the constructor.
+fn skip_build() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| !std::env::var("STEPS_BUILD").is_ok_and(|v| v == "1"))
 }
 
 /// Witnesses carry no spawns, so a spawn code no unit has marks a deferred

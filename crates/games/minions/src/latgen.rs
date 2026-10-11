@@ -2225,6 +2225,13 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
     }
     let left = std::mem::take(&mut *pool.lock().unwrap());
     save(&left)?;
+    eprintln!(
+        "  self-play totals: {} expansions, {} values, {} turns, {} games",
+        c.expansions.load(Relaxed),
+        c.values.load(Relaxed),
+        c.turns.load(Relaxed),
+        c.games.load(Relaxed)
+    );
     if cfg.rooted_frac > 0.0 {
         rooted_phase(cfg, bid, eval, &c, rooted_q, &t1_dir, &t2_dir)?;
     }
