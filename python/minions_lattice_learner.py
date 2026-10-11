@@ -136,12 +136,13 @@ def read_chunk(path, magic, dtype):
         return np.frombuffer(f.read(), dtype, count=count)
 
 
-def load_t2(dirs, old=False):
-    """Records and kids; with `old`, only chunks with `.old` side files
+def load_t2(dirs, old=False, sub="t2"):
+    """Records and kids from each dir's `sub` (t2/, or t2m/: rooted records
+    with mean targets); with `old`, only chunks with `.old` side files
     (--teacher-view) and those too."""
     recs, kids, olds = [], [], []
     for d in dirs:
-        for p in sorted(glob.glob(os.path.join(d, "t2", "chunk_*.bin"))):
+        for p in sorted(glob.glob(os.path.join(d, sub, "chunk_*.bin"))):
             if old and not os.path.exists(p[:-4] + ".old"):
                 continue
             r = read_chunk(p, b"MLT2", T2_DTYPE)
@@ -689,6 +690,7 @@ def energy_loss(trunk, t2, es, g, grad_trunk=True):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", nargs="+", help="lattice-gen output dirs (their t1/ and t2/)")
+    ap.add_argument("--t2-sub", default="t2", help="tier-2 records subdir: t2, or t2m (rooted records with mean targets, lattice-gen --rooted-mean-too)")
     ap.add_argument("--t1", help="tier-1 steps net.pt to start from (default: random init)")
     ap.add_argument("--t1-arch", default="res:32x4")
     ap.add_argument("--arch", default="32x2", help="tier-2 CHANNELSxBLOCKS")
@@ -764,7 +766,7 @@ def main():
     if args.teacher and not lv_teacher:
         recs, kids, old = load_t2(args.data, old=True)
     else:
-        recs, kids = load_t2(args.data)
+        recs, kids = load_t2(args.data, sub=args.t2_sub)
     ds = T2Set(recs, kids, dev, args.all_visit_targets, t2.slots)
     tv1 = None
     if lv_teacher:

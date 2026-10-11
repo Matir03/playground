@@ -941,6 +941,12 @@ enum Cmd {
         /// found).
         #[arg(long, default_value_t = 0.02)]
         rooted_tau: f64,
+        /// Rooted searches (tier-2 phase and anchors) also write their
+        /// records with MEAN targets (each kid's value the mean of the
+        /// complete turns below it, not the best) to t2m/, for the learner's
+        /// --t2-sub t2m.
+        #[arg(long)]
+        rooted_mean_too: bool,
         /// Tier-2 phase: seconds (the nodes left are dropped), searches per
         /// worker at a time, descents in flight per search, and expansions
         /// per search before falling back to witness-following.
@@ -1772,7 +1778,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::LatticeGen {
             out, onnx, ep, batcher, workers, games, n1, inflight, n2, c1, c2, pw_c, pw_alpha, retries,
             temp1, anchor, from_start, random_handicap, ramp_secs, stepwise, step_search, step_n1, step_temp, step_dir_alpha, step_dir_frac, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, start_turn_mean, secs,
-            target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, sd_frac, sd_descents, sd_tau, rooted_frac, rooted_n, rooted_min, rooted_tau, rooted_secs, rooted_tasks, rooted_inflight, rooted_budget, walk_accumulated, sink_values, walk_inflight, walk_marginal, walk_cq, lview, energy_min_visits, teacher_view, energy_prior, energy_temp, value_prior_tau, pipeline, openings, open_workers, pool, refill_to,
+            target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, sd_frac, sd_descents, sd_tau, rooted_frac, rooted_n, rooted_min, rooted_tau, rooted_mean_too, rooted_secs, rooted_tasks, rooted_inflight, rooted_budget, walk_accumulated, sink_values, walk_inflight, walk_marginal, walk_cq, lview, energy_min_visits, teacher_view, energy_prior, energy_temp, value_prior_tau, pipeline, openings, open_workers, pool, refill_to,
         } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
             // A directory is the lattice nets (tier1/tier2.onnx); a file a steps value net behind the bridge.
@@ -1851,6 +1857,7 @@ async fn main() -> anyhow::Result<()> {
                     inflight: rooted_inflight,
                     tau: rooted_tau,
                     budget: rooted_budget,
+                    mean_too: rooted_mean_too,
                 },
                 rooted_secs,
                 rooted_tasks,

@@ -633,6 +633,8 @@ struct Worker<'a> {
     bid: i16,
     t1w: ChunkWriter,
     t2w: ChunkWriter,
+    /// Rooted records with mean targets (`RootedParams::mean_too`), in t2m/.
+    t2m: Option<ChunkWriter>,
     t1e: ChunkWriter,
     /// The opening phase: finished openings go here, not into searches.
     collect: Option<Vec<StepState>>,
@@ -893,6 +895,9 @@ impl Worker<'_> {
                     self.c.t2_records.fetch_add(1, Relaxed);
                     self.c.anchors.fetch_add(1, Relaxed);
                 }
+                if let (Some(rec), Some(w)) = (r.record_mean.take(), self.t2m.as_mut()) {
+                    encode_t2(&lat.start, &rec, w, self.cfg.lview)?;
+                }
                 let reached = r.reached();
                 let (s, end) = if reached.is_empty() {
                     fallback.clone()
@@ -937,6 +942,9 @@ impl Worker<'_> {
                     encode_t2(&lat.start, &rec, &mut self.t2w, self.cfg.lview)?;
                     self.view_targets(&rec)?;
                     self.c.t2_records.fetch_add(1, Relaxed);
+                }
+                if let (Some(rec), Some(w)) = (r.record_mean.take(), self.t2m.as_mut()) {
+                    encode_t2(&lat.start, &rec, w, self.cfg.lview)?;
                 }
                 Ok(Next::Replace(self.next_rooted()?.into_iter().collect()))
             }
@@ -1000,6 +1008,9 @@ impl Worker<'_> {
             g = (g + 1) % p;
         }
         self.t1w.flush()?;
+        if let Some(w) = self.t2m.as_mut() {
+            w.flush()?;
+        }
         self.t2w.flush()
     }
 
@@ -1598,6 +1609,9 @@ impl Worker<'_> {
         }
         self.t1w.flush()?;
         self.t1e.flush()?;
+        if let Some(w) = self.t2m.as_mut() {
+            w.flush()?;
+        }
         self.t2w.flush()
     }
 
@@ -1879,6 +1893,18 @@ fn make_worker<'a>(
             }
             x
         },
+        t2m: cfg.rooted.mean_too.then(|| {
+            let mut x = ChunkWriter::new(
+                t2_dir.with_file_name("t2m"),
+                w,
+                b"MLT2",
+                T2_VERSION,
+                T2_REC_BYTES,
+                cfg.chunk_records,
+            );
+            x.side = Some((b"MLTK", Vec::new(), T2_KID_BYTES));
+            x
+        }),
         t1e: ChunkWriter::new(
             t1_dir.with_file_name("t1e"),
             w,
@@ -1899,6 +1925,9 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
     let t2_dir = cfg.out.join("t2");
     std::fs::create_dir_all(&t1_dir)?;
     std::fs::create_dir_all(&t2_dir)?;
+    if cfg.rooted.mean_too {
+        std::fs::create_dir_all(cfg.out.join("t2m"))?;
+    }
     if cfg.lview {
         std::fs::create_dir_all(cfg.out.join("t1e"))?;
     }

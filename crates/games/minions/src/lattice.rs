@@ -427,7 +427,10 @@ impl LNode {
         let mut w = self.kid_base(k);
         if let Ok(i) = self.wit_ex.binary_search_by_key(&(k as u16), |x| x.0) {
             let (_, len, at) = self.wit_ex[i];
-            spec_patch(&mut w, &self.wit_diff[at as usize..at as usize + len as usize]);
+            spec_patch(
+                &mut w,
+                &self.wit_diff[at as usize..at as usize + len as usize],
+            );
         }
         w
     }
@@ -653,10 +656,24 @@ impl Drop for Lattice {
 /// Memory accounting categories ([`Lattice::mem`]): node structs, state
 /// heap vectors, cached options, kids, witness exceptions, parent lists,
 /// index and lattice-level lists, trunk images (shared ones split).
-pub const MEM_NAMES: [&str; 12] = ["nodes", "state-vecs", "opts", "kids", "wit-ex", "parents", "index", "trunks", "node-slack", "pool", "nogoods", "touched"];
+pub const MEM_NAMES: [&str; 12] = [
+    "nodes",
+    "state-vecs",
+    "opts",
+    "kids",
+    "wit-ex",
+    "parents",
+    "index",
+    "trunks",
+    "node-slack",
+    "pool",
+    "nogoods",
+    "touched",
+];
 
 /// Live bytes per category, summed by the workers' periodic scans.
-pub static MEM: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+pub static MEM: [std::sync::atomic::AtomicU64; 12] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 12];
 
 fn trunk_bytes(t: &Option<Trunk>) -> f64 {
     t.as_ref().map_or(0.0, |a| {
@@ -668,13 +685,15 @@ impl Lattice {
     /// Bytes this lattice holds, by [`MEM_NAMES`] category, added to `out`.
     pub fn mem(&self, out: &mut [f64; 12]) {
         out[0] += (self.nodes.len() * std::mem::size_of::<LNode>()) as f64;
-        out[8] += ((self.nodes.capacity() - self.nodes.len()) * std::mem::size_of::<LNode>()) as f64;
+        out[8] +=
+            ((self.nodes.capacity() - self.nodes.len()) * std::mem::size_of::<LNode>()) as f64;
         for n in &self.nodes {
             let (v, o) = n.state.heap_bytes();
             out[1] += v as f64;
             out[2] += o as f64;
             out[3] += (n.kids.capacity() * std::mem::size_of::<Kid>()) as f64;
-            out[4] += (n.wit_ex.capacity() * std::mem::size_of::<(u16, u16, u32)>() + n.wit_diff.capacity()) as f64;
+            out[4] += (n.wit_ex.capacity() * std::mem::size_of::<(u16, u16, u32)>()
+                + n.wit_diff.capacity()) as f64;
             out[5] += (n.parents.capacity() * std::mem::size_of::<(u32, u16)>()) as f64;
             out[7] += trunk_bytes(&n.trunk);
         }
@@ -1846,6 +1865,10 @@ pub struct RootedParams {
     /// Expansions after which the descents follow witnesses (exact SAT
     /// fallback), and after twice which they are abandoned.
     pub budget: u32,
+    /// Also build `Rooted::record_mean`: the same search's record with
+    /// each kid's value the MEAN of the complete turns below it (the node's
+    /// the mean of all), and the prior softmax over those means.
+    pub mean_too: bool,
 }
 
 impl Default for RootedParams {
@@ -1857,6 +1880,7 @@ impl Default for RootedParams {
             inflight: 8,
             tau: 0.02,
             budget: 4000,
+            mean_too: false,
         }
     }
 }
@@ -1873,6 +1897,8 @@ pub struct Rooted {
     expansions: u32,
     pub abandoned: bool,
     pub record: Option<T2Record>,
+    /// With `RootedParams::mean_too`: the record with mean targets.
+    pub record_mean: Option<T2Record>,
 }
 
 impl Rooted {
@@ -1903,6 +1929,7 @@ impl Rooted {
             expansions: 0,
             abandoned: false,
             record: None,
+            record_mean: None,
         }
     }
 }
@@ -2040,7 +2067,11 @@ impl Lattice {
     /// that include `at`'s commitments, and per kid (dead ones too) those
     /// that also include the kid's. Every turn decides every variable, so
     /// one variable's kids split the node's visits.
-    pub fn turn_marginals(&self, at: u32, turns: &[(u32, f64, f64)]) -> ((f64, f64), Vec<(f64, f64)>) {
+    pub fn turn_marginals(
+        &self,
+        at: u32,
+        turns: &[(u32, f64, f64)],
+    ) -> ((f64, f64), Vec<(f64, f64)>) {
         let keys: Vec<(Key, f64, f64)> = turns
             .iter()
             .map(|&(s, n, w)| (self.nodes[s as usize].key, n, w))
@@ -2063,7 +2094,11 @@ impl Lattice {
     /// visits, summed value for the turn's mover, as in
     /// [`Self::tier1_records`]): each live kid's visits and value summed over
     /// the turns including its commitment. None: `at` is a dead end.
-    pub fn marginal_record(&mut self, at: u32, turns: &[(u32, f64, f64)]) -> Result<Option<T2Record>> {
+    pub fn marginal_record(
+        &mut self,
+        at: u32,
+        turns: &[(u32, f64, f64)],
+    ) -> Result<Option<T2Record>> {
         if self.nodes[at as usize].kind != Kind::Inner {
             return Ok(None);
         }
@@ -2504,23 +2539,30 @@ impl Lattice {
                 }
                 continue;
             }
-            r.record = self.rooted_record(r, p);
+            r.record = self.rooted_record(r, p, false);
+            if p.mean_too {
+                r.record_mean = self.rooted_record(r, p, true);
+            }
             return Ok(true);
         }
     }
 
-    fn rooted_record(&self, r: &Rooted, p: &RootedParams) -> Option<T2Record> {
+    /// Targets per kid from the complete turns containing it: the best
+    /// value, or with `mean` their mean (over descents, repeats included).
+    fn rooted_record(&self, r: &Rooted, p: &RootedParams, mean: bool) -> Option<T2Record> {
         let nd = &self.nodes[r.at as usize];
         if nd.kind != Kind::Inner || r.sinks.is_empty() {
             return None;
         }
         let nk = nd.kids.len();
         let (mut best, mut cnt) = (vec![f32::NEG_INFINITY; nk], vec![0f32; nk]);
+        let mut sum = vec![0f32; nk];
         for &(s, v) in &r.sinks {
             let key = self.nodes[s as usize].key;
             for (k, kid) in nd.kids.iter().enumerate() {
                 if key.mask & (1 << kid.var) != 0 && key.get(kid.var as usize) == kid.choice {
                     best[k] = best[k].max(v);
+                    sum[k] += v;
                     cnt[k] += 1.0;
                 }
             }
@@ -2530,6 +2572,11 @@ impl Lattice {
             .collect();
         if live.is_empty() {
             return None;
+        }
+        if mean {
+            for &k in &live {
+                best[k] = sum[k] / cnt[k];
+            }
         }
         let mut cell_best: HashMap<u8, f32> = HashMap::new();
         for &k in &live {
@@ -2550,12 +2597,15 @@ impl Lattice {
                 (kid.cell, kid.choice, wt, best[k], cnt[k])
             })
             .collect();
-        let q = r
-            .sinks
-            .iter()
-            .map(|x| x.1)
-            .fold(f32::NEG_INFINITY, f32::max);
         let n = r.sinks.len() as f32;
+        let q = if mean {
+            r.sinks.iter().map(|x| x.1).sum::<f32>() / n
+        } else {
+            r.sinks
+                .iter()
+                .map(|x| x.1)
+                .fold(f32::NEG_INFINITY, f32::max)
+        };
         Some(T2Record {
             node: nd.state.clone(),
             kids,
@@ -3300,6 +3350,7 @@ pub(crate) mod tests {
                 n: 40,
                 inflight,
                 tau,
+                mean_too: true,
                 ..RootedParams::default()
             };
             let (mut total, mut reached) = (0, 0);
@@ -3329,6 +3380,32 @@ pub(crate) mod tests {
                     }
                     let Some(rec) = r.record else { continue };
                     assert!(r.sinks.len() as u32 >= p.n.min(1));
+                    // Mean targets: the same kids, each at the mean of the
+                    // sinks containing it; the node at the mean of all.
+                    let rm = r.record_mean.as_ref().expect("mean record");
+                    assert_eq!(rm.kids.len(), rec.kids.len());
+                    let all = r.sinks.iter().map(|x| x.1).sum::<f32>() / r.sinks.len() as f32;
+                    assert!((rm.q - all).abs() < 1e-5);
+                    for (k, km) in rec.kids.iter().zip(&rm.kids) {
+                        assert_eq!((k.0, k.1, k.4), (km.0, km.1, km.4));
+                        let kid = f.nodes[at as usize]
+                            .kids
+                            .iter()
+                            .find(|x| x.cell == k.0 && x.choice == k.1)
+                            .unwrap();
+                        let vs: Vec<f32> = r
+                            .sinks
+                            .iter()
+                            .filter(|&&(sn, _)| {
+                                let sk = f.nodes[sn as usize].key;
+                                sk.mask & (1 << kid.var) != 0
+                                    && sk.get(kid.var as usize) == kid.choice
+                            })
+                            .map(|x| x.1)
+                            .collect();
+                        let m = vs.iter().sum::<f32>() / vs.len() as f32;
+                        assert!((km.3 - m).abs() < 1e-5 && km.3 <= k.3 + 1e-6);
+                    }
                     let best = rec
                         .kids
                         .iter()
