@@ -167,6 +167,8 @@ pub struct GenConfig {
     pub from_start: bool,
     /// Each worker starts its games spread over this many seconds.
     pub ramp_secs: f64,
+    /// Each game's handicap drawn from BID_MIN..=BID_MAX (else the bid).
+    pub random_handicap: bool,
     /// Stepwise with a search at each commitment (above). Off (the default
     /// since 2026-10-10, user): one search a turn, then the turn is chosen
     /// by stepping down its lattice, each commitment sampled from the
@@ -596,7 +598,7 @@ fn encode_t2(root: &StepState, r: &T2Record, w: &mut ChunkWriter, lview: bool) -
 /// The ordinal distribution over `vals` ranked best first: the i-th best of
 /// m, given no better one was taken, with probability `e + (1 - e) / (m -
 /// i)`, `e` uniform per choice.
-fn pick_ordinal(vals: &[f32], rng: &mut impl Rng) -> usize {
+pub(crate) fn pick_ordinal(vals: &[f32], rng: &mut impl Rng) -> usize {
     let mut idx: Vec<usize> = (0..vals.len()).collect();
     idx.sort_by(|&a, &b| vals[b].total_cmp(&vals[a]));
     let e: f64 = rng.gen();
@@ -638,11 +640,21 @@ struct Worker<'a> {
 }
 
 impl Worker<'_> {
+    /// A new game's handicap: drawn per game, or the net's bid.
+    fn handicap(&mut self) -> i16 {
+        if self.cfg.random_handicap {
+            self.rng.gen_range(crate::game::BID_MIN..=crate::game::BID_MAX)
+        } else {
+            self.bid
+        }
+    }
+
     fn new_game(&mut self) -> Result<Task> {
         if self.cfg.from_start && self.collect.is_none() {
             self.c.games.fetch_add(1, Relaxed);
             let salt: u64 = self.rng.gen();
-            let s = StepState::begin(&crate::game::MinionsState::with_bid(self.bid), salt);
+            let h = self.handicap();
+            let s = StepState::begin(&crate::game::MinionsState::with_bid(h), salt);
             return self.start(s, 0);
         }
         if self.collect.is_none() {
@@ -653,7 +665,8 @@ impl Worker<'_> {
             }
         }
         let salt: u64 = self.rng.gen();
-        let s = StepState::begin(&crate::game::MinionsState::with_bid(self.bid), salt);
+        let h = self.handicap();
+        let s = StepState::begin(&crate::game::MinionsState::with_bid(h), salt);
         if self.cfg.start_turn_mean > 0.0 {
             let q = truncated_geometric_q(self.cfg.start_turn_mean, crate::game::MAX_TURNS.into());
             let k = loop {

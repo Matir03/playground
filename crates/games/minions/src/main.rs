@@ -609,7 +609,22 @@ enum Cmd {
         b: String,
         #[arg(long, default_value_t = 100)]
         pairs: usize,
-        /// 0 = standard opening with bidding; otherwise random openings.
+        /// Pairs start after this many random turns from the standard start
+        /// (at --handicap); 0 = the older starts (--opening-max).
+        #[arg(long, default_value_t = 2)]
+        opening_turns: u32,
+        /// Dollars to blue at the start of --opening-turns games. Self-play's
+        /// net bid was 2, but yellow then won 30 of 32 equal games; 3-4 is
+        /// about even (2026-10-10).
+        #[arg(long, default_value_t = 3)]
+        handicap: i16,
+        /// After the opening, each side's net bids money to even the
+        /// position (the average applies). Needs a net trained on varied
+        /// starting money.
+        #[arg(long)]
+        even_bid: bool,
+        /// With --opening-turns 0: 0 = standard opening with bidding;
+        /// otherwise random openings (with a random handicap).
         #[arg(long, default_value_t = 22)]
         opening_max: u32,
         #[arg(long, default_value_t = 1.0884)]
@@ -660,6 +675,9 @@ enum Cmd {
         n1_b: Option<u32>,
         #[arg(long, default_value_t = 16)]
         lattice_inflight: usize,
+        /// B's tier-1 visits in flight, if different from A's.
+        #[arg(long)]
+        lattice_inflight_b: Option<usize>,
         /// Check every candidate option eagerly in the lattices (self-play,
         /// lattice-gen, defers them: `steps::LAZY_WITNESS`). Eager checks gave
         /// single games a heavy tail of 30+ minutes.
@@ -811,6 +829,11 @@ enum Cmd {
         /// --pool is ignored and left as it is).
         #[arg(long)]
         from_start: bool,
+        /// Every game draws its starting handicap (dollars to blue) uniformly
+        /// from BID_MIN..=BID_MAX, so the value head learns what money is
+        /// worth (a net trained at one handicap cannot bid).
+        #[arg(long)]
+        random_handicap: bool,
         /// Each worker starts its games spread over this many seconds (0:
         /// all at once), so searches peak in memory at different times.
         #[arg(long, default_value_t = 0.0)]
@@ -1639,20 +1662,20 @@ async fn main() -> anyhow::Result<()> {
             )?;
         }
         Cmd::NnueBench { active, reps } => minions_engine::nnue::bench_sweep(active, reps),
-        Cmd::StepsMatch { a, b, pairs, opening_max, opening_decay, ep, seed, expansions, expansions_b, power, power_b, heads, threads, two_tier_a, two_tier_b, t2_c, t2_retries, t2_widen, n1, n1_b, lattice_inflight, no_lazy_witness } => {
+        Cmd::StepsMatch { a, b, pairs, opening_turns, handicap, even_bid, opening_max, opening_decay, ep, seed, expansions, expansions_b, power, power_b, heads, threads, two_tier_a, two_tier_b, t2_c, t2_retries, t2_widen, n1, n1_b, lattice_inflight, lattice_inflight_b, no_lazy_witness } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
             // A match evaluates one batch at a time per game thread, so one
             // runner (two sessions per net, not four) is enough: the session
             // builds were most of a short match's time and memory.
             anyhow::ensure!(t2_widen == "current" || t2_widen == "static", "--t2-widen: current or static");
             let tt = minions_engine::two_tier::TwoTierParams { c_uct: t2_c, retries: t2_retries, widen_current: t2_widen == "current" };
-            let player = |spec: &str, expansions: u64, power: f32, two: bool, n1: u32| -> anyhow::Result<minions_engine::stepsp::Player> {
+            let player = |spec: &str, expansions: u64, power: f32, two: bool, n1: u32, inflight: usize| -> anyhow::Result<minions_engine::stepsp::Player> {
                 let params = minions_engine::bfs::Params { heads, power, ..Default::default() };
                 let two_tier = two.then(|| tt.clone());
-                let (spec, lattice) = lattice_play(spec, n1, lattice_inflight)?;
+                let (spec, lattice) = lattice_play(spec, n1, inflight)?;
                 Ok(minions_engine::stepsp::Player { eval: load_step_eval_runners(&spec, &ep, 1)?, expansions, params, two_tier, lattice, solver: false })
             };
-            let pa = player(&a, expansions, power, two_tier_a, n1)?;
+            let pa = player(&a, expansions, power, two_tier_a, n1, lattice_inflight)?;
             // `--b x,y,...`: a match against each in turn (seed + its index),
             // A loaded once and each B freed after its match.
             for (k, b) in b.split(',').enumerate() {
@@ -1661,10 +1684,10 @@ async fn main() -> anyhow::Result<()> {
                 let pb = if b == "greedy" {
                     Ok(minions_engine::stepsp::Player { solver: true, lattice: None, two_tier: None, expansions: 0, ..pa.clone() })
                 } else {
-                    player(b, expansions_b.unwrap_or(expansions), power_b.unwrap_or(power), two_tier_b, n1_b.unwrap_or(n1))
+                    player(b, expansions_b.unwrap_or(expansions), power_b.unwrap_or(power), two_tier_b, n1_b.unwrap_or(n1), lattice_inflight_b.unwrap_or(lattice_inflight))
                 };
                 let res = pb.and_then(|pb| {
-                    minions_engine::stepsp::play_match(&pa, &pb, pairs, opening_max, opening_decay, seed + k as u64, threads)
+                    minions_engine::stepsp::play_match(&pa, &pb, pairs, opening_turns, handicap, even_bid, opening_max, opening_decay, seed + k as u64, threads)
                 });
                 let (score, wdl) = match res {
                     Ok(r) => r,
@@ -1747,7 +1770,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::LatticeGen {
             out, onnx, ep, batcher, workers, games, n1, inflight, n2, c1, c2, pw_c, pw_alpha, retries,
-            temp1, anchor, from_start, ramp_secs, stepwise, step_search, step_n1, step_temp, step_dir_alpha, step_dir_frac, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, start_turn_mean, secs,
+            temp1, anchor, from_start, random_handicap, ramp_secs, stepwise, step_search, step_n1, step_temp, step_dir_alpha, step_dir_frac, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, start_turn_mean, secs,
             target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, sd_frac, sd_descents, sd_tau, rooted_frac, rooted_n, rooted_min, rooted_tau, rooted_secs, rooted_tasks, rooted_inflight, rooted_budget, walk_accumulated, sink_values, walk_inflight, walk_marginal, walk_cq, lview, energy_min_visits, teacher_view, energy_prior, energy_temp, value_prior_tau, pipeline, openings, open_workers, pool, refill_to,
         } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
@@ -1812,6 +1835,7 @@ async fn main() -> anyhow::Result<()> {
                 rooted_frac,
                 anchor,
                 from_start,
+                random_handicap,
                 ramp_secs,
                 stepwise,
                 step_search,

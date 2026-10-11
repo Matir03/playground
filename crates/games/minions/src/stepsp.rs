@@ -1048,6 +1048,128 @@ pub fn greedy_turn(
     Ok(s.real_base())
 }
 
+/// `n` uniformly random turns from the standard start with `handicap`
+/// dollars to blue, resampled while they end the game: a match's short,
+/// distinct opening.
+pub fn short_opening(n: u32, handicap: i16, rng: &mut rand_chacha::ChaCha8Rng) -> crate::game::MinionsState {
+    use playground_core::Game;
+    loop {
+        let mut s = crate::game::MinionsState::with_bid(handicap);
+        for _ in 0..n {
+            if crate::game::Minions::outcome(&s).is_terminal() {
+                break;
+            }
+            let spec = crate::turn::TurnSpec::random_playout(&s, rng);
+            s = crate::turn::realize(&s, &spec).next;
+        }
+        if !crate::game::Minions::outcome(&s).is_terminal() {
+            return s;
+        }
+    }
+}
+
+/// `n` turns from the standard start at `handicap`, each one tier-2 descent
+/// of `eval`'s lattice with a random variable order and each choice drawn
+/// by the ordinal rule over the net's values (self-play's opening sampler):
+/// plausible turns, distinct per pair. Resampled while the game ends.
+pub fn sampled_opening(
+    n: u32,
+    handicap: i16,
+    eval: &dyn crate::lattice::LatticeEval,
+    rng: &mut rand_chacha::ChaCha8Rng,
+) -> anyhow::Result<crate::game::MinionsState> {
+    use crate::lattice::{ExpandReq, Kind, Lattice, Need};
+    use rand::Rng;
+    'again: loop {
+        let mut s = StepState::begin(&crate::game::MinionsState::with_bid(handicap), rng.gen());
+        for _ in 0..n {
+            let mut lat = Lattice::new(s.clone())?;
+            if lat.terminal.is_some() {
+                continue 'again;
+            }
+            let mut at = 0u32;
+            loop {
+                match lat.nodes[at as usize].kind {
+                    Kind::Sink => break,
+                    Kind::Dead => at = 0,
+                    Kind::Inner => {
+                        if let Some(Need::Expand(e)) = lat.ensure_expanded(at)? {
+                            let (slots, node) = lat.request(e);
+                            let req = ExpandReq { root: &lat.start, node, slots: &slots, trunk: lat.trunk.clone() };
+                            let out = eval.expand(&[req])?.pop().expect("one output");
+                            lat.feed_expand(e, &out);
+                        }
+                        let nd = &lat.nodes[at as usize];
+                        if nd.kind != Kind::Inner {
+                            continue;
+                        }
+                        let mut vars: Vec<u8> = nd.kids.iter().filter(|k| !k.dead).map(|k| k.var).collect();
+                        vars.dedup();
+                        let var = vars[rng.gen_range(0..vars.len())];
+                        let idx: Vec<usize> = (0..nd.kids.len()).filter(|&i| nd.kids[i].var == var && !nd.kids[i].dead).collect();
+                        let vals: Vec<f32> = idx.iter().map(|&i| nd.kids[i].v).collect();
+                        let k = idx[crate::latgen::pick_ordinal(&vals, rng)];
+                        at = lat.child(at, k)?;
+                    }
+                }
+            }
+            s = lat.nodes[at as usize].state.clone();
+            if s.is_terminal() {
+                continue 'again;
+            }
+        }
+        return Ok(s.real_base());
+    }
+}
+
+/// `s` with `x` dollars added: to blue (the second player) if positive, to
+/// yellow if negative. The adjudication window restarts from here.
+pub fn with_money_bid(s: &crate::game::MinionsState, x: i16) -> crate::game::MinionsState {
+    let mut t = s.clone();
+    let side = if x >= 0 { 1 } else { 0 };
+    t.money[side] = t.money[side].saturating_add(x.unsigned_abs());
+    t.prime_nw_hist();
+    t
+}
+
+/// Bids range over this many dollars either way.
+pub const EVEN_BID_MAX: i16 = 30;
+
+/// A side's bid for position `s`: the dollars `x` (to blue if positive, to
+/// yellow if negative, on top of the money `s` has) at which its evaluator
+/// rates the position even, by binary search on yellow's (decreasing) value.
+pub fn even_bid(eval: &dyn Evaluator, s: &crate::game::MinionsState, salt: u64) -> anyhow::Result<i16> {
+    let yellow = |x: i16| -> anyhow::Result<f32> {
+        let t = with_money_bid(s, x);
+        let v = eval.eval(&[StepState::begin(&t, salt).view()])?[0];
+        Ok(if t.side == 0 { v } else { 1.0 - v })
+    };
+    if std::env::var_os("BID_DEBUG").is_some() {
+        let mut c = Vec::new();
+        for x in (-EVEN_BID_MAX..=EVEN_BID_MAX).step_by(5) {
+            c.push(format!("{x}:{:.2}", yellow(x)?));
+        }
+        eprintln!("yellow value by $ to blue (turn {}, money {:?}): {}", s.turn, s.money, c.join(" "));
+    }
+    let (mut lo, mut hi) = (-EVEN_BID_MAX, EVEN_BID_MAX);
+    if yellow(lo)? < 0.5 {
+        return Ok(lo);
+    }
+    if yellow(hi)? >= 0.5 {
+        return Ok(hi);
+    }
+    while hi - lo > 1 {
+        let mid = (lo + hi).div_euclid(2);
+        if yellow(mid)? >= 0.5 {
+            lo = mid
+        } else {
+            hi = mid
+        }
+    }
+    // The closer of the two to even.
+    Ok(if (yellow(lo)? - 0.5).abs() <= (0.5 - yellow(hi)?).abs() { lo } else { hi })
+}
+
 /// A side's bid: the handicap (money to the second player, `BID_MIN..=BID_MAX`)
 /// at which its own evaluator rates the opening even for the first player,
 /// found by binary search on the (decreasing) first-player value.
@@ -1410,6 +1532,9 @@ pub fn play_match(
     a: &Player,
     b: &Player,
     pairs: usize,
+    opening_turns: u32,
+    handicap: i16,
+    even_bid_on: bool,
     opening_max: u32,
     opening_decay: f32,
     seed: u64,
@@ -1420,13 +1545,33 @@ pub fn play_match(
     use std::sync::Mutex;
     let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
     // Starts drawn up front so results do not depend on the thread count.
+    // `opening_turns` > 0: that many random turns from the standard start
+    // at `handicap`, then (`even_bid_on`) each side bids money to even the
+    // position (applied per game, the two bids averaged); else the older
+    // random openings / standard bid. Nets trained at one fixed handicap
+    // cannot price money (gen 660's value moves 0.52 -> 0.47 over +-30 $),
+    // so the bid is off by default.
     let starts: Vec<(Option<crate::game::MinionsState>, u64)> = (0..pairs)
         .map(|_| {
-            let start = (opening_max != 0)
-                .then(|| crate::selfplay::random_opening(opening_max, opening_decay, &mut rng).0);
+            let start = if opening_turns > 0 {
+                Some(match a.lattice.as_ref().or(b.lattice.as_ref()) {
+                    // Both sides' nets in turn, so neither picks every opening.
+                    Some(_) => {
+                        let p = if rng.gen::<bool>() { a } else { b };
+                        let l = p.lattice.as_ref().or(a.lattice.as_ref()).or(b.lattice.as_ref()).expect("a lattice player");
+                        sampled_opening(opening_turns, handicap, l.eval.as_ref(), &mut rng)
+                            .unwrap_or_else(|_| short_opening(opening_turns, handicap, &mut rng))
+                    }
+                    None => short_opening(opening_turns, handicap, &mut rng),
+                })
+            } else {
+                (opening_max != 0)
+                    .then(|| crate::selfplay::random_opening(opening_max, opening_decay, &mut rng).0)
+            };
             (start, rng.gen())
         })
         .collect();
+    let bids_log: Mutex<Vec<i16>> = Mutex::new(Vec::new());
     let next = std::sync::atomic::AtomicUsize::new(0);
     // STEPS_SHOW=1: print every position (use with --threads 1).
     let show = std::env::var("STEPS_SHOW").is_ok();
@@ -1443,6 +1588,17 @@ pub fn play_match(
                 let (start, salt) = &starts[i];
                 let game = |a_first: bool| -> anyhow::Result<(Outcome, bool)> {
                     let mut real = match start {
+                        Some(s) if opening_turns > 0 && even_bid_on => {
+                            let (ba, bb) = (
+                                even_bid(a.eval.as_ref(), s, *salt)?,
+                                even_bid(b.eval.as_ref(), s, *salt)?,
+                            );
+                            let x = (ba + bb) / 2;
+                            if a_first {
+                                bids_log.lock().unwrap().push(x);
+                            }
+                            with_money_bid(s, x)
+                        }
                         Some(s) => s.clone(),
                         None => {
                             let (ba, bb) =
@@ -1515,6 +1671,16 @@ pub fn play_match(
         "first seat won {first_wins} of {} games; {split_pairs} of {pairs} pairs split 1-1 by seat",
         2 * pairs
     );
+    let mut bl = bids_log.into_inner().unwrap();
+    if !bl.is_empty() {
+        bl.sort_unstable();
+        eprintln!(
+            "post-opening bids ($ to blue): min {} median {} max {}",
+            bl[0],
+            bl[bl.len() / 2],
+            bl[bl.len() - 1]
+        );
+    }
     Ok((score / (2 * pairs) as f64, wdl))
 }
 
