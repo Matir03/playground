@@ -444,6 +444,36 @@ impl StepState {
         }
     }
 
+    /// The decisions made so far this turn, as [`Self::step_label`] names
+    /// them (fates, then moves, then spawns; "spare" fates and "no spawn"s
+    /// included), for analysis views.
+    pub fn decided_labels(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut s = self.bare_clone();
+        let stages = [Stage::Fates, Stage::Moves, Stage::Spawns];
+        for st in stages {
+            if st as u8 > self.stage as u8 && self.stage != Stage::Terminal {
+                break;
+            }
+            let n = match st {
+                Stage::Fates => if self.stage == st { self.idx } else { self.enemies.len() },
+                Stage::Moves => if self.stage == st { self.idx } else { self.friends.len() },
+                _ => if self.stage == st { self.idx } else { self.spawn_cells.len() },
+            };
+            s.stage = st;
+            for i in 0..n {
+                s.idx = i;
+                let v = match st {
+                    Stage::Fates => self.spec.targets[self.enemies[i] as usize],
+                    Stage::Moves => self.spec.moves[self.friends[i] as usize],
+                    _ => self.spec.spawns[self.spawn_cells[i] as usize],
+                };
+                out.push(s.step_label(v));
+            }
+        }
+        out
+    }
+
     /// Legal options for the current step (empty at a dead end or `Terminal`).
     pub fn children(&self) -> Vec<u8> {
         match &self.opts {

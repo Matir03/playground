@@ -178,6 +178,12 @@ pub struct GenConfig {
     /// (descents, temp1, Dirichlet). The path's other nodes go to the
     /// rooted phase with probability `rooted_frac`, as before.
     pub anchor: bool,
+    /// Explorer logs: every finished game (each turn's position, search,
+    /// picked, anchor and played turn) to `<out>/games/w<i>.jsonl`, and the
+    /// rooted phase's records, one in `game_log_t2_every`, to
+    /// `<out>/games/t2_w<i>.jsonl`.
+    pub game_log: bool,
+    pub game_log_t2_every: u32,
     /// Every game starts at the initial position (no openings, no pool).
     pub from_start: bool,
     /// Each worker starts its games spread over this many seconds.
@@ -659,9 +665,160 @@ struct Worker<'a> {
     /// starting searches.
     rooted_q: Option<&'a Mutex<Vec<(StepState, Key)>>>,
     deadline: Option<Instant>,
+    glog: Option<GameLogs>,
+}
+
+/// A worker's explorer logs ([`GenConfig::game_log`]): the games in play,
+/// by their salt (it stays with a game from turn to turn), and the files.
+struct GameLogs {
+    games: std::io::BufWriter<std::fs::File>,
+    t2: std::io::BufWriter<std::fs::File>,
+    live: HashMap<u64, Vec<serde_json::Value>>,
+    t2_seen: u32,
+}
+
+impl GameLogs {
+    fn new(dir: &Path, w: usize) -> Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let f = |name: String| -> Result<_> {
+            Ok(std::io::BufWriter::new(std::fs::File::create(dir.join(name))?))
+        };
+        Ok(Self {
+            games: f(format!("w{w:02}.jsonl"))?,
+            t2: f(format!("t2_w{w:02}.jsonl"))?,
+            live: HashMap::new(),
+            t2_seen: 0,
+        })
+    }
+}
+
+/// A tier-2 record for the explorer: the turn start, the commitments made,
+/// and per kid its visits and target.
+fn t2_json(start: &StepState, r: &T2Record, mean: Option<&T2Record>) -> serde_json::Value {
+    let kids: Vec<serde_json::Value> = r
+        .kids
+        .iter()
+        .enumerate()
+        .map(|(i, &(cell, slot, n, q, ns))| {
+            serde_json::json!({
+                "label": r.node.with_next(cell).step_label(slot),
+                "n": n,
+                "target": (q >= 0.0).then_some(q),
+                "mean": mean.and_then(|m| m.kids.get(i)).and_then(|k| (k.3 >= 0.0).then_some(k.3)),
+                "returns": ns,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "pos": crate::lattice_ui::board_hex(&start.real_base()),
+        "turn": start.base.turn,
+        "side": start.real_base().side,
+        "commits": r.node.decided_labels(),
+        "n": r.n,
+        "q": (r.q >= 0.0).then_some(r.q),
+        "kids": kids,
+    })
 }
 
 impl Worker<'_> {
+    /// Explorer log: the searched turn at `t1`'s root and the turn picked.
+    fn log_turn(&mut self, t1: &Tier1, pick: u32) {
+        let Some(g) = self.glog.as_mut() else {
+            return;
+        };
+        use crate::lattice_ui::{board_hex, turn_label};
+        let root = &t1.nodes[0];
+        let pri = t1.priors(0);
+        let mut kids: Vec<(usize, u32)> = root.children.iter().copied().enumerate().collect();
+        kids.sort_by_key(|&(_, c)| std::cmp::Reverse(t1.nodes[c as usize].n));
+        let label = |c: u32| turn_label(&root.state, &t1.nodes[c as usize].state);
+        let cands: Vec<serde_json::Value> = kids
+            .iter()
+            .take(12)
+            .map(|&(i, c)| {
+                let ch = &t1.nodes[c as usize];
+                serde_json::json!({
+                    "label": label(c),
+                    "n": ch.n,
+                    "q": (ch.n > 0).then(|| 1.0 - ch.q()),
+                    "prior": pri.get(i),
+                    "picked": c == pick,
+                })
+            })
+            .collect();
+        let real = root.state.real_base();
+        let e = serde_json::json!({
+            "pos": board_hex(&real),
+            "turn": real.turn,
+            "side": real.side,
+            "visits": root.n,
+            "kids": root.children.len(),
+            "value": t1.root_value(),
+            "cands": cands,
+            "picked": label(pick),
+            "picked_n": t1.nodes[pick as usize].n,
+        });
+        g.live.entry(root.state.salt).or_default().push(e);
+    }
+
+    /// Explorer log: the turn played in game `salt` (and the anchored
+    /// search it came from).
+    fn log_played(&mut self, salt: u64, played: String, anchor: Option<serde_json::Value>) {
+        let Some(g) = self.glog.as_mut() else {
+            return;
+        };
+        if let Some(e) = g.live.get_mut(&salt).and_then(|t| t.last_mut()) {
+            e["played"] = played.into();
+            if let Some(a) = anchor {
+                e["anchor"] = a;
+            }
+        }
+    }
+
+    /// Explorer log: game `salt` ended with the turn from `from` to `last`
+    /// (or at `last` itself); write it out.
+    fn log_end(&mut self, salt: u64, from: Option<&StepState>, last: &StepState) -> Result<()> {
+        let Some(g) = self.glog.as_mut() else {
+            return Ok(());
+        };
+        let Some(turns) = g.live.remove(&salt) else {
+            return Ok(());
+        };
+        let mut real = last.real_base();
+        if real.winner == 0 {
+            if let Some(p) = from.and_then(|f| crate::lattice_ui::post_position(f, last)) {
+                real = p;
+            }
+        }
+        let line = serde_json::json!({
+            "final": crate::lattice_ui::board_hex(&real),
+            "final_turn": real.turn,
+            "winner": real.winner,
+            "turns": turns,
+        });
+        use std::io::Write;
+        writeln!(g.games, "{line}")?;
+        Ok(())
+    }
+
+    /// Write the explorer logs' unfinished games (marked) and flush.
+    fn flush_logs(&mut self) -> Result<()> {
+        let Some(g) = self.glog.as_mut() else {
+            return Ok(());
+        };
+        use std::io::Write;
+        for (_, turns) in g.live.drain() {
+            if turns.is_empty() {
+                continue;
+            }
+            let line = serde_json::json!({ "unfinished": true, "winner": 0, "turns": turns });
+            writeln!(g.games, "{line}")?;
+        }
+        g.games.flush()?;
+        g.t2.flush()?;
+        Ok(())
+    }
+
     /// A new game's handicap: drawn per game, or the net's bid.
     fn handicap(&mut self) -> i16 {
         if self.cfg.random_handicap {
@@ -942,6 +1099,10 @@ impl Worker<'_> {
                             .collect(),
                     ));
                 }
+                let logged = self
+                    .glog
+                    .is_some()
+                    .then(|| r.record.as_ref().map(|x| t2_json(&lat.start, x, r.record_mean.as_ref())));
                 if let Some(rec) = r.record.take() {
                     encode_t2(&lat.start, &rec, &mut self.t2w, self.cfg.lview)?;
                     self.view_targets(&rec)?;
@@ -952,6 +1113,7 @@ impl Worker<'_> {
                     encode_t2(&lat.start, &rec, w, self.cfg.lview)?;
                 }
                 let reached = r.reached();
+                let mut chosen = None;
                 let (s, end) = if reached.is_empty() {
                     fallback.clone()
                 } else {
@@ -963,10 +1125,38 @@ impl Worker<'_> {
                         self.cfg.dir1_frac,
                         &mut self.rng,
                     );
+                    chosen = Some(i);
                     let sn = &lat.nodes[reached[i].0 as usize];
                     (sn.state.clone(), sn.terminal)
                 };
+                let salt = lat.start.salt;
+                if let Some(record) = logged {
+                    use crate::lattice_ui::turn_label;
+                    let mut order: Vec<usize> = (0..reached.len()).collect();
+                    order.sort_by_key(|&i| std::cmp::Reverse(reached[i].1));
+                    let rs: Vec<serde_json::Value> = order
+                        .iter()
+                        .take(12)
+                        .map(|&i| {
+                            serde_json::json!({
+                                "label": turn_label(&lat.start, &lat.nodes[reached[i].0 as usize].state),
+                                "n": reached[i].1,
+                                "v": reached[i].2,
+                                "played": Some(i) == chosen,
+                            })
+                        })
+                        .collect();
+                    let a = serde_json::json!({
+                        "from": if chosen.is_some() { "anchor" } else { "fallback" },
+                        "reached": rs,
+                        "n_reached": reached.len(),
+                        "record": record,
+                    });
+                    self.log_played(salt, turn_label(&lat.start, &s), Some(a));
+                }
                 let next = if end || s.is_terminal() {
+                    let from = lat.start.clone();
+                    self.log_end(salt, Some(&from), &s)?;
                     self.new_game()?
                 } else {
                     self.search(s, None)
@@ -990,6 +1180,13 @@ impl Worker<'_> {
                 self.c.rooted_done.fetch_add(1, Relaxed);
                 if r.abandoned {
                     self.c.rooted_abandoned.fetch_add(1, Relaxed);
+                }
+                if let (Some(g), Some(rec)) = (self.glog.as_mut(), r.record.as_ref()) {
+                    g.t2_seen += 1;
+                    if g.t2_seen % self.cfg.game_log_t2_every.max(1) == 1 % self.cfg.game_log_t2_every.max(1) {
+                        use std::io::Write;
+                        writeln!(g.t2, "{}", t2_json(&lat.start, rec, r.record_mean.as_ref()))?;
+                    }
                 }
                 if let Some(rec) = r.record.take() {
                     encode_t2(&lat.start, &rec, &mut self.t2w, self.cfg.lview)?;
@@ -1064,6 +1261,7 @@ impl Worker<'_> {
         if let Some(w) = self.t2m.as_mut() {
             w.flush()?;
         }
+        self.flush_logs()?;
         self.t2w.flush()
     }
 
@@ -1495,8 +1693,11 @@ impl Worker<'_> {
     /// Record the searched turn, pick the next one, and hand the root's
     /// lattice to a walk.
     fn finish_turn(&mut self, t1: &mut Tier1) -> Result<Next> {
+        let salt = t1.nodes[0].state.salt;
         if t1.nodes[0].terminal.is_some() {
             // The mover kills the necromancer: the game ends here.
+            let last = t1.nodes[0].state.clone();
+            self.log_end(salt, None, &last)?;
             return Ok(Next::Replace(vec![self.new_game()?]));
         }
         self.record_turn(t1)?;
@@ -1513,6 +1714,7 @@ impl Worker<'_> {
             self.cfg.dir1_frac,
             &mut self.rng,
         )];
+        self.log_turn(t1, pick);
         let mut out = Vec::with_capacity(2);
         if self.cfg.anchor {
             if let Some(task) = self.anchor_task(t1, pick)? {
@@ -1562,8 +1764,15 @@ impl Worker<'_> {
                 walk: Walk::new(&self.cfg.walk),
             });
         }
+        if self.glog.is_some() {
+            let label = crate::lattice_ui::turn_label(&t1.nodes[0].state, &t1.nodes[pick as usize].state);
+            self.log_played(salt, label, None);
+        }
         let child = &mut t1.nodes[pick as usize];
         if child.terminal.is_some() || child.state.is_terminal() {
+            let last = child.state.clone();
+            let from = t1.nodes[0].state.clone();
+            self.log_end(salt, Some(&from), &last)?;
             out.push(self.new_game()?);
         } else {
             let s = child.state.clone();
@@ -1665,6 +1874,7 @@ impl Worker<'_> {
         if let Some(w) = self.t2m.as_mut() {
             w.flush()?;
         }
+        self.flush_logs()?;
         self.t2w.flush()
     }
 
@@ -1970,6 +2180,11 @@ fn make_worker<'a>(
         pool: None,
         rooted_q: None,
         deadline: None,
+        glog: cfg
+            .game_log
+            .then(|| GameLogs::new(&t1_dir.with_file_name("games"), w))
+            .transpose()
+            .expect("the explorer game logs"),
     }
 }
 

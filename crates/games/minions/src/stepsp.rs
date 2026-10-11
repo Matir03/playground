@@ -1510,17 +1510,56 @@ pub struct LatticePlay {
     pub secs: f64,
 }
 
+/// Match game logs for the data explorer (`steps-match --game-log`): the
+/// file, and the current match's two players' names.
+static MATCH_LOG: std::sync::OnceLock<std::sync::Mutex<(std::io::BufWriter<std::fs::File>, String, String)>> =
+    std::sync::OnceLock::new();
+
+/// Log every game of this process's matches to `path` (JSON lines).
+pub fn set_match_log(path: &std::path::Path) -> anyhow::Result<()> {
+    let f = std::io::BufWriter::new(std::fs::File::create(path)?);
+    let _ = MATCH_LOG.set(std::sync::Mutex::new((f, String::new(), String::new())));
+    Ok(())
+}
+
+/// The players' names in the match log's next games.
+pub fn set_match_names(a: &str, b: &str) {
+    if let Some(m) = MATCH_LOG.get() {
+        let mut g = m.lock().unwrap();
+        g.1 = a.to_string();
+        g.2 = b.to_string();
+    }
+}
+
+fn match_logging() -> bool {
+    MATCH_LOG.get().is_some()
+}
+
 /// One turn by tier-1 lattice search.
 pub fn lattice_turn(
     real: &crate::game::MinionsState,
     lp: &LatticePlay,
     salt: u64,
 ) -> anyhow::Result<crate::game::MinionsState> {
+    lattice_turn_logged(real, lp, salt).map(|x| x.0)
+}
+
+/// [`lattice_turn`], and (when match games are logged) its root search and
+/// the turn played, for the explorer.
+pub fn lattice_turn_logged(
+    real: &crate::game::MinionsState,
+    lp: &LatticePlay,
+    salt: u64,
+) -> anyhow::Result<(crate::game::MinionsState, Option<serde_json::Value>)> {
     let start = StepState::begin(real, salt);
     // The mover kills the enemy necromancer: that ends the game.
     if !start.is_terminal() {
         if let Ok(end) = crate::lattice::necro_kill(&start) {
-            return Ok(end.real_base());
+            let log = match_logging().then(|| serde_json::json!({
+                "necro_kill": true,
+                "played": crate::lattice_ui::turn_label(&start, &end),
+            }));
+            return Ok((end.real_base(), log));
         }
     }
     let mut t = crate::tier1::Tier1::new(start, lp.params.clone());
@@ -1549,10 +1588,51 @@ pub fn lattice_turn(
     let b = t
         .best_child()
         .ok_or_else(|| anyhow::anyhow!("no turn found\n{}", real.render()))?;
-    Ok(t.nodes[b as usize].state.real_base())
+    let log = match_logging().then(|| {
+        use crate::lattice_ui::turn_label;
+        let root = &t.nodes[0];
+        let pri = t.priors(0);
+        let mut kids: Vec<(usize, u32)> = root.children.iter().copied().enumerate().collect();
+        kids.sort_by_key(|&(_, c)| std::cmp::Reverse(t.nodes[c as usize].n));
+        let cands: Vec<serde_json::Value> = kids
+            .iter()
+            .take(12)
+            .map(|&(i, c)| {
+                let ch = &t.nodes[c as usize];
+                serde_json::json!({
+                    "label": turn_label(&root.state, &ch.state),
+                    "n": ch.n,
+                    "q": (ch.n > 0).then(|| 1.0 - ch.q()),
+                    "prior": pri.get(i),
+                    "picked": c == b,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "visits": root.n,
+            "kids": root.children.len(),
+            "value": t.root_value(),
+            "secs": t0.elapsed().as_secs_f64(),
+            "cands": cands,
+            "played": turn_label(&root.state, &t.nodes[b as usize].state),
+        })
+    });
+    Ok((t.nodes[b as usize].state.real_base(), log))
 }
 
 impl Player {
+    /// [`Self::turn`], with a lattice player's search for the match log.
+    fn turn_logged(
+        &self,
+        real: &crate::game::MinionsState,
+        salt: u64,
+    ) -> anyhow::Result<(crate::game::MinionsState, Option<serde_json::Value>)> {
+        match &self.lattice {
+            Some(lp) if !self.solver => lattice_turn_logged(real, lp, salt),
+            _ => Ok((self.turn(real, salt)?, None)),
+        }
+    }
+
     fn turn(
         &self,
         real: &crate::game::MinionsState,
@@ -1670,10 +1750,23 @@ pub fn play_match(
                         }
                     };
                     let mut turns = 0;
+                    let mut log: Vec<serde_json::Value> = Vec::new();
                     while !crate::game::Minions::outcome(&real).is_terminal() && turns < 200 {
                         let a_moves = (real.side == 0) == a_first;
                         let p = if a_moves { a } else { b };
-                        real = p.turn(&real, salt ^ turns as u64)?;
+                        if match_logging() {
+                            let (next, search) = p.turn_logged(&real, salt ^ turns as u64)?;
+                            log.push(serde_json::json!({
+                                "pos": crate::lattice_ui::board_hex(&real),
+                                "turn": real.turn,
+                                "side": real.side,
+                                "mover": if a_moves { "a" } else { "b" },
+                                "search": search,
+                            }));
+                            real = next;
+                        } else {
+                            real = p.turn(&real, salt ^ turns as u64)?;
+                        }
                         turns += 1;
                         if show {
                             eprintln!(
@@ -1685,6 +1778,22 @@ pub fn play_match(
                         }
                     }
                     let res = crate::game::Minions::outcome(&real);
+                    if let Some(m) = MATCH_LOG.get() {
+                        use std::io::Write;
+                        let mut g = m.lock().unwrap();
+                        let line = serde_json::json!({
+                            "pair": i,
+                            "a_first": a_first,
+                            "a": g.1,
+                            "b": g.2,
+                            "winner": real.winner,
+                            "final": crate::lattice_ui::board_hex(&real),
+                            "final_turn": real.turn,
+                            "turns": log,
+                        });
+                        writeln!(g.0, "{line}")?;
+                        g.0.flush()?;
+                    }
                     Ok((res, a_first))
                 };
                 match game(true).and_then(|g1| Ok((g1, game(false)?))) {

@@ -720,6 +720,10 @@ enum Cmd {
         /// lattice-gen, defers them: `steps::LAZY_WITNESS`). Eager checks gave
         /// single games a heavy tail of 30+ minutes.
         #[arg(long)]
+        /// Log every game (positions, and each lattice player's root search
+        /// and played turn) to this file as JSON lines, for the explorer.
+        #[arg(long)]
+        game_log: Option<String>,
         no_lazy_witness: bool,
     },
     /// The step search (best-first) against the old sampled-AZ MCTS, standard
@@ -863,6 +867,14 @@ enum Cmd {
         /// (latgen::GenConfig::anchor).
         #[arg(long)]
         anchor: bool,
+        /// Explorer logs (the web data explorer): every finished game to
+        /// <out>/games/w<i>.jsonl (each turn's position, search, picked,
+        /// anchor and played turn), and one in --game-log-t2-every of the
+        /// rooted phase's records to <out>/games/t2_w<i>.jsonl.
+        #[arg(long)]
+        game_log: bool,
+        #[arg(long, default_value_t = 10)]
+        game_log_t2_every: u32,
         /// Every game starts at the initial position (no openings; any
         /// --pool is ignored and left as it is).
         #[arg(long)]
@@ -1824,8 +1836,11 @@ async fn main() -> anyhow::Result<()> {
             let value = load_step_eval_runners(&vspec, &ep, 1)?;
             minions_engine::stepsp::money_probe(value.as_ref(), lat.eval.as_ref(), positions, opening_turns, handicap, seed)?;
         }
-        Cmd::StepsMatch { a, b, pairs, opening_turns, handicap, even_bid, opening_max, opening_decay, ep, seed, expansions, expansions_b, power, power_b, heads, threads, two_tier_a, two_tier_b, t2_c, t2_retries, t2_widen, n1, n1_b, lattice_inflight, lattice_inflight_b, no_lazy_witness } => {
+        Cmd::StepsMatch { a, b, pairs, opening_turns, handicap, even_bid, opening_max, opening_decay, ep, seed, expansions, expansions_b, power, power_b, heads, threads, two_tier_a, two_tier_b, t2_c, t2_retries, t2_widen, n1, n1_b, lattice_inflight, lattice_inflight_b, no_lazy_witness, game_log } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
+            if let Some(p) = &game_log {
+                minions_engine::stepsp::set_match_log(std::path::Path::new(p))?;
+            }
             // A match evaluates one batch at a time per game thread, so one
             // runner (two sessions per net, not four) is enough: the session
             // builds were most of a short match's time and memory.
@@ -1848,6 +1863,7 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     player(b, expansions_b.unwrap_or(expansions), power_b.unwrap_or(power), two_tier_b, n1_b.unwrap_or(n1), lattice_inflight_b.unwrap_or(lattice_inflight))
                 };
+                minions_engine::stepsp::set_match_names(&a, b);
                 let res = pb.and_then(|pb| {
                     minions_engine::stepsp::play_match(&pa, &pb, pairs, opening_turns, handicap, even_bid, opening_max, opening_decay, seed + k as u64, threads)
                 });
@@ -1932,7 +1948,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::LatticeGen {
             out, onnx, ep, batcher, workers, games, n1, inflight, n2, c1, c2, pw_c, pw_alpha, retries,
-            temp1, anchor, from_start, random_handicap, ramp_secs, stepwise, step_search, step_n1, step_temp, step_dir_alpha, step_dir_frac, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, start_turn_mean, start_turn_max, even_open_tau, even_open_tol, secs,
+            temp1, anchor, game_log, game_log_t2_every, from_start, random_handicap, ramp_secs, stepwise, step_search, step_n1, step_temp, step_dir_alpha, step_dir_frac, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, start_turn_mean, start_turn_max, even_open_tau, even_open_tol, secs,
             target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, sd_frac, sd_descents, sd_tau, rooted_frac, rooted_n, rooted_min, rooted_tau, rooted_mean_too, rooted_secs, rooted_tasks, rooted_inflight, rooted_budget, walk_accumulated, sink_values, walk_inflight, walk_marginal, walk_cq, lview, energy_min_visits, teacher_view, energy_prior, energy_temp, value_prior_tau, pipeline, openings, open_workers, pool, refill_to,
         } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
@@ -1999,6 +2015,8 @@ async fn main() -> anyhow::Result<()> {
                 refill_to,
                 rooted_frac,
                 anchor,
+                game_log,
+                game_log_t2_every,
                 from_start,
                 random_handicap,
                 ramp_secs,

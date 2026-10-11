@@ -259,13 +259,23 @@ fn find(id: u64) -> anyhow::Result<Arc<Mutex<Search>>> {
         .ok_or_else(|| anyhow::anyhow!("search {id} is no longer kept"))
 }
 
-fn board_hex(s: &MinionsState) -> String {
+pub(crate) fn board_hex(s: &MinionsState) -> String {
     hex(&Minions::encode_state(s))
 }
 
 /// A complete turn from `from` (a turn start) to `to`, compactly: moves
 /// `Zc0→d1`, attacks `d1✕e2`, buys `+Z`, spawns `Z@b1`.
-fn turn_label(from: &StepState, to: &StepState) -> String {
+/// The real position after the complete turn from `from` (a turn start) to
+/// `to`, played out.
+pub(crate) fn post_position(from: &StepState, to: &StepState) -> Option<MinionsState> {
+    let mut s = from.real_base();
+    for m in &crate::steps::turn_actions(&s, &to.done).ok()? {
+        s = Minions::apply(&s, m);
+    }
+    Some(s)
+}
+
+pub(crate) fn turn_label(from: &StepState, to: &StepState) -> String {
     use crate::map::cell_name;
     let real = from.real_base();
     let Ok(actions) = crate::steps::turn_actions(&real, &to.done) else {

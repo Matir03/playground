@@ -7,6 +7,7 @@ import { HexBoard } from "./games/hex/Board";
 import { MinionsBoard } from "./games/minions/Board";
 import { Recordings } from "./games/minions/Recordings";
 import { Trees } from "./games/minions/Trees";
+import { Explorer } from "./games/minions/Explorer";
 
 // Engines are reached under same-origin proxy paths (see vite.config.ts), so the
 // whole app works behind one origin without CORS.
@@ -63,6 +64,8 @@ export function App() {
   const [recordings, setRecordings] = useState(false);
   // Saved self-play trees: static too, for the same reason.
   const [trees, setTrees] = useState(false);
+  // The lattice cycle's training-data explorer: static logs too.
+  const [explorer, setExplorer] = useState(false);
   const [healths, setHealths] = useState<Record<string, EngineHealth>>(
     Object.fromEntries(GAMES.map((g) => [g.id, { status: "unknown" }])),
   );
@@ -86,8 +89,10 @@ export function App() {
     // Wider while a game is open: a board with an analysis panel beside it
     // does not fit in 720px, and wrapping the panel underneath puts the board
     // off screen exactly when the panel is driving it.
-    <main style={{ fontFamily: "system-ui, sans-serif", padding: "2rem", maxWidth: game == null && !recordings && !trees ? 720 : 1400 }}>
-      {recordings ? (
+    <main style={{ fontFamily: "system-ui, sans-serif", padding: "2rem", maxWidth: game == null && !recordings && !trees && !explorer ? 720 : 1500 }}>
+      {explorer ? (
+        <Explorer onBack={() => setExplorer(false)} />
+      ) : recordings ? (
         <Recordings onBack={() => setRecordings(false)} />
       ) : trees ? (
         <Trees onBack={() => setTrees(false)} />
@@ -97,6 +102,7 @@ export function App() {
           onPick={setSelected}
           onRecordings={() => setRecordings(true)}
           onTrees={() => setTrees(true)}
+          onExplorer={() => setExplorer(true)}
         />
       ) : (
         <GameView game={game} health={healths[game.id]} onBack={() => setSelected(null)} />
@@ -110,11 +116,13 @@ function Menu({
   onPick,
   onRecordings,
   onTrees,
+  onExplorer,
 }: {
   healths: Record<string, EngineHealth>;
   onPick: (id: GameId) => void;
   onRecordings: () => void;
   onTrees: () => void;
+  onExplorer: () => void;
 }) {
   return (
     <>
@@ -173,6 +181,19 @@ function Menu({
         <div style={{ color: "#666", fontSize: "0.9rem", marginTop: 4 }}>
           Browse the shared step-search trees saved by <code>steps-selfplay --save-trees</code>:
           what each game's move was decided on, in the analysis window's tree view.
+        </div>
+      </button>
+      <button
+        onClick={onExplorer}
+        style={{
+          marginTop: "0.75rem", textAlign: "left", padding: "1rem 1.25rem", borderRadius: 10,
+          border: "1px solid #ddd", background: "#fff", cursor: "pointer", font: "inherit", width: "100%",
+        }}
+      >
+        <strong style={{ fontSize: "1.1rem" }}>Minions training-data explorer</strong>
+        <div style={{ color: "#666", fontSize: "0.9rem", marginTop: 4 }}>
+          The lattice cycle's self-play games (search, picked / anchored / played turns, tier-2 targets) and
+          gate games, generation by generation, with side-by-side stats.
         </div>
       </button>
     </>
