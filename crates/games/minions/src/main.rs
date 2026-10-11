@@ -1193,7 +1193,8 @@ fn lattice_play(spec: &str, n1: u32, inflight: usize) -> anyhow::Result<(String,
     };
     let (spec, pw) = match spec.strip_prefix("pw=").and_then(|r| r.split_once(':')) {
         Some((t, s)) => {
-            let (c, a) = t.split_once(',').ok_or_else(|| anyhow::anyhow!("pw=<c>,<alpha>"))?;
+            // `/` also separates them (a match's `--b` list splits on commas).
+            let (c, a) = t.split_once([',', '/']).ok_or_else(|| anyhow::anyhow!("pw=<c>,<alpha>"))?;
             (s, Some((c.parse::<f32>()?, a.parse::<f32>()?)))
         }
         None => (spec, None),
