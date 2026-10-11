@@ -53,6 +53,10 @@ use crate::steps::{Stage, StepState, View, MAX_ACTIVE, N_SCALARS};
 use crate::tier1::{Need1, T1Params, Tier1, Visit};
 
 pub const T2_VERSION: u32 = 1;
+/// Random handicaps (`GenConfig::random_handicap`): centred on the even
+/// point of equal-net matches (~3).
+pub const HANDICAP_MEAN: f64 = 3.5;
+pub const HANDICAP_STD: f64 = 1.0;
 pub const T2_REC_BYTES: usize = 528;
 pub const T2_KID_BYTES: usize = 12;
 
@@ -167,7 +171,8 @@ pub struct GenConfig {
     pub from_start: bool,
     /// Each worker starts its games spread over this many seconds.
     pub ramp_secs: f64,
-    /// Each game's handicap drawn from BID_MIN..=BID_MAX (else the bid).
+    /// Each game's handicap drawn from N(HANDICAP_MEAN, HANDICAP_STD),
+    /// rounded and clipped to BID_MIN..=BID_MAX (else the bid).
     pub random_handicap: bool,
     /// Stepwise with a search at each commitment (above). Off (the default
     /// since 2026-10-10, user): one search a turn, then the turn is chosen
@@ -643,7 +648,13 @@ impl Worker<'_> {
     /// A new game's handicap: drawn per game, or the net's bid.
     fn handicap(&mut self) -> i16 {
         if self.cfg.random_handicap {
-            self.rng.gen_range(crate::game::BID_MIN..=crate::game::BID_MAX)
+            // Normal around the even point, rounded and clipped to the bid
+            // range: 3 and 4 dollars ~38% each, 2 and 5 ~12% each.
+            use rand_distr::{Distribution, Normal};
+            let x = Normal::new(HANDICAP_MEAN, HANDICAP_STD)
+                .unwrap()
+                .sample(&mut self.rng);
+            (x.round() as i16).clamp(crate::game::BID_MIN, crate::game::BID_MAX)
         } else {
             self.bid
         }
@@ -1233,7 +1244,12 @@ impl Worker<'_> {
     /// the search's tier-1 marginals (the tier-2 prior where no searched
     /// turn lies below; the net expands such nodes first) with the step
     /// noise, down to a complete turn, which is played.
-    fn step_pick(&mut self, t1: &mut Tier1, cur: &mut u32, trail: &mut Vec<(u32, bool)>) -> Result<Next> {
+    fn step_pick(
+        &mut self,
+        t1: &mut Tier1,
+        cur: &mut u32,
+        trail: &mut Vec<(u32, bool)>,
+    ) -> Result<Next> {
         let turns = t1.turns(0);
         loop {
             let at = *cur;
@@ -1674,9 +1690,10 @@ impl Worker<'_> {
                         &s.lattice(t1).nodes[n as usize].state
                     }
                 }
-                (Req::LatValue { n }, Task::Walk { lat, .. } | Task::Rooted { lat, .. } | Task::Anchor { lat, .. }) => {
-                    &lat.nodes[n as usize].state
-                }
+                (
+                    Req::LatValue { n },
+                    Task::Walk { lat, .. } | Task::Rooted { lat, .. } | Task::Anchor { lat, .. },
+                ) => &lat.nodes[n as usize].state,
                 _ => unreachable!("request and task disagree"),
             };
             states.push(s);
@@ -1739,9 +1756,7 @@ impl Worker<'_> {
                 Task::Opening { lat, .. }
                 | Task::Walk { lat, .. }
                 | Task::Rooted { lat, .. }
-                | Task::Anchor { lat, .. } => {
-                    lat.feed_expand(n, &outs[j])
-                }
+                | Task::Anchor { lat, .. } => lat.feed_expand(n, &outs[j]),
             }
         }
         for (j, &k) in f.en_idx.iter().enumerate() {
@@ -1763,9 +1778,10 @@ impl Worker<'_> {
                         s.feed_sink_value(t1, n, &vals[j]);
                     }
                 }
-                (Req::LatValue { n }, Task::Walk { lat, .. } | Task::Rooted { lat, .. } | Task::Anchor { lat, .. }) => {
-                    lat.feed_value(n, &vals[j])
-                }
+                (
+                    Req::LatValue { n },
+                    Task::Walk { lat, .. } | Task::Rooted { lat, .. } | Task::Anchor { lat, .. },
+                ) => lat.feed_value(n, &vals[j]),
                 _ => unreachable!(),
             }
         }
@@ -2049,8 +2065,15 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
                         .zip(crate::lattice::MEM_NAMES)
                         .map(|(x, n)| format!("{n} {:.2}", x.load(Relaxed) as f64 / 1e9))
                         .collect();
-                    let tot: f64 = crate::lattice::MEM.iter().map(|x| x.load(Relaxed) as f64).sum();
-                    eprintln!("    memory (GB): {} = {:.2} accounted", m.join(", "), tot / 1e9);
+                    let tot: f64 = crate::lattice::MEM
+                        .iter()
+                        .map(|x| x.load(Relaxed) as f64)
+                        .sum();
+                    eprintln!(
+                        "    memory (GB): {} = {:.2} accounted",
+                        m.join(", "),
+                        tot / 1e9
+                    );
                 }
                 {
                     use crate::lattice::{WIT_CLASS, WIT_INHERIT, WIT_RESOLVE};

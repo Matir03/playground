@@ -829,9 +829,10 @@ enum Cmd {
         /// --pool is ignored and left as it is).
         #[arg(long)]
         from_start: bool,
-        /// Every game draws its starting handicap (dollars to blue) uniformly
-        /// from BID_MIN..=BID_MAX, so the value head learns what money is
-        /// worth (a net trained at one handicap cannot bid).
+        /// Every game draws its starting handicap (dollars to blue) from
+        /// N(3.5, 1), rounded and clipped to BID_MIN..=BID_MAX, so the value
+        /// head learns what money is worth (a net trained at one handicap
+        /// cannot bid).
         #[arg(long)]
         random_handicap: bool,
         /// Each worker starts its games spread over this many seconds (0:
