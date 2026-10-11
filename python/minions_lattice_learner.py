@@ -724,6 +724,7 @@ def main():
     ap.add_argument("--wd", type=float, default=1e-4)
     ap.add_argument("--holdout-every", type=int, default=20)
     ap.add_argument("--export-only", action="store_true", help="export --t1/--init (or random weights) to --out")
+    ap.add_argument("--average", nargs="+", default=None, help="net dirs: no training; --out gets the mean of their weights (net.pt, t2.pt), BatchNorm re-estimated on --data (--bn-recal) and the holdout reported")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     torch.manual_seed(args.seed)
@@ -870,6 +871,21 @@ def main():
 
     base = holdout()
     print("holdout before:", json.dumps(base))
+    if args.average:
+        # The mean of the given nets' weights (float tensors; the rest, e.g.
+        # BatchNorm's batch counter, from the first); BatchNorm statistics are
+        # re-estimated below rather than averaged.
+        with torch.no_grad():
+            for m, f in ((net1, "net.pt"), (t2, "t2.pt")):
+                sds = [torch.load(os.path.join(d, f), map_location=dev) for d in args.average]
+                if f == "net.pt" and isinstance(net1, PosNet):
+                    sds = [pos_from_res(x) for x in sds]
+                if f == "t2.pt":
+                    sds = [translate_t2(x, args.lview) for x in sds]
+                avg = {k: (torch.stack([x[k].float() for x in sds]).mean(0).to(v.dtype) if v.dtype.is_floating_point else v) for k, v in sds[0].items()}
+                m.load_state_dict(avg)
+        print(f"averaged {len(args.average)} nets: {' '.join(args.average)}")
+        args.epochs = 0
     w0 = {k: v.detach().clone() for k, v in list(net1.state_dict().items()) + [("t2." + k, v) for k, v in t2.state_dict().items()]}
     if args.freeze_trunk:
         for p in trunk.parameters():
@@ -878,8 +894,8 @@ def main():
     else:
         params = list(t2.parameters()) + list(net1.parameters())
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.wd)
-    steps = max(int(args.epochs * len(tr) / args.batch), 1)
-    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=steps, pct_start=0.05)
+    steps = 0 if args.average else max(int(args.epochs * len(tr) / args.batch), 1)
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=max(steps, 1), pct_start=0.05)
     trunk.train(not args.freeze_trunk)
     t2.train()
     bn_all = [m for m in list(net1.modules()) + list(t2.modules()) if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d))]
@@ -959,6 +975,7 @@ def main():
             "t1_records": len(r1),
             "holdout_before": base,
             "holdout": final,
+            "average": args.average,
             "steps": steps,
             "train_seconds": time.time() - t0,
         }

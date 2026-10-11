@@ -85,6 +85,17 @@ pub struct GenConfig {
     /// If positive, overrides both: the start turn itself is geometric on
     /// 0, 1, 2, ... (below `MAX_TURNS`) with this mean.
     pub start_turn_mean: f64,
+    /// If positive, overrides the above: the start turn is uniform on
+    /// 0..=min(this, MAX_TURNS - 2).
+    pub start_turn_max: u32,
+    /// If positive, opening commitments are drawn with weight
+    /// exp(-|v - 0.5| / this), v the net's value right after the commitment
+    /// (the kid's), so the position stays even, instead of by rank.
+    pub even_open_tau: f64,
+    /// If positive (with `even_open_tau`), an opening whose last turn ends
+    /// further than this from even (the last commitment's value) is dropped
+    /// and the game restarted.
+    pub even_open_tol: f64,
     pub secs: f64,
     /// Stop after this many tier-2 records (0 = no limit).
     pub target_t2: u64,
@@ -288,6 +299,8 @@ pub struct GenCounters {
     pub eval_ns: AtomicU64,
     pub cpu_ns: AtomicU64,
     pub opening_turns: AtomicU64,
+    /// Openings dropped for ending uneven (`even_open_tol`).
+    pub open_rejects: AtomicU64,
     /// Games started from the opening pool (the rest played theirs inline).
     pub pooled: AtomicU64,
     /// Tier-1 records on partial-turn views (`view_min_visits`).
@@ -309,6 +322,8 @@ enum Task {
         lat: Lattice,
         at: u32,
         left: u32,
+        /// The value right after the last commitment (`even_open_tau`).
+        v: f32,
     },
     /// `started` of `n1` visits begun; `vis` those in flight. Stepwise:
     /// `step` commitments made, `recorded` the lattice node last recorded.
@@ -680,6 +695,14 @@ impl Worker<'_> {
         let salt: u64 = self.rng.gen();
         let h = self.handicap();
         let s = StepState::begin(&crate::game::MinionsState::with_bid(h), salt);
+        if self.cfg.start_turn_max > 0 {
+            let hi = self
+                .cfg
+                .start_turn_max
+                .min(u32::from(crate::game::MAX_TURNS).saturating_sub(2));
+            let k = self.rng.gen_range(0..=hi);
+            return self.start(s, k);
+        }
         if self.cfg.start_turn_mean > 0.0 {
             let q = truncated_geometric_q(self.cfg.start_turn_mean, crate::game::MAX_TURNS.into());
             let k = loop {
@@ -720,6 +743,7 @@ impl Worker<'_> {
             lat: Lattice::new(s)?,
             at: 0,
             left: k,
+            v: 0.5,
         })
     }
 
@@ -739,7 +763,7 @@ impl Worker<'_> {
 
     fn advance(&mut self, task: &mut Task) -> Result<Next> {
         match task {
-            Task::Opening { lat, at, left } => loop {
+            Task::Opening { lat, at, left, v } => loop {
                 if lat.terminal.is_some() {
                     return Ok(Next::Replace(vec![self.new_game()?]));
                 }
@@ -752,6 +776,14 @@ impl Worker<'_> {
                             return Ok(Next::Replace(vec![self.new_game()?]));
                         }
                         *left -= 1;
+                        if *left == 0
+                            && self.cfg.even_open_tau > 0.0
+                            && self.cfg.even_open_tol > 0.0
+                            && (f64::from(*v) - 0.5).abs() > self.cfg.even_open_tol
+                        {
+                            self.c.open_rejects.fetch_add(1, Relaxed);
+                            return Ok(Next::Replace(vec![self.new_game()?]));
+                        }
                         if *left == 0 {
                             if let Some(out) = self.collect.as_mut() {
                                 out.push(s);
@@ -779,8 +811,29 @@ impl Worker<'_> {
                             .filter(|&i| nd.kids[i].var == var && !nd.kids[i].dead)
                             .collect();
                         let vals: Vec<f32> = idx.iter().map(|&i| nd.kids[i].v).collect();
-                        let k = idx[pick_ordinal(&vals, &mut self.rng)];
-                        *at = lat.child(n, k)?;
+                        let j = if self.cfg.even_open_tau > 0.0 {
+                            // Keep it even: weight by closeness to 0.5.
+                            let w: Vec<f64> = vals
+                                .iter()
+                                .map(|&x| {
+                                    (-(f64::from(x) - 0.5).abs() / self.cfg.even_open_tau).exp()
+                                })
+                                .collect();
+                            let mut r = self.rng.gen::<f64>() * w.iter().sum::<f64>();
+                            let mut j = w.len() - 1;
+                            for (i, &x) in w.iter().enumerate() {
+                                if r < x {
+                                    j = i;
+                                    break;
+                                }
+                                r -= x;
+                            }
+                            j
+                        } else {
+                            pick_ordinal(&vals, &mut self.rng)
+                        };
+                        *v = vals[j];
+                        *at = lat.child(n, idx[j])?;
                     }
                 }
             },
@@ -1980,10 +2033,11 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
             p.extend(r?);
         }
         eprintln!(
-            "  openings: {} in {:.1}s ({} turns, {} rounds, {} expansions) on {ow} threads",
+            "  openings: {} in {:.1}s ({} turns, {} dropped uneven, {} rounds, {} expansions) on {ow} threads",
             p.len(),
             t.elapsed().as_secs_f64(),
             c.opening_turns.load(Relaxed),
+            c.open_rejects.load(Relaxed),
             c.rounds.load(Relaxed),
             c.expansions.load(Relaxed),
         );
