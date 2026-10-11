@@ -1170,6 +1170,61 @@ pub fn even_bid(eval: &dyn Evaluator, s: &crate::game::MinionsState, salt: u64) 
     Ok(if (yellow(lo)? - 0.5).abs() <= (0.5 - yellow(hi)?).abs() { lo } else { hi })
 }
 
+/// How a net values money: over `positions` openings sampled as matches
+/// sample them (`opening_turns` net-sampled turns at `handicap`), yellow's
+/// value (by `value`, the tier-1 net) with extra dollars to blue (or yellow,
+/// if negative) on top of the position's money; prints the mean curve, the
+/// share of positions where it falls monotonically, its slope around 0 and
+/// the even bids. A net that prices money: a steep, monotone curve and bids
+/// off the +-EVEN_BID_MAX bounds.
+pub fn money_probe(
+    value: &dyn Evaluator,
+    lat: &dyn crate::lattice::LatticeEval,
+    positions: u32,
+    opening_turns: u32,
+    handicap: i16,
+    seed: u64,
+) -> anyhow::Result<()> {
+    const GRID: [i16; 9] = [-10, -6, -4, -2, 0, 2, 4, 6, 10];
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+    let (mut sum, mut mono, mut slopes, mut bids) = ([0f64; 9], 0u32, Vec::new(), Vec::new());
+    for i in 0..positions {
+        let s = sampled_opening(opening_turns, handicap, lat, &mut rng)?;
+        let salt = seed ^ u64::from(i).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let ts: Vec<crate::game::MinionsState> = GRID.iter().map(|&x| with_money_bid(&s, x)).collect();
+        let ss: Vec<StepState> = ts.iter().map(|t| StepState::begin(t, salt)).collect();
+        let views: Vec<View> = ss.iter().map(|x| x.view()).collect();
+        let v = value.eval(&views)?;
+        let y: Vec<f64> = ts
+            .iter()
+            .zip(&v)
+            .map(|(t, &v)| f64::from(if t.side == 0 { v } else { 1.0 - v }))
+            .collect();
+        for k in 0..9 {
+            sum[k] += y[k];
+        }
+        if y.windows(2).all(|w| w[1] <= w[0] + 0.005) {
+            mono += 1;
+        }
+        slopes.push((y[2] - y[6]) / 8.0);
+        bids.push(f64::from(even_bid(value, &s, salt)?));
+    }
+    let n = f64::from(positions.max(1));
+    let curve: Vec<String> = GRID.iter().zip(&sum).map(|(x, s)| format!("{x}:{:.3}", s / n)).collect();
+    let ms = |v: &[f64]| {
+        let m = v.iter().sum::<f64>() / v.len().max(1) as f64;
+        (m, (v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / v.len().max(1) as f64).sqrt())
+    };
+    let ((sm, ssd), (bm, bsd)) = (ms(&slopes), ms(&bids));
+    let bound = bids.iter().filter(|b| b.abs() >= f64::from(EVEN_BID_MAX)).count();
+    println!("money probe: {positions} positions after {opening_turns} sampled turns at handicap {handicap}");
+    println!("  yellow value by $ to blue: {}", curve.join(" "));
+    println!("  monotone (falling) in {:.0}% of positions", 100.0 * f64::from(mono) / n);
+    println!("  slope -4..+4: {sm:.4} per dollar (sd {ssd:.4})");
+    println!("  even bid: mean {bm:.1}, sd {bsd:.1}, at the +-{EVEN_BID_MAX} bound in {bound} of {positions}");
+    Ok(())
+}
+
 /// A side's bid: the handicap (money to the second player, `BID_MIN..=BID_MAX`)
 /// at which its own evaluator rates the opening even for the first player,
 /// found by binary search on the (decreasing) first-player value.

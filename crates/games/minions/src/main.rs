@@ -602,6 +602,24 @@ enum Cmd {
     /// option, take the best). Evaluators: `old:<dir>`, `<path>.onnx`, or an
     /// MLP's `<path>.bin` (CPU). `--b` may list several, comma-separated: one
     /// match against each, in turn.
+    /// How a lattice net values money (`stepsp::money_probe`): its curve of
+    /// yellow's value against extra dollars after sampled openings, and the
+    /// even bids, to tell when matches can use --even-bid.
+    MoneyProbe {
+        /// Lattice net dir (tier-1 value and the opening sampler).
+        #[arg(long)]
+        net: String,
+        #[arg(long, default_value_t = 64)]
+        positions: u32,
+        #[arg(long, default_value_t = 2)]
+        opening_turns: u32,
+        #[arg(long, default_value_t = 3)]
+        handicap: i16,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        #[arg(long, default_value = "trt")]
+        ep: String,
+    },
     StepsMatch {
         #[arg(long)]
         a: String,
@@ -1669,6 +1687,12 @@ async fn main() -> anyhow::Result<()> {
             )?;
         }
         Cmd::NnueBench { active, reps } => minions_engine::nnue::bench_sweep(active, reps),
+        Cmd::MoneyProbe { net, positions, opening_turns, handicap, seed, ep } => {
+            let (vspec, lat) = lattice_play(&net, 1, 1)?;
+            let lat = lat.ok_or_else(|| anyhow::anyhow!("{net}: not a lattice net dir"))?;
+            let value = load_step_eval_runners(&vspec, &ep, 1)?;
+            minions_engine::stepsp::money_probe(value.as_ref(), lat.eval.as_ref(), positions, opening_turns, handicap, seed)?;
+        }
         Cmd::StepsMatch { a, b, pairs, opening_turns, handicap, even_bid, opening_max, opening_decay, ep, seed, expansions, expansions_b, power, power_b, heads, threads, two_tier_a, two_tier_b, t2_c, t2_retries, t2_widen, n1, n1_b, lattice_inflight, lattice_inflight_b, no_lazy_witness } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
             // A match evaluates one batch at a time per game thread, so one
