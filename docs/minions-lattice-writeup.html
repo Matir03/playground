@@ -42,7 +42,7 @@
 <main>
 
 <h1>The Minions turn-lattice player</h1>
-<div class="sub">System description · champion net: gen 660 · weights in <code>weights/minions/lattice-gen660</code></div>
+<div class="sub">System description</div>
 
 <div class="box">
 <p><strong>Overview.</strong> The player searches in two tiers. Tier 1 is AlphaZero-style MCTS over <em>complete turns</em>, using progressive widening. Tier 2 is a second MCTS over the <em>lattice of partial turns</em>: sets of commitments ordered by inclusion. Tier 2 proposes the turns that tier 1 compares. Two small networks drive both tiers:</p>
@@ -154,8 +154,8 @@
 <h2>5. Networks</h2>
 <table>
 <tr><th>net</th><th>architecture</th><th>input</th><th>output</th></tr>
-<tr><td>tier-1 trunk + value</td><td><code>pos:96x8</code>: 96 channels, 8 residual blocks, 1.40M params</td><td>the full-turn position only: unit and graveyard planes; money, reinforcement and turns-left scalars; a constant plane</td><td>value, plus a 96×7×7 trunk image (fp16), cached per position</td></tr>
-<tr><td>tier-2 head</td><td><code>96x6</code>, 1.03M params</td><td>the trunk image plus the <em>lattice view</em>: the original position; enemy fates; decided friends at their origin; final friendly units at their final cell; a from-spawn bit; projected scalars</td><td>46 slots per cell (3 fates, 37 move destinations, 6 spawns) as prior logits and child values; node value; position value; energy</td></tr>
+<tr><td>tier-1 trunk + value</td><td>residual CNN: 96 channels, 8 residual blocks, 1.40M params</td><td>the full-turn position only: unit and graveyard planes; money, reinforcement and turns-left scalars; a constant plane</td><td>value, plus a 96×7×7 trunk image (fp16), cached per position</td></tr>
+<tr><td>tier-2 head</td><td>residual CNN: 96 channels, 6 residual blocks, 1.03M params</td><td>the trunk image plus the <em>lattice view</em>: the original position; enemy fates; decided friends at their origin; final friendly units at their final cell; a from-spawn bit; projected scalars</td><td>46 slots per cell (3 fates, 37 move destinations, 6 spawns) as prior logits and child values; node value; position value; energy</td></tr>
 </table>
 <ul>
 <li><strong>One value function.</strong> The exported tier-1 value is the tier-2 head's node value at the empty declaration. Tier 1 and tier 2 therefore cannot disagree about a turn start.</li>
@@ -170,7 +170,7 @@
 <tr><td>self-play net</td><td>the champion</td></tr>
 <tr><td>concurrency</td><td>16 workers × 16 games, 8 tier-1 visits in flight per search, games started over a 60 s ramp; ~7 GB RSS</td></tr>
 <tr><td>starting position</td><td>every game from the initial position</td></tr>
-<tr><td>handicap</td><td>uniform per game on −5..10 dollars, so the value head learns what money is worth</td></tr>
+<tr><td>handicap</td><td>drawn per game from a normal distribution (mean 3.5 dollars, s.d. 1), rounded and clipped to −5..10, so the value head learns what money is worth</td></tr>
 <tr><td>tier-1 search</td><td>800 visits per turn; prior softmax(value/100); <span class="math">c</span> 1.5; widening <span class="math">⌈N<sup>0.5</sup>⌉</span></td></tr>
 <tr><td>turn choice</td><td>anchored (below): temperature 1, Dirichlet α 0.3, weight 0.25</td></tr>
 <tr><td>time split per generation</td><td>400 s of self-play, then up to 190 s for the tier-2 phase</td></tr>
@@ -183,7 +183,7 @@
 <li>Run a from-scratch tier-2 search rooted at the anchor, in a fresh lattice. Its record is a tier-2 training target.</li>
 <li>Draw the played turn from the complete turns that search reached, by descents, with temperature and Dirichlet noise.</li>
 </ol>
-<p>The other nodes on the path join the tier-2 phase queue with probability 0.15. Games can thus leave the top tier-1 turns for turns that share a reasonable partial declaration with them; this noise is the only source of opening variety.</p>
+<p>The other nodes on the path join the tier-2 phase queue with probability 0.5. Games can thus leave the top tier-1 turns for turns that share a reasonable partial declaration with them; this noise is the only source of opening variety.</p>
 
 <h3>Records</h3>
 <ul>
@@ -196,13 +196,13 @@
 <tr><th>a typical generation</th><th class="n">count</th></tr>
 <tr><td>games / searched turns in 400 s</td><td class="n">~270 / ~1,000</td></tr>
 <tr><td>tier-1 records</td><td class="n">~27,000</td></tr>
-<tr><td>tier-2 records: anchors / tier-2 phase</td><td class="n">~1,000 / ~3,000</td></tr>
+<tr><td>tier-2 records: anchors / tier-2 phase</td><td class="n">~1,000 / up to ~10,000</td></tr>
 <tr><td>tier-2 phase throughput</td><td class="n">~56 searches/s, ~55k expansions/s</td></tr>
 </table>
 
 <h2>7. Training and gating</h2>
 <ul>
-<li><strong>Learner</strong> (<code>python/minions_lattice_learner.py</code>). Joint training:
+<li><strong>Learner.</strong> Joint training:
   <ul>
   <li>tier-2 prior cross-entropy;</li>
   <li>child-value and node-value BCE;</li>
@@ -210,12 +210,11 @@
   <li>energy loss at weight 0.2.</li>
   </ul>
   The tier-2 losses also train the trunk. AdamW at learning rate 10<sup>−3</sup>, one epoch over a window of the last 8 generations. About 130 steps and 60 s per generation.</li>
-<li><strong>Cycle</strong> (<code>data/models/minions/lattice537/cycle.sh</code>):
+<li><strong>Cycle:</strong>
   <ul>
   <li>Net G−1 trains while generation G self-plays, about 8 minutes per generation.</li>
   <li>Training continues a <em>chain</em>: each candidate starts from the previous one.</li>
   <li>The champion plays the self-play games.</li>
-  <li>After a reset, no training runs until the window holds 4 generations of data.</li>
   </ul></li>
 <li><strong>Gate</strong>, every 4 generations: 64 seat-swapped pairs (128 games) against the champion, at 100 tier-1 visits with 16 in flight. Each pair starts after 2 net-sampled opening turns at handicap 3, where equal nets are even. A candidate becomes champion at ≥ 0.55 (standard error ≈ 0.044).</li>
 </ul>
@@ -232,32 +231,6 @@
   <li>boxed rarely-used fields.</li>
   </ul></li>
 </ul>
-
-<h2>Appendix: running it</h2>
-<pre>source scripts/ort-env.sh            # TensorRT runtime; required
-
-# play / inspect in the UI (lattice panel on :7107)
-./target/release/minions-engine serve --addr 127.0.0.1:7105 \
-    --lattice-net vprior=100:weights/minions/lattice-gen660
-
-# match two lattice nets (gate format: 2 sampled opening turns, handicap 3)
-./target/release/minions-engine steps-match --a vprior=100:&lt;dirA&gt; \
-    --b vprior=100:&lt;dirB&gt; --pairs 64 --n1 100 --threads 16
-
-# the training cycle (detached); stop with: touch data/models/minions/lattice537/STOP
-SP_CHAMP=1 MIN_WINDOW=4 T1_ARCH=pos:96x8 T2_ARCH=96x6 RESET_MIN=0 \
-GEN_FLAGS="--workers 16 --games 16 --inflight 8 --ramp-secs 60 --anchor --from-start --random-handicap" \
-setsid nohup bash data/models/minions/lattice537/cycle.sh &gt;&gt; data/models/minions/lattice537/cycle.log 2&gt;&amp;1 &lt; /dev/null &amp;</pre>
-<table>
-<tr><th>code</th><th>role</th></tr>
-<tr><td><code>crates/games/minions/src/lattice.rs</code></td><td>lattice, tier-2 PUCT, lazy propagation, rooted searches</td></tr>
-<tr><td><code>tier1.rs</code></td><td>tier-1 MCTS with progressive widening, in-flight handling</td></tr>
-<tr><td><code>latgen.rs</code></td><td>self-play driver (<code>lattice-gen</code>), anchored choice, records</td></tr>
-<tr><td><code>lattice_ort.rs</code>, <code>lview.rs</code>, <code>sat.rs</code></td><td>ONNX/TensorRT evaluator; lattice view; SAT check</td></tr>
-<tr><td><code>stepsp.rs</code>, <code>lattice_ui.rs</code></td><td>matches and openings; the UI's lattice panel server</td></tr>
-<tr><td><code>python/minions_lattice_learner.py</code></td><td>learner and ONNX export</td></tr>
-<tr><td><code>docs/minions-lattice.md</code></td><td>the design document</td></tr>
-</table>
 
 </main>
 </body>
