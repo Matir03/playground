@@ -975,6 +975,42 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
     setSelected(null);
     setSpawnUnit(null);
   }, [hist, canUndo, curNode]);
+  /** Take back whole turns: to the start of the human's turn being played,
+   *  or (at a turn's start) of their previous turn, dropping the engine's
+   *  reply. A search in flight is abandoned; the server re-syncs by replay on
+   *  the next move. */
+  const takeBackTarget = (() => {
+    if (!hist || !curNode || compose || !atTip) return null;
+    let id: number | null = curNode.parent;
+    while (id !== null) {
+      const n = H.node(hist, id);
+      if (!n) return null;
+      if (H.isBoundary(hist, id, turnInfo) && seatToMove(n.state) === "human") return id;
+      id = n.parent;
+    }
+    return null;
+  })();
+  const takeBack = useCallback(() => {
+    if (!hist || takeBackTarget === null) return;
+    const target = H.node(hist, takeBackTarget);
+    if (!target) return;
+    // The child of the target on the path to the current node.
+    let id = hist.current;
+    let child: number | null = null;
+    while (id !== takeBackTarget) {
+      const n = H.node(hist, id);
+      if (!n || n.parent === null) return;
+      child = id;
+      id = n.parent;
+    }
+    if (child === null) return;
+    engineAbort.current?.abort();
+    engineTurnRef.current = null;
+    setHist(H.drop(hist, child));
+    setState(target.state);
+    setSelected(null);
+    setSpawnUnit(null);
+  }, [hist, takeBackTarget]);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === "z") {
@@ -1086,6 +1122,11 @@ export function MinionsBoard({ client }: { client: Client<typeof EngineService> 
         <SeatPicker label={SIDE_NAME[1]} seat={secondSeat} onChange={setSecondSeat} />
         <button onClick={() => void newGame()} disabled={busy}>New game</button>
         {boardLive && <button onClick={endPhase} disabled={!canAct}>{endLabel}</button>}
+        {hist && (
+          <button onClick={takeBack} disabled={takeBackTarget === null} title="take back to the start of your turn (or your previous turn, with the engine's reply)">
+            ⟲ take back turn
+          </button>
+        )}
         {boardLive && (
           <button onClick={undo} disabled={!canUndo} title="take back the last action of this turn (Ctrl+Z)">
             ↶ undo
