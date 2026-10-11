@@ -1,0 +1,22 @@
+{
+ "records": 70773,
+ "t1_records": 264904,
+ "holdout": {
+  "prior": 0.7908691167831421,
+  "prior_excess": 0.10700494050979614,
+  "value": 0.4603509306907654,
+  "node": 0.4506549835205078,
+  "t1_bce_excess": 0.025549730127102155,
+  "t1_root_bce_excess": 0.04404950141906738,
+  "energy": 1.54673405399689,
+  "energy_excess": 0.1847148469514453,
+  "pos_value_bce_excess": 0.025583901704842593
+ },
+ "steps": 131,
+ "train_seconds": 63.67099666595459,
+ "t1_arch": "pos:96x8",
+ "arch": "96x6",
+ "t1_from_t2": false,
+ "lview": true,
+ "trained_from": "lattice537 gen 659, on self-play gens 653-660"
+}

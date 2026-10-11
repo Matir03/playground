@@ -453,6 +453,9 @@ export function LatticePanel({ state, auto = false }: { state: GameState | null;
     <section style={{ marginTop: "1rem", border: "1px solid #d8dbe0", borderRadius: 10, padding: "0.75rem 1rem", background: "#fafbfc" }}>
       <div style={{ display: "flex", gap: "1rem", alignItems: "center", flexWrap: "wrap", marginBottom: 8 }}>
         <strong style={{ fontSize: 15 }}>Lattice search</strong>
+        <a href="/writeups/minions-lattice.pdf" target="_blank" rel="noreferrer" style={{ fontSize: 13 }} title="how the lattice player, its search and its training work (PDF)">
+          writeup (PDF)
+        </a>
         <label style={{ fontSize: 13 }}>
           <input type="checkbox" checked={follow} onChange={(e) => setFollow(e.target.checked)} /> follow the net's moves
         </label>

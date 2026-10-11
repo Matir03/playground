@@ -47,6 +47,10 @@ python/src/playground/gen/playground/
 *.safetensors
 *.pt
 *.onnx
+# Exported weights are tracked.
+!/weights/**/*.pt
+!/weights/**/*.onnx
+/weights/**/*.trt_cache/
 # Length-delimited proto record shards (see docs/schemas.md).
 *.pb
 # Connect 4 opening book (~32 MB; fetch via scripts/fetch-connect4-book.sh).

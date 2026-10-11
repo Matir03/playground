@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Minions Lattice Player</title>
+<style>
+  :root {
+    --ink: #1d2129; --muted: #5b6270; --rule: #d9dce2; --accent: #2f5d8a;
+    --soft: #f4f6f9; --good: #2e7d4f; --bad: #a33a2b; --bg: #ffffff;
+  }
+  @page { size: A4; margin: 18mm 17mm 18mm 17mm; }
+  * { box-sizing: border-box; }
+  body { background: var(--bg); color: var(--ink); font: 10.4pt/1.48 "DejaVu Serif", Georgia, serif; margin: 0; }
+  main { max-width: 760px; margin: 0 auto; padding: 0 16px; }
+  h1 { font: 600 22pt/1.15 "DejaVu Sans", Helvetica, sans-serif; margin: 0 0 4px; letter-spacing: -0.01em; }
+  h2 { font: 600 13.5pt/1.25 "DejaVu Sans", Helvetica, sans-serif; color: var(--accent); margin: 22px 0 6px; padding-top: 6px; border-top: 1px solid var(--rule); break-after: avoid; }
+  h3 { font: 600 11pt/1.3 "DejaVu Sans", Helvetica, sans-serif; margin: 14px 0 4px; break-after: avoid; }
+  p { margin: 6px 0; }
+  ul, ol { margin: 4px 0 8px; padding-left: 20px; }
+  li { margin: 2px 0; }
+  code { font: 9pt "DejaVu Sans Mono", Menlo, monospace; background: var(--soft); padding: 0 3px; border-radius: 3px; }
+  pre { font: 8.6pt/1.4 "DejaVu Sans Mono", Menlo, monospace; background: var(--soft); padding: 8px 10px; border-radius: 4px; white-space: pre-wrap; break-inside: avoid; }
+  table { border-collapse: collapse; width: 100%; margin: 6px 0 10px; font-size: 9.2pt; break-inside: avoid; }
+  th, td { text-align: left; vertical-align: top; padding: 3px 6px; border-bottom: 1px solid var(--rule); }
+  th { font-family: "DejaVu Sans", Helvetica, sans-serif; font-weight: 600; background: var(--soft); }
+  th.n, td.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .sub { color: var(--muted); font: 10pt "DejaVu Sans", Helvetica, sans-serif; margin-bottom: 14px; }
+  .box { background: var(--soft); border-left: 3px solid var(--accent); padding: 8px 12px; margin: 10px 0; break-inside: avoid; }
+  .box p:first-child, .box ul:first-child { margin-top: 0; }
+  .math { font-family: "DejaVu Serif", Georgia, serif; font-style: italic; white-space: nowrap; }
+  .good { color: var(--good); } .bad { color: var(--bad); }
+  figure { margin: 10px 0 12px; break-inside: avoid; }
+  figcaption { font: 8.8pt/1.4 "DejaVu Sans", Helvetica, sans-serif; color: var(--muted); margin-top: 4px; }
+  svg { max-width: 100%; height: auto; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 640px) { .cols { grid-template-columns: 1fr; } }
+  @media print { main { max-width: none; padding: 0; } h2 { break-before: auto; } }
+</style>
+</head>
+<body>
+<main>
+
+<h1>The Minions turn-lattice player</h1>
+<div class="sub">System writeup · 10 October 2026 · champion gen 660 of the <code>lattice537</code> lineage · weights in <code>weights/minions/lattice-gen660</code></div>
+
+<div class="box">
+<p><strong>In one paragraph.</strong> The player searches in two tiers. Tier 1 is AlphaZero-style MCTS over <em>complete turns</em>, using progressive widening. Tier 2 is a second MCTS over the <em>lattice of partial turns</em>: sets of commitments ordered by inclusion. Tier 2 proposes the turns that tier 1 compares. Two small networks drive both tiers:</p>
+<ul>
+<li>a position trunk with a value head, 1.40M parameters;</li>
+<li>a partial-turn head, 1.03M parameters.</li>
+</ul>
+<p>The current lineage started on 4 October from the Athenan steps net gen 537. Gen 660 has been champion since 9 October, promoted at 0.562 over gen 556. With the search fix of 10 October, the user rates it at roughly their own level in the UI. The current training run changes three things in self-play: random handicaps, anchored turn choice, and games from the start position. Since 20:15 on 10 October, the champion plays all self-play games. No net trained since the 10 October restart has beaten gen 660 yet.</p>
+</div>
+
+<h2>1. The problem: one turn is a combinatorial action</h2>
+<p>Minions is a two-player game on a 49-cell hex board, stored as a 7×7 grid. A player wins by killing the enemy necromancer, or on net worth at the 30-turn cap. Each turn has three parts:</p>
+<ul>
+<li>attacks, which decide the fate of each enemy unit;</li>
+<li>movement, which gives each friendly unit a destination;</li>
+<li>spawns, which buy units onto spawn cells with money.</li>
+</ul>
+<p>The legal turns are the product of these choices, subject to a realizability constraint: some legal order of moves and attacks must achieve the declared outcome. That leaves far too many turns to enumerate, and their legality is expensive to check. The design gets around both problems by searching over <em>declarations</em> instead of move sequences.</p>
+<p>The first player gets a money handicap (the bid). Fixed at 2 in older self-play, it is now drawn at random per game.</p>
+
+<h2>2. The turn lattice</h2>
+<p>A turn is a set of <strong>commitments</strong>:</p>
+<ul>
+<li>each enemy unit gets a fate (stays, killed, or unsummoned);</li>
+<li>each friendly unit gets a destination;</li>
+<li>each spawn cell gets a unit or nothing.</li>
+</ul>
+<p>A <strong>lattice node</strong> is a partial set of commitments that can still be completed to a legal turn. Nodes are ordered by inclusion. The source is the empty declaration, the sinks are complete turns, and every edge adds one commitment. There is no fixed variable order: a node's children are every feasible (cell, choice) pair for every undecided variable of the current phase.</p>
+
+<figure>
+<svg viewBox="0 0 720 230" xmlns="http://www.w3.org/2000/svg" font-family="DejaVu Sans, Helvetica, sans-serif" font-size="11">
+  <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#5b6270"/></marker></defs>
+  <text x="10" y="16" font-weight="600" fill="#2f5d8a">Tier 1: MCTS over complete turns</text>
+  <g stroke="#9aa3b1" stroke-width="1.2">
+    <line x1="110" y1="45" x2="50" y2="105"/><line x1="110" y1="45" x2="110" y2="105"/><line x1="110" y1="45" x2="170" y2="105"/>
+    <line x1="50" y1="115" x2="25" y2="175"/><line x1="50" y1="115" x2="75" y2="175"/><line x1="170" y1="115" x2="170" y2="175"/>
+  </g>
+  <g fill="#fff" stroke="#2f5d8a" stroke-width="1.6">
+    <circle cx="110" cy="40" r="9" fill="#dce7f3"/><circle cx="50" cy="110" r="8"/><circle cx="110" cy="110" r="8"/><circle cx="170" cy="110" r="8"/>
+    <circle cx="25" cy="180" r="7"/><circle cx="75" cy="180" r="7"/><circle cx="170" cy="180" r="7"/>
+  </g>
+  <text x="10" y="215" fill="#5b6270">node = start-of-turn position; edge = a complete turn</text>
+  <text x="10" y="228" fill="#5b6270">children widen as k(N) = ⌈N^0.5⌉</text>
+  <path d="M125,40 C230,30 260,60 300,95" fill="none" stroke="#5b6270" stroke-dasharray="4 3" marker-end="url(#a)"/>
+  <text x="200" y="28" fill="#5b6270">each node owns a lattice</text>
+  <text x="330" y="16" font-weight="600" fill="#2f5d8a">Tier 2: MCTS over its lattice of partial turns</text>
+  <g stroke="#9aa3b1" stroke-width="1.2">
+    <line x1="520" y1="45" x2="420" y2="95"/><line x1="520" y1="45" x2="520" y2="95"/><line x1="520" y1="45" x2="620" y2="95"/>
+    <line x1="420" y1="105" x2="370" y2="150"/><line x1="420" y1="105" x2="470" y2="150"/><line x1="520" y1="105" x2="470" y2="150"/><line x1="520" y1="105" x2="570" y2="150"/><line x1="620" y1="105" x2="570" y2="150"/><line x1="620" y1="105" x2="670" y2="150"/>
+    <line x1="470" y1="160" x2="470" y2="195"/><line x1="570" y1="160" x2="570" y2="195"/>
+  </g>
+  <g fill="#fff" stroke="#8a6a2f" stroke-width="1.5">
+    <rect x="500" y="33" width="40" height="18" rx="4" fill="#f6efe0"/>
+    <rect x="395" y="95" width="50" height="18" rx="4"/><rect x="495" y="95" width="50" height="18" rx="4"/><rect x="595" y="95" width="50" height="18" rx="4"/>
+    <rect x="345" y="142" width="50" height="18" rx="4"/><rect x="445" y="142" width="50" height="18" rx="4"/><rect x="545" y="142" width="50" height="18" rx="4"/><rect x="645" y="142" width="50" height="18" rx="4"/>
+  </g>
+  <g fill="#2f5d8a" stroke="#2f5d8a"><rect x="455" y="190" width="30" height="16" rx="3"/><rect x="555" y="190" width="30" height="16" rx="3"/></g>
+  <g font-size="9.5" text-anchor="middle" fill="#1d2129">
+    <text x="520" y="46">{ }</text><text x="420" y="108">e₁=kill</text><text x="520" y="108">e₂=kill</text><text x="620" y="108">e₁=stay</text>
+    <text x="370" y="155">+f₁→c</text><text x="470" y="155">e₁,e₂ kill</text><text x="570" y="155">+e₂=kill</text><text x="670" y="155">+e₂=stay</text>
+    <text x="470" y="202" fill="#fff">turn</text><text x="570" y="202" fill="#fff">turn</text>
+  </g>
+  <text x="345" y="226" fill="#5b6270">order-free: {e₁=kill, e₂=kill} is one node, reached from both parents</text>
+</svg>
+<figcaption>Figure 1. Two tiers. A tier-1 widening is one tier-2 descent from the lattice source to a sink, i.e. a complete turn. Lattice nodes are partial declarations ordered by inclusion, so different commitment orders reach the same node.</figcaption>
+</figure>
+
+<ul>
+<li><strong>Phases.</strong> Fates come first, until every enemy is fated. Then moves, until every friendly unit has a destination. The attack part is then realized. Spawns run last, on the real spawn-phase board, until none remain available. A spawn cell whose only remaining option is "nothing" is committed automatically.</li>
+<li><strong>Necromancer.</strong> Its fate is never a choice. If the enemy necromancer can be killed this turn, the tier-1 node is terminal with that score. A complete turn after which the opponent can kill our necromancer is scored as a loss on the spot.</li>
+<li><strong>Keys and inclusion.</strong> A node is a <code>mask</code>, one bit per variable, plus 6 bits per variable for the choice. Node <span class="math">X</span> includes node <span class="math">P</span> iff <code>P.mask &amp; !X.mask == 0</code> and <code>(X.packed ^ P.packed) &amp; field(P.mask) == 0</code>. That is a handful of word operations.</li>
+<li><strong>Feasibility.</strong> Every offered child carries a <em>witness</em>, a concrete completion that proves it realizable. The checks are layered from cheap to expensive:
+  <ol>
+  <li>cheap filters;</li>
+  <li>a fast realizer;</li>
+  <li>a Hall-type assignment bound;</li>
+  <li>an exact search.</li>
+  </ol>
+  Witnesses are checked lazily: a child's check runs when the child is first expanded. Each lattice keeps a pool of witnesses and a list of <em>nogoods</em>, keys proven infeasible, which prunes the nodes that include them. When a widening exceeds 1000 expansions, an exact SAT encoding of the attack phase takes over (CaDiCaL: 2.7 ms to encode, 0.065 ms per query). It either returns a witness or refutes the node.</li>
+<li><strong>Cyclic moves.</strong> Rotations of friendly units are legal, as in the reference rules since 8 October. The lattice can therefore hold distinct declarations that reach the same position. Tier 1 merges them by position: a turn that reaches a position an existing child already holds is a repeat, not a new child.</li>
+</ul>
+
+<h2>3. Tier 2: PUCT over the lattice</h2>
+<ul>
+<li><strong>Selection.</strong> From the source, take the child with the highest PUCT score (<span class="math">c</span> = 1.5), expanding along the way, until a sink. Every descent is a whole source-to-turn path. Priors are a softmax within each cell, so each cell's choices sum to 1. A single PUCT comparison over every (cell, choice) pair therefore picks the cell and its choice at once.</li>
+<li><strong>Expansion</strong> is one tier-2 net call. It returns, for each undecided cell:
+  <ul>
+  <li>prior logits over the cell's choices;</li>
+  <li>one value per child;</li>
+  <li>a value for the node itself.</li>
+  </ul>
+  The expansion counts as direct visits at those values.</li>
+<li><strong>Sinks</strong> are valued by the tier-1 value of the resulting position, flipped to the mover, or by their terminal score.</li>
+<li><strong>Lazy sublattice propagation.</strong> A visit to a node counts as a visit to every node it includes. There is no path backup. The search keeps a list of direct visits and computes <span class="math">N(P) = Σ<sub>X⊇P</sub> n<sub>X</sub></span> and <span class="math">W(P)</span> with one scan of that list per selection step, which credits each child of <span class="math">P</span> at the same time. Lazy and brute-force statistics agree in tests.</li>
+<li><strong>Targets average complete turns only</strong> (the user's rule). The lattice's own predicted values only steer the search. Every training value comes from sink returns: complete turns valued by tier 1.</li>
+</ul>
+
+<h2>4. Tier 1: AlphaZero over turns with progressive widening</h2>
+<ul>
+<li>A tier-1 node is a start-of-turn position, and its children are the complete turns found so far. A visit <strong>widens</strong> while the node has fewer than <span class="math">k(N) = ⌈N<sup>0.5</sup>⌉</span> children. A widening is one tier-2 descent in that node's lattice. A repeat is retried up to 20 times, after which the node stops widening.</li>
+<li>PUCT with <span class="math">c</span> = 1.5 and mean backup, with the side flipped at every edge.</li>
+<li><strong>The tier-1 prior is effectively uniform:</strong> softmax(child value / 100). The original prior, log-odds accumulated along the lattice path, lost to a uniform prior 0.427 over 384 games. Value-based priors at temperatures 0.05–0.6 did no better than uniform. No learned tier-1 prior has helped yet.</li>
+<li><strong>Visits in flight.</strong> Each search keeps several visits running at once, with virtual loss along the path, so the net is called in batches.</li>
+</ul>
+
+<div class="box">
+<p><strong>The in-flight widening race</strong> (found and fixed 10 October, commit <code>9cbde00</code>). While a node's widening was in flight, it had fewer children than a serial search would give it. The other in-flight visits then piled onto whichever children existed, whatever their value. Every self-play generation before gen 754 ran with 64 visits in flight.</p>
+<p>The fix has two parts:</p>
+<ul>
+<li>a visit waits while its node has a widening pending and fewer than <span class="math">k(N)</span> children;</li>
+<li>the root, which has no virtual loss, counts the other in-flight visits in its widening threshold.</li>
+</ul>
+</div>
+<table>
+<tr><th>turn-3 test position, 400 visits</th><th class="n">serial</th><th class="n">16 in flight</th><th class="n">64 in flight</th></tr>
+<tr><td>visits to turns with Q &lt; 0.3, before the fix</td><td class="n">6</td><td class="n">22</td><td class="n bad">79</td></tr>
+<tr><td>after the fix</td><td class="n">6</td><td class="n">8</td><td class="n">19</td></tr>
+</table>
+<p>A strength check at 200 visits, 32 games per setting against serial, found no trend: ×4 0.469, ×8 0.438, ×16 0.531. The fix itself was checked in detail on one position only.</p>
+
+<h2>5. Networks</h2>
+<table>
+<tr><th>net</th><th>architecture</th><th>input</th><th>output</th></tr>
+<tr><td>tier-1 trunk + value</td><td><code>pos:96x8</code>: 96 channels, 8 residual blocks, 1.40M params</td><td>the full-turn position only: unit and graveyard planes; money, reinforcement and turns-left scalars; a constant plane</td><td>value, plus a 96×7×7 trunk image (fp16), cached per position</td></tr>
+<tr><td>tier-2 head</td><td><code>96x6</code>, 1.03M params</td><td>the trunk image plus the <em>lattice view</em>: the original position; enemy fates; decided friends at their origin; final friendly units at their final cell; a from-spawn bit; projected scalars</td><td>46 slots per cell (3 fates, 37 move destinations, 6 spawns) as prior logits and child values; node value; position value; energy</td></tr>
+</table>
+<ul>
+<li><strong>One value function</strong> (<code>--t1-node</code>). The exported tier-1 value is the tier-2 head's node value at the empty declaration. Tier 1 and tier 2 therefore cannot disagree about a turn start.</li>
+<li><strong>Partial turns never enter the trunk</strong> (the user's rule). The trunk sees full-turn positions; decisions reach tier 2 only. Tier 1 trains on turn records and tier 2 on lattice records.</li>
+<li>An <strong>energy head</strong> (a softmax over a node's tier-1 children) is trained with weight 0.2. The search does not use it.</li>
+<li><strong>Runtime.</strong> Two ONNX graphs run under TensorRT; the CUDA execution provider returns wrong values for some shapes. A single runner merges requests from all games into large batches. Tier-2 batches gather cached trunk images instead of recomputing the trunk.</li>
+</ul>
+
+<h2>6. Self-play: the current recipe (gens 759+)</h2>
+<table>
+<tr><th>setting</th><th>value</th></tr>
+<tr><td>self-play net</td><td>the champion (<code>SP_CHAMP=1</code>), currently gen 660</td></tr>
+<tr><td>concurrency</td><td>16 workers × 16 games, 8 tier-1 visits in flight per search, games started over a 60 s ramp; ~7 GB RSS</td></tr>
+<tr><td>starting position</td><td>the initial position; no opening pool or random opening (<code>--from-start</code>)</td></tr>
+<tr><td>handicap</td><td>uniform per game on −5..10 dollars (<code>--random-handicap</code>)</td></tr>
+<tr><td>tier-1 search</td><td>800 visits per turn; prior softmax(value/100); <span class="math">c</span> 1.5; widening <span class="math">⌈N<sup>0.5</sup>⌉</span></td></tr>
+<tr><td>turn choice</td><td>anchored (below): temperature 1, Dirichlet α 0.3, weight 0.25</td></tr>
+<tr><td>time split</td><td>400 s of self-play, then up to 190 s for the tier-2 phase</td></tr>
+</table>
+
+<h3>Anchored turn choice</h3>
+<ol>
+<li>Run the tier-1 search, then pick a turn from the root visits with temperature and Dirichlet noise.</li>
+<li>Take a random lattice path to that turn and pick one node on it as the <em>anchor</em>.</li>
+<li>Run a from-scratch tier-2 search rooted at the anchor, in a fresh lattice. Its record is a tier-2 training target.</li>
+<li>Draw the played turn from the complete turns that search reached, by descents, with temperature and Dirichlet noise.</li>
+</ol>
+<p>The other nodes on the path join the tier-2 phase queue with probability 0.15. This lets the game leave the top tier-1 turns, toward turns that share a reasonable partial declaration with them, without a uniformly random opening.</p>
+
+<h3>Records</h3>
+<ul>
+<li><strong>Tier-1 value targets:</strong> the root of each searched turn, plus every tier-1 node with at least 16 visits, at the mean of its backed-up tier-1 values. That is about 26 records per searched turn.</li>
+<li><strong>Tier-2 targets</strong> come from rooted searches: the anchors plus the tier-2 phase. Each search runs 128 descents, visiting every kid once first. A kid's value target is the best complete turn reached below it. The prior target is a per-cell softmax of those values at τ = 0.02.</li>
+<li><strong>Energy groups:</strong> each turn start with its tier-1 children's declarations and visits.</li>
+<li>Game results are never trained on.</li>
+</ul>
+<table>
+<tr><th>per generation (gen 758, gen-660 self-play)</th><th class="n">count</th></tr>
+<tr><td>games / searched turns in 400 s</td><td class="n">267 / 1,024</td></tr>
+<tr><td>tier-1 records</td><td class="n">26,892</td></tr>
+<tr><td>tier-2 records: anchors / tier-2 phase</td><td class="n">1,005 / 3,002</td></tr>
+<tr><td>tier-2 phase throughput (finished in 54 s of its 190 s)</td><td class="n">56 searches/s, 55k expansions/s</td></tr>
+</table>
+
+<h2>7. Training and gating</h2>
+<ul>
+<li><strong>Learner</strong> (<code>python/minions_lattice_learner.py</code>). Joint training:
+  <ul>
+  <li>tier-2 prior cross-entropy;</li>
+  <li>child-value and node-value BCE;</li>
+  <li>tier-1 value BCE, on 256 tier-1 records per step;</li>
+  <li>energy loss at weight 0.2.</li>
+  </ul>
+  The tier-2 losses also train the trunk. AdamW at learning rate 10<sup>−3</sup>, one epoch over a window of the last 8 generations, warm-started from the previous net in the chain. About 130 steps and 60 s per generation.</li>
+<li><strong>Cycle</strong> (<code>data/models/minions/lattice537/cycle.sh</code>):
+  <ul>
+  <li>Net G−1 trains while generation G self-plays, about 8 minutes per generation.</li>
+  <li>Training continues a <em>chain</em>: each net starts from the previous one.</li>
+  <li>The champion plays the self-play games.</li>
+  <li>After a restart, no training runs until the window holds 4 generations of data (<code>MIN_WINDOW</code>).</li>
+  </ul></li>
+<li><strong>Gate</strong>, every 4 generations: 64 seat-swapped pairs (128 games) against the champion, at 100 tier-1 visits with 16 in flight. Each pair starts after 2 net-sampled opening turns at handicap 3, the calibrated even point. A candidate becomes champion at ≥ 0.55 (standard error ≈ 0.044).</li>
+</ul>
+
+<h2>8. How it got here</h2>
+<table>
+<tr><th>date</th><th>change</th><th>result</th></tr>
+<tr><td>10-03</td><td>design (the user's); built and trained from random init</td><td>shelved at gen 76: lost 1–31 to the heuristic greedy bot (the end-heavy curriculum taught it not to spawn)</td></tr>
+<tr><td>10-04</td><td><code>lattice537</code>: tier 1 from Athenan gen 537; "bridge" self-play on its value net (gens 13–45)</td><td>reached Athenan's level, not past it</td></tr>
+<tr><td>10-05</td><td>gating; tier 2 distilled from Athenan (D0)</td><td>D0 beat Athenan-537 0.594: the first time the full design did</td></tr>
+<tr><td>10-06</td><td>single value function, 64×6 trunk; value-based tier-2 targets; lattice view</td><td>p64: 0.672 vs Athenan-537</td></tr>
+<tr><td>10-07</td><td>chained training; uniform tier-1 prior; exact SAT check</td><td>champions 338 → 424</td></tr>
+<tr><td>10-08</td><td>rooted tier-2 phase; 800 visits; nets grown to 96×8 / 96×6; cyclic-move rules</td><td>prior CE excess 0.32 → 0.19; champions 478, 496, 534, 556</td></tr>
+<tr><td>10-09</td><td>champion 660 (0.562 vs 556); stepwise self-play tried</td><td>gen 648 vs 526: 0.555 ± 0.020 over 640 games. Stepwise lost: 0.49 → 0.27 vs 660</td></tr>
+<tr><td>10-10</td><td>race fix; anchored turn choice; from-start; random handicap; champion self-play</td><td>post-restart nets 0.40–0.42 vs 660 (§9)</td></tr>
+</table>
+
+<h2>9. The 10 October restart</h2>
+<p>All three recipe changes started from champion 660 at gen 754. Every earlier generation had trained on data from the race-biased search.</p>
+<table>
+<tr><th>net</th><th>trained on</th><th class="n">vs 660</th></tr>
+<tr><td>gen 754</td><td>one generation of data (19k tier-1 / 3.7k tier-2 records)</td><td class="n bad">0.234 ± 0.053</td></tr>
+<tr><td>gen 755 / 756</td><td>two / three generations</td><td class="n bad">0.141 / 0.164</td></tr>
+<tr><td colspan="3"><em>reset to 660, with 4 generations of warm-up self-play by 660</em></td></tr>
+<tr><td>gen 757</td><td>4 generations, the first step from 660</td><td class="n">0.281 ± 0.056</td></tr>
+<tr><td>gen 758 / 760</td><td>self-play by the chain</td><td class="n">0.422 / 0.398</td></tr>
+<tr><td>gen 764</td><td>self-play by the chain</td><td class="n bad">0.367</td></tr>
+<tr><td colspan="3"><em>reset to 660 again; the champion plays self-play from gen 759 on</em></td></tr>
+</table>
+<p>As a control, gen 752 from the old chain scored 0.391 ± 0.061 in the new gate format, so the format itself is not what makes the new nets look weak.</p>
+
+<h2>10. Lessons</h2>
+<ul>
+<li><strong>Visit counts are not prior targets in an order-free lattice.</strong> A complete turn is a visit for <em>all</em> of its commitments, so the counts fail either way:
+  <ul>
+  <li>marginal counts reward leftover choices;</li>
+  <li>first-step counts are pushed by PUCT toward choices not yet in any found turn.</li>
+  </ul>
+  Both collapsed a good tier 2, to 0.14–0.25 and to 0–64. Only value-based per-cell softmax targets have worked.</li>
+<li><strong>Losses do not predict strength.</strong> Stepwise targets improved every in-window loss while the gates fell from 0.49 to 0.27. Only matches count.</li>
+<li><strong>Parallelism can bias the search.</strong> The widening race distorted visit distributions for hundreds of generations before anyone noticed.</li>
+<li><strong>Window size matters on a restart.</strong> One generation of data cost 660 about 0.27 in score in a single step.</li>
+<li><strong>A fixed handicap leaves money unpriced.</strong> Gen 660's value for yellow moved only from 0.52 to 0.47 across −30..+30 dollars. Equal-net matches are even near a handicap of 3.</li>
+<li><strong>Proposal quality bounds the search.</strong> Tier 1 ranks the turns it is given well, but progressive widening only ever gives it <span class="math">√N</span> turns, all proposed by tier 2. A weak tier 2 means weak play.</li>
+</ul>
+
+<h2>11. Throughput and memory</h2>
+<ul>
+<li>Self-play is bound by latency, not memory or GPU compute. Throughput tracks the total visits in flight, games × in-flight. About 2,048 in flight gives about 3 searched turns/s, whether that is 4 games × 32 or 16 games × 8.</li>
+<li>The single ONNX runner's per-call host cost dominates: 1–2 ms per call whatever the row count. The GPU is 16–40% busy.</li>
+<li>Memory is dominated by lattice nodes, about 25 per tier-1 visit. Changes on 10 October cut memory per node by about 45%:
+  <ul>
+  <li>a hashed key index;</li>
+  <li>witnesses stored as differences;</li>
+  <li>a packed node pool;</li>
+  <li>boxed rarely-used fields.</li>
+  </ul></li>
+</ul>
+
+<h2>12. Open issues</h2>
+<ol>
+<li><strong>Max versus mean.</strong> Rooted tier-2 value targets take the <em>best</em> complete turn below each kid. That conflicts with the rule that targets <em>average</em> complete turns. Unresolved.</li>
+<li><strong>The tier-2 phase sits idle for about 70% of its budget</strong> (54 of 190 s at gen 758). Moving that time to self-play, or raising the queue fraction, is free throughput.</li>
+<li><strong>No post-restart net has beaten 660.</strong> Champion self-play only started at gen 759. If the gates stay below 0.45, the next steps to try are a lower learning rate for the first generations, or mixing older data back in.</li>
+<li><strong>Money is still unpriced.</strong> Random-handicap data is meant to teach the value head about money. The post-opening even bid (<code>--even-bid</code>) waits until it can.</li>
+<li><strong>The tier-1 prior is still uniform;</strong> the energy head is trained but unused.</li>
+<li><strong>The training-data explorer UI</strong> (games, their records and how they were generated) is designed but not built.</li>
+</ol>
+
+<h2>Appendix: running it</h2>
+<pre>source scripts/ort-env.sh            # TensorRT runtime; required
+
+# play / inspect in the UI (lattice panel on :7107)
+./target/release/minions-engine serve --addr 127.0.0.1:7105 \
+    --lattice-net vprior=100:weights/minions/lattice-gen660
+
+# match two lattice nets (gate format: 2 sampled opening turns, handicap 3)
+./target/release/minions-engine steps-match --a vprior=100:&lt;dirA&gt; \
+    --b vprior=100:&lt;dirB&gt; --pairs 64 --n1 100 --threads 16
+
+# the training cycle (detached); stop with: touch data/models/minions/lattice537/STOP
+SP_CHAMP=1 MIN_WINDOW=4 T1_ARCH=pos:96x8 T2_ARCH=96x6 RESET_MIN=0 \
+GEN_FLAGS="--workers 16 --games 16 --inflight 8 --ramp-secs 60 --anchor --from-start --random-handicap" \
+setsid nohup bash data/models/minions/lattice537/cycle.sh &gt;&gt; data/models/minions/lattice537/cycle.log 2&gt;&amp;1 &lt; /dev/null &amp;</pre>
+<table>
+<tr><th>code</th><th>role</th></tr>
+<tr><td><code>crates/games/minions/src/lattice.rs</code></td><td>lattice, tier-2 PUCT, lazy propagation, rooted searches</td></tr>
+<tr><td><code>tier1.rs</code></td><td>tier-1 MCTS with progressive widening, in-flight handling</td></tr>
+<tr><td><code>latgen.rs</code></td><td>self-play driver (<code>lattice-gen</code>), anchored choice, records</td></tr>
+<tr><td><code>lattice_ort.rs</code>, <code>lview.rs</code>, <code>sat.rs</code></td><td>ONNX/TensorRT evaluator; lattice view; SAT check</td></tr>
+<tr><td><code>stepsp.rs</code>, <code>lattice_ui.rs</code></td><td>matches and openings; the UI's lattice panel server</td></tr>
+<tr><td><code>python/minions_lattice_learner.py</code></td><td>learner and ONNX export</td></tr>
+<tr><td><code>docs/minions-lattice.md</code></td><td>the design document and its history</td></tr>
+</table>
+
+</main>
+</body>
+</html>
