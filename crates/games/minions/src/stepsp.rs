@@ -1535,6 +1535,15 @@ fn match_logging() -> bool {
     MATCH_LOG.get().is_some()
 }
 
+/// `steps-match --shadow`: at every logged turn the player not moving also
+/// searches the position (logged as the turn's "shadow"; never played), so
+/// the explorer can set the two nets' beliefs side by side.
+static MATCH_SHADOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_match_shadow(on: bool) {
+    MATCH_SHADOW.store(on, Ordering::Relaxed);
+}
+
 /// One turn by tier-1 lattice search.
 pub fn lattice_turn(
     real: &crate::game::MinionsState,
@@ -1755,6 +1764,12 @@ pub fn play_match(
                         let a_moves = (real.side == 0) == a_first;
                         let p = if a_moves { a } else { b };
                         if match_logging() {
+                            let shadow = if MATCH_SHADOW.load(Ordering::Relaxed) {
+                                let o = if a_moves { b } else { a };
+                                o.turn_logged(&real, salt ^ turns as u64)?.1
+                            } else {
+                                None
+                            };
                             let (next, search) = p.turn_logged(&real, salt ^ turns as u64)?;
                             log.push(serde_json::json!({
                                 "pos": crate::lattice_ui::board_hex(&real),
@@ -1762,6 +1777,7 @@ pub fn play_match(
                                 "side": real.side,
                                 "mover": if a_moves { "a" } else { "b" },
                                 "search": search,
+                                "shadow": shadow,
                             }));
                             real = next;
                         } else {

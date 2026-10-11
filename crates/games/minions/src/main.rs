@@ -724,6 +724,11 @@ enum Cmd {
         /// and played turn) to this file as JSON lines, for the explorer.
         #[arg(long)]
         game_log: Option<String>,
+        /// With --game-log: at every turn the player not moving also searches
+        /// the position, logged beside the mover's (never played) -- both
+        /// nets' beliefs at every node, for the explorer's featured games.
+        #[arg(long)]
+        shadow: bool,
         no_lazy_witness: bool,
     },
     /// The step search (best-first) against the old sampled-AZ MCTS, standard
@@ -1836,11 +1841,13 @@ async fn main() -> anyhow::Result<()> {
             let value = load_step_eval_runners(&vspec, &ep, 1)?;
             minions_engine::stepsp::money_probe(value.as_ref(), lat.eval.as_ref(), positions, opening_turns, handicap, seed)?;
         }
-        Cmd::StepsMatch { a, b, pairs, opening_turns, handicap, even_bid, opening_max, opening_decay, ep, seed, expansions, expansions_b, power, power_b, heads, threads, two_tier_a, two_tier_b, t2_c, t2_retries, t2_widen, n1, n1_b, lattice_inflight, lattice_inflight_b, no_lazy_witness, game_log } => {
+        Cmd::StepsMatch { a, b, pairs, opening_turns, handicap, even_bid, opening_max, opening_decay, ep, seed, expansions, expansions_b, power, power_b, heads, threads, two_tier_a, two_tier_b, t2_c, t2_retries, t2_widen, n1, n1_b, lattice_inflight, lattice_inflight_b, no_lazy_witness, game_log, shadow } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
             if let Some(p) = &game_log {
                 minions_engine::stepsp::set_match_log(std::path::Path::new(p))?;
             }
+            anyhow::ensure!(!shadow || game_log.is_some(), "--shadow needs --game-log");
+            minions_engine::stepsp::set_match_shadow(shadow);
             // A match evaluates one batch at a time per game thread, so one
             // runner (two sessions per net, not four) is enough: the session
             // builds were most of a short match's time and memory.

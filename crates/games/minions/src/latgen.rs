@@ -700,11 +700,17 @@ fn t2_json(start: &StepState, r: &T2Record, mean: Option<&T2Record>) -> serde_js
         .iter()
         .enumerate()
         .map(|(i, &(cell, slot, n, q, ns))| {
+            // `n` / `w_mean`: the policy weights the learner reads (per variable,
+            // exp((target - the variable's best) / tau), or descents at tau
+            // 0) of the max and mean records.
+            let m = mean.and_then(|m| m.kids.get(i));
             serde_json::json!({
+                "var": cell,
                 "label": r.node.with_next(cell).step_label(slot),
                 "n": n,
                 "target": (q >= 0.0).then_some(q),
-                "mean": mean.and_then(|m| m.kids.get(i)).and_then(|k| (k.3 >= 0.0).then_some(k.3)),
+                "w_mean": m.map(|k| k.2),
+                "mean": m.and_then(|k| (k.3 >= 0.0).then_some(k.3)),
                 "returns": ns,
             })
         })

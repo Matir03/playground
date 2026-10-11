@@ -87,6 +87,10 @@ function summary(g: Game, i: number) {
     anchored: turns.filter((t) => t.anchor).length,
     value_dev: mean(searched.map((t) => Math.abs((t.value ?? 0.5) - 0.5))),
     a_turns: turns.filter((t) => t.mover === "a").length,
+    // Featured games (steps-match --shadow): both nets searched every turn.
+    shadowed: turns.filter((t) => t.shadow).length,
+    agree: mean(turns.filter((t) => t.shadow && t.played).map((t) => (t.shadow.played === t.played ? 1 : 0))),
+    vdiff: mean(turns.filter((t) => t.shadow && t.value != null).map((t) => Math.abs(t.value - t.shadow.value))),
   };
 }
 

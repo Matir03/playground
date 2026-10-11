@@ -48,6 +48,20 @@ interface Summary {
   anchored: number;
   value_dev: number | null;
   a_turns: number;
+  shadowed: number;
+  agree: number | null;
+  vdiff: number | null;
+}
+
+/** A root search as the match log writes it (the mover's, or the shadow's). */
+interface Search {
+  visits: number;
+  kids: number;
+  value: number;
+  secs?: number;
+  cands: Cand[];
+  played: string;
+  necro_kill?: boolean;
 }
 
 interface Cand {
@@ -59,10 +73,17 @@ interface Cand {
 }
 
 interface T2Kid {
+  /** The variable (cell) this choice decides; older logs lack it. */
+  var?: number;
   label: string;
+  /** Max record's policy weight: exp((target - the variable's best) / tau). */
   n: number;
+  /** Best completion value through this choice (the max record). */
   target: number | null;
+  /** Mean record's policy weight and value target. */
+  w_mean?: number | null;
   mean: number | null;
+  /** Descents of the search that went through this choice. */
   returns: number;
 }
 
@@ -90,6 +111,8 @@ interface Turn {
   picked_n?: number;
   played?: string;
   necro_kill?: boolean;
+  /** Featured games: the other net's search of the same position. */
+  shadow?: Search | null;
   anchor?: {
     from: "anchor" | "fallback";
     reached: { label: string; n: number; v: number; played: boolean }[];
@@ -207,6 +230,18 @@ const STATS: Stat[] = [
     label: "|root value − 0.5|",
     hint: "how decided the searched positions look to the net",
     value: (s) => fmt(mean(s.map((g) => g.value_dev)), 3),
+  },
+  {
+    key: "agree",
+    label: "nets agree on the turn",
+    hint: "featured games: the turn the mover played is the one the other net would have played",
+    value: (s) => (s.some((g) => g.shadowed) ? pct(mean(s.filter((g) => g.shadowed).map((g) => g.agree))) : "–"),
+  },
+  {
+    key: "vdiff",
+    label: "|value(mover) − value(other)|",
+    hint: "featured games: the two nets' root values of the same position, mean absolute gap",
+    value: (s) => (s.some((g) => g.shadowed) ? fmt(mean(s.filter((g) => g.shadowed).map((g) => g.vdiff)), 3) : "–"),
   },
   {
     key: "ascore",
@@ -398,42 +433,163 @@ function CandTable({ cands, played, picked, onHover }: { cands: Cand[]; played?:
   );
 }
 
+/** A variable key for a kid: its cell, or (older logs) the cell its label
+ *  names first after the verb ("spare zombie b4", "move zombie f6f5",
+ *  "Z@e6", "no spawn e6"). */
+function varOf(k: T2Kid): string {
+  if (k.var != null) return String(k.var);
+  const m = /([a-g]\d)(?:[a-g]\d)?$/.exec(k.label);
+  return m ? m[1] : k.label;
+}
+
 function T2View({ rec, hideIdle }: { rec: T2Rec; hideIdle: boolean }) {
   const idle = (l: string) => l.startsWith("spare ") || l.startsWith("no spawn");
   const commits = hideIdle ? rec.commits.filter((c) => !idle(c)) : rec.commits;
-  const kids = [...rec.kids].sort((a, b) => b.n - a.n);
+  // Group the kids by variable; within one, the policy weights normalized
+  // (the learner's per-variable softmax target).
+  const groups = new Map<string, T2Kid[]>();
+  for (const k of rec.kids) {
+    const v = varOf(k);
+    if (!groups.has(v)) groups.set(v, []);
+    groups.get(v)!.push(k);
+  }
+  const all = [...groups.values()].map((ks) => {
+    const sm = ks.reduce((a, k) => a + (k.w_mean ?? 0), 0);
+    const sx = ks.reduce((a, k) => a + k.n, 0);
+    return ks
+      .map((k) => ({ ...k, pm: sm > 0 ? (k.w_mean ?? 0) / sm : null, px: sx > 0 ? k.n / sx : null }))
+      .sort((a, b) => (b.mean ?? -1) - (a.mean ?? -1));
+  });
+  const forced = all.filter((g) => g.length === 1);
+  const open = all.filter((g) => g.length > 1).sort((a, b) => b.length - a.length);
+  const shown = hideIdle ? open : [...open, ...forced];
+  const hasMean = rec.kids.some((k) => k.w_mean != null);
   return (
     <div style={{ fontSize: 12 }}>
       <div style={{ marginBottom: 4 }}>
-        <strong>commitments ({rec.commits.length}{hideIdle ? `, ${rec.commits.length - commits.length} idle hidden` : ""}):</strong>{" "}
+        <strong>commitments so far ({rec.commits.length}{hideIdle ? `, ${rec.commits.length - commits.length} idle hidden` : ""}):</strong>{" "}
         <span style={{ fontFamily: "monospace", fontSize: 11 }}>{commits.join(" · ") || "none (turn start)"}</span>
       </div>
-      <div style={{ marginBottom: 4 }}>
-        node: {fmt(rec.n, 0)} visits, target {fmt(rec.q, 3)}
+      <div style={{ marginBottom: 6, color: "#444" }}>
+        {fmt(rec.n, 0)} descents from this node, each ending at a complete turn. Per choice: the descents through it, the
+        best and the mean value of the complete turns they reached, and the policy target (per variable, softmax of the
+        values at τ 0.02). <strong>The cycle trains on the mean record</strong> (value = mean, policy from the means);
+        the best-value column is the old max record, not trained since 2026-10-10.
+        {hideIdle && forced.length > 0 && <> {forced.length} variables with a single choice hidden.</>}
       </div>
       <table style={{ borderCollapse: "collapse", width: "100%" }}>
         <thead>
           <tr>
-            <th style={th}>next commitment</th>
-            <th style={{ ...th, textAlign: "right" }}>visit share</th>
-            <th style={{ ...th, textAlign: "right" }}>target</th>
-            <th style={{ ...th, textAlign: "right" }}>mean</th>
-            <th style={{ ...th, textAlign: "right" }}>returns</th>
+            <th style={th}>choice</th>
+            <th style={{ ...th, textAlign: "right" }} title="descents through this choice">descents</th>
+            <th style={{ ...th, textAlign: "right" }} title="mean value of the complete turns reached through it (trained)">mean ✓</th>
+            {hasMean && <th style={{ ...th, textAlign: "right" }} title="policy target from the means, within the variable (trained)">policy ✓</th>}
+            <th style={{ ...th, textAlign: "right" }} title="best complete turn through it (max record, not trained)">best</th>
           </tr>
         </thead>
         <tbody>
-          {kids.slice(0, 30).map((k, i) => (
-            <tr key={i}>
-              <td style={{ ...td, fontFamily: "monospace", fontSize: 11 }}>{k.label}</td>
-              <td style={num}>{pct(k.n)}</td>
-              <td style={num}>{fmt(k.target, 3)}</td>
-              <td style={num}>{fmt(k.mean, 3)}</td>
-              <td style={num}>{fmt(k.returns, 0)}</td>
-            </tr>
-          ))}
+          {shown.map((g, gi) =>
+            g.map((k, i) => (
+              <tr key={`${gi}-${i}`} style={{ borderTop: i === 0 ? "1px solid #ccc" : undefined }}>
+                <td style={{ ...td, fontFamily: "monospace", fontSize: 11 }}>{k.label}</td>
+                <td style={num}>{fmt(k.returns, 0)}</td>
+                <td style={num}>{fmt(k.mean, 3)}</td>
+                {hasMean && <td style={num}>{pct(k.pm)}</td>}
+                <td style={{ ...num, color: "#888" }}>{fmt(k.target, 3)}</td>
+              </tr>
+            )),
+          )}
         </tbody>
       </table>
-      {kids.length > 30 && <div style={{ color: "#888" }}>… {kids.length - 30} more</div>}
+    </div>
+  );
+}
+
+/** Where `label` sits in a search: rank among the logged top turns, visits,
+ *  Q; null if outside them. */
+function rankIn(s: Search, label?: string) {
+  const sorted = [...s.cands].sort((a, b) => b.n - a.n);
+  const i = sorted.findIndex((c) => c.label === label);
+  return i < 0 ? null : { rank: i + 1, c: sorted[i], share: sorted[i].n / Math.max(1, s.visits) };
+}
+
+function ShadowCompare({ t, onHover }: { t: Turn; onHover: (l?: string) => void }) {
+  const sh = t.shadow!;
+  const mine: Search = { visits: t.visits ?? 0, kids: t.kids ?? 0, value: t.value ?? NaN, cands: t.cands ?? [], played: t.played ?? "" };
+  const me = (t.mover ?? "a").toUpperCase();
+  const other = me === "A" ? "B" : "A";
+  const agree = sh.played === t.played;
+  const theirsInMine = rankIn(mine, sh.played);
+  const mineInTheirs = rankIn(sh, t.played);
+  const where = (r: ReturnType<typeof rankIn>, who: string) =>
+    r ? `#${r.rank} for ${who} (${r.c.n} visits, ${pct(r.share)}, Q ${fmt(r.c.q, 3)})` : `not in ${who}'s top ${who === me ? mine.cands.length : sh.cands.length}`;
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <div
+        style={{
+          padding: "6px 10px", borderRadius: 6, fontSize: 13, marginBottom: 8,
+          background: agree ? "#e3f1e0" : "#fde2e1", border: `1px solid ${agree ? "#9cc89a" : "#e59a96"}`,
+        }}
+      >
+        {agree ? (
+          <><strong>Both nets pick the same turn.</strong></>
+        ) : (
+          <>
+            <strong>Disagreement.</strong> {me} played its #1; {other} would play a different turn.
+            <div>{other}'s choice is {where(theirsInMine, me)}.</div>
+            <div>{me}'s choice is {where(mineInTheirs, other)}.</div>
+          </>
+        )}
+        <div>
+          root value (for the side to move): {me} {fmt(mine.value, 3)} · {other} {fmt(sh.value, 3)}{" "}
+          <span style={{ color: Math.abs(mine.value - sh.value) > 0.1 ? "#b42318" : "#555" }}>
+            (gap {fmt(Math.abs(mine.value - sh.value), 3)})
+          </span>
+        </div>
+      </div>
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+        {[
+          { who: `${me} (moved)`, s: mine, other: sh.played },
+          { who: `${other} (shadow)`, s: sh, other: t.played },
+        ].map((col) => (
+          <div key={col.who} style={{ flex: "1 1 340px", minWidth: 320 }}>
+            <h4 style={{ margin: "4px 0" }}>
+              {col.who}: {col.s.visits} visits over {col.s.kids} turns
+            </h4>
+            <table style={{ borderCollapse: "collapse", fontSize: 12, width: "100%" }}>
+              <thead>
+                <tr>
+                  <th style={th}>turn</th>
+                  <th style={{ ...th, textAlign: "right" }}>visits</th>
+                  <th style={{ ...th, textAlign: "right" }}>Q</th>
+                </tr>
+              </thead>
+              <tbody>
+                {[...col.s.cands].sort((a, b) => b.n - a.n).map((c, k) => {
+                  const chosen = c.label === col.s.played;
+                  const otherPick = c.label === col.other;
+                  return (
+                    <tr
+                      key={k}
+                      onMouseEnter={() => onHover(c.label)}
+                      onMouseLeave={() => onHover(undefined)}
+                      style={{ background: chosen && otherPick ? "#e3f1e0" : chosen ? "#dbe6f8" : otherPick ? "#fde2e1" : undefined }}
+                    >
+                      <td style={{ ...td, fontFamily: "monospace", fontSize: 11 }}>
+                        {c.label}
+                        {chosen && <strong> ← its pick</strong>}
+                        {otherPick && !chosen && <strong> ← other's pick</strong>}
+                      </td>
+                      <td style={num}>{c.n} <span style={{ color: "#888" }}>({pct(c.n / Math.max(1, col.s.visits))})</span></td>
+                      <td style={num}>{fmt(c.q, 3)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -445,6 +601,9 @@ function TurnDetail({ t, next, coords, hideIdle }: { t: Turn; next?: string; coo
     <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", alignItems: "flex-start" }}>
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         <ExBoard pos={t.pos} label={shown} coords={coords} title={hover ? "hovered turn" : "turn start, played turn drawn"} />
+        {t.shadow && t.shadow.played !== t.played && !hover && (
+          <ExBoard pos={t.pos} label={t.shadow.played} coords={coords} title="the other net's choice" />
+        )}
         {next && <ExBoard pos={next} coords={coords} title="after the turn" />}
       </div>
       <div style={{ flex: "1 1 420px", minWidth: 360 }}>
@@ -460,7 +619,8 @@ function TurnDetail({ t, next, coords, hideIdle }: { t: Turn; next?: string; coo
             <div><strong>picked from the root:</strong> <span style={{ fontFamily: "monospace", fontSize: 11 }}>{t.picked}</span> ({t.picked_n} visits)</div>
           )}
         </div>
-        {t.cands && t.cands.length > 0 && (
+        {t.shadow && <ShadowCompare t={t} onHover={setHover} />}
+        {!t.shadow && t.cands && t.cands.length > 0 && (
           <>
             <h4 style={{ margin: "8px 0 4px" }}>tier-1 search: top turns</h4>
             <CandTable cands={t.cands} played={t.played} picked={t.picked} onHover={setHover} />
@@ -475,11 +635,17 @@ function TurnDetail({ t, next, coords, hideIdle }: { t: Turn; next?: string; coo
               </span>
             </h4>
             {t.anchor.reached.length > 0 && (
+              <div style={{ fontSize: 12, color: "#444", marginBottom: 4 }}>
+                The played turn is drawn from these in proportion to their descents (temperature 1, Dirichlet noise), so
+                when every count is 1 it is close to uniform among the {t.anchor.n_reached} reached. Top 12 by descents shown.
+              </div>
+            )}
+            {t.anchor.reached.length > 0 && (
               <table style={{ borderCollapse: "collapse", fontSize: 12, width: "100%", marginBottom: 8 }}>
                 <thead>
                   <tr>
                     <th style={th}>complete turn reached</th>
-                    <th style={{ ...th, textAlign: "right" }}>times</th>
+                    <th style={{ ...th, textAlign: "right" }} title="descents that ended at this complete turn">descents</th>
                     <th style={{ ...th, textAlign: "right" }}>value</th>
                   </tr>
                 </thead>
@@ -719,7 +885,7 @@ export function Explorer({ onBack }: { onBack: () => void }) {
                       title={x.played}
                       style={{
                         minWidth: 34, padding: "2px 4px", fontSize: 12,
-                        border: k === turnIdx ? "2px solid #2f5d8a" : "1px solid #ccc",
+                        border: k === turnIdx ? "2px solid #2f5d8a" : x.shadow && x.shadow.played !== x.played ? "2px solid #d92d20" : "1px solid #ccc",
                         background: x.side === 0 ? "#fbefd0" : "#dbe6f8",
                         fontWeight: x.mover === "a" ? 700 : 400,
                       }}
@@ -729,7 +895,7 @@ export function Explorer({ onBack }: { onBack: () => void }) {
                     </button>
                   ))}
                   <span style={{ fontSize: 12, color: "#666", alignSelf: "center" }}>
-                    {isMatch ? "bold = seat A · " : ""}← / → keys · {game.unfinished ? "unfinished" : `ended turn ${game.final_turn}, ${["", "yellow wins", "blue wins", "draw"][game.winner]}`}
+                    {isMatch ? "bold = seat A · " : ""}{game.turns.some((x) => x.shadow) ? "red = the nets disagree · " : ""}← / → keys · {game.unfinished ? "unfinished" : `ended turn ${game.final_turn}, ${["", "yellow wins", "blue wins", "draw"][game.winner]}`}
                   </span>
                 </div>
                 <TurnDetail t={t} next={nextPos} coords={coords} hideIdle={hideIdle} />
