@@ -389,6 +389,18 @@ fn runner(mut s1: Session, mut s2: Session, c: usize, gather: bool, q: &Queue) {
 }
 
 impl OrtLatticeEval {
+    /// Override lattice.json's tier-2 prior settings: `temp` divides the
+    /// prior head's logits (infinite: uniform priors within each variable),
+    /// `value_tau` > 0 takes the kids' values over it instead.
+    pub fn set_t2_prior(&mut self, temp: Option<f32>, value_tau: Option<f32>) {
+        if let Some(t) = temp {
+            self.prior_temp = t;
+        }
+        if let Some(v) = value_tau {
+            self.value_prior_tau = v;
+        }
+    }
+
     /// `dir` holds `tier1.onnx`, `tier2.onnx` and `lattice.json`.
     pub fn load(dir: &Path, ep: &str, fp16: bool, runners: usize) -> Result<Self> {
         let meta: serde_json::Value =

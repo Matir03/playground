@@ -1204,6 +1204,16 @@ fn lattice_play(spec: &str, n1: u32, inflight: usize) -> anyhow::Result<(String,
     }
     // `secs=<s>:<spec>`: search s seconds a turn instead of n1 visits;
     // `pw=<c>,<alpha>:<spec>`: tier-1 widening k(N) = ceil(c * N^alpha).
+    // `t2temp=<t>:` divides tier 2's prior logits by t (`inf`: uniform tier-2
+    // priors); `t2vprior=<tau>:` makes them the kids' values over tau.
+    let (spec, t2temp) = match spec.strip_prefix("t2temp=").and_then(|r| r.split_once(':')) {
+        Some((t, s)) => (s, Some(t.parse::<f32>()?)),
+        None => (spec, None),
+    };
+    let (spec, t2vtau) = match spec.strip_prefix("t2vprior=").and_then(|r| r.split_once(':')) {
+        Some((t, s)) => (s, Some(t.parse::<f32>()?)),
+        None => (spec, None),
+    };
     let (spec, secs) = match spec.strip_prefix("secs=").and_then(|r| r.split_once(':')) {
         Some((t, s)) => (s, t.parse::<f64>()?),
         None => (spec, 0.0),
@@ -1236,7 +1246,9 @@ fn lattice_play(spec: &str, n1: u32, inflight: usize) -> anyhow::Result<(String,
     if !dir.join("tier1.onnx").is_file() {
         return Ok((spec.to_string(), None));
     }
-    let eval = std::sync::Arc::new(minions_engine::lattice_ort::OrtLatticeEval::load(dir, "trt", true, 1)?);
+    let mut ev = minions_engine::lattice_ort::OrtLatticeEval::load(dir, "trt", true, 1)?;
+    ev.set_t2_prior(t2temp, t2vtau);
+    let eval = std::sync::Arc::new(ev);
     let mut params = minions_engine::tier1::T1Params { energy_prior: energy, value_prior_tau: vtau, random_order, ..Default::default() };
     if let Some((c, a)) = pw {
         params.pw_c = c;
