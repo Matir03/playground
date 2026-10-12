@@ -90,13 +90,11 @@ pub const BASE_INCOME: u16 = 3;
 /// 20 side-turns — ten apiece — on the 7x7 board.
 pub const MAX_TURNS: u16 = 30;
 
-/// Turns averaged when adjudicating at the cap.
+/// Net-worth balances kept in the state (`nw_hist`, newest last).
 ///
-/// Adjudicating on the single final position hands the result to whoever the
-/// clock happens to stop on: a side that has just banked income and not yet been
-/// answered looks ahead by a full turn's worth of gold. Averaging the net-worth
-/// difference over the last six turns — three apiece — cancels that, and also
-/// smooths a one-off trade that happens to land on the boundary.
+/// Adjudication averaged them until 2026-10-11; it now reads only the newest,
+/// the balance at the end of the final turn (the user's rule). The window stays
+/// in the state so its byte layout (records, pools, the UI) is unchanged.
 pub const ADJ_WINDOW: usize = 6;
 
 /// Feature planes produced by [`Game::to_features`].
@@ -186,10 +184,10 @@ pub fn game_score(state: &MinionsState, side: u8) -> f32 {
 }
 
 pub fn adjudicate(state: &MinionsState) -> u8 {
-    // Mean over the window rather than the final position: see [`ADJ_WINDOW`].
-    // Summed as i32 and compared against zero, so no division and no rounding
-    // decides a close game.
-    let total: i32 = state.nw_hist.iter().map(|&v| v as i32).sum();
+    // The balance at the end of the final turn (the newest history entry),
+    // since 2026-10-11 (user): the 6-turn mean it replaced depended on a
+    // history the nets never see in their input.
+    let total = i32::from(state.nw_hist[ADJ_WINDOW - 1]);
     match total.cmp(&0) {
         std::cmp::Ordering::Greater => 1, // first wins
         std::cmp::Ordering::Less => 2,    // second wins
@@ -1691,8 +1689,8 @@ mod tests {
     #[test]
     fn adjudication_follows_gold_and_draws_exact_ties() {
         let mut s = after_opening();
-        // Adjudication averages the window, so each position has to be given a
-        // history — `prime_nw_hist` states "this balance has held".
+        // Adjudication reads the history, so each position has to be given
+        // one — `prime_nw_hist` states "this balance has held".
         s.money = [11, 4];
         s.prime_nw_hist();
         assert_eq!(adjudicate(&s), 1);
@@ -1725,25 +1723,25 @@ mod tests {
         assert_eq!(adjudicate(&yellow), 1, "a negative bid pays yellow instead");
 
         // The adjudication window is primed from the position, so a handicap
-        // applied after construction has to be reflected in it — otherwise the
-        // average is taken over a balance the game never had.
+        // applied after construction has to be reflected in it — otherwise
+        // adjudication reads a balance the game never had.
         assert!(blue.nw_hist.iter().all(|&v| v < 0), "window must see blue ahead");
         assert!(yellow.nw_hist.iter().all(|&v| v > 0), "window must see yellow ahead");
     }
 
-    fn adjudication_averages_away_a_last_turn_swing() {
+    #[test]
+    fn adjudication_is_the_final_balance() {
         let mut s = after_opening();
         s.money = [0, 0];
         s.prime_nw_hist();
-        // Level throughout, then first player banks a turn's income at the buzzer.
-        s.nw_hist[ADJ_WINDOW - 1] = 4;
-        assert_eq!(adjudicate(&s), 1, "a +4 blip against five level turns still wins?");
-
-        // Against a sustained deficit, the same blip must not flip the result.
-        for v in s.nw_hist.iter_mut().take(ADJ_WINDOW - 1) {
+        // Behind for five turns, ahead at the end of the last: a win.
+        for v in s.nw_hist.iter_mut() {
             *v = -2;
         }
-        assert_eq!(adjudicate(&s), 2, "sustained -2 x5 must outweigh a +4 final turn");
+        s.nw_hist[ADJ_WINDOW - 1] = 4;
+        assert_eq!(adjudicate(&s), 1, "only the final balance counts");
+        s.nw_hist[ADJ_WINDOW - 1] = 0;
+        assert_eq!(adjudicate(&s), 3, "level at the end is a draw");
     }
 
     #[test]

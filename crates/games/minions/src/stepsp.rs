@@ -1184,12 +1184,22 @@ pub fn money_probe(
     opening_turns: u32,
     handicap: i16,
     seed: u64,
+    turns_left: Option<u16>,
 ) -> anyhow::Result<()> {
     const GRID: [i16; 9] = [-10, -6, -4, -2, 0, 2, 4, 6, 10];
     let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
     let (mut sum, mut mono, mut slopes, mut bids) = ([0f64; 9], 0u32, Vec::new(), Vec::new());
     for i in 0..positions {
-        let s = sampled_opening(opening_turns, handicap, lat, &mut rng)?;
+        let mut s = sampled_opening(opening_turns, handicap, lat, &mut rng)?;
+        // --turns-left: the same position, but the cap that many turns away
+        // (turn parity kept, so the side to move is unchanged).
+        if let Some(k) = turns_left {
+            let mut t = crate::game::MAX_TURNS.saturating_sub(k);
+            if t % 2 != s.turn % 2 {
+                t = t.saturating_sub(1);
+            }
+            s.turn = t;
+        }
         let salt = seed ^ u64::from(i).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let ts: Vec<crate::game::MinionsState> = GRID.iter().map(|&x| with_money_bid(&s, x)).collect();
         let ss: Vec<StepState> = ts.iter().map(|t| StepState::begin(t, salt)).collect();
@@ -1217,7 +1227,10 @@ pub fn money_probe(
     };
     let ((sm, ssd), (bm, bsd)) = (ms(&slopes), ms(&bids));
     let bound = bids.iter().filter(|b| b.abs() >= f64::from(EVEN_BID_MAX)).count();
-    println!("money probe: {positions} positions after {opening_turns} sampled turns at handicap {handicap}");
+    println!(
+        "money probe: {positions} positions after {opening_turns} sampled turns at handicap {handicap}{}",
+        turns_left.map_or(String::new(), |k| format!(", {k} turns left"))
+    );
     println!("  yellow value by $ to blue: {}", curve.join(" "));
     println!("  monotone (falling) in {:.0}% of positions", 100.0 * f64::from(mono) / n);
     println!("  slope -4..+4: {sm:.4} per dollar (sd {ssd:.4})");
