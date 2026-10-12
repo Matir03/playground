@@ -50,6 +50,8 @@ interface Summary {
   a_turns: number;
   shadowed: number;
   agree: number | null;
+  regret: number | null;
+  outside: number | null;
   vdiff: number | null;
 }
 
@@ -233,9 +235,21 @@ const STATS: Stat[] = [
   },
   {
     key: "agree",
-    label: "nets agree on the turn",
-    hint: "featured games: the turn the mover played is the one the other net would have played",
+    label: "played turn = other net's top",
+    hint: "featured games: the mover's turn is among the other net's most-visited turns (visit ties count)",
     value: (s) => (s.some((g) => g.shadowed) ? pct(mean(s.filter((g) => g.shadowed).map((g) => g.agree))) : "–"),
+  },
+  {
+    key: "regret",
+    label: "other net's regret on the played turn",
+    hint: "featured games: the other net's best Q minus its Q of the mover's turn, where it searched that turn (0 = it rates it as good as its own pick)",
+    value: (s) => (s.some((g) => g.shadowed) ? fmt(mean(s.filter((g) => g.shadowed).map((g) => g.regret)), 3) : "–"),
+  },
+  {
+    key: "outside",
+    label: "played turn outside the other's logged turns",
+    hint: "featured games: the other net did not have the mover's turn among its 12 most-visited",
+    value: (s) => (s.some((g) => g.shadowed) ? pct(mean(s.filter((g) => g.shadowed).map((g) => g.outside))) : "–"),
   },
   {
     key: "vdiff",
@@ -518,11 +532,21 @@ function ShadowCompare({ t, onHover }: { t: Turn; onHover: (l?: string) => void 
   const mine: Search = { visits: t.visits ?? 0, kids: t.kids ?? 0, value: t.value ?? NaN, cands: t.cands ?? [], played: t.played ?? "" };
   const me = (t.mover ?? "a").toUpperCase();
   const other = me === "A" ? "B" : "A";
-  const agree = sh.played === t.played;
+  const topOf = (s: Search) => {
+    const m = Math.max(...s.cands.map((c) => c.n));
+    return new Set(s.cands.filter((c) => c.n === m).map((c) => c.label));
+  };
+  const regret = (s: Search, label?: string) => {
+    const qs = s.cands.filter((c) => c.q != null);
+    const c = qs.find((x) => x.label === label);
+    return c && qs.length ? Math.max(...qs.map((x) => x.q as number)) - (c.q as number) : null;
+  };
+  const agree = sh.played === t.played || topOf(sh).has(t.played ?? "");
+  const tied = agree && sh.played !== t.played;
   const theirsInMine = rankIn(mine, sh.played);
   const mineInTheirs = rankIn(sh, t.played);
   const where = (r: ReturnType<typeof rankIn>, who: string) =>
-    r ? `#${r.rank} for ${who} (${r.c.n} visits, ${pct(r.share)}, Q ${fmt(r.c.q, 3)})` : `not in ${who}'s top ${who === me ? mine.cands.length : sh.cands.length}`;
+    r ? `#${r.rank} for ${who} (${r.c.n} visits, ${pct(r.share)}, Q ${fmt(r.c.q, 3)})` : `not among the ${who === me ? mine.cands.length : sh.cands.length} turns ${who} logged`;
   return (
     <div style={{ marginBottom: 10 }}>
       <div
@@ -532,12 +556,18 @@ function ShadowCompare({ t, onHover }: { t: Turn; onHover: (l?: string) => void 
         }}
       >
         {agree ? (
-          <><strong>Both nets pick the same turn.</strong></>
+          <>
+            <strong>{tied ? "The mover's turn ties for the other net's top." : "Both nets pick the same turn."}</strong>
+          </>
         ) : (
           <>
             <strong>Disagreement.</strong> {me} played its #1; {other} would play a different turn.
             <div>{other}'s choice is {where(theirsInMine, me)}.</div>
             <div>{me}'s choice is {where(mineInTheirs, other)}.</div>
+            <div>
+              {other}'s regret on {me}'s turn: {fmt(regret(sh, t.played), 3)} · {me}'s regret on {other}'s turn:{" "}
+              {fmt(regret(mine, sh.played), 3)} (best Q minus the turn's Q; – = not searched by that net)
+            </div>
           </>
         )}
         <div>
@@ -565,7 +595,11 @@ function ShadowCompare({ t, onHover }: { t: Turn; onHover: (l?: string) => void 
                 </tr>
               </thead>
               <tbody>
-                {[...col.s.cands].sort((a, b) => b.n - a.n).map((c, k) => {
+                {[...col.s.cands]
+                  .sort((a, b) => b.n - a.n)
+                  .map((c, k) => ({ c, k }))
+                  .filter(({ c, k }) => k < 12 || c.label === col.other || c.label === col.s.played)
+                  .map(({ c, k }) => {
                   const chosen = c.label === col.s.played;
                   const otherPick = c.label === col.other;
                   return (
@@ -576,6 +610,7 @@ function ShadowCompare({ t, onHover }: { t: Turn; onHover: (l?: string) => void 
                       style={{ background: chosen && otherPick ? "#e3f1e0" : chosen ? "#dbe6f8" : otherPick ? "#fde2e1" : undefined }}
                     >
                       <td style={{ ...td, fontFamily: "monospace", fontSize: 11 }}>
+                        {k >= 12 && <span style={{ color: "#888" }}>#{k + 1} </span>}
                         {c.label}
                         {chosen && <strong> ← its pick</strong>}
                         {otherPick && !chosen && <strong> ← other's pick</strong>}

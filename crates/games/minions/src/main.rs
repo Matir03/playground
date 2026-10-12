@@ -640,6 +640,29 @@ enum Cmd {
         #[arg(long, default_value = "trt")]
         ep: String,
     },
+    /// Keep the openings of a pool whose searched value (a lattice search of
+    /// --n1 visits by --net, for the side to move) is within --tol of even;
+    /// duplicates dropped. For gate starts: positions the champion calls even.
+    FilterOpenings {
+        /// A lattice player spec (prefixes as in steps-match).
+        #[arg(long)]
+        net: String,
+        #[arg(long)]
+        pool: String,
+        #[arg(long)]
+        out: String,
+        #[arg(long, default_value_t = 400)]
+        n1: u32,
+        #[arg(long, default_value_t = 16)]
+        inflight: usize,
+        #[arg(long, default_value_t = 0.1)]
+        tol: f32,
+        /// Stop once this many are kept.
+        #[arg(long, default_value_t = 64)]
+        count: usize,
+        #[arg(long, default_value_t = 8)]
+        threads: usize,
+    },
     StepsMatch {
         #[arg(long)]
         a: String,
@@ -724,6 +747,11 @@ enum Cmd {
         /// and played turn) to this file as JSON lines, for the explorer.
         #[arg(long)]
         game_log: Option<String>,
+        /// Pairs start from these positions (an opening pool file, as
+        /// lattice-gen writes it; pair i takes entry i) instead of random
+        /// openings: e.g. even openings selected by the champion.
+        #[arg(long)]
+        openings: Option<String>,
         /// With --game-log: at every turn the player not moving also searches
         /// the position, logged beside the mover's (never played) -- both
         /// nets' beliefs at every node, for the explorer's featured games.
@@ -885,11 +913,18 @@ enum Cmd {
         #[arg(long)]
         from_start: bool,
         /// Every game draws its starting handicap (dollars to blue) from
-        /// N(3.5, 1), rounded and clipped to BID_MIN..=BID_MAX, so the value
+        /// N(3.5, --handicap-std), rounded and clipped to BID_MIN..=BID_MAX, so the value
         /// head learns what money is worth (a net trained at one handicap
         /// cannot bid).
         #[arg(long)]
         random_handicap: bool,
+        /// --random-handicap's standard deviation in dollars.
+        #[arg(long, default_value_t = minions_engine::latgen::HANDICAP_STD)]
+        handicap_std: f64,
+        /// Every game at this handicap (dollars to blue) instead of the net's
+        /// bid (without --random-handicap).
+        #[arg(long)]
+        handicap: Option<i16>,
         /// Each worker starts its games spread over this many seconds (0:
         /// all at once), so searches peak in memory at different times.
         #[arg(long, default_value_t = 0.0)]
@@ -1853,13 +1888,70 @@ async fn main() -> anyhow::Result<()> {
             let value = load_step_eval_runners(&vspec, &ep, 1)?;
             minions_engine::stepsp::money_probe(value.as_ref(), lat.eval.as_ref(), positions, opening_turns, handicap, seed)?;
         }
-        Cmd::StepsMatch { a, b, pairs, opening_turns, handicap, even_bid, opening_max, opening_decay, ep, seed, expansions, expansions_b, power, power_b, heads, threads, two_tier_a, two_tier_b, t2_c, t2_retries, t2_widen, n1, n1_b, lattice_inflight, lattice_inflight_b, no_lazy_witness, game_log, shadow } => {
+        Cmd::FilterOpenings { net, pool, out, n1, inflight, tol, count, threads } => {
+            let (_, lp) = lattice_play(&net, n1, inflight)?;
+            let lp = lp.ok_or_else(|| anyhow::anyhow!("--net: not a lattice net"))?;
+            let all = minions_engine::latgen::load_pool(std::path::Path::new(&pool))?;
+            let mut seen = std::collections::HashSet::new();
+            let uniq: Vec<_> = all
+                .into_iter()
+                .filter(|s| seen.insert(<minions_engine::game::Minions as playground_core::game::Game>::encode_state(&s.real_base())))
+                .collect();
+            eprintln!("filter-openings: {} unique openings", uniq.len());
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let kept: std::sync::Mutex<Vec<(usize, minions_engine::steps::StepState, f64)>> = std::sync::Mutex::new(Vec::new());
+            let done = std::sync::atomic::AtomicBool::new(false);
+            std::thread::scope(|sc| {
+                for _ in 0..threads.max(1) {
+                    sc.spawn(|| loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= uniq.len() || done.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
+                        let s = uniq[i].clone();
+                        let mut t = minions_engine::tier1::Tier1::new(s.clone(), lp.params.clone());
+                        if t.run_inflight(lp.eval.as_ref(), lp.n1, lp.inflight).is_err() {
+                            continue;
+                        }
+                        let v = t.root_value();
+                        if (v - 0.5).abs() <= f64::from(tol) {
+                            let mut k = kept.lock().unwrap();
+                            k.push((i, s, v));
+                            if k.len() >= count {
+                                done.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    });
+                }
+            });
+            let mut k = kept.into_inner().unwrap();
+            k.sort_by_key(|x| x.0);
+            k.truncate(count);
+            let vs: Vec<f64> = k.iter().map(|x| x.2).collect();
+            let m = vs.iter().sum::<f64>() / vs.len().max(1) as f64;
+            eprintln!("filter-openings: kept {} of {} tried (searched value mean {m:.3})", k.len(), next.load(std::sync::atomic::Ordering::Relaxed).min(uniq.len()));
+            let states: Vec<_> = k.into_iter().map(|x| x.1).collect();
+            minions_engine::latgen::save_pool(std::path::Path::new(&out), &states)?;
+        }
+        Cmd::StepsMatch { a, b, pairs, opening_turns, handicap, even_bid, opening_max, opening_decay, ep, seed, expansions, expansions_b, power, power_b, heads, threads, two_tier_a, two_tier_b, t2_c, t2_retries, t2_widen, n1, n1_b, lattice_inflight, lattice_inflight_b, no_lazy_witness, game_log, shadow, openings } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
             if let Some(p) = &game_log {
                 minions_engine::stepsp::set_match_log(std::path::Path::new(p))?;
             }
             anyhow::ensure!(!shadow || game_log.is_some(), "--shadow needs --game-log");
             minions_engine::stepsp::set_match_shadow(shadow);
+            if let Some(p) = &openings {
+                let pool = minions_engine::latgen::load_pool(std::path::Path::new(p))?;
+                // Duplicate positions play out (nearly) identically: one each.
+                let mut seen = std::collections::HashSet::new();
+                let starts: Vec<_> = pool
+                    .iter()
+                    .map(|s| s.real_base())
+                    .filter(|r| seen.insert(<minions_engine::game::Minions as playground_core::game::Game>::encode_state(r)))
+                    .collect();
+                anyhow::ensure!(starts.len() >= pairs, "{p}: {} distinct openings for {pairs} pairs", starts.len());
+                minions_engine::stepsp::set_match_starts(starts);
+            }
             // A match evaluates one batch at a time per game thread, so one
             // runner (two sessions per net, not four) is enough: the session
             // builds were most of a short match's time and memory.
@@ -1967,7 +2059,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::LatticeGen {
             out, onnx, ep, batcher, workers, games, n1, inflight, n2, c1, c2, pw_c, pw_alpha, retries,
-            temp1, anchor, game_log, game_log_t2_every, from_start, random_handicap, ramp_secs, stepwise, step_search, step_n1, step_temp, step_dir_alpha, step_dir_frac, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, start_turn_mean, start_turn_max, even_open_tau, even_open_tol, secs,
+            temp1, anchor, game_log, game_log_t2_every, from_start, random_handicap, handicap_std, handicap, ramp_secs, stepwise, step_search, step_n1, step_temp, step_dir_alpha, step_dir_frac, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, start_turn_mean, start_turn_max, even_open_tau, even_open_tol, secs,
             target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, sd_frac, sd_descents, sd_tau, rooted_frac, rooted_n, rooted_min, rooted_tau, rooted_mean_too, rooted_secs, rooted_tasks, rooted_inflight, rooted_budget, walk_accumulated, sink_values, walk_inflight, walk_marginal, walk_cq, lview, energy_min_visits, teacher_view, energy_prior, energy_temp, value_prior_tau, pipeline, openings, open_workers, pool, refill_to,
         } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
@@ -2038,6 +2130,8 @@ async fn main() -> anyhow::Result<()> {
                 game_log_t2_every,
                 from_start,
                 random_handicap,
+                handicap_std,
+                handicap,
                 ramp_secs,
                 stepwise,
                 step_search,

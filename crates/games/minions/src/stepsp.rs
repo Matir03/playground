@@ -1544,6 +1544,13 @@ pub fn set_match_shadow(on: bool) {
     MATCH_SHADOW.store(on, Ordering::Relaxed);
 }
 
+/// `steps-match --openings`: pair i starts from entry i.
+static MATCH_STARTS: std::sync::OnceLock<Vec<crate::game::MinionsState>> = std::sync::OnceLock::new();
+
+pub fn set_match_starts(starts: Vec<crate::game::MinionsState>) {
+    let _ = MATCH_STARTS.set(starts);
+}
+
 /// One turn by tier-1 lattice search.
 pub fn lattice_turn(
     real: &crate::game::MinionsState,
@@ -1603,9 +1610,12 @@ pub fn lattice_turn_logged(
         let pri = t.priors(0);
         let mut kids: Vec<(usize, u32)> = root.children.iter().copied().enumerate().collect();
         kids.sort_by_key(|&(_, c)| std::cmp::Reverse(t.nodes[c as usize].n));
+        // Featured games (--shadow) log every root turn, so each net's view of
+        // the other's choice is there however widely the visits spread.
+        let top = if MATCH_SHADOW.load(Ordering::Relaxed) { usize::MAX } else { 12 };
         let cands: Vec<serde_json::Value> = kids
             .iter()
-            .take(12)
+            .take(top)
             .map(|&(i, c)| {
                 let ch = &t.nodes[c as usize];
                 serde_json::json!({
@@ -1703,7 +1713,10 @@ pub fn play_match(
     // cannot price money (gen 660's value moves 0.52 -> 0.47 over +-30 $),
     // so the bid is off by default.
     let starts: Vec<(Option<crate::game::MinionsState>, u64)> = (0..pairs)
-        .map(|_| {
+        .map(|i| {
+            if let Some(fixed) = MATCH_STARTS.get() {
+                return (Some(fixed[i % fixed.len()].clone()), rng.gen());
+            }
             let start = if opening_turns > 0 {
                 Some(match a.lattice.as_ref().or(b.lattice.as_ref()) {
                     // Both sides' nets in turn, so neither picks every opening.

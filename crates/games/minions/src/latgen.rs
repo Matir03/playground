@@ -56,7 +56,9 @@ pub const T2_VERSION: u32 = 1;
 /// Random handicaps (`GenConfig::random_handicap`): centred on the even
 /// point of equal-net matches (~3).
 pub const HANDICAP_MEAN: f64 = 3.5;
-pub const HANDICAP_STD: f64 = 1.0;
+/// The default spread (--handicap-std): 1 until 2026-10-11, when the value
+/// head's money slope had fallen to ~0; 3 until money is understood.
+pub const HANDICAP_STD: f64 = 3.0;
 pub const T2_REC_BYTES: usize = 528;
 pub const T2_KID_BYTES: usize = 12;
 
@@ -188,7 +190,11 @@ pub struct GenConfig {
     pub from_start: bool,
     /// Each worker starts its games spread over this many seconds.
     pub ramp_secs: f64,
-    /// Each game's handicap drawn from N(HANDICAP_MEAN, HANDICAP_STD),
+    /// The random handicap's standard deviation (dollars).
+    pub handicap_std: f64,
+    /// A fixed handicap for every game (else the net's bid, or random).
+    pub handicap: Option<i16>,
+    /// Each game's handicap drawn from N(HANDICAP_MEAN, handicap_std),
     /// rounded and clipped to BID_MIN..=BID_MAX (else the bid).
     pub random_handicap: bool,
     /// Stepwise with a search at each commitment (above). Off (the default
@@ -238,7 +244,7 @@ const POOL_MAGIC: &[u8; 4] = b"MOPN";
 
 /// The pool file: magic, record size, then each opening's real position
 /// (`Game::encode_state`), oldest first. Read back with fresh salts.
-fn load_pool(path: &Path) -> Result<Vec<StepState>> {
+pub fn load_pool(path: &Path) -> Result<Vec<StepState>> {
     use playground_core::Game;
     let b = match std::fs::read(path) {
         Ok(b) => b,
@@ -274,7 +280,7 @@ fn load_pool(path: &Path) -> Result<Vec<StepState>> {
 }
 
 /// Write `pool` (oldest first), atomically.
-fn save_pool(path: &Path, pool: &[StepState]) -> Result<()> {
+pub fn save_pool(path: &Path, pool: &[StepState]) -> Result<()> {
     use playground_core::Game;
     let recs: Vec<Vec<u8>> = pool
         .iter()
@@ -831,7 +837,7 @@ impl Worker<'_> {
             // Normal around the even point, rounded and clipped to the bid
             // range: 3 and 4 dollars ~38% each, 2 and 5 ~12% each.
             use rand_distr::{Distribution, Normal};
-            let x = Normal::new(HANDICAP_MEAN, HANDICAP_STD)
+            let x = Normal::new(HANDICAP_MEAN, self.cfg.handicap_std)
                 .unwrap()
                 .sample(&mut self.rng);
             (x.round() as i16).clamp(crate::game::BID_MIN, crate::game::BID_MAX)
@@ -863,7 +869,11 @@ impl Worker<'_> {
                 .cfg
                 .start_turn_max
                 .min(u32::from(crate::game::MAX_TURNS).saturating_sub(2));
-            let k = self.rng.gen_range(0..=hi);
+            // With even openings, at least one turn: a 0-turn opening skips
+            // the evenness check, so it flooded the pool (~13% of it was the
+            // initial position at a 28-turn range; 2026-10-11).
+            let lo = u32::from(self.cfg.even_open_tau > 0.0).min(hi);
+            let k = self.rng.gen_range(lo..=hi);
             return self.start(s, k);
         }
         if self.cfg.start_turn_mean > 0.0 {
@@ -2205,7 +2215,10 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
     if cfg.lview {
         std::fs::create_dir_all(cfg.out.join("t1e"))?;
     }
-    let bid = lattice_bid(eval.as_ref())?;
+    let bid = match cfg.handicap {
+        Some(h) => h,
+        None => lattice_bid(eval.as_ref())?,
+    };
     eprintln!(
         "lattice-gen: bid {bid}, {} workers x {} games, n1 {}, n2 {}",
         cfg.workers, cfg.games, cfg.n1, cfg.walk.n2

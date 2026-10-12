@@ -62,8 +62,23 @@ function norm(t: Game): Game {
   return t.search !== undefined ? { ...t, ...(t.search ?? {}), search: undefined } : t;
 }
 
+/** A search's most-visited turns (all of them on a tie). */
+function topSet(s: Game): Set<string> {
+  const max = Math.max(...s.cands.map((c: Game) => c.n));
+  return new Set(s.cands.filter((c: Game) => c.n === max).map((c: Game) => c.label));
+}
+
+/** A search's best Q minus its Q of `label` (null if it did not log it). */
+function regretOf(s: Game, label: string): number | null {
+  const qs = s.cands.filter((c: Game) => c.q != null);
+  const c = qs.find((x: Game) => x.label === label);
+  if (!c || !qs.length) return null;
+  return Math.max(...qs.map((x: Game) => x.q)) - c.q;
+}
+
 function summary(g: Game, i: number) {
   const turns: Game[] = (g.turns ?? []).map(norm);
+  const sh = turns.filter((t) => t.shadow && t.played && t.shadow.cands?.length);
   const searched = turns.filter((t) => t.cands && t.cands.length > 0);
   const mean = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null);
   const top = (t: Game) => t.cands.reduce((a: Game, b: Game) => (b.n > a.n ? b : a));
@@ -88,9 +103,15 @@ function summary(g: Game, i: number) {
     value_dev: mean(searched.map((t) => Math.abs((t.value ?? 0.5) - 0.5))),
     a_turns: turns.filter((t) => t.mover === "a").length,
     // Featured games (steps-match --shadow): both nets searched every turn.
-    shadowed: turns.filter((t) => t.shadow).length,
-    agree: mean(turns.filter((t) => t.shadow && t.played).map((t) => (t.shadow.played === t.played ? 1 : 0))),
-    vdiff: mean(turns.filter((t) => t.shadow && t.value != null).map((t) => Math.abs(t.value - t.shadow.value))),
+    shadowed: sh.length,
+    // The mover's turn among the other net's most-visited (ties count).
+    agree: mean(sh.map((t) => (topSet(t.shadow).has(t.played) ? 1 : 0))),
+    // The other net's regret on the mover's turn: its best Q minus its Q of
+    // that turn (where it searched it), and how often it is outside the
+    // other's logged top turns.
+    regret: mean(sh.map((t) => regretOf(t.shadow, t.played)).filter((x): x is number => x != null)),
+    outside: mean(sh.map((t) => (t.shadow.cands.some((c: Game) => c.label === t.played) ? 0 : 1))),
+    vdiff: mean(sh.filter((t) => t.value != null).map((t) => Math.abs(t.value - t.shadow.value))),
   };
 }
 
