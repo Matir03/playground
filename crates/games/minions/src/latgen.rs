@@ -56,9 +56,11 @@ pub const T2_VERSION: u32 = 1;
 /// Random handicaps (`GenConfig::random_handicap`): centred on the even
 /// point of equal-net matches (~3).
 pub const HANDICAP_MEAN: f64 = 3.5;
-/// The default spread (--handicap-std): 1 until 2026-10-11, when the value
-/// head's money slope had fallen to ~0; 3 until money is understood.
-pub const HANDICAP_STD: f64 = 3.0;
+/// The default spread (--handicap-std). 3 for a few hours on 2026-10-11,
+/// "until money is understood" (user): that ~0 money slope was a probe
+/// artefact (the steps-format export), the nets price money at ~0.09 value
+/// per dollar, so a std of 3 mostly made lopsided games. Back to 1.
+pub const HANDICAP_STD: f64 = 1.0;
 /// The largest money swing (`GenConfig::money_swing`), in dollars.
 pub const MONEY_SWING_MAX: i16 = 10;
 pub const T2_REC_BYTES: usize = 528;
