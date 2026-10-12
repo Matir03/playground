@@ -61,8 +61,6 @@ pub const HANDICAP_MEAN: f64 = 3.5;
 /// artefact (the steps-format export), the nets price money at ~0.09 value
 /// per dollar, so a std of 3 mostly made lopsided games. Back to 1.
 pub const HANDICAP_STD: f64 = 1.0;
-/// The largest money swing (`GenConfig::money_swing`), in dollars.
-pub const MONEY_SWING_MAX: i16 = 10;
 pub const T2_REC_BYTES: usize = 528;
 pub const T2_KID_BYTES: usize = 12;
 
@@ -196,10 +194,6 @@ pub struct GenConfig {
     pub ramp_secs: f64,
     /// The random handicap's standard deviation (dollars).
     pub handicap_std: f64,
-    /// Each game started from the pool gets a money swing: dollars drawn
-    /// from N(0, money_swing), rounded and clipped to +-MONEY_SWING_MAX, to
-    /// blue if positive, to yellow if negative (0: none).
-    pub money_swing: f64,
     /// A fixed handicap for every game (else the net's bid, or random).
     pub handicap: Option<i16>,
     /// Each game's handicap drawn from N(HANDICAP_MEAN, handicap_std),
@@ -854,23 +848,6 @@ impl Worker<'_> {
         }
     }
 
-    /// `s` with a random money swing (`GenConfig::money_swing`), so the
-    /// value head sees money vary with the position held fixed (user,
-    /// 2026-10-11: the nets were near money-blind).
-    fn swing_money(&mut self, s: StepState) -> StepState {
-        if self.cfg.money_swing <= 0.0 {
-            return s;
-        }
-        use rand_distr::{Distribution, Normal};
-        let x = Normal::new(0.0, self.cfg.money_swing).unwrap().sample(&mut self.rng);
-        let x = (x.round() as i16).clamp(-MONEY_SWING_MAX, MONEY_SWING_MAX);
-        if x == 0 {
-            return s;
-        }
-        let salt: u64 = self.rng.gen();
-        StepState::begin(&crate::stepsp::with_money_bid(&s.real_base(), x), salt)
-    }
-
     fn new_game(&mut self) -> Result<Task> {
         if self.cfg.from_start && self.collect.is_none() {
             self.c.games.fetch_add(1, Relaxed);
@@ -883,7 +860,6 @@ impl Worker<'_> {
             self.c.games.fetch_add(1, Relaxed);
             if let Some(s) = self.pool.and_then(|p| p.lock().unwrap().pop()) {
                 self.c.pooled.fetch_add(1, Relaxed);
-                let s = self.swing_money(s);
                 return Ok(self.search(s, None));
             }
         }

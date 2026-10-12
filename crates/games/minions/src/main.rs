@@ -947,11 +947,6 @@ enum Cmd {
         /// cannot bid).
         #[arg(long)]
         random_handicap: bool,
-        /// Games started from the pool get a money swing: dollars from
-        /// N(0, this), rounded and clipped to +-10, to blue if positive,
-        /// yellow if negative, on top of the opening's money (0: none).
-        #[arg(long, default_value_t = 0.0)]
-        money_swing: f64,
         /// --random-handicap's standard deviation in dollars.
         #[arg(long, default_value_t = minions_engine::latgen::HANDICAP_STD)]
         handicap_std: f64,
@@ -2106,7 +2101,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::LatticeGen {
             out, onnx, ep, batcher, workers, games, n1, inflight, n2, c1, c2, pw_c, pw_alpha, retries,
-            temp1, anchor, game_log, game_log_t2_every, from_start, random_handicap, handicap_std, handicap, money_swing, ramp_secs, stepwise, step_search, step_n1, step_temp, step_dir_alpha, step_dir_frac, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, start_turn_mean, start_turn_max, even_open_tau, even_open_tol, secs,
+            temp1, anchor, game_log, game_log_t2_every, from_start, random_handicap, handicap_std, handicap, ramp_secs, stepwise, step_search, step_n1, step_temp, step_dir_alpha, step_dir_frac, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, start_turn_mean, start_turn_max, even_open_tau, even_open_tol, secs,
             target_t2, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, sd_frac, sd_descents, sd_tau, rooted_frac, rooted_n, rooted_min, rooted_tau, rooted_mean_too, rooted_secs, rooted_tasks, rooted_inflight, rooted_budget, walk_accumulated, sink_values, walk_inflight, walk_marginal, walk_cq, lview, energy_min_visits, teacher_view, energy_prior, energy_temp, value_prior_tau, pipeline, openings, open_workers, pool, refill_to,
         } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
@@ -2178,7 +2173,6 @@ async fn main() -> anyhow::Result<()> {
                 from_start,
                 random_handicap,
                 handicap_std,
-                money_swing,
                 handicap,
                 ramp_secs,
                 stepwise,

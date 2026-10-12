@@ -1135,10 +1135,28 @@ pub fn with_money_bid(s: &crate::game::MinionsState, x: i16) -> crate::game::Min
 /// Bids range over this many dollars either way.
 pub const EVEN_BID_MAX: i16 = 30;
 
+/// A player's [`even_bid`]: a lattice player's by its lattice value
+/// ([`lattice_even_bid`]; its `eval` is a stale steps-format head).
+fn player_even_bid(p: &Player, s: &crate::game::MinionsState, salt: u64) -> anyhow::Result<i16> {
+    match p.lattice.as_ref() {
+        Some(l) => lattice_even_bid(l.eval.as_ref(), s, salt),
+        None => even_bid(p.eval.as_ref(), s, salt),
+    }
+}
+
+/// A player's opening bid (see [`player_even_bid`]).
+fn player_bid(p: &Player, salt: u64) -> anyhow::Result<i16> {
+    match p.lattice.as_ref() {
+        Some(l) => crate::latgen::lattice_bid(l.eval.as_ref()),
+        None => bid(p.eval.as_ref(), salt),
+    }
+}
+
 /// [`even_bid`] by the lattice's own tier-1 value (what search reads). The
-/// steps-format export of the same net (`value_sparse.onnx`) is nearly blind
-/// to money (2026-10-11: slope ~0 vs 0.09 per dollar here), so bids and
-/// money probes read this.
+/// steps-format export in a lattice net dir (`value_sparse.onnx`) is the
+/// trunk's own value head, which `--lview` training never updates (tier 1
+/// reads the tier-2 head at the root): stale, and blind to money (slope ~0
+/// vs 0.09 per dollar here, 2026-10-11). Bids and money probes read this.
 pub fn lattice_even_bid(lat: &dyn crate::lattice::LatticeEval, s: &crate::game::MinionsState, salt: u64) -> anyhow::Result<i16> {
     let yellow = |x: i16| -> anyhow::Result<f32> {
         let t = with_money_bid(s, x);
@@ -1761,9 +1779,9 @@ pub fn play_match(
     // `opening_turns` > 0: that many random turns from the standard start
     // at `handicap`, then (`even_bid_on`) each side bids money to even the
     // position (applied per game, the two bids averaged); else the older
-    // random openings / standard bid. Nets trained at one fixed handicap
-    // cannot price money (gen 660's value moves 0.52 -> 0.47 over +-30 $),
-    // so the bid is off by default.
+    // random openings / standard bid. Lattice players bid by their lattice
+    // value (`player_even_bid`); the bid is off by default (gates use the
+    // champion's even openings, --openings).
     let starts: Vec<(Option<crate::game::MinionsState>, u64)> = (0..pairs)
         .map(|i| {
             if let Some(fixed) = MATCH_STARTS.get() {
@@ -1805,10 +1823,7 @@ pub fn play_match(
                 let game = |a_first: bool| -> anyhow::Result<(Outcome, bool)> {
                     let mut real = match start {
                         Some(s) if opening_turns > 0 && even_bid_on => {
-                            let (ba, bb) = (
-                                even_bid(a.eval.as_ref(), s, *salt)?,
-                                even_bid(b.eval.as_ref(), s, *salt)?,
-                            );
+                            let (ba, bb) = (player_even_bid(a, s, *salt)?, player_even_bid(b, s, *salt)?);
                             let x = (ba + bb) / 2;
                             if a_first {
                                 bids_log.lock().unwrap().push(x);
@@ -1817,8 +1832,7 @@ pub fn play_match(
                         }
                         Some(s) => s.clone(),
                         None => {
-                            let (ba, bb) =
-                                (bid(a.eval.as_ref(), *salt)?, bid(b.eval.as_ref(), *salt)?);
+                            let (ba, bb) = (player_bid(a, *salt)?, player_bid(b, *salt)?);
                             // The two bids' average (rounded toward zero) is the handicap.
                             crate::game::MinionsState::with_bid((ba + bb) / 2)
                         }
