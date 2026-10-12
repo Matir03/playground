@@ -1135,6 +1135,34 @@ pub fn with_money_bid(s: &crate::game::MinionsState, x: i16) -> crate::game::Min
 /// Bids range over this many dollars either way.
 pub const EVEN_BID_MAX: i16 = 30;
 
+/// [`even_bid`] by the lattice's own tier-1 value (what search reads). The
+/// steps-format export of the same net (`value_sparse.onnx`) is nearly blind
+/// to money (2026-10-11: slope ~0 vs 0.09 per dollar here), so bids and
+/// money probes read this.
+pub fn lattice_even_bid(lat: &dyn crate::lattice::LatticeEval, s: &crate::game::MinionsState, salt: u64) -> anyhow::Result<i16> {
+    let yellow = |x: i16| -> anyhow::Result<f32> {
+        let t = with_money_bid(s, x);
+        let v = lat.value(&[&StepState::begin(&t, salt)])?[0];
+        Ok(if t.side == 0 { v } else { 1.0 - v })
+    };
+    let (mut lo, mut hi) = (-EVEN_BID_MAX, EVEN_BID_MAX);
+    if yellow(lo)? < 0.5 {
+        return Ok(lo);
+    }
+    if yellow(hi)? >= 0.5 {
+        return Ok(hi);
+    }
+    while hi - lo > 1 {
+        let mid = (lo + hi).div_euclid(2);
+        if yellow(mid)? >= 0.5 {
+            lo = mid
+        } else {
+            hi = mid
+        }
+    }
+    Ok(if (yellow(lo)? - 0.5).abs() <= (0.5 - yellow(hi)?).abs() { lo } else { hi })
+}
+
 /// A side's bid for position `s`: the dollars `x` (to blue if positive, to
 /// yellow if negative, on top of the money `s` has) at which its evaluator
 /// rates the position even, by binary search on yellow's (decreasing) value.
@@ -1204,7 +1232,14 @@ pub fn money_probe(
         let ts: Vec<crate::game::MinionsState> = GRID.iter().map(|&x| with_money_bid(&s, x)).collect();
         let ss: Vec<StepState> = ts.iter().map(|t| StepState::begin(t, salt)).collect();
         let views: Vec<View> = ss.iter().map(|x| x.view()).collect();
-        let v = value.eval(&views)?;
+        // MONEY_PROBE_STEPS=1: the old path, the tier-1 net exported as a
+        // steps value net (value_sparse.onnx). By default the lattice's own
+        // tier-1 value, as search reads it.
+        let v = if std::env::var("MONEY_PROBE_STEPS").is_ok_and(|x| x == "1") {
+            value.eval(&views)?
+        } else {
+            lat.value(&ss.iter().collect::<Vec<_>>())?
+        };
         let y: Vec<f64> = ts
             .iter()
             .zip(&v)
@@ -1217,7 +1252,11 @@ pub fn money_probe(
             mono += 1;
         }
         slopes.push((y[2] - y[6]) / 8.0);
-        bids.push(f64::from(even_bid(value, &s, salt)?));
+        bids.push(f64::from(if std::env::var("MONEY_PROBE_STEPS").is_ok_and(|x| x == "1") {
+            even_bid(value, &s, salt)?
+        } else {
+            lattice_even_bid(lat, &s, salt)?
+        }));
     }
     let n = f64::from(positions.max(1));
     let curve: Vec<String> = GRID.iter().zip(&sum).map(|(x, s)| format!("{x}:{:.3}", s / n)).collect();
@@ -2093,4 +2132,101 @@ mod tests {
         // Unfinished game: unknown, whatever the turns.
         assert_eq!(outcome_code(0, 0, 5, 9), 0);
     }
+}
+
+/// `search-tree`: one tier-1 search of `real` (by `lp`), printed as a tree:
+/// the root's `top` turns by visits, under each its `top2` most-visited
+/// replies, then the most-visited line to its end with each position's money
+/// and net worth. Values are the root mover's (yellow or blue, as `real`).
+pub fn print_search_tree(
+    real: &crate::game::MinionsState,
+    lp: &LatticePlay,
+    salt: u64,
+    top: usize,
+    top2: usize,
+) -> anyhow::Result<()> {
+    use crate::game::net_worth;
+    use crate::lattice_ui::turn_label;
+    let start = StepState::begin(real, salt);
+    let mut t = crate::tier1::Tier1::new(start, lp.params.clone());
+    t.run_inflight(lp.eval.as_ref(), lp.n1, lp.inflight)?;
+    let me = real.side;
+    let name = |s: u8| if s == 0 { "yellow" } else { "blue" };
+    let money = |s: &crate::game::MinionsState| {
+        format!(
+            "${}/${} nw {}/{} (yellow/blue)",
+            s.money[0],
+            s.money[1],
+            net_worth(s, 0),
+            net_worth(s, 1)
+        )
+    };
+    // Node c's value for the root mover: q() is the value for the side that
+    // chose the turn into c, i.e. the mover at c's parent.
+    let mine = |c: u32, depth: usize| {
+        let q = 1.0 - t.nodes[c as usize].q();
+        if depth % 2 == 1 { q } else { 1.0 - q }
+    };
+    let sorted = |p: u32| {
+        let mut k: Vec<u32> = t.nodes[p as usize].children.clone();
+        k.sort_by_key(|&c| std::cmp::Reverse(t.nodes[c as usize].n));
+        k
+    };
+    println!(
+        "turn {} {} to move, {}; root value for {} {:.3}, {} visits, {} root turns",
+        real.turn,
+        name(me),
+        money(real),
+        name(me),
+        t.root_value(),
+        t.nodes[0].n,
+        t.nodes[0].children.len()
+    );
+    for &c in sorted(0).iter().take(top) {
+        let ch = &t.nodes[c as usize];
+        let cs = ch.state.real_base();
+        println!(
+            "  n {:4}  v {:.3}  {}  -> {}",
+            ch.n,
+            mine(c, 1),
+            turn_label(&t.nodes[0].state, &ch.state),
+            money(&cs)
+        );
+        for &g in sorted(c).iter().take(top2) {
+            let gn = &t.nodes[g as usize];
+            if gn.n == 0 {
+                continue;
+            }
+            println!(
+                "      n {:4}  v {:.3}  {}  -> {}",
+                gn.n,
+                mine(g, 2),
+                turn_label(&ch.state, &gn.state),
+                money(&gn.state.real_base())
+            );
+        }
+    }
+    println!("  most-visited line:");
+    let (mut p, mut d) = (0u32, 0usize);
+    loop {
+        let Some(&c) = sorted(p).first() else { break };
+        let cn = &t.nodes[c as usize];
+        if cn.n == 0 {
+            break;
+        }
+        d += 1;
+        let cs = cn.state.real_base();
+        println!(
+            "    {d}. turn {} {} n {:4} v {:.3}  {} -> {}{}",
+            t.nodes[p as usize].state.real_base().turn,
+            name(t.nodes[p as usize].state.real_base().side),
+            cn.n,
+            mine(c, d),
+            turn_label(&t.nodes[p as usize].state, &cn.state),
+            money(&cs),
+            if cs.winner != 0 { format!("  [ends: winner {}]", cs.winner) } else { String::new() }
+        );
+        p = c;
+    }
+    Ok(())
 }

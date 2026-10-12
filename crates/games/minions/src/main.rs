@@ -644,6 +644,31 @@ enum Cmd {
         #[arg(long)]
         turns_left: Option<u16>,
     },
+    /// One position searched at several money swings, each printed as a tree
+    /// (`stepsp::print_search_tree`): does search price the money?
+    SearchTree {
+        /// A lattice player spec (prefixes as in steps-match).
+        #[arg(long)]
+        net: String,
+        /// An opening pool file; the position is entry --index.
+        #[arg(long)]
+        pool: String,
+        #[arg(long, default_value_t = 0)]
+        index: usize,
+        /// Dollars to blue (negative: to yellow), comma-separated.
+        #[arg(long, default_value = "0,10,-10", allow_hyphen_values = true)]
+        swings: String,
+        #[arg(long, default_value_t = 800)]
+        n1: u32,
+        #[arg(long, default_value_t = 16)]
+        inflight: usize,
+        #[arg(long, default_value_t = 8)]
+        top: usize,
+        #[arg(long, default_value_t = 3)]
+        top2: usize,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+    },
     /// Keep the openings of a pool whose searched value (a lattice search of
     /// --n1 visits by --net, for the side to move) is within --tol of even;
     /// duplicates dropped. For gate starts: positions the champion calls even.
@@ -1896,6 +1921,19 @@ async fn main() -> anyhow::Result<()> {
             let lat = lat.ok_or_else(|| anyhow::anyhow!("{net}: not a lattice net dir"))?;
             let value = load_step_eval_runners(&vspec, &ep, 1)?;
             minions_engine::stepsp::money_probe(value.as_ref(), lat.eval.as_ref(), positions, opening_turns, handicap, seed, turns_left)?;
+        }
+        Cmd::SearchTree { net, pool, index, swings, n1, inflight, top, top2, seed } => {
+            let (_, lp) = lattice_play(&net, n1, inflight)?;
+            let lp = lp.ok_or_else(|| anyhow::anyhow!("--net: not a lattice net"))?;
+            let all = minions_engine::latgen::load_pool(std::path::Path::new(&pool))?;
+            let base = all.get(index).ok_or_else(|| anyhow::anyhow!("{pool}: no entry {index}"))?.real_base();
+            for x in swings.split(',') {
+                let x: i16 = x.trim().parse()?;
+                println!("=== swing {x:+} (dollars to blue)");
+                let s = minions_engine::stepsp::with_money_bid(&base, x);
+                minions_engine::stepsp::print_search_tree(&s, &lp, seed, top, top2)?;
+                println!();
+            }
         }
         Cmd::FilterOpenings { net, pool, out, n1, inflight, tol, count, threads } => {
             let (_, lp) = lattice_play(&net, n1, inflight)?;
