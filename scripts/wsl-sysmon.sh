@@ -8,6 +8,9 @@ DIR=${DIR:-$HOME/.wsl-sysmon}
 INTERVAL=${INTERVAL:-15}
 KEEP_DAYS=${KEEP_DAYS:-14}
 SMI=/usr/lib/wsl/lib/nvidia-smi
+# WSL's own nvidia-smi segfaults with driver 617.42 (2026-10-12); the Windows
+# one sees the whole GPU (WSL's memory included) and answers in ~1.5 s.
+timeout 20 $SMI -L > /dev/null 2>&1 || SMI=/mnt/c/Windows/System32/nvidia-smi.exe
 mkdir -p "$DIR"
 # One monitor at a time.
 exec 9> "$DIR/.lock"
@@ -19,7 +22,7 @@ while true; do
           v["MemAvailable:"], v["Cached:"], v["Dirty:"], v["Writeback:"], v["SwapTotal:"]-v["SwapFree:"] }' /proc/meminfo)
   load=$(cut -d' ' -f1-3 /proc/loadavg)
   gpu=$($SMI --query-gpu=utilization.gpu,memory.used,temperature.gpu,power.draw,clocks.sm \
-          --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' || echo "?")
+          --format=csv,noheader,nounits 2>/dev/null | tr -d ' \r' || echo "?")
   disk=$(df --output=avail -BG / | tail -1 | tr -d ' ')
   top=$(ps -eo rss=,comm= --sort=-rss | head -3 | awk '{printf "%s:%dM ", $2, $1/1024}')
   echo "$(date '+%F %T') up=$(cut -d' ' -f1 /proc/uptime) $m load=${load// /,} gpu=$gpu disk=$disk top=[${top% }]" \

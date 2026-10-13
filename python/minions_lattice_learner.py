@@ -615,9 +615,15 @@ class ESet:
         gid = np.cumsum(kind == 0) - 1
         child = np.flatnonzero((kind == 1) & (gid >= 0))
         t = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(dev)
-        self.act = t(recs["active"].view(np.int16))
-        self.cnt = t(recs["n_active"])
-        self.scal = t(recs["scalars"].astype(np.float32))
+        # The sparse rows (~3 GB at 11M rows) stay in host memory and only a
+        # batch's rows go to the device: on it they filled the 8 GB card with
+        # the activations, and a full card preceded two host crashes
+        # (2026-10-12, 2026-10-13).
+        host = lambda a: torch.from_numpy(np.ascontiguousarray(a))
+        self.dev = dev
+        self.act = host(recs["active"].view(np.int16))
+        self.cnt = host(recs["n_active"])
+        self.scal = host(recs["scalars"].astype(np.float32))
         self.visits = t(recs["visits"].astype(np.float32))
         self.q = t(recs["q"].astype(np.float32))
         self.prior = t(recs["prior"].astype(np.float32))
@@ -631,7 +637,8 @@ class ESet:
         self.off = torch.cumsum(self.nkids, 0) - self.nkids
 
     def x(self, rows):
-        return dense(self.act[rows], self.cnt[rows], self.scal[rows])
+        r = rows.cpu()
+        return dense(self.act[r].to(self.dev), self.cnt[r].to(self.dev), self.scal[r].to(self.dev))
 
 
 ENERGY_TARGET = {"kind": "visits", "tau": 0.02, "cq_visit": 50.0, "cq_scale": 0.1}
@@ -726,10 +733,15 @@ def main():
     ap.add_argument("--export-only", action="store_true", help="export --t1/--init (or random weights) to --out")
     ap.add_argument("--average", nargs="+", default=None, help="net dirs: no training; --out gets the mean of their weights (net.pt, t2.pt), BatchNorm re-estimated on --data (--bn-recal) and the holdout reported")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--vram-frac", type=float, default=0.75, help="cap on this process's share of GPU memory (1 = none); a full 8 GB card preceded two host crashes")
     args = ap.parse_args()
     torch.manual_seed(args.seed)
     ENERGY_TARGET.update(kind=args.energy_target, tau=args.energy_tau)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
+    if dev == "cuda" and args.vram_frac < 1:
+        # A hard cap: past it the allocator frees its cache, then fails
+        # (out of memory) rather than filling the card.
+        torch.cuda.set_per_process_memory_fraction(args.vram_frac)
     os.makedirs(args.out, exist_ok=True)
     net1 = build_t1(args.t1_arch).to(dev)
     if args.t1:
@@ -857,10 +869,10 @@ def main():
                 ex["t1_root_bce_excess"] = lr / len(ho1r) - hr
             if es is not None and len(hoe):
                 ce = hf = 0.0
-                for i in range(0, len(hoe), 512):
-                    c_, h_ = energy_loss(trunk, t2, es, hoe[i : i + 512])
-                    ce += c_.item() * len(hoe[i : i + 512])
-                    hf += h_.item() * len(hoe[i : i + 512])
+                for i in range(0, len(hoe), 128):
+                    c_, h_ = energy_loss(trunk, t2, es, hoe[i : i + 128])
+                    ce += c_.item() * len(hoe[i : i + 128])
+                    hf += h_.item() * len(hoe[i : i + 128])
                 ex |= {"energy": ce / len(hoe), "energy_excess": (ce - hf) / len(hoe)}
         trunk.train()
         t2.train()
