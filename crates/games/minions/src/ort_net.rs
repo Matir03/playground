@@ -511,10 +511,26 @@ pub(crate) fn build_trt_profile(
     opt: &str,
     max: &str,
 ) -> anyhow::Result<Session> {
+    build_trt_profile_graph(path, fp16, cache_dir, min, opt, max, false)
+}
+
+/// `build_trt_profile` with TensorRT's CUDA-graph capture on or off. With it
+/// on, the session needs fixed shapes and inputs/outputs bound at fixed
+/// device addresses (`IoBinding`); see `lattice_ort::tests::cuda_graph_tier1`.
+pub(crate) fn build_trt_profile_graph(
+    path: &Path,
+    fp16: bool,
+    cache_dir: &str,
+    min: &str,
+    opt: &str,
+    max: &str,
+    cuda_graph: bool,
+) -> anyhow::Result<Session> {
     std::fs::create_dir_all(cache_dir).ok();
     let trt = TensorRT::default()
         .with_device_id(0)
         .with_fp16(fp16)
+        .with_cuda_graph(cuda_graph)
         .with_engine_cache(true)
         .with_engine_cache_path(cache_dir.to_string())
         .with_profile_min_shapes(min)
@@ -1841,6 +1857,11 @@ mod tests {
     /// points at the input. ORT may run in-place ops on a bound input buffer.
     #[test]
     fn bound_h_is_not_mutated_across_runs() {
+        // A provider that fails to register is only a tracing warning; without
+        // a subscriber the CPU fallback passes silently (2026-09-18).
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("ort=warn"))
+            .try_init();
         let Ok(dir) = std::env::var("MINIONS_ORT_DIR") else {
             return;
         };
@@ -1899,6 +1920,11 @@ mod tests {
     /// Diagnostic: is the mismatch from rebinding `decl`, or from `h`?
     #[test]
     fn bound_pass_diagnosis() {
+        // A provider that fails to register is only a tracing warning; without
+        // a subscriber the CPU fallback passes silently (2026-09-18).
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("ort=warn"))
+            .try_init();
         let Ok(dir) = std::env::var("MINIONS_ORT_DIR") else {
             return;
         };
@@ -2267,6 +2293,11 @@ mod tests {
 
     #[test]
     fn bound_pass_matches_per_step_path() {
+        // A provider that fails to register is only a tracing warning; without
+        // a subscriber the CPU fallback passes silently (2026-09-18).
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("ort=warn"))
+            .try_init();
         let Ok(dir) = std::env::var("MINIONS_ORT_DIR") else {
             eprintln!("MINIONS_ORT_DIR unset — skipping bound-pass parity");
             return;

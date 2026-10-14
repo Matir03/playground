@@ -641,9 +641,20 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(dir.join("lattice.json")).unwrap())
                 .unwrap();
         let c = meta["c_trunk"].as_u64().unwrap() as usize;
+        let gather = meta["trunk_gather"].as_bool().unwrap_or(false);
+        // Provider registration failures are tracing warnings: without a
+        // subscriber a CPU fallback would pass silently (2026-09-18).
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("ort=warn"))
+            .try_init();
         let p1 = |b: usize| format!("ridx:{b}x{MAX_ACTIVE},rscal:{b}x{N_SCALARS}");
-        let p2 = |b: usize, t: usize| {
-            format!("h:{b}x{c}x7x7,nidx:{b}x{MAX_ACTIVE},nscal:{b}x{N_SCALARS},kid:{t}")
+        let p2 = |b: usize, t: usize, u: usize| {
+            let h = if gather {
+                format!("hs:{u}x{c}x7x7,hidx:{b}")
+            } else {
+                format!("h:{b}x{c}x7x7")
+            };
+            format!("{h},nidx:{b}x{MAX_ACTIVE},nscal:{b}x{N_SCALARS},kid:{t}")
         };
         let build = |name: &str, min: String, opt: String, max: String| {
             let p = dir.join(name);
@@ -653,9 +664,9 @@ mod tests {
         let mut s1 = build("tier1.onnx", p1(1), p1(128), p1(MAX_ROWS));
         let mut s2 = build(
             "tier2.onnx",
-            p2(1, 1),
-            p2(1024, 32 * 1024),
-            p2(MAX_ROWS, MAX_TOTAL_KIDS),
+            p2(1, 1, 1),
+            p2(1024, 32 * 1024, 64),
+            p2(MAX_ROWS, MAX_TOTAL_KIDS, MAX_ROWS),
         );
         let trunk: Trunk = vec![half::f16::from_f32(0.1); c * CELLS].into();
         let batch = |n1: usize, n2: usize, k: usize| Batch {
@@ -681,7 +692,7 @@ mod tests {
         for round in 0..32 {
             for (i, &(n1, n2, k)) in shapes.iter().enumerate() {
                 let t0 = std::time::Instant::now();
-                run_batch(&mut s1, &mut s2, c, false, batch(n1, n2, k)).unwrap();
+                run_batch(&mut s1, &mut s2, c, gather, batch(n1, n2, k)).unwrap();
                 if round >= 2 {
                     times[i].push(t0.elapsed().as_secs_f64() * 1e3);
                 }
@@ -694,6 +705,458 @@ mod tests {
                 t[t.len() / 2]
             );
         }
+    }
+
+    /// CUDA-graph feasibility on the tier-1 net (2026-10-14, after the driver
+    /// update to 617.42 / CUDA 13.4 let ONNX Runtime >= 1.27 load). A fixed
+    /// batch of `CG_ROWS` (default 128) rows; inputs and outputs live in
+    /// device tensors bound once, so the captured graph sees fixed addresses.
+    /// Per round: fresh host inputs copied in, a replay, outputs copied out,
+    /// checked against a plain session on the same inputs, and both timed.
+    /// `LATTICE_DIR` names the nets.
+    #[test]
+    #[ignore]
+    fn cuda_graph_tier1() {
+        use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType};
+        use ort::value::Tensor;
+        let Ok(dir) = std::env::var("LATTICE_DIR") else {
+            eprintln!("set LATTICE_DIR");
+            return;
+        };
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("ort=warn"))
+            .try_init();
+        let dir = Path::new(&dir);
+        let b: usize = std::env::var("CG_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(128);
+        let p = dir.join("tier1.onnx");
+        let shape = format!("ridx:{b}x{MAX_ACTIVE},rscal:{b}x{N_SCALARS}");
+        let cache = |tag: &str| {
+            dir.join(format!("tier1_{tag}.trt_cache"))
+                .to_string_lossy()
+                .into_owned()
+        };
+        let mut plain = crate::ort_net::build_trt_profile_graph(
+            &p,
+            true,
+            &cache("plain"),
+            &shape,
+            &shape,
+            &shape,
+            false,
+        )
+        .unwrap();
+        let mut graph = crate::ort_net::build_trt_profile_graph(
+            &p,
+            true,
+            &cache(if std::env::var("CG_GRAPH").map_or(true, |v| v != "0") {
+                "graph"
+            } else {
+                "bound"
+            }),
+            &shape,
+            &shape,
+            &shape,
+            std::env::var("CG_GRAPH").map_or(true, |v| v != "0"),
+        )
+        .unwrap();
+        let mem = MemoryInfo::new(
+            AllocationDevice::CUDA,
+            0,
+            AllocatorType::Device,
+            MemoryType::Default,
+        )
+        .unwrap();
+        let alloc = Allocator::new(&graph, mem).unwrap();
+        let mut ridx_d = Tensor::<i32>::new(&alloc, [b, MAX_ACTIVE]).unwrap();
+        let mut rscal_d = Tensor::<f32>::new(&alloc, [b, N_SCALARS]).unwrap();
+        let v1_d = Tensor::<f32>::new(&alloc, [b]).unwrap();
+        let c = {
+            let meta: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("lattice.json")).unwrap())
+                    .unwrap();
+            meta["c_trunk"].as_u64().unwrap() as usize
+        };
+        let h_d = Tensor::<f16>::new(&alloc, [b, c, 7, 7]).unwrap();
+        // Raw device addresses of the bound buffers, for the cudaMemcpy path.
+        let (ridx_p, rscal_p) = (
+            ridx_d.data_ptr_mut() as usize,
+            rscal_d.data_ptr_mut() as usize,
+        );
+        let v1_p = v1_d.data_ptr() as usize;
+        let lib = unsafe {
+            libloading::Library::new("libcudart.so.13")
+                .or_else(|_| libloading::Library::new("libcudart.so.12"))
+        }
+        .expect("the CUDA runtime ORT loaded");
+        type Memcpy =
+            unsafe extern "C" fn(*mut std::ffi::c_void, *const std::ffi::c_void, usize, i32) -> i32;
+        let memcpy: libloading::Symbol<Memcpy> = unsafe { lib.get(b"cudaMemcpy") }.unwrap();
+        let mut binding = graph.create_binding().unwrap();
+        binding.bind_input("ridx", &ridx_d).unwrap();
+        binding.bind_input("rscal", &rscal_d).unwrap();
+        binding.bind_output("v1", v1_d).unwrap();
+        binding.bind_output("h", h_d).unwrap();
+        let mut rng = 12345u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let (mut t_plain, mut t_in, mut t_run, mut t_out) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut worst = 0f32;
+        let (mut r_in, mut r_run, mut r_out) = (Vec::new(), Vec::new(), Vec::new());
+        let mut worst_raw = 0f32;
+        for round in 0..40 {
+            // Different rows every round: a replay that ignored new inputs
+            // (or a stale binding) would repeat the previous round's values.
+            let ridx: Vec<i32> = (0..b * MAX_ACTIVE)
+                .map(|i| {
+                    if i % MAX_ACTIVE < 12 {
+                        (next() % SPARSE_DIM as u64) as i32
+                    } else {
+                        SPARSE_DIM as i32
+                    }
+                })
+                .collect();
+            let rscal: Vec<f32> = (0..b * N_SCALARS)
+                .map(|_| (next() % 1000) as f32 / 1000.0)
+                .collect();
+            let t0 = std::time::Instant::now();
+            let want = {
+                let o = plain
+                    .run(ort::inputs![
+                        "ridx" => Tensor::from_array((vec![b as i64, MAX_ACTIVE as i64], ridx.clone())).unwrap(),
+                        "rscal" => Tensor::from_array((vec![b as i64, N_SCALARS as i64], rscal.clone())).unwrap(),
+                    ])
+                    .unwrap();
+                let (_, v) = o["v1"].try_extract_tensor::<f32>().unwrap();
+                v.to_vec()
+            };
+            let tp = t0.elapsed().as_secs_f64() * 1e3;
+            let t1 = std::time::Instant::now();
+            Tensor::from_array((vec![b as i64, MAX_ACTIVE as i64], ridx.clone()))
+                .unwrap()
+                .copy_into(&mut ridx_d)
+                .unwrap();
+            Tensor::from_array((vec![b as i64, N_SCALARS as i64], rscal.clone()))
+                .unwrap()
+                .copy_into(&mut rscal_d)
+                .unwrap();
+            let t2 = std::time::Instant::now();
+            let out = graph.run_binding(&binding).unwrap();
+            binding.synchronize_outputs().unwrap();
+            let t3 = std::time::Instant::now();
+            let v1 = out["v1"]
+                .downcast_ref::<ort::value::DynTensorValueType>()
+                .unwrap();
+            let host = v1.to(AllocationDevice::CPU, 0).unwrap();
+            let (_, got) = host.try_extract_tensor::<f32>().unwrap();
+            let got = got.to_vec();
+            let t4 = std::time::Instant::now();
+            // The same replay with plain cudaMemcpy in and out (synchronous,
+            // so ordered against the session's stream by the host).
+            drop(out);
+            let u1 = std::time::Instant::now();
+            unsafe {
+                assert_eq!(
+                    memcpy(
+                        ridx_p as *mut _,
+                        ridx.as_ptr() as *const _,
+                        ridx.len() * 4,
+                        1
+                    ),
+                    0
+                );
+                assert_eq!(
+                    memcpy(
+                        rscal_p as *mut _,
+                        rscal.as_ptr() as *const _,
+                        rscal.len() * 4,
+                        1
+                    ),
+                    0
+                );
+            }
+            let u2 = std::time::Instant::now();
+            graph.run_binding(&binding).unwrap();
+            binding.synchronize_outputs().unwrap();
+            let u3 = std::time::Instant::now();
+            let mut raw = vec![0f32; b];
+            unsafe {
+                assert_eq!(
+                    memcpy(raw.as_mut_ptr() as *mut _, v1_p as *const _, b * 4, 2),
+                    0
+                );
+            }
+            let u4 = std::time::Instant::now();
+            let err_raw = raw
+                .iter()
+                .zip(&want)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max);
+            if round >= 4 {
+                worst_raw = worst_raw.max(err_raw);
+                r_in.push((u2 - u1).as_secs_f64() * 1e3);
+                r_run.push((u3 - u2).as_secs_f64() * 1e3);
+                r_out.push((u4 - u3).as_secs_f64() * 1e3);
+            }
+            let err = got
+                .iter()
+                .zip(&want)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max);
+            if round < 3 || err > 1e-2 {
+                eprintln!(
+                    "round {round}: max |graph - plain| {err:.2e} (v1[0] {} vs {})",
+                    got[0], want[0]
+                );
+            }
+            if round >= 4 {
+                worst = worst.max(err);
+                t_plain.push(tp);
+                t_in.push((t2 - t1).as_secs_f64() * 1e3);
+                t_run.push((t3 - t2).as_secs_f64() * 1e3);
+                t_out.push((t4 - t3).as_secs_f64() * 1e3);
+            }
+        }
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[v.len() / 2]
+        };
+        eprintln!(
+            "{b} rows: plain {:.3} ms | graph: copy in {:.3} + replay {:.3} + copy out {:.3} ms; worst |diff| {worst:.2e}",
+            med(&mut t_plain),
+            med(&mut t_in),
+            med(&mut t_run),
+            med(&mut t_out)
+        );
+        eprintln!(
+            "{b} rows, cudaMemcpy: copy in {:.3} + replay {:.3} + copy out {:.3} ms; worst |diff| {worst_raw:.2e}",
+            med(&mut r_in),
+            med(&mut r_run),
+            med(&mut r_out)
+        );
+        assert!(
+            worst_raw < 1e-2,
+            "cudaMemcpy replay disagrees with the plain session"
+        );
+        assert!(
+            worst < 1e-2,
+            "graph replay disagrees with the plain session"
+        );
+    }
+
+    /// Several CUDA graphs in one session: the production tier-1 engine
+    /// (dynamic profile 1..MAX_ROWS, as `load` builds it), one captured graph
+    /// per batch size selected by the `gpu_graph_id` run option, each with its
+    /// own device buffers. Sizes interleave round-robin; every result is
+    /// checked against a plain session on the same inputs (replaying the
+    /// wrong graph would give another size's values). `LATTICE_DIR`.
+    #[test]
+    #[ignore]
+    fn cuda_graph_ids_tier1() {
+        use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType};
+        use ort::session::RunOptions;
+        use ort::value::Tensor;
+        let Ok(dir) = std::env::var("LATTICE_DIR") else {
+            eprintln!("set LATTICE_DIR");
+            return;
+        };
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("ort=warn"))
+            .try_init();
+        let dir = Path::new(&dir);
+        let c = {
+            let meta: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("lattice.json")).unwrap())
+                    .unwrap();
+            meta["c_trunk"].as_u64().unwrap() as usize
+        };
+        let p = dir.join("tier1.onnx");
+        let p1 = |b: usize| format!("ridx:{b}x{MAX_ACTIVE},rscal:{b}x{N_SCALARS}");
+        let cache = p.with_extension("trt_cache").to_string_lossy().into_owned();
+        let mut plain = crate::ort_net::build_trt_profile_graph(
+            &p,
+            true,
+            &cache,
+            &p1(1),
+            &p1(128),
+            &p1(MAX_ROWS),
+            false,
+        )
+        .unwrap();
+        // TensorRT keeps one captured graph per session (it ignores
+        // `gpu_graph_id`: measured 2026-10-14 on ORT 1.26 and 1.31), so
+        // CG_PER_SIZE=1 gives each size its own session on the same engine.
+        let per_size = std::env::var("CG_PER_SIZE").is_ok_and(|v| v == "1");
+        let mk = || {
+            crate::ort_net::build_trt_profile_graph(
+                &p,
+                true,
+                &cache,
+                &p1(1),
+                &p1(128),
+                &p1(MAX_ROWS),
+                true,
+            )
+            .unwrap()
+        };
+        let mut sessions: Vec<Session> = vec![mk()];
+        let mem = MemoryInfo::new(
+            AllocationDevice::CUDA,
+            0,
+            AllocatorType::Device,
+            MemoryType::Default,
+        )
+        .unwrap();
+        let alloc = Allocator::new(&sessions[0], mem).unwrap();
+        let lib = unsafe {
+            libloading::Library::new("libcudart.so.13")
+                .or_else(|_| libloading::Library::new("libcudart.so.12"))
+        }
+        .unwrap();
+        type Memcpy =
+            unsafe extern "C" fn(*mut std::ffi::c_void, *const std::ffi::c_void, usize, i32) -> i32;
+        let memcpy: libloading::Symbol<Memcpy> = unsafe { lib.get(b"cudaMemcpy") }.unwrap();
+        let sizes: Vec<usize> = std::env::var("CG_SIZES")
+            .ok()
+            .map(|v| v.split(',').map(|x| x.parse().unwrap()).collect())
+            .unwrap_or(vec![16, 64, 128, 256]);
+        // Per size: (ridx, rscal, v1) device addresses, the binding, run options.
+        let mut slots = Vec::new();
+        for (i, &b) in sizes.iter().enumerate() {
+            let mut ridx_d = Tensor::<i32>::new(&alloc, [b, MAX_ACTIVE]).unwrap();
+            let mut rscal_d = Tensor::<f32>::new(&alloc, [b, N_SCALARS]).unwrap();
+            let v1_d = Tensor::<f32>::new(&alloc, [b]).unwrap();
+            let h_d = Tensor::<f16>::new(&alloc, [b, c, 7, 7]).unwrap();
+            let ptrs = (
+                ridx_d.data_ptr_mut() as usize,
+                rscal_d.data_ptr_mut() as usize,
+                v1_d.data_ptr() as usize,
+            );
+            if per_size && i > 0 {
+                sessions.push(mk());
+            }
+            let si = if per_size { i } else { 0 };
+            let mut binding = sessions[si].create_binding().unwrap();
+            binding.bind_input("ridx", &ridx_d).unwrap();
+            binding.bind_input("rscal", &rscal_d).unwrap();
+            binding.bind_output("v1", v1_d).unwrap();
+            binding.bind_output("h", h_d).unwrap();
+            let mut opts = RunOptions::new().unwrap();
+            opts.set("gpu_graph_id", (i + 1).to_string()).unwrap();
+            slots.push((b, ptrs, binding, opts, ridx_d, rscal_d, si));
+        }
+        {
+            type MemInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> i32;
+            let info: libloading::Symbol<MemInfo> = unsafe { lib.get(b"cudaMemGetInfo") }.unwrap();
+            let (mut free, mut total) = (0usize, 0usize);
+            unsafe { info(&mut free, &mut total) };
+            eprintln!(
+                "{} sessions: device memory in use {:.0} MiB of {:.0} (all processes)",
+                sessions.len(),
+                (total - free) as f64 / 1048576.0,
+                total as f64 / 1048576.0
+            );
+        }
+        let mut rng = 777u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut times: Vec<(Vec<f64>, Vec<f64>)> = vec![(Vec::new(), Vec::new()); sizes.len()];
+        let mut worst = 0f32;
+        for round in 0..24 {
+            for (k, (b, (rp, sp, vp), binding, opts, _, _, si)) in slots.iter().enumerate() {
+                let b = *b;
+                let ridx: Vec<i32> = (0..b * MAX_ACTIVE)
+                    .map(|i| {
+                        if i % MAX_ACTIVE < 12 {
+                            (next() % SPARSE_DIM as u64) as i32
+                        } else {
+                            SPARSE_DIM as i32
+                        }
+                    })
+                    .collect();
+                let rscal: Vec<f32> = (0..b * N_SCALARS)
+                    .map(|_| (next() % 1000) as f32 / 1000.0)
+                    .collect();
+                let t0 = std::time::Instant::now();
+                let want = {
+                    let o = plain
+                        .run(ort::inputs![
+                            "ridx" => Tensor::from_array((vec![b as i64, MAX_ACTIVE as i64], ridx.clone())).unwrap(),
+                            "rscal" => Tensor::from_array((vec![b as i64, N_SCALARS as i64], rscal.clone())).unwrap(),
+                        ])
+                        .unwrap();
+                    let (_, v) = o["v1"].try_extract_tensor::<f32>().unwrap();
+                    v.to_vec()
+                };
+                let tp = t0.elapsed().as_secs_f64() * 1e3;
+                let t1 = std::time::Instant::now();
+                let mut got = vec![0f32; b];
+                unsafe {
+                    assert_eq!(
+                        memcpy(*rp as *mut _, ridx.as_ptr() as *const _, ridx.len() * 4, 1),
+                        0
+                    );
+                    assert_eq!(
+                        memcpy(
+                            *sp as *mut _,
+                            rscal.as_ptr() as *const _,
+                            rscal.len() * 4,
+                            1
+                        ),
+                        0
+                    );
+                }
+                sessions[*si]
+                    .run_binding_with_options(binding, opts)
+                    .unwrap();
+                binding.synchronize_outputs().unwrap();
+                unsafe {
+                    assert_eq!(
+                        memcpy(got.as_mut_ptr() as *mut _, *vp as *const _, b * 4, 2),
+                        0
+                    );
+                }
+                let tg = t1.elapsed().as_secs_f64() * 1e3;
+                let err = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0f32, f32::max);
+                if err > 1e-2 {
+                    eprintln!("round {round}, {b} rows: max |graph - plain| {err:.2e}");
+                }
+                if round >= 3 {
+                    worst = worst.max(err);
+                    times[k].0.push(tp);
+                    times[k].1.push(tg);
+                }
+            }
+        }
+        for (&b, (tp, tg)) in sizes.iter().zip(&mut times) {
+            tp.sort_by(|a, b| a.total_cmp(b));
+            tg.sort_by(|a, b| a.total_cmp(b));
+            eprintln!(
+                "{b:4} rows: plain {:.3} ms, graph (copies included) {:.3} ms",
+                tp[tp.len() / 2],
+                tg[tg.len() / 2]
+            );
+        }
+        eprintln!("worst |graph - plain| {worst:.2e}");
+        assert!(
+            worst < 1e-2,
+            "a graph replay disagrees with the plain session"
+        );
     }
 
     /// Tier-1 search on random openings next to the greedy steps turn:

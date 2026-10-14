@@ -61,3 +61,4 @@ python/src/playground/gen/playground/
 .idea/
 .vscode/
 *.swp
+.venv-*/

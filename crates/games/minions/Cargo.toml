@@ -63,3 +63,6 @@ default = ["mimalloc"]
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
 # mimalloc as the global allocator, for the self-play malloc churn.
 mimalloc = ["dep:mimalloc"]
+
+[dev-dependencies]
+libloading = "0.8"
