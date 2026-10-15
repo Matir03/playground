@@ -680,22 +680,51 @@ def energy_targets(es, rows, grp, n_groups):
     return torch.where(bad[grp], vis, t)
 
 
-def energy_loss(trunk, t2, es, g, grad_trunk=True):
+def energy_chunks(cnt, max_kids):
+    """Contiguous ranges of groups holding at most `max_kids` children each
+    (a bigger group alone)."""
+    out, start, tot = [], 0, 0
+    for i, k in enumerate(cnt.tolist()):
+        if i > start and tot + k > max_kids:
+            out.append((start, i))
+            start, tot = i, 0
+        tot += k
+    out.append((start, len(cnt)))
+    return out
+
+
+def energy_loss(trunk, t2, es, g, grad_trunk=True, max_kids=None, backward_scale=None):
     """Cross-entropy of the softmax over each group's children's energies
     against their targets (`energy_targets`); and its floor (the targets'
-    entropy)."""
+    entropy).
+
+    `max_kids`: tier 2 runs over chunks of whole groups of at most that many
+    children. The softmax is per group, so the loss is unchanged; in training
+    mode only BatchNorm's batch statistics differ. `backward_scale`: each
+    chunk's share of backward_scale * ce is back-propagated as soon as it is
+    computed, so only one chunk's activations are held, and the returned ce is
+    detached. c16 widening raised children per group from 18 to 85 (64
+    groups: 5.5k children a step, ~6.5 GB; 2026-10-14)."""
     with torch.set_grad_enabled(grad_trunk and torch.is_grad_enabled()):
         h, _ = trunk(es.x(es.root[g]))
     cnt = es.nkids[g]
-    grp = torch.repeat_interleave(torch.arange(len(g), device=g.device), cnt)
-    first = torch.repeat_interleave(torch.cumsum(cnt, 0) - cnt, cnt)
-    rows = es.child[torch.repeat_interleave(es.off[g], cnt) + torch.arange(len(grp), device=g.device) - first]
-    e = t2(h[grp], es.x(rows))[3][:, 1]
-    lp = group_log_softmax(e, grp, len(g))
-    tgt = energy_targets(es, rows, grp, len(g))
-    ng = torch.tensor(len(g), device=g.device).clamp(min=1)
-    ce = -(tgt * lp).sum() / ng
-    hf = -(tgt * torch.log(tgt.clamp(min=1e-9))).sum() / ng
+    ng = max(len(g), 1)
+    ranges = energy_chunks(cnt, max_kids) if max_kids else [(0, len(g))]
+    ce = hf = 0
+    for i, (a, b) in enumerate(ranges):
+        gc, cc = g[a:b], cnt[a:b]
+        grp = torch.repeat_interleave(torch.arange(b - a, device=g.device), cc)
+        first = torch.repeat_interleave(torch.cumsum(cc, 0) - cc, cc)
+        rows = es.child[torch.repeat_interleave(es.off[gc], cc) + torch.arange(len(grp), device=g.device) - first]
+        e = t2(h[a:b][grp], es.x(rows))[3][:, 1]
+        lp = group_log_softmax(e, grp, b - a)
+        tgt = energy_targets(es, rows, grp, b - a)
+        c_ce = -(tgt * lp).sum() / ng
+        c_hf = -(tgt * torch.log(tgt.clamp(min=1e-9))).sum() / ng
+        if backward_scale is not None and c_ce.requires_grad:
+            (backward_scale * c_ce).backward(retain_graph=i < len(ranges) - 1)
+            c_ce = c_ce.detach()
+        ce, hf = ce + c_ce, hf + c_hf
     return ce, hf
 
 
@@ -724,6 +753,8 @@ def main():
     ap.add_argument("--energy-target", choices=["visits", "value", "cq"], default="visits", help="energy targets over a turn start's tier-1 children: visit shares, softmax(value / --energy-tau), or completed-Q (Gumbel)")
     ap.add_argument("--energy-tau", type=float, default=0.02)
     ap.add_argument("--energy-batch", type=int, default=64, help="energy groups per step")
+    ap.add_argument("--energy-chunk-kids", type=int, default=2048, help="tier 2 runs the energy batch in chunks of whole groups with at most this many children, back-propagating each (same loss; bounds VRAM; 0 = one pass)")
+    ap.add_argument("--energy-recal-kids", type=int, default=0, help="the same for the BatchNorm re-estimate (no gradients; 0 = one pass)")
     ap.add_argument("--t1-min-visits", type=int, default=0, help="train tier 1 only on value targets searched at least this deep (the holdout keeps them all)")
     ap.add_argument("--t1-root-visits", type=int, default=600, help="holdout also reports tier 1 on targets at least this deep (searched roots)")
     ap.add_argument("--min-cell-support", type=int, default=1, help="prior targets only for cells where at least this many kids have visits")
@@ -875,7 +906,7 @@ def main():
             if es is not None and len(hoe):
                 ce = hf = 0.0
                 for i in range(0, len(hoe), 128):
-                    c_, h_ = energy_loss(trunk, t2, es, hoe[i : i + 128])
+                    c_, h_ = energy_loss(trunk, t2, es, hoe[i : i + 128], max_kids=args.energy_chunk_kids)
                     ce += c_.item() * len(hoe[i : i + 128])
                     hf += h_.item() * len(hoe[i : i + 128])
                 ex |= {"energy": ce / len(hoe), "energy_excess": (ce - hf) / len(hoe)}
@@ -941,10 +972,12 @@ def main():
             if pvnet is not None and len(tr1):
                 l1 = l1 + t1_loss(pvnet, xs1, ys1, b1)
         le = torch.zeros((), device=dev)
-        if es is not None and len(tre):
-            le, _ = energy_loss(trunk, t2, es, tre[torch.randint(len(tre), (args.energy_batch,), device=dev)], not (args.freeze_trunk or args.t2_detach))
-        loss = args.prior_weight * lp + args.value_weight * (lv + ln) + args.t1_weight * l1 + args.energy_weight * le
+        # Before the energy loss: its chunks back-propagate as they go.
         opt.zero_grad(set_to_none=True)
+        if es is not None and len(tre):
+            le, _ = energy_loss(trunk, t2, es, tre[torch.randint(len(tre), (args.energy_batch,), device=dev)], not (args.freeze_trunk or args.t2_detach),
+                                max_kids=args.energy_chunk_kids, backward_scale=args.energy_weight)
+        loss = args.prior_weight * lp + args.value_weight * (lv + ln) + args.t1_weight * l1 + args.energy_weight * le
         loss.backward()
         opt.step()
         sched.step()
@@ -969,7 +1002,7 @@ def main():
                 if len(tr1):
                     v1net(xs1.dense(tr1[torch.randint(len(tr1), (args.t1_batch,), device=dev)]))
                 if es is not None and len(tre):
-                    energy_loss(trunk, t2, es, tre[torch.randint(len(tre), (args.energy_batch,), device=dev)])
+                    energy_loss(trunk, t2, es, tre[torch.randint(len(tre), (args.energy_batch,), device=dev)], max_kids=args.energy_recal_kids or None)
         for m in bns:
             m.momentum = 0.1
         print(f"BatchNorm statistics re-estimated over {args.bn_recal} batches")
