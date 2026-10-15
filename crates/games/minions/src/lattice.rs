@@ -360,6 +360,9 @@ pub struct LNode {
     /// Direct visits: the expansion's own value, and a sink's returns.
     pub n: u32,
     pub w: f64,
+    /// Descents holding their virtual loss here (also counted in `n`): the
+    /// quick mode's statistics count them as zero-value returns.
+    vl: u32,
     /// Sink: its value for the lattice's mover once known, whether that is
     /// a terminal score, and the summed log prior of the descents that
     /// reached it (and how many).
@@ -462,6 +465,7 @@ impl LNode {
             kid_w: 0.0,
             n: 0,
             w: 0.0,
+            vl: 0,
             value: None,
             terminal: false,
             lp_sum: 0.0,
@@ -489,6 +493,9 @@ pub struct LatticeStats {
     /// Follow-mode SAT checks and how many refuted their node.
     pub sat_calls: u64,
     pub sat_refuted: u64,
+    /// Quick mode: greedy chains from a base, and their commits.
+    pub quick_chains: u64,
+    pub quick_commits: u64,
 }
 
 /// One descent in progress: where it is, the `(node, kid)` path from where
@@ -504,6 +511,10 @@ pub struct Cursor {
     pub follow: bool,
     /// The node holding this descent's virtual loss (`NONE`: none yet).
     vl: u32,
+    /// Quick mode: whether the node the descent is at has no completed
+    /// descents below it (a base: expanded, then committed greedily from its
+    /// priors); None: not known yet.
+    fresh: Option<bool>,
 }
 
 impl Cursor {
@@ -514,6 +525,7 @@ impl Cursor {
             lp,
             follow: false,
             vl: NONE,
+            fresh: None,
         }
     }
 }
@@ -544,6 +556,11 @@ pub struct Stats {
     pub sn: f64,
     pub sw: f64,
     pub skids: Vec<(f64, f64)>,
+    /// Quick mode only: the sinks' returns plus the descents in flight
+    /// (virtual losses, zero-value returns).
+    pub qn: f64,
+    pub qw: f64,
+    pub qkids: Vec<(f64, f64)>,
 }
 
 pub struct Lattice {
@@ -588,6 +605,13 @@ pub struct Lattice {
     pub random_order: bool,
     /// The turn start's tier-1 trunk image, once known.
     pub trunk: Option<Trunk>,
+    /// Quick descents (the user's design, 2026-10-15): PUCT counts only
+    /// completed descents (sink returns), and from the first node without
+    /// any (the base, expanded) a descent commits greedily on the base's
+    /// priors without expanding, while the commitments so far are provably
+    /// the likeliest cell over their variables ([`Lattice::quick_plan`]);
+    /// where that stops, the node reached is expanded as the next base.
+    pub quick: bool,
 }
 
 thread_local! {
@@ -732,6 +756,7 @@ impl Lattice {
             stats: LatticeStats::default(),
             random_order: false,
             trunk: None,
+            quick: false,
         };
         if start.is_terminal() {
             l.terminal = Some(start.terminal_value());
@@ -1326,6 +1351,13 @@ impl Lattice {
             sn: 0.0,
             sw: 0.0,
             skids: vec![(0.0, 0.0); pn.kids.len()],
+            qn: 0.0,
+            qw: 0.0,
+            qkids: if self.quick {
+                vec![(0.0, 0.0); pn.kids.len()]
+            } else {
+                Vec::new()
+            },
         };
         let slot = &*slot_m;
         let credit = |st: &mut Stats, x: &Key, mut extra: u64, cn: f64, cw: f64| {
@@ -1351,6 +1383,21 @@ impl Lattice {
             let extra = xk.mask & !pk.mask & allowed;
             if missing == 0 {
                 credit(&mut st, xk, extra, f64::from(xn.n), xn.w);
+                if self.quick && (xn.ret_n > 0 || xn.vl > 0) {
+                    let (cn, cw) = (f64::from(xn.ret_n + xn.vl), xn.ret_w);
+                    st.qn += cn;
+                    st.qw += cw;
+                    let mut e = extra;
+                    while e != 0 {
+                        let v = e.trailing_zeros() as usize;
+                        e &= e - 1;
+                        let s = slot[v * 64 + xk.get(v) as usize];
+                        if s != u16::MAX {
+                            st.qkids[s as usize].0 += cn;
+                            st.qkids[s as usize].1 += cw;
+                        }
+                    }
+                }
                 if xn.ret_n > 0 {
                     let (cn, cw) = (f64::from(xn.ret_n), xn.ret_w);
                     st.sn += cn;
@@ -1436,6 +1483,119 @@ impl Lattice {
         best
     }
 
+    /// The quick mode's PUCT over the live kids of expanded node `p`: visits
+    /// are completed descents (and descents in flight) only; an unvisited
+    /// kid's value is its expansion value. Also whether the kid has no
+    /// completed descent below it (a fresh base).
+    pub fn select_quick(&mut self, p: u32, c_puct: f32) -> Option<(usize, bool)> {
+        let st = self.stats(p);
+        let pn = &self.nodes[p as usize];
+        let sq = st.qn.max(1.0).sqrt();
+        let mut best = None;
+        let mut best_u = f64::NEG_INFINITY;
+        for (i, k) in pn.kids.iter().enumerate() {
+            if k.dead {
+                continue;
+            }
+            let (n, w) = st.qkids[i];
+            let q = if n > 0.0 { w / n } else { f64::from(k.v) };
+            let u = q + f64::from(c_puct) * f64::from(k.logp).exp() * sq / (1.0 + n);
+            if u > best_u {
+                best_u = u;
+                best = Some(i);
+            }
+        }
+        best.map(|i| (i, st.qkids[i].0 <= 0.0))
+    }
+
+    /// The greedy commitments from expanded node `n`'s priors: variables in
+    /// order of their best choice's prior 1 - a_i, each committed to that
+    /// choice, while no alternative's prior (the best other choice b_j of
+    /// any variable taken so far) exceeds 1 - (a_1 + ... + a_k). A cell over
+    /// those variables differing from the commitments differs at some j, so
+    /// its prior is at most b_j, while the commitments' joint prior is at
+    /// least 1 - sum a_i (a union bound): they are the likeliest cell. The
+    /// first variable is always taken (b_1 <= 1 - p_1 = a_1, and p_1 is its
+    /// best). (var, choice, log prior) each.
+    pub fn quick_plan(&self, n: u32) -> Vec<(u8, u8, f32)> {
+        let node = &self.nodes[n as usize];
+        // Per variable: (best prior, var, its choice, its logp, second-best prior).
+        let mut vars: Vec<(f32, u8, u8, f32, f32)> = Vec::new();
+        for k in node.kids.iter().filter(|k| !k.dead) {
+            let p = k.logp.exp();
+            match vars.last_mut() {
+                Some(v) if v.1 == k.var => {
+                    if p > v.0 {
+                        v.4 = v.0;
+                        v.0 = p;
+                        v.2 = k.choice;
+                        v.3 = k.logp;
+                    } else if p > v.4 {
+                        v.4 = p;
+                    }
+                }
+                _ => vars.push((p, k.var, k.choice, k.logp, 0.0)),
+            }
+        }
+        vars.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let (mut a_sum, mut b_max) = (0f32, 0f32);
+        let mut plan = Vec::new();
+        for (p, var, choice, logp, b) in vars {
+            a_sum += 1.0 - p;
+            b_max = b_max.max(b);
+            if !plan.is_empty() && b_max > 1.0 - a_sum {
+                break;
+            }
+            plan.push((var, choice, logp));
+        }
+        plan
+    }
+
+    /// Commit [`Lattice::quick_plan`] from expanded node `n` one variable at
+    /// a time, without expanding the nodes between: each is only prepared
+    /// (its options and witnesses), and the chain stops early where the
+    /// planned choice is no longer offered (or the node is dead or a sink).
+    /// The nodes passed get the base's log prior for the kid taken until
+    /// they are expanded. `cur` ends on the last node reached. The commits
+    /// made (0: `n` has no live kid).
+    fn quick_commit(&mut self, n: u32, cur: &mut Cursor) -> Result<u64> {
+        let plan = self.quick_plan(n);
+        let mut x = n;
+        let mut commits = 0;
+        for (var, choice, logp) in plan {
+            let xn = &self.nodes[x as usize];
+            if xn.kind != Kind::Inner {
+                break;
+            }
+            if !xn.prepared && !self.prepare(x)? {
+                self.kill(x)?;
+                break;
+            }
+            let xn = &self.nodes[x as usize];
+            let Ok(k) = xn
+                .kids
+                .binary_search_by_key(&(var, choice), |k| (k.var, k.choice))
+            else {
+                break;
+            };
+            if xn.kids[k].dead {
+                break;
+            }
+            if !xn.expanded {
+                self.nodes[x as usize].kids[k].logp = logp;
+            }
+            let c = self.child(x, k)?;
+            cur.lp += f64::from(self.nodes[x as usize].kids[k].logp);
+            cur.path.push((x, k as u16));
+            x = c;
+            commits += 1;
+        }
+        self.stats.quick_chains += 1;
+        self.stats.quick_commits += commits;
+        cur.at = x;
+        Ok(commits)
+    }
+
     /// Run descent `cur` until it needs the net or reaches a sink.
     pub fn advance(&mut self, cur: &mut Cursor, c_puct: f32) -> Result<Need> {
         for _ in 0..1_000_000 {
@@ -1454,6 +1614,7 @@ impl Lattice {
                     };
                     cur.lp -= f64::from(self.nodes[p as usize].kids[k as usize].logp);
                     cur.at = p;
+                    cur.fresh = None;
                 }
                 Kind::Sink => {
                     let Some(v) = node.value else {
@@ -1487,6 +1648,34 @@ impl Lattice {
                         return Ok(Need::Expand(n));
                     }
                     self.kill(n)?;
+                }
+                Kind::Inner if self.quick && !cur.follow => {
+                    let fresh = match cur.fresh {
+                        Some(f) => f,
+                        None => {
+                            // Not counting this descent's own virtual loss.
+                            let own = f64::from(u8::from(cur.vl == n));
+                            self.stats(n).qn - own <= 0.0
+                        }
+                    };
+                    if fresh {
+                        if self.quick_commit(n, cur)? == 0 {
+                            self.kill(n)?;
+                        }
+                        // The node reached is the next base.
+                        cur.fresh = Some(true);
+                        continue;
+                    }
+                    match self.select_quick(n, c_puct) {
+                        None => self.kill(n)?,
+                        Some((k, kid_fresh)) => {
+                            let c = self.child(n, k)?;
+                            cur.lp += f64::from(self.nodes[n as usize].kids[k].logp);
+                            cur.path.push((n, k as u16));
+                            cur.at = c;
+                            cur.fresh = Some(kid_fresh);
+                        }
+                    }
                 }
                 Kind::Inner => match if cur.follow {
                     self.follow_kid(n, c_puct)
@@ -1572,7 +1761,9 @@ impl Lattice {
     /// Move `cur`'s virtual loss to node `to` (`NONE`: drop it).
     fn move_vl(&mut self, cur: &mut Cursor, to: u32) {
         if cur.vl != NONE {
-            self.nodes[cur.vl as usize].n -= 1;
+            let node = &mut self.nodes[cur.vl as usize];
+            node.n -= 1;
+            node.vl -= 1;
         }
         if to != NONE {
             let node = &mut self.nodes[to as usize];
@@ -1581,6 +1772,7 @@ impl Lattice {
                 self.touched.push(to);
             }
             node.n += 1;
+            node.vl += 1;
         }
         cur.vl = to;
     }
@@ -2968,7 +3160,7 @@ pub(crate) mod tests {
                 .fold((0.0, 0.0), |s, a| (s.0 + a.1, s.1 + a.2))
         };
         let (sn, sw) = ssum(&pn.key);
-        let skids = pn
+        let skids: Vec<(f64, f64)> = pn
             .kids
             .iter()
             .map(|k| {
@@ -2979,12 +3171,21 @@ pub(crate) mod tests {
                 }
             })
             .collect();
+        // With no descent in flight the quick counts are the sinks' returns.
+        let (qn, qw, qkids) = if l.quick {
+            (sn, sw, skids.clone())
+        } else {
+            (0.0, 0.0, Vec::new())
+        };
         Stats {
             n,
             w,
             sn,
             sw,
             skids,
+            qn,
+            qw,
+            qkids,
             kids: pn
                 .kids
                 .iter()
@@ -3024,6 +3225,13 @@ pub(crate) mod tests {
                 assert!(
                     (x.0 - y.0).abs() < 1e-6 && (x.1 - y.1).abs() < 1e-6,
                     "node {p} kid {i} sinks: {x:?} vs {y:?}"
+                );
+            }
+            assert!((a.qn - b.qn).abs() < 1e-6 && a.qkids.len() == b.qkids.len());
+            for (i, (x, y)) in a.qkids.iter().zip(&b.qkids).enumerate() {
+                assert!(
+                    (x.0 - y.0).abs() < 1e-6 && (x.1 - y.1).abs() < 1e-6,
+                    "node {p} kid {i} quick: {x:?} vs {y:?}"
                 );
             }
         }
@@ -3253,6 +3461,95 @@ pub(crate) mod tests {
             );
         }
         assert!(spawn_nodes > 0, "never reached a spawn phase");
+    }
+
+    /// Quick descents end on full turns, their fresh flags are right, the
+    /// greedy chains commit more than one variable on average, and they need
+    /// fewer expansions per descent than plain descents on the same turns.
+    #[test]
+    fn quick_descents() {
+        let (mut exp_plain, mut exp_quick, mut descents) = (0u64, 0u64, 0u64);
+        let (mut chains, mut commits) = (0u64, 0u64);
+        for s in positions(6, 11) {
+            for quick in [false, true] {
+                let mut l = Lattice::new(s.clone()).unwrap();
+                if l.terminal.is_some() {
+                    continue;
+                }
+                l.quick = quick;
+                let mut sinks = std::collections::HashSet::new();
+                for i in 0..60 {
+                    let (sink, v, fresh) = l
+                        .descend(&HashLatticeEval, Cursor::at(0, 0.0), 1.0)
+                        .unwrap();
+                    let sn = &l.nodes[sink as usize];
+                    assert_eq!(sn.kind, Kind::Sink);
+                    assert!(sn.state.is_terminal() || sn.state.flipped != l.start.flipped);
+                    assert!((0.0..=1.0).contains(&v));
+                    assert_eq!(fresh, sinks.insert(sink), "fresh flag wrong at descent {i}");
+                    if i % 20 == 19 {
+                        check_stats(&mut l);
+                    }
+                }
+                assert!(
+                    l.nodes.iter().all(|n| n.vl == 0),
+                    "a virtual loss left behind"
+                );
+                if quick {
+                    exp_quick += l.stats.expansions;
+                    descents += l.stats.descents;
+                    chains += l.stats.quick_chains;
+                    commits += l.stats.quick_commits;
+                } else {
+                    exp_plain += l.stats.expansions;
+                }
+            }
+        }
+        assert!(descents > 0);
+        assert!(
+            commits > chains,
+            "chains of one commit only: {commits} in {chains}"
+        );
+        assert!(
+            exp_quick < exp_plain,
+            "quick {exp_quick} expansions vs plain {exp_plain}"
+        );
+        eprintln!(
+            "expansions plain {exp_plain}, quick {exp_quick}; {:.2} commits per chain",
+            commits as f64 / chains as f64
+        );
+    }
+
+    /// A plan is the likeliest cell over its variables: every alternative
+    /// prior is at most the union bound 1 - sum a_i.
+    #[test]
+    fn quick_plan_bound() {
+        for s in positions(4, 5) {
+            let mut l = Lattice::new(s).unwrap();
+            if l.terminal.is_some() {
+                continue;
+            }
+            l.descend(&HashLatticeEval, Cursor::at(0, 0.0), 1.0)
+                .unwrap();
+            let plan = l.quick_plan(0);
+            assert!(!plan.is_empty());
+            let kids = &l.nodes[0].kids;
+            let bound = 1.0 - plan.iter().map(|&(_, _, lp)| 1.0 - lp.exp()).sum::<f32>();
+            for &(var, choice, lp) in &plan {
+                for k in kids.iter().filter(|k| k.var == var && !k.dead) {
+                    assert!(
+                        k.logp <= lp + 1e-6,
+                        "the plan's choice is not its variable's best"
+                    );
+                    if k.choice != choice && plan.len() > 1 {
+                        assert!(
+                            k.logp.exp() <= bound + 1e-6,
+                            "an alternative beats the bound"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// The walk ends on a full turn, records one node per locked ply, and

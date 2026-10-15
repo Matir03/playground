@@ -1296,6 +1296,11 @@ fn lattice_play(spec: &str, n1: u32, inflight: usize) -> anyhow::Result<(String,
         Some(s) => (s, true),
         None => (spec, false),
     };
+    // `quick:<spec>`: quick tier-2 descents (`Lattice::quick`).
+    let (spec, quick) = match spec.strip_prefix("quick:") {
+        Some(s) => (s, true),
+        None => (spec, false),
+    };
     // `energy:<lattice dir>`: tier-1 priors from the net's energies;
     // `vprior=<tau>:<lattice dir>`: from the children's static values.
     let (spec, energy) = match spec.strip_prefix("energy:") {
@@ -1313,7 +1318,7 @@ fn lattice_play(spec: &str, n1: u32, inflight: usize) -> anyhow::Result<(String,
     let mut ev = minions_engine::lattice_ort::OrtLatticeEval::load(dir, "trt", true, 1)?;
     ev.set_t2_prior(t2temp, t2vtau);
     let eval = std::sync::Arc::new(ev);
-    let mut params = minions_engine::tier1::T1Params { energy_prior: energy, value_prior_tau: vtau, random_order, ..Default::default() };
+    let mut params = minions_engine::tier1::T1Params { energy_prior: energy, value_prior_tau: vtau, random_order, quick, ..Default::default() };
     if let Some((c, a)) = pw {
         params.pw_c = c;
         params.pw_alpha = a;
@@ -1838,7 +1843,10 @@ async fn main() -> anyhow::Result<()> {
         Cmd::NnueBench { active, reps } => minions_engine::nnue::bench_sweep(active, reps),
         Cmd::LatticeSpeed { net, n1, inflight, positions, seed, secs: tsecs } => {
             use rand::SeedableRng;
-            let (_, lat) = lattice_play(&format!("vprior=100:{net}"), n1, 1)?;
+            // A bare net dir gets vprior=100 (the cycle's); a spec with
+            // prefixes (pw=, quick:, ...) is taken as it is.
+            let spec = if net.contains(':') { net.clone() } else { format!("vprior=100:{net}") };
+            let (_, lat) = lattice_play(&spec, n1, 1)?;
             let lp = lat.ok_or_else(|| anyhow::anyhow!("{net}: not a lattice net dir"))?;
             let ks: Vec<usize> = inflight.split(',').map(|x| x.trim().parse()).collect::<Result<_, _>>()?;
             let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);

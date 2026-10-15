@@ -45,6 +45,8 @@ pub struct T1Params {
     /// Lattices over a random variable order instead of order-free
     /// (`Lattice::random_order`; an ablation).
     pub random_order: bool,
+    /// Quick tier-2 descents ([`Lattice::quick`]).
+    pub quick: bool,
 }
 
 impl Default for T1Params {
@@ -60,6 +62,7 @@ impl Default for T1Params {
             energy_temp: 1.0,
             value_prior_tau: 0.0,
             random_order: false,
+            quick: false,
         }
     }
 }
@@ -502,6 +505,7 @@ impl Tier1 {
         if self.nodes[0].lattice.is_none() {
             let mut l = Lattice::new(self.nodes[0].state.clone())?;
             l.random_order = self.params.random_order;
+            l.quick = self.params.quick;
             let root = &mut self.nodes[0];
             if let Some(v) = l.terminal {
                 root.terminal = Some(v);
@@ -631,6 +635,7 @@ impl Tier1 {
             if nd.lattice.is_none() {
                 let mut l = Lattice::new(nd.state.clone())?;
                 l.random_order = self.params.random_order;
+                l.quick = self.params.quick;
                 if l.terminal.is_some() {
                     // The parent's lattice scores such turns itself, so a
                     // child is never a necromancer kill it missed.
