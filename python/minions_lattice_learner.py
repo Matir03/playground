@@ -733,7 +733,7 @@ def main():
     ap.add_argument("--export-only", action="store_true", help="export --t1/--init (or random weights) to --out")
     ap.add_argument("--average", nargs="+", default=None, help="net dirs: no training; --out gets the mean of their weights (net.pt, t2.pt), BatchNorm re-estimated on --data (--bn-recal) and the holdout reported")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--vram-frac", type=float, default=0.45, help="cap on this process's share of GPU memory (1 = none); a full 8 GB card preceded two host crashes. 0.75 let the caching allocator hold ~4.4 GB beside 3 matches (7.9 GB total, 2026-10-14); the window needs 2.8 GB allocated, 3.1 GB reserved")
+    ap.add_argument("--vram-frac", type=float, default=0.6, help="cap on this process's share of GPU memory (1 = none); a full 8 GB card preceded two host crashes. 0.75 let the caching allocator hold ~4.4 GB beside 3 matches (7.9 GB total, 2026-10-14). Peak allocated grows with children per energy group: 2.8 GB at 18/group (c4 widening), 3.77 GB at 36/group (c16; 0.45 OOMed), ~4.1 GB expected at pure c16")
     args = ap.parse_args()
     torch.manual_seed(args.seed)
     ENERGY_TARGET.update(kind=args.energy_target, tau=args.energy_tau)
