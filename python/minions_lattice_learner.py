@@ -39,6 +39,11 @@ import os
 import time
 
 import numpy as np
+
+# Energy batches vary in size (children per group), which fragments the
+# caching allocator: gen 960 OOMed under its 4.8 GB cap with 0.83 GB reserved
+# but unusable (2026-10-14). Expandable segments grow in place instead.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -733,7 +738,7 @@ def main():
     ap.add_argument("--export-only", action="store_true", help="export --t1/--init (or random weights) to --out")
     ap.add_argument("--average", nargs="+", default=None, help="net dirs: no training; --out gets the mean of their weights (net.pt, t2.pt), BatchNorm re-estimated on --data (--bn-recal) and the holdout reported")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--vram-frac", type=float, default=0.6, help="cap on this process's share of GPU memory (1 = none); a full 8 GB card preceded two host crashes. 0.75 let the caching allocator hold ~4.4 GB beside 3 matches (7.9 GB total, 2026-10-14). Peak allocated grows with children per energy group: 2.8 GB at 18/group (c4 widening), 3.77 GB at 36/group (c16; 0.45 OOMed), ~4.1 GB expected at pure c16")
+    ap.add_argument("--vram-frac", type=float, default=0.7, help="cap on this process's share of GPU memory (1 = none); a full 8 GB card preceded two host crashes. 0.75 let the caching allocator hold ~4.4 GB beside 3 matches (7.9 GB total, 2026-10-14). Peak allocated grows with children per energy group: 2.8 GB at 18/group (c4 widening), 3.77 GB at 36/group (c16; 0.45 OOMed), 4.46 GB at 49/group (gen 960, with expandable segments; it OOMed at 0.6 without them). Self-play waits for training and no new match chunk starts during it, so the card holds the learner plus at most one running match")
     args = ap.parse_args()
     torch.manual_seed(args.seed)
     ENERGY_TARGET.update(kind=args.energy_target, tau=args.energy_tau)
