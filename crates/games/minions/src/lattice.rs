@@ -40,6 +40,55 @@ pub static LIVE: [std::sync::atomic::AtomicI64; 4] =
 
 pub static SCANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Shadow quick descents ([`Lattice::shadow_quick`]), summed over the
+/// process: 0 plans (quick chains a plain descent passed the base of), 1
+/// their commits, 2 plans whose first |plan| plain picks were exactly the
+/// plan's commitments (quick would have reached the same node), 3 plans whose
+/// first plain pick at the base was one of them, 4 plans the descent's sink
+/// agrees with entirely, 5 commits the sink agrees with, 6 plans dropped
+/// (their descent backtracked from a dead end), 7 plans of 2+ commits, 8 of
+/// those reaching the same node, 9 of those the sink agrees with.
+pub static SHADOW: [std::sync::atomic::AtomicU64; 10] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+/// [`SHADOW`] as a report line, if any plan was counted.
+pub fn shadow_report() -> Option<String> {
+    let c: Vec<f64> = SHADOW
+        .iter()
+        .map(|x| x.load(std::sync::atomic::Ordering::Relaxed) as f64)
+        .collect();
+    if c[0] == 0.0 {
+        return None;
+    }
+    let pct = |a: f64, b: f64| 100.0 * a / b.max(1.0);
+    Some(format!(
+        "shadow quick: {:.0} chains ({:.2} commits each, {:.0} dropped); plain reached quick's node {:.1}%, its first pick was a quick commit {:.1}%, its turn agrees with the whole chain {:.1}% ({:.1}% of commits); chains of 2+ ({:.1}% of chains): same node {:.1}%, turn agrees {:.1}%",
+        c[0],
+        c[1] / c[0],
+        c[6],
+        pct(c[2], c[0]),
+        pct(c[3], c[0]),
+        pct(c[4], c[0]),
+        pct(c[5], c[1]),
+        pct(c[7], c[0]),
+        pct(c[8], c[7]),
+        pct(c[9], c[7]),
+    ))
+}
+
+/// One shadow quick chain along a plain descent ([`Lattice::shadow_quick`]).
+#[derive(Clone, Debug)]
+pub struct ShadowPlan {
+    /// The quick chain's commitments (var, choice).
+    cells: Vec<(u8, u8)>,
+    /// The plain descent's picks since the base, up to |cells| of them.
+    picks: Vec<(u8, u8)>,
+    /// Whether the first pick was one of the chain's commitments.
+    first: Option<bool>,
+    /// Whether the picks were the chain's commitments (once |cells| made).
+    same: Option<bool>,
+}
+
 /// Option-check cost breakdown while preparing nodes: per
 /// [`crate::steps::cand_log`] class, candidates and nanoseconds.
 pub static WIT_CLASS: [[std::sync::atomic::AtomicU64; 2]; crate::steps::cand_log::N] =
@@ -515,6 +564,9 @@ pub struct Cursor {
     /// descents below it (a base: expanded, then committed greedily from its
     /// priors); None: not known yet.
     fresh: Option<bool>,
+    /// Shadow quick chains along this (plain) descent, the last one open
+    /// until the descent has made as many picks.
+    shadow: Vec<ShadowPlan>,
 }
 
 impl Cursor {
@@ -526,6 +578,7 @@ impl Cursor {
             follow: false,
             vl: NONE,
             fresh: None,
+            shadow: Vec::new(),
         }
     }
 }
@@ -612,6 +665,10 @@ pub struct Lattice {
     /// the likeliest cell over their variables ([`Lattice::quick_plan`]);
     /// where that stops, the node reached is expanded as the next base.
     pub quick: bool,
+    /// Plain descents also record what a quick descent would have committed
+    /// at each base on their way and whether they diverged from it
+    /// ([`SHADOW`]). Diagnostics only: the search is unchanged.
+    pub shadow_quick: bool,
 }
 
 thread_local! {
@@ -664,6 +721,31 @@ pub fn necro_kill(start: &StepState) -> std::result::Result<StepState, StepState
     }
     // "Spare" is always offered: the empty declaration's witness keeps it.
     Err(s.lattice_child(TARGET_STAY, spare.unwrap_or_default()))
+}
+
+/// Count a finished plain descent's shadow chains against its sink `key`.
+fn shadow_finish(key: &Key, plans: &mut Vec<ShadowPlan>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    for p in plans.drain(..) {
+        let agree = p
+            .cells
+            .iter()
+            .filter(|&&(v, c)| key.mask >> v & 1 == 1 && key.get(v as usize) == c)
+            .count();
+        let all = agree == p.cells.len();
+        let same = p.same == Some(true);
+        SHADOW[0].fetch_add(1, Relaxed);
+        SHADOW[1].fetch_add(p.cells.len() as u64, Relaxed);
+        SHADOW[2].fetch_add(u64::from(same), Relaxed);
+        SHADOW[3].fetch_add(u64::from(p.first == Some(true)), Relaxed);
+        SHADOW[4].fetch_add(u64::from(all), Relaxed);
+        SHADOW[5].fetch_add(agree as u64, Relaxed);
+        if p.cells.len() > 1 {
+            SHADOW[7].fetch_add(1, Relaxed);
+            SHADOW[8].fetch_add(u64::from(same), Relaxed);
+            SHADOW[9].fetch_add(u64::from(all), Relaxed);
+        }
+    }
 }
 
 impl Drop for Lattice {
@@ -757,6 +839,7 @@ impl Lattice {
             random_order: false,
             trunk: None,
             quick: false,
+            shadow_quick: false,
         };
         if start.is_terminal() {
             l.terminal = Some(start.terminal_value());
@@ -1508,6 +1591,45 @@ impl Lattice {
         best.map(|i| (i, st.qkids[i].0 <= 0.0))
     }
 
+    /// Shadow quick mode: at expanded node `n` with no completed descent
+    /// below it (a quick base) and no chain open, open the chain quick would
+    /// commit here.
+    fn shadow_at(&mut self, n: u32, cur: &mut Cursor) {
+        if cur.shadow.last().is_some_and(|p| p.same.is_none()) || self.stats(n).sn > 0.0 {
+            return;
+        }
+        let cells = self
+            .quick_plan(n)
+            .into_iter()
+            .map(|(v, c, _)| (v, c))
+            .collect();
+        cur.shadow.push(ShadowPlan {
+            cells,
+            picks: Vec::new(),
+            first: None,
+            same: None,
+        });
+    }
+
+    /// Shadow quick mode: the plain descent picks kid `k` of `n`.
+    fn shadow_pick(&self, n: u32, k: usize, cur: &mut Cursor) {
+        let kid = self.nodes[n as usize].kids[k];
+        let Some(p) = cur.shadow.last_mut().filter(|p| p.same.is_none()) else {
+            return;
+        };
+        let x = (kid.var, kid.choice);
+        if p.first.is_none() {
+            p.first = Some(p.cells.contains(&x));
+        }
+        p.picks.push(x);
+        if p.picks.len() == p.cells.len() {
+            let (mut a, mut b) = (p.picks.clone(), p.cells.clone());
+            a.sort_unstable();
+            b.sort_unstable();
+            p.same = Some(a == b);
+        }
+    }
+
     /// The greedy commitments from expanded node `n`'s priors: variables in
     /// order of their best choice's prior 1 - a_i, each committed to that
     /// choice, while no alternative's prior (the best other choice b_j of
@@ -1615,6 +1737,13 @@ impl Lattice {
                     cur.lp -= f64::from(self.nodes[p as usize].kids[k as usize].logp);
                     cur.at = p;
                     cur.fresh = None;
+                    if !cur.shadow.is_empty() {
+                        SHADOW[6].fetch_add(
+                            cur.shadow.len() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        cur.shadow.clear();
+                    }
                 }
                 Kind::Sink => {
                     let Some(v) = node.value else {
@@ -1633,6 +1762,10 @@ impl Lattice {
                     node.lp_sum += cur.lp;
                     node.lp_n += 1;
                     self.stats.descents += 1;
+                    if !cur.shadow.is_empty() {
+                        let key = self.nodes[n as usize].key;
+                        shadow_finish(&key, &mut cur.shadow);
+                    }
                     return Ok(Need::Done {
                         sink: n,
                         value: v,
@@ -1680,10 +1813,16 @@ impl Lattice {
                 Kind::Inner => match if cur.follow {
                     self.follow_kid(n, c_puct)
                 } else {
+                    if self.shadow_quick {
+                        self.shadow_at(n, cur);
+                    }
                     self.select(n, c_puct)
                 } {
                     None => self.kill(n)?,
                     Some(k) => {
+                        if self.shadow_quick && !cur.follow {
+                            self.shadow_pick(n, k, cur);
+                        }
                         let c = self.child(n, k)?;
                         cur.lp += f64::from(self.nodes[n as usize].kids[k].logp);
                         cur.path.push((n, k as u16));
@@ -3518,6 +3657,37 @@ pub(crate) mod tests {
             "expansions plain {exp_plain}, quick {exp_quick}; {:.2} commits per chain",
             commits as f64 / chains as f64
         );
+    }
+
+    /// Shadow quick mode leaves plain descents unchanged (the same sinks,
+    /// descent by descent) and counts chains.
+    #[test]
+    fn shadow_quick_is_passive() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let before = SHADOW[0].load(Relaxed);
+        for s in positions(4, 13) {
+            let mut runs = Vec::new();
+            for shadow in [false, true] {
+                let mut l = Lattice::new(s.clone()).unwrap();
+                if l.terminal.is_some() {
+                    break;
+                }
+                l.shadow_quick = shadow;
+                let sinks: Vec<u32> = (0..40)
+                    .map(|_| {
+                        l.descend(&HashLatticeEval, Cursor::at(0, 0.0), 1.0)
+                            .unwrap()
+                            .0
+                    })
+                    .collect();
+                runs.push(sinks);
+            }
+            if runs.len() == 2 {
+                assert_eq!(runs[0], runs[1], "shadow mode changed the search");
+            }
+        }
+        assert!(SHADOW[0].load(Relaxed) > before, "no shadow chain counted");
+        eprintln!("{}", shadow_report().unwrap());
     }
 
     /// A plan is the likeliest cell over its variables: every alternative

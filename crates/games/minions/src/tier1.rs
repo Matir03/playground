@@ -47,6 +47,8 @@ pub struct T1Params {
     pub random_order: bool,
     /// Quick tier-2 descents ([`Lattice::quick`]).
     pub quick: bool,
+    /// Plain descents record quick's shadow choices ([`Lattice::shadow_quick`]).
+    pub shadow_quick: bool,
 }
 
 impl Default for T1Params {
@@ -63,6 +65,7 @@ impl Default for T1Params {
             value_prior_tau: 0.0,
             random_order: false,
             quick: false,
+            shadow_quick: false,
         }
     }
 }
@@ -506,6 +509,7 @@ impl Tier1 {
             let mut l = Lattice::new(self.nodes[0].state.clone())?;
             l.random_order = self.params.random_order;
             l.quick = self.params.quick;
+            l.shadow_quick = self.params.shadow_quick;
             let root = &mut self.nodes[0];
             if let Some(v) = l.terminal {
                 root.terminal = Some(v);
@@ -636,6 +640,7 @@ impl Tier1 {
                 let mut l = Lattice::new(nd.state.clone())?;
                 l.random_order = self.params.random_order;
                 l.quick = self.params.quick;
+                l.shadow_quick = self.params.shadow_quick;
                 if l.terminal.is_some() {
                     // The parent's lattice scores such turns itself, so a
                     // child is never a necromancer kill it missed.

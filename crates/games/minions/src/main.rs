@@ -1301,6 +1301,12 @@ fn lattice_play(spec: &str, n1: u32, inflight: usize) -> anyhow::Result<(String,
         Some(s) => (s, true),
         None => (spec, false),
     };
+    // `shadowq:<spec>`: plain descents count where quick ones would have
+    // diverged (`Lattice::shadow_quick`; reported at the end).
+    let (spec, shadow_quick) = match spec.strip_prefix("shadowq:") {
+        Some(s) => (s, true),
+        None => (spec, false),
+    };
     // `energy:<lattice dir>`: tier-1 priors from the net's energies;
     // `vprior=<tau>:<lattice dir>`: from the children's static values.
     let (spec, energy) = match spec.strip_prefix("energy:") {
@@ -1318,7 +1324,7 @@ fn lattice_play(spec: &str, n1: u32, inflight: usize) -> anyhow::Result<(String,
     let mut ev = minions_engine::lattice_ort::OrtLatticeEval::load(dir, "trt", true, 1)?;
     ev.set_t2_prior(t2temp, t2vtau);
     let eval = std::sync::Arc::new(ev);
-    let mut params = minions_engine::tier1::T1Params { energy_prior: energy, value_prior_tau: vtau, random_order, quick, ..Default::default() };
+    let mut params = minions_engine::tier1::T1Params { energy_prior: energy, value_prior_tau: vtau, random_order, quick, shadow_quick, ..Default::default() };
     if let Some((c, a)) = pw {
         params.pw_c = c;
         params.pw_alpha = a;
@@ -1913,6 +1919,9 @@ async fn main() -> anyhow::Result<()> {
                 }
                 return Ok(());
             }
+            if let Some(r) = minions_engine::lattice::shadow_report() {
+                println!("{r}");
+            }
             println!("tier-1 search speed, {n1} visits, {} positions, each in flight up and back down:", pos.len());
             for (i, k) in ks.iter().enumerate() {
                 let per = secs[i] / searches;
@@ -2041,6 +2050,9 @@ async fn main() -> anyhow::Result<()> {
                     "A {a}\nB {b}\nA score {score:.3} +- {se:.3} over {} games (A wins {}, B wins {}, draws {}) in {:.0}s",
                     2 * pairs, wdl[0], wdl[1], wdl[2], t.elapsed().as_secs_f64()
                 );
+                if let Some(r) = minions_engine::lattice::shadow_report() {
+                    println!("{r}");
+                }
             }
         }
         Cmd::StepsVsMcts { a, old, pairs, ep, seed, expansions, heads, sims, candidates, t_steps, resample_every, threads, equal_time, n1, lattice_inflight } => {
