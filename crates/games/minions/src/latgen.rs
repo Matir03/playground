@@ -100,9 +100,12 @@ pub struct GenConfig {
     /// further than this from even (the last commitment's value) is dropped
     /// and the game restarted.
     pub even_open_tol: f64,
+    /// Self-play seconds (0 = no limit).
     pub secs: f64,
     /// Stop after this many tier-2 records (0 = no limit).
     pub target_t2: u64,
+    /// Stop self-play after this many tier-1 records (0 = no limit).
+    pub target_t1: u64,
     pub seed: u64,
     pub chunk_records: usize,
     /// Also record every non-root tier-1 node with at least this many
@@ -213,7 +216,12 @@ pub struct GenConfig {
     pub step_dir_alpha: f64,
     pub step_dir_frac: f64,
     pub rooted: RootedParams,
+    /// The tier-2 phase's seconds (0 = no limit).
     pub rooted_secs: f64,
+    /// If positive, the tier-2 phase searches this many nodes per tier-1
+    /// record written by self-play, drawn at random from the queue (all of
+    /// it if shorter), instead of the whole queue.
+    pub rooted_per_t1: f64,
     /// Searches per worker at a time in that phase.
     pub rooted_tasks: usize,
 }
@@ -2340,7 +2348,10 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
             std::thread::sleep(std::time::Duration::from_millis(500));
             let el = t0.elapsed().as_secs_f64();
             let t2r = c.t2_records.load(Relaxed);
-            if el >= cfg.secs || (cfg.target_t2 > 0 && t2r >= cfg.target_t2) {
+            if (cfg.secs > 0.0 && el >= cfg.secs)
+                || (cfg.target_t2 > 0 && t2r >= cfg.target_t2)
+                || (cfg.target_t1 > 0 && c.t1_records.load(Relaxed) >= cfg.target_t1)
+            {
                 stop.store(true, Relaxed);
             }
             let done = hs.iter().all(|h| h.is_finished());
@@ -2482,9 +2493,9 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
     Ok(())
 }
 
-/// The separate tier-2 phase: every queued node (in random order) gets a
-/// search of its own rooted there, until the queue is empty or
-/// `cfg.rooted_secs` pass.
+/// The separate tier-2 phase: every queued node (in random order; with
+/// `cfg.rooted_per_t1`, that many per tier-1 record) gets a search of its own
+/// rooted there, until the queue is empty or `cfg.rooted_secs` pass.
 fn rooted_phase(
     cfg: &GenConfig,
     bid: i16,
@@ -2500,18 +2511,36 @@ fn rooted_phase(
         v.shuffle(&mut rand_chacha::ChaCha8Rng::seed_from_u64(
             cfg.seed ^ 0x7007,
         ));
+        if cfg.rooted_per_t1 > 0.0 {
+            let t1 = c.t1_records.load(Relaxed);
+            let want = (cfg.rooted_per_t1 * t1 as f64).round() as usize;
+            eprintln!(
+                "  tier-2 phase: target {want} nodes ({} per tier-1 record x {t1}) of {} queued",
+                cfg.rooted_per_t1,
+                v.len()
+            );
+            v.truncate(want);
+        }
         v.len()
     };
     let t0 = Instant::now();
-    let deadline = t0 + std::time::Duration::from_secs_f64(cfg.rooted_secs);
+    let deadline =
+        (cfg.rooted_secs > 0.0).then(|| t0 + std::time::Duration::from_secs_f64(cfg.rooted_secs));
     let (ex0, va0, t2_0) = (
         c.expansions.load(Relaxed),
         c.values.load(Relaxed),
         c.t2_records.load(Relaxed),
     );
     eprintln!(
-        "  tier-2 phase: {n} nodes queued, {} searches per worker, n {} (min {} per kid), budget {:.0}s",
-        cfg.rooted_tasks, cfg.rooted.n, cfg.rooted.min_per_kid, cfg.rooted_secs
+        "  tier-2 phase: {n} nodes queued, {} searches per worker, n {} (min {} per kid), {}",
+        cfg.rooted_tasks,
+        cfg.rooted.n,
+        cfg.rooted.min_per_kid,
+        if cfg.rooted_secs > 0.0 {
+            format!("budget {:.0}s", cfg.rooted_secs)
+        } else {
+            "no time limit".to_string()
+        }
     );
     let res: Vec<Result<()>> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..cfg.workers)
@@ -2521,7 +2550,7 @@ fn rooted_phase(
                     // Writer tags after the self-play workers' and openers'.
                     let mut wk = make_worker(cfg, bid, 1000 + w, t1_dir, t2_dir, c);
                     wk.rooted_q = Some(q);
-                    wk.deadline = Some(deadline);
+                    wk.deadline = deadline;
                     wk.rooted_phase(eval.as_ref())
                 })
             })
