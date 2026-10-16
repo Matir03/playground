@@ -689,7 +689,9 @@ impl GameLogs {
     fn new(dir: &Path, w: usize) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         let f = |name: String| -> Result<_> {
-            Ok(std::io::BufWriter::new(std::fs::File::create(dir.join(name))?))
+            Ok(std::io::BufWriter::new(std::fs::File::create(
+                dir.join(name),
+            )?))
         };
         Ok(Self {
             games: f(format!("w{w:02}.jsonl"))?,
@@ -1117,10 +1119,11 @@ impl Worker<'_> {
                             .collect(),
                     ));
                 }
-                let logged = self
-                    .glog
-                    .is_some()
-                    .then(|| r.record.as_ref().map(|x| t2_json(&lat.start, x, r.record_mean.as_ref())));
+                let logged = self.glog.is_some().then(|| {
+                    r.record
+                        .as_ref()
+                        .map(|x| t2_json(&lat.start, x, r.record_mean.as_ref()))
+                });
                 if let Some(rec) = r.record.take() {
                     encode_t2(&lat.start, &rec, &mut self.t2w, self.cfg.lview)?;
                     self.view_targets(&rec)?;
@@ -1201,7 +1204,9 @@ impl Worker<'_> {
                 }
                 if let (Some(g), Some(rec)) = (self.glog.as_mut(), r.record.as_ref()) {
                     g.t2_seen += 1;
-                    if g.t2_seen % self.cfg.game_log_t2_every.max(1) == 1 % self.cfg.game_log_t2_every.max(1) {
+                    if g.t2_seen % self.cfg.game_log_t2_every.max(1)
+                        == 1 % self.cfg.game_log_t2_every.max(1)
+                    {
                         use std::io::Write;
                         writeln!(g.t2, "{}", t2_json(&lat.start, rec, r.record_mean.as_ref()))?;
                     }
@@ -1233,6 +1238,7 @@ impl Worker<'_> {
                 return Ok(None);
             };
             let mut lat = Lattice::new(s)?;
+            lat.quick = self.cfg.t1.quick;
             if lat.terminal.is_some() {
                 continue;
             }
@@ -1672,6 +1678,7 @@ impl Worker<'_> {
         }
         // From scratch, as the rooted phase searches.
         let mut fresh = Lattice::new(lat.start.clone())?;
+        fresh.quick = self.cfg.t1.quick;
         if fresh.terminal.is_some() {
             return Ok(None);
         }
@@ -1783,7 +1790,8 @@ impl Worker<'_> {
             });
         }
         if self.glog.is_some() {
-            let label = crate::lattice_ui::turn_label(&t1.nodes[0].state, &t1.nodes[pick as usize].state);
+            let label =
+                crate::lattice_ui::turn_label(&t1.nodes[0].state, &t1.nodes[pick as usize].state);
             self.log_played(salt, label, None);
         }
         let child = &mut t1.nodes[pick as usize];
