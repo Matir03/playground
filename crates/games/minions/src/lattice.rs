@@ -669,6 +669,80 @@ pub struct Lattice {
     /// at each base on their way and whether they diverged from it
     /// ([`SHADOW`]). Diagnostics only: the search is unchanged.
     pub shadow_quick: bool,
+    /// Incremental stats: every change to the direct-visit atoms goes to a
+    /// log, and [`Lattice::stats`] brings a node's cached stats up to date
+    /// from the log instead of scanning every touched node (the full scan
+    /// grows with the search: rooted searches at n 512 spent 75% of their
+    /// time in it). Same sums, up to float rounding.
+    pub incremental: bool,
+    dlog: Vec<Delta>,
+    /// Bumped when the log is cleared (every cache goes stale).
+    depoch: u32,
+    scache: HashMap<u32, StatsCache>,
+}
+
+/// One change to the direct-visit atoms, at commitments `key`.
+#[derive(Clone, Copy, Debug)]
+struct Delta {
+    key: Key,
+    kind: DeltaKind,
+    n: f64,
+    w: f64,
+    rn: f64,
+    rw: f64,
+    vl: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DeltaKind {
+    /// A node's own visits, sink returns and virtual losses.
+    Own,
+    /// An expanded node's expansion visits, all kids together (`kid_n`,
+    /// `kid_w`): they count where the node's own visits do.
+    Mass,
+    /// One kid's expansion visit, for the kid's own slot below a node the
+    /// key includes, and for the node the kid's commitment completes.
+    Kid { var: u8, choice: u8 },
+}
+
+struct StatsCache {
+    epoch: u32,
+    pos: usize,
+    nkids: usize,
+    st: Stats,
+}
+
+/// The incremental-stats log is cleared (every cache stale) at this many
+/// entries, and a cache this far behind is rebuilt by a full scan.
+fn dlog_cap(touched: usize) -> usize {
+    static C: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    let (a, b) = *C.get_or_init(|| {
+        let v = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(d)
+        };
+        (v("DLOG_BASE", 16384), v("DLOG_PER", 16))
+    });
+    a + b * touched
+}
+
+fn backlog_cap(touched: usize) -> usize {
+    static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *C.get_or_init(|| {
+        std::env::var("DLOG_BACKLOG")
+            .ok()
+            .and_then(|x| x.parse().ok())
+            .unwrap_or(8)
+    }) * touched
+}
+
+/// LATTICE_CHECK_STATS set: every incremental stats query is checked
+/// against a full scan (slow; for tests).
+fn check_stats() -> bool {
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var_os("LATTICE_CHECK_STATS").is_some())
 }
 
 thread_local! {
@@ -840,6 +914,10 @@ impl Lattice {
             trunk: None,
             quick: false,
             shadow_quick: false,
+            incremental: std::env::var_os("LATTICE_INCREMENTAL").is_some(),
+            dlog: Vec::new(),
+            depoch: 0,
+            scache: HashMap::new(),
         };
         if start.is_terminal() {
             l.terminal = Some(start.terminal_value());
@@ -1321,6 +1399,7 @@ impl Lattice {
         node.expanded = true;
         self.stats.expansions += 1;
         self.stats.kids += node.kids.len() as u64;
+        self.log_kids(n, 1.0);
         self.visit(n, out.value);
     }
 
@@ -1345,6 +1424,62 @@ impl Lattice {
         }
         node.n += 1;
         node.w += f64::from(v);
+        self.log(n, DeltaKind::Own, 1.0, f64::from(v), 0.0, 0.0, 0.0);
+    }
+
+    /// Log a change to node `x`'s atoms (incremental stats; a dead node's
+    /// atoms no longer count anywhere).
+    #[allow(clippy::too_many_arguments)]
+    fn log(&mut self, x: u32, kind: DeltaKind, n: f64, w: f64, rn: f64, rw: f64, vl: f64) {
+        if !self.incremental {
+            return;
+        }
+        let nd = &self.nodes[x as usize];
+        if nd.kind == Kind::Dead {
+            return;
+        }
+        let key = nd.key;
+        if self.dlog.len() >= dlog_cap(self.touched.len()) {
+            self.dlog.clear();
+            self.depoch = self.depoch.wrapping_add(1);
+        }
+        self.dlog.push(Delta {
+            key,
+            kind,
+            n,
+            w,
+            rn,
+            rw,
+            vl,
+        });
+    }
+
+    /// Log node `x`'s expansion visits (all of its live kids', or with
+    /// `sign` -1 their removal).
+    fn log_kids(&mut self, x: u32, sign: f64) {
+        if !self.incremental || self.nodes[x as usize].kind == Kind::Dead {
+            return;
+        }
+        let nd = &self.nodes[x as usize];
+        let (kn, kw) = (f64::from(nd.kid_n), nd.kid_w);
+        let kids: Vec<(u8, u8, f32)> = nd
+            .kids
+            .iter()
+            .filter(|k| !k.dead)
+            .map(|k| (k.var, k.choice, k.v))
+            .collect();
+        self.log(x, DeltaKind::Mass, sign * kn, sign * kw, 0.0, 0.0, 0.0);
+        for (var, choice, v) in kids {
+            self.log(
+                x,
+                DeltaKind::Kid { var, choice },
+                sign,
+                sign * f64::from(v),
+                0.0,
+                0.0,
+                0.0,
+            );
+        }
     }
 
     /// Mark `n` dead, and every parent all of whose kids are.
@@ -1360,12 +1495,17 @@ impl Lattice {
             return;
         }
         kid.dead = true;
+        let (var, choice, v) = (kid.var, kid.choice, f64::from(kid.v));
         if pn.expanded {
             pn.kid_n -= 1;
-            pn.kid_w -= f64::from(kid.v);
+            pn.kid_w -= v;
         }
         if pn.kids.iter().all(|k| k.dead) {
             stack.push(p);
+        }
+        if self.nodes[p as usize].expanded {
+            self.log(p, DeltaKind::Mass, -1.0, -v, 0.0, 0.0, 0.0);
+            self.log(p, DeltaKind::Kid { var, choice }, -1.0, -v, 0.0, 0.0, 0.0);
         }
     }
 
@@ -1386,6 +1526,22 @@ impl Lattice {
             {
                 self.nogoods.push(nd.key);
             }
+            if self.incremental {
+                let nd = &self.nodes[x as usize];
+                let own = (
+                    f64::from(nd.n),
+                    nd.w,
+                    f64::from(nd.ret_n),
+                    nd.ret_w,
+                    f64::from(nd.vl),
+                );
+                if own != (0.0, 0.0, 0.0, 0.0, 0.0) {
+                    self.log(x, DeltaKind::Own, -own.0, -own.1, -own.2, -own.3, -own.4);
+                }
+                if self.nodes[x as usize].expanded {
+                    self.log_kids(x, -1.0);
+                }
+            }
             self.nodes[x as usize].kind = Kind::Dead;
             for (p, k) in self.nodes[x as usize].parents.clone() {
                 self.drop_kid(p, k as usize, &mut stack);
@@ -1403,18 +1559,174 @@ impl Lattice {
     /// node (its expansion's visit to that child, at commitments X + kid).
     pub fn stats(&mut self, p: u32) -> Stats {
         let t0 = std::time::Instant::now();
-        PROF[4].fetch_add(
-            self.touched.len() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        SCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !self.incremental {
+            PROF[4].fetch_add(
+                self.touched.len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            SCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let r = self.stats_inner(p);
         prof(1, t0);
         r
     }
 
     fn stats_inner(&mut self, p: u32) -> Stats {
+        if self.incremental {
+            return self.stats_incr(p);
+        }
         SLOT.with(|slot| self.stats_with(p, &mut slot.borrow_mut()))
+    }
+
+    /// [`Lattice::stats`] from node `p`'s cache brought up to date from the
+    /// log (a full scan when there is no cache, it is stale, or the log
+    /// since is longer than a scan).
+    fn stats_incr(&mut self, p: u32) -> Stats {
+        let nk = self.nodes[p as usize].kids.len();
+        let fresh = match self.scache.get(&p) {
+            Some(c) => {
+                c.epoch != self.depoch
+                    || c.nkids != nk
+                    || self.dlog.len() - c.pos > backlog_cap(self.touched.len())
+            }
+            None => true,
+        };
+        let mut st = if fresh {
+            PROF[4].fetch_add(
+                self.touched.len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            SCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let st = SLOT.with(|slot| self.stats_with(p, &mut slot.borrow_mut()));
+            self.scache.insert(
+                p,
+                StatsCache {
+                    epoch: self.depoch,
+                    pos: self.dlog.len(),
+                    nkids: nk,
+                    st: st.clone(),
+                },
+            );
+            st
+        } else {
+            let mut c = self.scache.remove(&p).unwrap();
+            SLOT.with(|slot| self.apply_log(p, &mut c, &mut slot.borrow_mut()));
+            let st = c.st.clone();
+            self.scache.insert(p, c);
+            st
+        };
+        for (i, k) in self.nodes[p as usize].kids.iter().enumerate() {
+            if k.dead {
+                st.kids[i] = (0.0, 0.0);
+                st.skids[i] = (0.0, 0.0);
+                if self.quick {
+                    st.qkids[i] = (0.0, 0.0);
+                }
+            }
+        }
+        if check_stats() {
+            let full = SLOT.with(|slot| self.stats_with(p, &mut slot.borrow_mut()));
+            let close = |a: f64, b: f64| (a - b).abs() <= 1e-6 * (1.0 + b.abs());
+            let pairs = |a: &[(f64, f64)], b: &[(f64, f64)]| {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b)
+                        .all(|(x, y)| close(x.0, y.0) && close(x.1, y.1))
+            };
+            assert!(
+                close(st.n, full.n)
+                    && close(st.w, full.w)
+                    && close(st.sn, full.sn)
+                    && close(st.sw, full.sw)
+                    && close(st.qn, full.qn)
+                    && close(st.qw, full.qw)
+                    && pairs(&st.kids, &full.kids)
+                    && pairs(&st.skids, &full.skids)
+                    && pairs(&st.qkids, &full.qkids),
+                "incremental stats of node {p} differ:\n{st:?}\nfull:\n{full:?}"
+            );
+        }
+        st
+    }
+
+    /// Apply the log since `c.pos` to node `p`'s cached stats.
+    fn apply_log(&self, p: u32, c: &mut StatsCache, slot_m: &mut [u16]) {
+        let pn = &self.nodes[p as usize];
+        let pk = pn.key;
+        let mut allowed = 0u64;
+        for (i, k) in pn.kids.iter().enumerate() {
+            if !k.dead {
+                allowed |= 1 << k.var;
+                slot_m[k.var as usize * 64 + k.choice as usize] = i as u16;
+            }
+        }
+        let slot = &*slot_m;
+        let st = &mut c.st;
+        let quick = self.quick;
+        for d in &self.dlog[c.pos..] {
+            let xk = &d.key;
+            let missing = pk.mask & !xk.mask;
+            let fits =
+                missing == 0 || matches!(d.kind, DeltaKind::Kid { var, .. } if missing == 1 << var);
+            if !fits || xk.conflicts(&pk) {
+                continue;
+            }
+            let extra = xk.mask & !pk.mask & allowed;
+            let credit = |kids: &mut Vec<(f64, f64)>, cn: f64, cw: f64| {
+                let mut e = extra;
+                while e != 0 {
+                    let v = e.trailing_zeros() as usize;
+                    e &= e - 1;
+                    let s = slot[v * 64 + xk.get(v) as usize];
+                    if s != u16::MAX {
+                        kids[s as usize].0 += cn;
+                        kids[s as usize].1 += cw;
+                    }
+                }
+            };
+            match d.kind {
+                DeltaKind::Own if missing == 0 => {
+                    st.n += d.n;
+                    st.w += d.w;
+                    credit(&mut st.kids, d.n, d.w);
+                    if d.rn != 0.0 || d.rw != 0.0 {
+                        st.sn += d.rn;
+                        st.sw += d.rw;
+                        credit(&mut st.skids, d.rn, d.rw);
+                    }
+                    if quick && (d.rn != 0.0 || d.rw != 0.0 || d.vl != 0.0) {
+                        st.qn += d.rn + d.vl;
+                        st.qw += d.rw;
+                        credit(&mut st.qkids, d.rn + d.vl, d.rw);
+                    }
+                }
+                DeltaKind::Mass if missing == 0 => {
+                    st.n += d.n;
+                    st.w += d.w;
+                    credit(&mut st.kids, d.n, d.w);
+                }
+                DeltaKind::Kid { var, choice } => {
+                    if missing == 0 {
+                        if allowed & (1 << var) != 0 {
+                            let s = slot[var as usize * 64 + choice as usize];
+                            if s != u16::MAX {
+                                st.kids[s as usize].0 += d.n;
+                                st.kids[s as usize].1 += d.w;
+                            }
+                        }
+                    } else if missing == 1 << var && pk.get(var as usize) == choice {
+                        st.n += d.n;
+                        st.w += d.w;
+                        credit(&mut st.kids, d.n, d.w);
+                    }
+                }
+                _ => {}
+            }
+        }
+        c.pos = self.dlog.len();
+        for k in &pn.kids {
+            slot_m[k.var as usize * 64 + k.choice as usize] = u16::MAX;
+        }
     }
 
     fn stats_with(&self, p: u32, slot_m: &mut [u16]) -> Stats {
@@ -1755,6 +2067,7 @@ impl Lattice {
                     };
                     self.move_vl(cur, NONE);
                     self.visit(n, v);
+                    self.log(n, DeltaKind::Own, 0.0, 0.0, 1.0, f64::from(v), 0.0);
                     let node = &mut self.nodes[n as usize];
                     node.ret_n += 1;
                     node.ret_w += f64::from(v);
@@ -1900,6 +2213,7 @@ impl Lattice {
     /// Move `cur`'s virtual loss to node `to` (`NONE`: drop it).
     fn move_vl(&mut self, cur: &mut Cursor, to: u32) {
         if cur.vl != NONE {
+            self.log(cur.vl, DeltaKind::Own, -1.0, 0.0, 0.0, 0.0, -1.0);
             let node = &mut self.nodes[cur.vl as usize];
             node.n -= 1;
             node.vl -= 1;
@@ -1912,6 +2226,7 @@ impl Lattice {
             }
             node.n += 1;
             node.vl += 1;
+            self.log(to, DeltaKind::Own, 1.0, 0.0, 0.0, 0.0, 1.0);
         }
         cur.vl = to;
     }
@@ -3829,6 +4144,77 @@ pub(crate) mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    /// Tier-2 phase speed (CPU only, hash priors): rooted searches at the
+    /// cycle's settings (n 512, budget 16000, quick) on the nodes of one
+    /// descent's path per position; prints the time, the stats scans and a
+    /// digest of the records. BENCH_N sets n, BENCH_PLAIN turns quick off,
+    /// BENCH_FULL turns incremental stats off.
+    /// `cargo test --release rooted_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn rooted_bench() {
+        use std::hash::{Hash, Hasher};
+        use std::sync::atomic::Ordering::Relaxed;
+        let quick = std::env::var("BENCH_PLAIN").is_err();
+        let incr = std::env::var("BENCH_FULL").is_err();
+        let n = std::env::var("BENCH_N").map_or(512, |v| v.parse().unwrap());
+        let p = RootedParams {
+            n,
+            budget: 16000,
+            mean_too: true,
+            ..RootedParams::default()
+        };
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7);
+        let mut jobs = Vec::new();
+        for s in positions(8, 77) {
+            let mut l = Lattice::new(s.clone()).unwrap();
+            if l.terminal.is_some() {
+                continue;
+            }
+            let (sink, _, _) = l
+                .descend(&HashLatticeEval, Cursor::at(0, 0.0), 1.5)
+                .unwrap();
+            for n in l.path_to(sink, &mut rng).unwrap() {
+                jobs.push((s.clone(), l.nodes[n as usize].key));
+            }
+        }
+        let (s0, t0) = (SCANS.load(Relaxed), PROF[4].load(Relaxed));
+        let mut dig = std::collections::hash_map::DefaultHasher::new();
+        let (mut recs, mut exps) = (0, 0u64);
+        let t = std::time::Instant::now();
+        for (s, key) in &jobs {
+            let mut f = Lattice::new(s.clone()).unwrap();
+            f.quick = quick;
+            f.incremental = incr;
+            let Some(at) = f.reach(*key).unwrap() else {
+                continue;
+            };
+            let mut r = Rooted::new(at);
+            let mut needs = Vec::new();
+            while !f.advance_rooted(&mut r, &p, &mut needs).unwrap() {
+                serve(&mut f, &mut needs);
+            }
+            exps += u64::from(r.expansions);
+            if let Some(rec) = &r.record {
+                recs += 1;
+                rec.q.to_bits().hash(&mut dig);
+                for k in &rec.kids {
+                    (k.0, k.1, k.3.to_bits(), k.4.to_bits()).hash(&mut dig);
+                }
+            }
+        }
+        let el = t.elapsed().as_secs_f64();
+        let scans = SCANS.load(Relaxed) - s0;
+        let touched = PROF[4].load(Relaxed) - t0;
+        eprintln!(
+            "rooted bench (quick {quick}, incremental {incr}, n {n}): {} jobs, {recs} records, {exps} expansions in {el:.2}s ({:.1} searches/s); {scans} full stats scans, {:.0} touched per scan; digest {:016x}",
+            jobs.len(),
+            jobs.len() as f64 / el,
+            touched as f64 / scans.max(1) as f64,
+            dig.finish()
+        );
     }
 
     /// The tier-2 phase: nodes from one lattice are reached by key in a

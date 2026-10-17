@@ -1247,6 +1247,7 @@ impl Worker<'_> {
             };
             let mut lat = Lattice::new(s)?;
             lat.quick = self.cfg.t1.quick;
+            lat.incremental = true;
             if lat.terminal.is_some() {
                 continue;
             }
@@ -1687,6 +1688,7 @@ impl Worker<'_> {
         // From scratch, as the rooted phase searches.
         let mut fresh = Lattice::new(lat.start.clone())?;
         fresh.quick = self.cfg.t1.quick;
+        fresh.incremental = true;
         if fresh.terminal.is_some() {
             return Ok(None);
         }
