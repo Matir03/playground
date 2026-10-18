@@ -337,6 +337,9 @@ pub struct GenCounters {
     pub anchors: AtomicU64,
     pub rooted_unreached: AtomicU64,
     pub rooted_abandoned: AtomicU64,
+    /// Energy-weighted rooted targets: sums of `Rooted::ediag`, of |weighted
+    /// minus per-descent node value|, and the searches counted.
+    pub rooted_ediag: std::sync::Mutex<[f64; 11]>,
 }
 
 enum Task {
@@ -1207,6 +1210,17 @@ impl Worker<'_> {
                     ));
                 }
                 self.c.rooted_done.fetch_add(1, Relaxed);
+                if let Some(d) = r.ediag {
+                    let mut a = self.c.rooted_ediag.lock().unwrap();
+                    for i in 0..4 {
+                        a[i] += d[i];
+                    }
+                    a[4] += d[3].abs();
+                    a[5] += 1.0;
+                    for i in 4..9 {
+                        a[i + 2] += d[i];
+                    }
+                }
                 if r.abandoned {
                     self.c.rooted_abandoned.fetch_add(1, Relaxed);
                 }
@@ -1962,27 +1976,41 @@ impl Worker<'_> {
             });
         }
         // Energy priors: each tier-1 sink value request also asks for its
-        // declaration's energy (a kid-less tier-2 row).
+        // declaration's energy (a kid-less tier-2 row); so does each rooted
+        // search's sink value request for energy-weighted targets.
         let mut en_idx = Vec::new();
         let mut decls = Vec::new();
-        if self.cfg.t1.energy_prior {
+        let rooted_energy = self.cfg.rooted.mean_too && self.cfg.rooted.energy_temp > 0.0;
+        if self.cfg.t1.energy_prior || rooted_energy {
             for &k in &val_idx {
                 let (ti, r) = reqs[k];
-                if let (Req::T1Value { t1, n }, Task::Search { t1: s, .. }) = (r, &tasks[ti]) {
-                    if n != NONE {
-                        let l = s.lattice(t1);
-                        decls.push(crate::lview::decl_state(
-                            &l.start,
-                            &l.nodes[n as usize].state.done,
-                        ));
-                        en_idx.push(k);
+                let l = match (r, &tasks[ti]) {
+                    (Req::T1Value { t1, n }, Task::Search { t1: s, .. })
+                        if n != NONE && self.cfg.t1.energy_prior =>
+                    {
+                        Some((s.lattice(t1), n))
                     }
+                    (Req::LatValue { n }, Task::Rooted { lat, .. } | Task::Anchor { lat, .. })
+                        if rooted_energy =>
+                    {
+                        Some((lat, n))
+                    }
+                    _ => None,
+                };
+                if let Some((l, n)) = l {
+                    decls.push(crate::lview::decl_state(
+                        &l.start,
+                        &l.nodes[n as usize].state.done,
+                    ));
+                    en_idx.push(k);
                 }
             }
         }
         for (&k, d) in en_idx.iter().zip(&decls) {
-            let (ti, Req::T1Value { t1, .. }) = reqs[k] else {
-                unreachable!()
+            let (ti, r) = reqs[k];
+            let t1 = match r {
+                Req::T1Value { t1, .. } => t1,
+                _ => NONE,
             };
             let l = lat_of(&tasks[ti], t1);
             ex_reqs.push(ExpandReq {
@@ -2073,12 +2101,16 @@ impl Worker<'_> {
             }
         }
         for (j, &k) in f.en_idx.iter().enumerate() {
-            let (ti, Req::T1Value { t1, n }) = reqs[k] else {
-                unreachable!()
-            };
-            if let Task::Search { t1: s, .. } = &mut tasks[ti] {
-                s.lattice_mut(t1)
-                    .feed_energy(n, outs[f.ex_idx.len() + j].energy);
+            let e = outs[f.ex_idx.len() + j].energy;
+            let (ti, r) = reqs[k];
+            match (r, &mut tasks[ti]) {
+                (Req::T1Value { t1, n }, Task::Search { t1: s, .. }) => {
+                    s.lattice_mut(t1).feed_energy(n, e)
+                }
+                (Req::LatValue { n }, Task::Rooted { lat, .. } | Task::Anchor { lat, .. }) => {
+                    lat.feed_energy(n, e)
+                }
+                _ => unreachable!("energy request and task disagree"),
             }
         }
         for (j, &k) in f.val_idx.iter().enumerate() {
@@ -2641,6 +2673,22 @@ fn rooted_phase(
             "  tier-2 phase calls: {}{}",
             crate::lattice_ort::call_hist_report(&hist0),
             crate::lattice_ort::cg_report()
+        );
+    }
+    let a = *c.rooted_ediag.lock().unwrap();
+    if a[5] > 0.0 {
+        eprintln!(
+            "  tier-2 phase energy weights: {:.1} distinct turns per search ({:.1}% with an energy, sd {:.3}), effective {:.1} (at temp 0.3 {:.1}, 0.1 {:.1}); node value weighted minus per-descent mean {:+.4} (mean |.| {:.4}; at temp 0.1 {:+.4}); energy-value correlation {:.3}",
+            a[0] / a[5],
+            100.0 * a[1] / a[0].max(1.0),
+            a[6] / a[5],
+            a[2] / a[5],
+            a[7] / a[5],
+            a[8] / a[5],
+            a[3] / a[5],
+            a[4] / a[5],
+            a[10] / a[5],
+            a[9] / a[5]
         );
     }
     let dropped = q.lock().unwrap().len();

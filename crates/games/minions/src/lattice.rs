@@ -2721,6 +2721,13 @@ pub struct RootedParams {
     /// each kid's value the MEAN of the complete turns below it (the node's
     /// the mean of all), and the prior softmax over those means.
     pub mean_too: bool,
+    /// With `mean_too`: weight the complete turns reached by softmax(energy
+    /// / this) (energy: the tier-2 net's logit for the turn's declaration,
+    /// trained on tier-1 visit shares), each distinct turn once, instead of
+    /// every descent equally. Kid values are the weighted means of the turns
+    /// containing them, kid counts their weighted shares (times the
+    /// descents), the node's value the weighted mean of all. 0: off.
+    pub energy_temp: f64,
 }
 
 impl Default for RootedParams {
@@ -2733,6 +2740,7 @@ impl Default for RootedParams {
             tau: 0.02,
             budget: 4000,
             mean_too: false,
+            energy_temp: 0.0,
         }
     }
 }
@@ -2751,6 +2759,13 @@ pub struct Rooted {
     pub record: Option<T2Record>,
     /// With `RootedParams::mean_too`: the record with mean targets.
     pub record_mean: Option<T2Record>,
+    /// With `RootedParams::energy_temp`: [distinct turns reached, those
+    /// with an energy, the weights' effective sample size, weighted minus
+    /// per-descent mean node value, the known energies' standard deviation,
+    /// the effective sample size at temperatures 0.3 and 0.1, the energies'
+    /// correlation with the turns' values, the weighted minus per-descent
+    /// mean node value at temperature 0.1].
+    pub ediag: Option<[f64; 9]>,
 }
 
 impl Rooted {
@@ -2782,6 +2797,7 @@ impl Rooted {
             abandoned: false,
             record: None,
             record_mean: None,
+            ediag: None,
         }
     }
 }
@@ -3394,6 +3410,65 @@ impl Lattice {
             r.record = self.rooted_record(r, p, false);
             if p.mean_too {
                 r.record_mean = self.rooted_record(r, p, true);
+                if p.energy_temp > 0.0 {
+                    if let Some(q) = r.record_mean.as_ref().map(|x| x.q) {
+                        let ws = self.energy_weights(r, p.energy_temp);
+                        let (s1, s2) = ws.iter().fold((0.0, 0.0), |a, w| (a.0 + w, a.1 + w * w));
+                        let eq = r.sinks.iter().map(|x| f64::from(x.1)).sum::<f64>()
+                            / r.sinks.len() as f64;
+                        let ev: Vec<(f64, f64)> = r
+                            .reached()
+                            .iter()
+                            .filter_map(|x| {
+                                self.nodes[x.0 as usize].energy.map(|e| (f64::from(e), x.2))
+                            })
+                            .collect();
+                        let es: Vec<f64> = ev.iter().map(|x| x.0).collect();
+                        let corr = {
+                            let k = ev.len().max(1) as f64;
+                            let (me, mv) = ev
+                                .iter()
+                                .fold((0.0, 0.0), |a, x| (a.0 + x.0 / k, a.1 + x.1 / k));
+                            let (mut c, mut se, mut sv) = (0.0, 0.0, 0.0);
+                            for x in &ev {
+                                c += (x.0 - me) * (x.1 - mv);
+                                se += (x.0 - me).powi(2);
+                                sv += (x.1 - mv).powi(2);
+                            }
+                            if se > 0.0 && sv > 0.0 {
+                                c / (se * sv).sqrt()
+                            } else {
+                                0.0
+                            }
+                        };
+                        let q01 = {
+                            let ws = self.energy_weights(r, 0.1);
+                            let rs = r.reached();
+                            rs.iter().zip(&ws).map(|(x, w)| w * x.2).sum::<f64>()
+                                / ws.iter().sum::<f64>()
+                        };
+                        let m = es.iter().sum::<f64>() / es.len().max(1) as f64;
+                        let sd = (es.iter().map(|e| (e - m).powi(2)).sum::<f64>()
+                            / es.len().max(1) as f64)
+                            .sqrt();
+                        let ess = |t: f64| {
+                            let ws = self.energy_weights(r, t);
+                            let (a, b) = ws.iter().fold((0.0, 0.0), |a, w| (a.0 + w, a.1 + w * w));
+                            a * a / b
+                        };
+                        r.ediag = Some([
+                            ws.len() as f64,
+                            es.len() as f64,
+                            s1 * s1 / s2,
+                            f64::from(q) - eq,
+                            sd,
+                            ess(0.3),
+                            ess(0.1),
+                            corr,
+                            q01 - eq,
+                        ]);
+                    }
+                }
             }
             return Ok(true);
         }
@@ -3425,7 +3500,10 @@ impl Lattice {
         if live.is_empty() {
             return None;
         }
-        if mean {
+        let mut q_w = None;
+        if mean && p.energy_temp > 0.0 {
+            q_w = Some(self.energy_weighted(r, p.energy_temp, &mut best, &mut cnt));
+        } else if mean {
             for &k in &live {
                 best[k] = sum[k] / cnt[k];
             }
@@ -3450,7 +3528,9 @@ impl Lattice {
             })
             .collect();
         let n = r.sinks.len() as f32;
-        let q = if mean {
+        let q = if let Some(q) = q_w {
+            q
+        } else if mean {
             r.sinks.iter().map(|x| x.1).sum::<f32>() / n
         } else {
             r.sinks
@@ -3465,6 +3545,61 @@ impl Lattice {
             q,
             ns: n,
         })
+    }
+
+    /// Energy-weighted targets (`RootedParams::energy_temp`): per kid of
+    /// `r.at`, the weighted mean value of the distinct complete turns reached
+    /// that contain it (into `best`) and their weighted share times the
+    /// descents (into `cnt`); returns the weighted mean over all turns.
+    /// Turns without an energy (terminal ones) get the known ones' mean.
+    fn energy_weighted(&self, r: &Rooted, temp: f64, best: &mut [f32], cnt: &mut [f32]) -> f32 {
+        let nd = &self.nodes[r.at as usize];
+        let reached = r.reached();
+        let ws = self.energy_weights(r, temp);
+        let total: f64 = ws.iter().sum();
+        let n = r.sinks.len() as f64;
+        let nk = nd.kids.len();
+        let (mut w, mut wv) = (vec![0f64; nk], vec![0f64; nk]);
+        for (x, &wt) in reached.iter().zip(&ws) {
+            let key = self.nodes[x.0 as usize].key;
+            for (k, kid) in nd.kids.iter().enumerate() {
+                if key.mask & (1 << kid.var) != 0 && key.get(kid.var as usize) == kid.choice {
+                    w[k] += wt;
+                    wv[k] += wt * x.2;
+                }
+            }
+        }
+        for k in 0..nk {
+            if cnt[k] > 0.0 && w[k] > 0.0 {
+                best[k] = (wv[k] / w[k]) as f32;
+                cnt[k] = (n * w[k] / total) as f32;
+            }
+        }
+        let q: f64 = reached.iter().zip(&ws).map(|(x, &wt)| wt * x.2).sum();
+        (q / total) as f32
+    }
+
+    /// Per distinct complete turn `r` reached (`Rooted::reached` order):
+    /// exp((energy - top) / temp), turns without an energy at the known
+    /// ones' mean.
+    fn energy_weights(&self, r: &Rooted, temp: f64) -> Vec<f64> {
+        let reached = r.reached();
+        let known: Vec<f64> = reached
+            .iter()
+            .filter_map(|x| self.nodes[x.0 as usize].energy)
+            .map(f64::from)
+            .collect();
+        let fill = if known.is_empty() {
+            0.0
+        } else {
+            known.iter().sum::<f64>() / known.len() as f64
+        };
+        let es: Vec<f64> = reached
+            .iter()
+            .map(|x| self.nodes[x.0 as usize].energy.map_or(fill, f64::from))
+            .collect();
+        let top = es.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        es.iter().map(|e| ((e - top) / temp).exp()).collect()
     }
 
     /// Run walk `w` until every descent in flight (up to `p.inflight` at a
@@ -4513,6 +4648,95 @@ pub(crate) mod tests {
                 "{total} records, {reached} reached"
             );
         }
+    }
+
+    /// Energy-weighted mean targets: each distinct complete turn reached
+    /// counts once, at softmax(energy / temp) (turns without an energy at
+    /// the known ones' mean); kids get the weighted mean of the turns
+    /// containing them and their weighted share of the descents.
+    #[test]
+    fn rooted_energy_targets() {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(9);
+        let p = RootedParams {
+            n: 40,
+            inflight: 4,
+            mean_too: true,
+            ..RootedParams::default()
+        };
+        let pe = RootedParams {
+            energy_temp: 0.7,
+            ..p.clone()
+        };
+        let mut total = 0;
+        for s in positions(4, 43) {
+            let mut l = Lattice::new(s.clone()).unwrap();
+            if l.terminal.is_some() {
+                continue;
+            }
+            let (sink, _, _) = l
+                .descend(&HashLatticeEval, Cursor::at(0, 0.0), 1.5)
+                .unwrap();
+            for n in l.path_to(sink, &mut rng).unwrap() {
+                let key = l.nodes[n as usize].key;
+                let mut f = Lattice::new(s.clone()).unwrap();
+                let at = f.reach(key).unwrap().unwrap();
+                let mut r = Rooted::new(at);
+                let mut needs = Vec::new();
+                while !f.advance_rooted(&mut r, &p, &mut needs).unwrap() {
+                    serve(&mut f, &mut needs);
+                }
+                if r.record.is_none() {
+                    continue;
+                }
+                let reached = r.reached();
+                // Pseudo-energies; every third turn has none.
+                for (i, x) in reached.iter().enumerate() {
+                    if i % 3 != 2 {
+                        f.feed_energy(x.0, ((x.0 * 7919) % 13) as f32 * 0.4 - 2.0);
+                    }
+                }
+                let known: Vec<f64> = reached
+                    .iter()
+                    .filter_map(|x| f.nodes[x.0 as usize].energy.map(f64::from))
+                    .collect();
+                let fill = known.iter().sum::<f64>() / known.len().max(1) as f64;
+                let ws: Vec<f64> = reached
+                    .iter()
+                    .map(|x| (f.nodes[x.0 as usize].energy.map_or(fill, f64::from) / 0.7).exp())
+                    .collect();
+                let wsum: f64 = ws.iter().sum();
+                let rec = f.rooted_record(&r, &pe, true).unwrap();
+                let q: f64 = reached.iter().zip(&ws).map(|(x, w)| w * x.2).sum::<f64>() / wsum;
+                assert!((f64::from(rec.q) - q).abs() < 1e-5, "{} vs {q}", rec.q);
+                let nd = &f.nodes[at as usize];
+                let mut share = 0.0;
+                for k in &rec.kids {
+                    let kid = nd
+                        .kids
+                        .iter()
+                        .find(|x| x.cell == k.0 && x.choice == k.1)
+                        .unwrap();
+                    let (mut w, mut wv) = (0.0, 0.0);
+                    for (x, &wt) in reached.iter().zip(&ws) {
+                        let sk = f.nodes[x.0 as usize].key;
+                        if sk.mask & (1 << kid.var) != 0 && sk.get(kid.var as usize) == kid.choice {
+                            w += wt;
+                            wv += wt * x.2;
+                        }
+                    }
+                    assert!(w > 0.0);
+                    assert!((f64::from(k.3) - wv / w).abs() < 1e-5);
+                    let c = r.sinks.len() as f64 * w / wsum;
+                    assert!((f64::from(k.4) - c).abs() < 1e-3 * c.max(1.0));
+                    share += c;
+                }
+                // Each turn fixes one choice per decided variable, so the
+                // shares per variable sum to the descents; overall at least.
+                assert!(share >= r.sinks.len() as f64 * 0.999);
+                total += 1;
+            }
+        }
+        assert!(total > 5, "{total} records");
     }
 
     /// `random_order`: every prepared node offers one variable's choices,

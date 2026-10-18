@@ -1091,6 +1091,13 @@ enum Cmd {
         /// --t2-sub t2m.
         #[arg(long)]
         rooted_mean_too: bool,
+        /// With --rooted-mean-too: weight the complete turns each rooted
+        /// search reached by softmax(energy / this) (the tier-2 net's energy
+        /// for the turn, each distinct turn once) instead of every descent
+        /// equally, for the kids' values and counts and the node's value
+        /// (0 = off; needs a lattice-view net with an energy output).
+        #[arg(long, default_value_t = 0.0)]
+        rooted_energy_temp: f64,
         /// Tier-2 phase: seconds (the nodes left are dropped), searches per
         /// worker at a time, descents in flight per search, and expansions
         /// per search before falling back to witness-following.
@@ -2140,7 +2147,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::LatticeGen {
             out, onnx, ep, batcher, workers, games, n1, inflight, n2, c1, c2, pw_c, pw_alpha, retries,
             temp1, anchor, game_log, game_log_t2_every, from_start, random_handicap, handicap_std, handicap, ramp_secs, stepwise, step_search, step_n1, step_temp, step_dir_alpha, step_dir_frac, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, start_turn_mean, start_turn_max, even_open_tau, even_open_tol, secs,
-            target_t2, target_t1, rooted_per_t1, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, cuda_graph, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, sd_frac, sd_descents, sd_tau, rooted_frac, rooted_n, rooted_min, rooted_tau, rooted_mean_too, rooted_secs, rooted_tasks, rooted_inflight, rooted_budget, walk_accumulated, sink_values, walk_inflight, walk_marginal, walk_cq, lview, energy_min_visits, teacher_view, energy_prior, energy_temp, value_prior_tau, quick, pipeline, openings, open_workers, pool, refill_to,
+            target_t2, target_t1, rooted_per_t1, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, cuda_graph, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, sd_frac, sd_descents, sd_tau, rooted_frac, rooted_n, rooted_min, rooted_tau, rooted_mean_too, rooted_energy_temp, rooted_secs, rooted_tasks, rooted_inflight, rooted_budget, walk_accumulated, sink_values, walk_inflight, walk_marginal, walk_cq, lview, energy_min_visits, teacher_view, energy_prior, energy_temp, value_prior_tau, quick, pipeline, openings, open_workers, pool, refill_to,
         } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
             if cuda_graph {
@@ -2231,6 +2238,7 @@ async fn main() -> anyhow::Result<()> {
                     tau: rooted_tau,
                     budget: rooted_budget,
                     mean_too: rooted_mean_too,
+                    energy_temp: rooted_energy_temp,
                 },
                 rooted_secs,
                 rooted_per_t1,
