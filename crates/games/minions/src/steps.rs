@@ -816,9 +816,9 @@ impl StepState {
         // may kill an undecided enemy to open a path.
         let own = wit.targets[e as usize];
         let (mut out, mut ws) = (vec![own], vec![*wit]);
-        cand_log::add(own, cand_log::OWN, std::time::Instant::now());
+        cand_log::add(own, cand_log::OWN, crate::clock::Tick::now());
         for v in [TARGET_STAY, TARGET_KILL, TARGET_UNSUMMON] {
-            let tc = std::time::Instant::now();
+            let tc = crate::clock::Tick::now();
             if v == own || v == TARGET_UNSUMMON && t.stats().persistent {
                 continue;
             }
@@ -929,7 +929,7 @@ impl StepState {
             k => k,
         };
         for k in 0..N_OFFSETS as u8 {
-            let tc = std::time::Instant::now();
+            let tc = crate::clock::Tick::now();
             let d = MOVE_DEST[c as usize][k as usize];
             if d == NO_CELL {
                 continue;
@@ -1035,7 +1035,7 @@ impl StepState {
     /// the movement constraints as a vertex-disjoint-paths max flow; kills are
     /// not modelled here.
     fn movers_completable(&self, spec: &TurnSpec, claimed: Bb, c: u8, k: u8) -> bool {
-        let t0 = std::time::Instant::now();
+        let t0 = crate::clock::Tick::now();
         let r = self.movers_completable_inner(spec, claimed, c, k);
         prof::add(6, t0);
         r
@@ -1524,7 +1524,7 @@ fn known_realizable(base: &MinionsState, spec: &TurnSpec) -> bool {
 /// time (six rotations of which target goes first). Incomplete: a miss is not
 /// a proof. Cheap enough for the witness swap checks.
 pub fn attack_part_fast(base: &MinionsState, spec: &TurnSpec) -> Option<MinionsState> {
-    let t0 = std::time::Instant::now();
+    let t0 = crate::clock::Tick::now();
     let r = attack_part_fast_inner(base, spec);
     prof::add(3, t0);
     r
@@ -1854,8 +1854,8 @@ pub mod prof {
     pub static TOTAL: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 
     #[inline]
-    pub fn add(i: usize, t0: std::time::Instant) {
-        let ns = t0.elapsed().as_nanos() as u64;
+    pub fn add(i: usize, t0: crate::clock::Tick) {
+        let ns = t0.ns();
         ACC.with(|a| {
             let mut v = a.get();
             v[i] += ns;
@@ -1919,9 +1919,9 @@ pub mod cand_log {
     }
 
     #[inline]
-    pub fn add(choice: u8, class: u8, t0: std::time::Instant) {
+    pub fn add(choice: u8, class: u8, t0: crate::clock::Tick) {
         if ON.with(|o| o.get()) {
-            let ns = t0.elapsed().as_nanos().min(u32::MAX as u128) as u32;
+            let ns = t0.ns().min(u64::from(u32::MAX)) as u32;
             LOG.with(|l| l.borrow_mut().push((choice, class, ns)));
         }
     }
@@ -3560,7 +3560,7 @@ fn kill_targets(
 /// the enemies in `open` are still unfated (they may be killed to open paths
 /// and hexes, so they are treated as removable).
 fn relaxed_feasible(base: &MinionsState, spec: &TurnSpec, decided: &[u8], open: Bb) -> bool {
-    let t0 = std::time::Instant::now();
+    let t0 = crate::clock::Tick::now();
     let r = relaxed_feasible_inner(base, spec, decided, open);
     prof::add(5, t0);
     r
@@ -3593,7 +3593,7 @@ fn relaxed_feasible_inner(base: &MinionsState, spec: &TurnSpec, decided: &[u8], 
 /// forced off claimed origins relocated, everyone else staying. `None` if no
 /// attempt realizes within the budget.
 fn build_witness(base: &MinionsState, spec: &TurnSpec, decided: &[u8]) -> Option<TurnSpec> {
-    let t0 = std::time::Instant::now();
+    let t0 = crate::clock::Tick::now();
     let r = build_witness_inner(base, spec, decided);
     prof::add(4, t0);
     r

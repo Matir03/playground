@@ -1184,7 +1184,7 @@ type Work = (StepState, Option<Option<Leaf>>);
 /// values come from below. A forced step that ends the turn or the game stays
 /// an ordinary, evaluated child. The leaf's own state is left as it is.
 fn build_one(s: &mut StepState) -> Option<Leaf> {
-    let tp = Instant::now();
+    let tp = crate::clock::Tick::now();
     let mut chain: Vec<(u8, StepState)> = Vec::new();
     let opts = loop {
         let cur = match chain.last_mut() {
@@ -1219,7 +1219,7 @@ fn build_one(s: &mut StepState) -> Option<Leaf> {
     let mut kids = Vec::with_capacity(opts.len());
     let mut views = Vec::with_capacity(opts.len());
     for v in opts {
-        let tp = Instant::now();
+        let tp = crate::clock::Tick::now();
         let c = e.child(v);
         crate::steps::prof::add(1, tp);
         let flip = c.flipped != e.flipped;
@@ -1227,7 +1227,7 @@ fn build_one(s: &mut StepState) -> Option<Leaf> {
             let tv = (c.terminal_value(), c.terminal_outcome());
             kids.push((v, flip, Some(tv), c));
         } else {
-            let tp = Instant::now();
+            let tp = crate::clock::Tick::now();
             views.push(c.view());
             crate::steps::prof::add(2, tp);
             kids.push((v, flip, None, c));

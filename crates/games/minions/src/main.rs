@@ -1028,6 +1028,11 @@ enum Cmd {
         lattice_ep: String,
         #[arg(long, default_value_t = 1)]
         lattice_sessions: usize,
+        /// Lattice nets on TensorRT: replay CUDA graphs, one per call-size
+        /// bucket (`LATTICE_CG1` / `LATTICE_CG2` / `LATTICE_CG_KIDS`); calls
+        /// past every bucket run plainly.
+        #[arg(long)]
+        cuda_graph: bool,
         #[arg(long, default_value_t = 20000)]
         chunk_records: usize,
         /// Also record non-root tier-1 turns with at least this many visits
@@ -2135,9 +2140,12 @@ async fn main() -> anyhow::Result<()> {
         Cmd::LatticeGen {
             out, onnx, ep, batcher, workers, games, n1, inflight, n2, c1, c2, pw_c, pw_alpha, retries,
             temp1, anchor, game_log, game_log_t2_every, from_start, random_handicap, handicap_std, handicap, ramp_secs, stepwise, step_search, step_n1, step_temp, step_dir_alpha, step_dir_frac, dir1_alpha, dir1_frac, temp2, dir2_alpha, dir2_frac, from_end_mean, from_end_median, start_turn_mean, start_turn_max, even_open_tau, even_open_tol, secs,
-            target_t2, target_t1, rooted_per_t1, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, sd_frac, sd_descents, sd_tau, rooted_frac, rooted_n, rooted_min, rooted_tau, rooted_mean_too, rooted_secs, rooted_tasks, rooted_inflight, rooted_budget, walk_accumulated, sink_values, walk_inflight, walk_marginal, walk_cq, lview, energy_min_visits, teacher_view, energy_prior, energy_temp, value_prior_tau, quick, pipeline, openings, open_workers, pool, refill_to,
+            target_t2, target_t1, rooted_per_t1, seed, chunk_records, no_lazy_witness, lattice_ep, lattice_sessions, cuda_graph, t1_min_visits, view_min_visits, t2_from_t1, distill_tau, distill_frac, sd_frac, sd_descents, sd_tau, rooted_frac, rooted_n, rooted_min, rooted_tau, rooted_mean_too, rooted_secs, rooted_tasks, rooted_inflight, rooted_budget, walk_accumulated, sink_values, walk_inflight, walk_marginal, walk_cq, lview, energy_min_visits, teacher_view, energy_prior, energy_temp, value_prior_tau, quick, pipeline, openings, open_workers, pool, refill_to,
         } => {
             minions_engine::steps::LAZY_WITNESS.store(!no_lazy_witness, std::sync::atomic::Ordering::Relaxed);
+            if cuda_graph {
+                std::env::set_var("LATTICE_CUDA_GRAPH", "1");
+            }
             // A directory is the lattice nets (tier1/tier2.onnx); a file a steps value net behind the bridge.
             let bridge: std::sync::Arc<dyn minions_engine::lattice::LatticeEval> = if std::path::Path::new(&onnx).is_dir() {
                 std::sync::Arc::new(minions_engine::lattice_ort::OrtLatticeEval::load(std::path::Path::new(&onnx), &lattice_ep, true, lattice_sessions)?)
@@ -2230,6 +2238,21 @@ async fn main() -> anyhow::Result<()> {
                 open_workers: if open_workers > 0 { open_workers } else { std::thread::available_parallelism().map_or(8, |n| n.get()) },
             };
             minions_engine::latgen::generate(&cfg, bridge)?;
+            // Everything is written. TensorRT/CUDA teardown can hang and
+            // crash (signal 11 after a 2.5 min hang, 2026-10-17, past a
+            // complete generation), and the cycle takes a non-zero status
+            // for a failed generation and regenerates it: leave without
+            // running destructors.
+            {
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                let _ = std::io::stderr().flush();
+                extern "C" {
+                    fn _exit(code: i32) -> !;
+                }
+                // SAFETY: plain process exit; no Rust state is needed after.
+                unsafe { _exit(0) }
+            }
         }
         Cmd::StepsSelfplay {
             out,

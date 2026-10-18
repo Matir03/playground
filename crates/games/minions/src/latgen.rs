@@ -2467,6 +2467,13 @@ pub fn generate(cfg: &GenConfig, eval: Arc<dyn LatticeEval>) -> Result<()> {
                         1e-6 * rp[1] / rp[4].max(1.0)
                     );
                 }
+                if stop.load(Relaxed) && done {
+                    eprintln!(
+                        "    runner calls: {}{}",
+                        crate::lattice_ort::call_hist_report(&[]),
+                        crate::lattice_ort::cg_report()
+                    );
+                }
                 last = (Instant::now(), ex, va, t2r);
             }
             if done {
@@ -2533,6 +2540,17 @@ fn rooted_phase(
         c.values.load(Relaxed),
         c.t2_records.load(Relaxed),
     );
+    // Baselines for the phase summary.
+    let (ev0, cpu0) = (c.eval_ns.load(Relaxed), c.cpu_ns.load(Relaxed));
+    let prof0: Vec<u64> = crate::lattice::PROF
+        .iter()
+        .map(|x| x.load(Relaxed))
+        .collect();
+    let run0: Vec<u64> = crate::lattice_ort::RUN_PROF
+        .iter()
+        .map(|x| x.load(Relaxed))
+        .collect();
+    let hist0 = crate::lattice_ort::call_hist_snapshot();
     eprintln!(
         "  tier-2 phase: {n} nodes queued, {} searches per worker, n {} (min {} per kid), {}",
         cfg.rooted_tasks,
@@ -2586,6 +2604,44 @@ fn rooted_phase(
     });
     for r in res {
         r?;
+    }
+    {
+        let el = t0.elapsed().as_secs_f64().max(1e-9);
+        let ev = (c.eval_ns.load(Relaxed) - ev0) as f64;
+        let cpu = (c.cpu_ns.load(Relaxed) - cpu0) as f64;
+        let tot = (ev + cpu).max(1.0);
+        let pr: Vec<f64> = crate::lattice::PROF
+            .iter()
+            .zip(&prof0)
+            .map(|(x, b)| (x.load(Relaxed) - b) as f64)
+            .collect();
+        let rp: Vec<f64> = crate::lattice_ort::RUN_PROF
+            .iter()
+            .zip(&run0)
+            .map(|(x, b)| (x.load(Relaxed) - b) as f64)
+            .collect();
+        eprintln!(
+            "  tier-2 phase thread time: eval share {:.0}%, prepare {:.0}%, stats {:.0}%, child {:.0}%",
+            100.0 * ev / tot,
+            100.0 * pr[0] / tot,
+            100.0 * pr[1] / tot,
+            100.0 * pr[2] / tot,
+        );
+        eprintln!(
+            "  tier-2 phase runner (of wall): run {:.0}% (tier 1 {:.0}%, tier-2 inputs {:.0}%, tier-2 session {:.0}%); {:.0} calls/s, {:.0} rows/call, {:.2} ms/call",
+            100.0 * rp[1] / (el * 1e9),
+            100.0 * rp[3] / (el * 1e9),
+            100.0 * rp[6] / (el * 1e9),
+            100.0 * rp[7] / (el * 1e9),
+            rp[4] / el,
+            rp[5] / rp[4].max(1.0),
+            1e-6 * rp[1] / rp[4].max(1.0)
+        );
+        eprintln!(
+            "  tier-2 phase calls: {}{}",
+            crate::lattice_ort::call_hist_report(&hist0),
+            crate::lattice_ort::cg_report()
+        );
     }
     let dropped = q.lock().unwrap().len();
     if dropped > 0 {

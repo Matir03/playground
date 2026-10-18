@@ -14,6 +14,7 @@
 pub mod assign;
 pub mod bfs;
 pub mod bitboard;
+pub mod clock;
 pub(crate) mod combine;
 pub mod eval;
 pub mod game;

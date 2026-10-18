@@ -40,6 +40,54 @@ const CELLS: usize = crate::map::NUM_CELLS;
 /// the tier-2 `Session::run` alone.
 pub static RUN_PROF: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
+/// Runner calls by size: tier-1 rows, tier-2 rows, tier-2 kids (flattened),
+/// each in power-of-two buckets (bucket `b` > 0 holds sizes in
+/// `[2^(b-1), 2^b)`; bucket 0 is empty calls).
+const HIST_B: usize = 21;
+pub static CALL_HIST: [[AtomicU64; HIST_B]; 3] =
+    [const { [const { AtomicU64::new(0) }; HIST_B] }; 3];
+
+fn hist_add(which: usize, x: usize) {
+    let b = (usize::BITS - x.leading_zeros()) as usize;
+    CALL_HIST[which][b.min(HIST_B - 1)].fetch_add(1, Relaxed);
+}
+
+/// [`CALL_HIST`] now, for [`call_hist_report`]'s baseline.
+pub fn call_hist_snapshot() -> Vec<u64> {
+    CALL_HIST
+        .iter()
+        .flat_map(|h| h.iter().map(|x| x.load(Relaxed)))
+        .collect()
+}
+
+/// Calls by size since `since` (a [`call_hist_snapshot`]): per kind, the
+/// share of calls in each bucket, as `<upper bound>:<percent>`.
+pub fn call_hist_report(since: &[u64]) -> String {
+    let now = call_hist_snapshot();
+    let names = ["tier-1 rows", "tier-2 rows", "tier-2 kids"];
+    let mut out = Vec::new();
+    for (k, name) in names.iter().enumerate() {
+        let d: Vec<u64> = (0..HIST_B)
+            .map(|b| now[k * HIST_B + b] - since.get(k * HIST_B + b).copied().unwrap_or(0))
+            .collect();
+        let tot: u64 = d.iter().sum();
+        if tot == 0 {
+            continue;
+        }
+        let parts: Vec<String> = d
+            .iter()
+            .enumerate()
+            .filter(|(_, &x)| 100 * x >= tot)
+            .map(|(b, &x)| {
+                let hi = if b == 0 { 0 } else { (1usize << b) - 1 };
+                format!("<={hi}:{:.0}%", 100.0 * x as f64 / tot as f64)
+            })
+            .collect();
+        out.push(format!("{name} {}", parts.join(" ")));
+    }
+    out.join("; ")
+}
+
 fn push_view(v: &View, idx: &mut Vec<i32>, scal: &mut Vec<f32>) {
     let mut act = Vec::with_capacity(MAX_ACTIVE);
     let mut sc = [0f32; N_SCALARS];
@@ -163,7 +211,14 @@ impl Drop for OrtLatticeEval {
 /// `gather`: `tier2.onnx` takes the call's distinct trunk images (`hs`) and
 /// each row's index into them (`hidx`) rather than an image per row (`h`;
 /// nets exported before 2026-10-05).
-fn run_batch(s1: &mut Session, s2: &mut Session, c: usize, gather: bool, b: Batch) -> Result<Outs> {
+fn run_batch(
+    s1: &mut Session,
+    s2: &mut Session,
+    mut g: Option<&mut Graphs>,
+    c: usize,
+    gather: bool,
+    b: Batch,
+) -> Result<Outs> {
     use ort::value::Tensor;
     let e = |e: ort::Error| anyhow::anyhow!("{e}");
     let hw = c * CELLS;
@@ -171,23 +226,36 @@ fn run_batch(s1: &mut Session, s2: &mut Session, c: usize, gather: bool, b: Batc
     let t0 = std::time::Instant::now();
     if b.n1 > 0 {
         anyhow::ensure!(b.n1 <= MAX_ROWS, "tier-1 batch {} over the profile", b.n1);
-        let n1 = b.n1 as i64;
-        let outs = s1
+        let graphed = match g.as_mut() {
+            Some(gr) => gr.tier1(b.n1, &b.ridx, &b.rscal)?,
+            None => None,
+        };
+        if let Some((v1, h)) = graphed {
+            CG_CALLS[0].fetch_add(1, Relaxed);
+            out.v1 = v1;
+            out.h = h.chunks(hw).map(Trunk::from).collect();
+        } else {
+            if g.is_some() {
+                CG_CALLS[2].fetch_add(1, Relaxed);
+            }
+            let n1 = b.n1 as i64;
+            let outs = s1
             .run(ort::inputs![
                 "ridx" => Tensor::from_array((vec![n1, MAX_ACTIVE as i64], b.ridx)).map_err(e)?,
                 "rscal" => Tensor::from_array((vec![n1, N_SCALARS as i64], b.rscal)).map_err(e)?,
             ])
             .map_err(e)?;
-        let (_, v1) = outs["v1"].try_extract_tensor::<f32>().map_err(e)?;
-        let (_, h) = outs["h"].try_extract_tensor::<f16>().map_err(e)?;
-        anyhow::ensure!(
-            h.len() == b.n1 * hw,
-            "tier1 h has {} values, expected {}",
-            h.len(),
-            b.n1 * hw
-        );
-        out.v1 = v1.to_vec();
-        out.h = h.chunks(hw).map(Trunk::from).collect();
+            let (_, v1) = outs["v1"].try_extract_tensor::<f32>().map_err(e)?;
+            let (_, h) = outs["h"].try_extract_tensor::<f16>().map_err(e)?;
+            anyhow::ensure!(
+                h.len() == b.n1 * hw,
+                "tier1 h has {} values, expected {}",
+                h.len(),
+                b.n1 * hw
+            );
+            out.v1 = v1.to_vec();
+            out.h = h.chunks(hw).map(Trunk::from).collect();
+        }
     }
     RUN_PROF[3].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
     let n2 = b.kids.len();
@@ -238,29 +306,47 @@ fn run_batch(s1: &mut Session, s2: &mut Session, c: usize, gather: bool, b: Batc
         let nh = (h.len() / hw) as i64;
         RUN_PROF[6].fetch_add(t_prep.elapsed().as_nanos() as u64, Relaxed);
         let t_run = std::time::Instant::now();
-        let outs = if gather {
-            s2.run(ort::inputs![
-                "hs" => Tensor::from_array((vec![nh, c as i64, 7, 7], h)).map_err(e)?,
-                "hidx" => Tensor::from_array((vec![n], hidx)).map_err(e)?,
-                "nidx" => Tensor::from_array((vec![n, a], b.nidx)).map_err(e)?,
-                "nscal" => Tensor::from_array((vec![n, sc], b.nscal)).map_err(e)?,
-                "kid" => Tensor::from_array((vec![t as i64], kid)).map_err(e)?,
-            ])
-        } else {
-            s2.run(ort::inputs![
-                "h" => Tensor::from_array((vec![n, c as i64, 7, 7], h)).map_err(e)?,
-                "nidx" => Tensor::from_array((vec![n, a], b.nidx)).map_err(e)?,
-                "nscal" => Tensor::from_array((vec![n, sc], b.nscal)).map_err(e)?,
-                "kid" => Tensor::from_array((vec![t as i64], kid)).map_err(e)?,
-            ])
-        }
-        .map_err(e)?;
-        RUN_PROF[7].fetch_add(t_run.elapsed().as_nanos() as u64, Relaxed);
-        let get = |name: &str| -> Result<Vec<f32>> {
-            let (_, v) = outs[name].try_extract_tensor::<f32>().map_err(e)?;
-            Ok(v.to_vec())
+        let graphed = match g.as_mut() {
+            Some(gr) if gather => gr.tier2(n2, &h, &hidx, &b.nidx, &b.nscal, &kid)?,
+            _ => None,
         };
-        let (logit, value, v2) = (get("logit")?, get("value")?, get("v2")?);
+        let (logit, value, v2, energy) = if let Some(x) = graphed {
+            CG_CALLS[1].fetch_add(1, Relaxed);
+            x
+        } else {
+            if g.is_some() {
+                CG_CALLS[3].fetch_add(1, Relaxed);
+            }
+            let outs = if gather {
+                s2.run(ort::inputs![
+                    "hs" => Tensor::from_array((vec![nh, c as i64, 7, 7], h)).map_err(e)?,
+                    "hidx" => Tensor::from_array((vec![n], hidx)).map_err(e)?,
+                    "nidx" => Tensor::from_array((vec![n, a], b.nidx)).map_err(e)?,
+                    "nscal" => Tensor::from_array((vec![n, sc], b.nscal)).map_err(e)?,
+                    "kid" => Tensor::from_array((vec![t as i64], kid)).map_err(e)?,
+                ])
+            } else {
+                s2.run(ort::inputs![
+                    "h" => Tensor::from_array((vec![n, c as i64, 7, 7], h)).map_err(e)?,
+                    "nidx" => Tensor::from_array((vec![n, a], b.nidx)).map_err(e)?,
+                    "nscal" => Tensor::from_array((vec![n, sc], b.nscal)).map_err(e)?,
+                    "kid" => Tensor::from_array((vec![t as i64], kid)).map_err(e)?,
+                ])
+            }
+            .map_err(e)?;
+            let get = |name: &str| -> Result<Vec<f32>> {
+                let (_, v) = outs[name].try_extract_tensor::<f32>().map_err(e)?;
+                Ok(v.to_vec())
+            };
+            let (logit, value, v2) = (get("logit")?, get("value")?, get("v2")?);
+            let energy = if outs.contains_key("energy") {
+                get("energy")?
+            } else {
+                vec![f32::NAN; v2.len()]
+            };
+            (logit, value, v2, energy)
+        };
+        RUN_PROF[7].fetch_add(t_run.elapsed().as_nanos() as u64, Relaxed);
         let per = |x: &[f32]| -> Vec<Vec<f32>> {
             let mut at = 0;
             b.kids
@@ -272,17 +358,431 @@ fn run_batch(s1: &mut Session, s2: &mut Session, c: usize, gather: bool, b: Batc
                 })
                 .collect()
         };
-        out.energy = if outs.contains_key("energy") {
-            get("energy")?
-        } else {
-            vec![f32::NAN; v2.len()]
-        };
+        out.energy = energy;
         out.logit = per(&logit);
         out.value = per(&value);
         out.v2 = v2;
     }
     RUN_PROF[1].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
     Ok(out)
+}
+
+/// The CUDA runtime entry points the graph path needs, from the `libcudart`
+/// ORT already loaded.
+struct Cuda {
+    _lib: libloading::Library,
+    memcpy_async: unsafe extern "C" fn(*mut u8, *const u8, usize, i32, *mut u8) -> i32,
+    stream_sync: unsafe extern "C" fn(*mut u8) -> i32,
+    /// This runner's non-blocking stream: copies must not serialize against
+    /// ORT's streams or the other runners'.
+    stream: *mut u8,
+}
+
+// SAFETY: the stream handle is usable from any thread; one runner owns it.
+unsafe impl Send for Cuda {}
+
+impl Cuda {
+    fn load() -> Result<Self> {
+        type StreamCreate = unsafe extern "C" fn(*mut *mut u8, u32) -> i32;
+        // SAFETY: loading the CUDA runtime and resolving documented symbols
+        // with their documented signatures.
+        unsafe {
+            let lib = libloading::Library::new("libcudart.so.12")
+                .or_else(|_| libloading::Library::new("libcudart.so.13"))?;
+            let memcpy_async =
+                *lib.get::<unsafe extern "C" fn(*mut u8, *const u8, usize, i32, *mut u8) -> i32>(
+                    b"cudaMemcpyAsync\0",
+                )?;
+            let stream_sync =
+                *lib.get::<unsafe extern "C" fn(*mut u8) -> i32>(b"cudaStreamSynchronize\0")?;
+            let create = *lib.get::<StreamCreate>(b"cudaStreamCreateWithFlags\0")?;
+            let mut stream: *mut u8 = std::ptr::null_mut();
+            // cudaStreamNonBlocking = 1
+            let rc = create(&mut stream, 1);
+            anyhow::ensure!(rc == 0, "cudaStreamCreateWithFlags failed: {rc}");
+            Ok(Cuda {
+                _lib: lib,
+                memcpy_async,
+                stream_sync,
+                stream,
+            })
+        }
+    }
+
+    /// Queue a host -> device copy of `src` to device address `dst`.
+    fn h2d<T>(&self, dst: usize, src: &[T]) -> Result<()> {
+        if src.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: `dst` is a bound buffer at least this long (the caller
+        // checked the bucket), `src` lives until `sync`.
+        let rc = unsafe {
+            (self.memcpy_async)(
+                dst as *mut u8,
+                src.as_ptr() as *const u8,
+                std::mem::size_of_val(src),
+                1,
+                self.stream,
+            )
+        };
+        anyhow::ensure!(rc == 0, "cudaMemcpyAsync (to device) failed: {rc}");
+        Ok(())
+    }
+
+    /// Queue a device -> host copy into `dst` from device address `src`.
+    fn d2h<T>(&self, dst: &mut [T], src: usize) -> Result<()> {
+        if dst.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: as `h2d`.
+        let rc = unsafe {
+            (self.memcpy_async)(
+                dst.as_mut_ptr() as *mut u8,
+                src as *const u8,
+                std::mem::size_of_val(dst),
+                2,
+                self.stream,
+            )
+        };
+        anyhow::ensure!(rc == 0, "cudaMemcpyAsync (to host) failed: {rc}");
+        Ok(())
+    }
+
+    /// Wait for this runner's queued copies.
+    fn sync(&self) -> Result<()> {
+        // SAFETY: our own stream.
+        let rc = unsafe { (self.stream_sync)(self.stream) };
+        anyhow::ensure!(rc == 0, "cudaStreamSynchronize failed: {rc}");
+        Ok(())
+    }
+}
+
+/// One captured CUDA graph: a session (TensorRT keeps one graph per
+/// session) replaying a fixed shape, its inputs and outputs bound at fixed
+/// device addresses (`dev`: name -> address).
+struct Graph {
+    /// Tier 1: rows. Tier 2: rows, kids (flattened), distinct trunks.
+    rows: usize,
+    kids: usize,
+    trunks: usize,
+    sess: Session,
+    bind: ort::session::IoBinding,
+    dev: HashMap<&'static str, usize>,
+    /// The input tensors (the binding only refers to them).
+    _keep: Vec<ort::value::DynValue>,
+}
+
+impl Graph {
+    fn run(&mut self) -> Result<()> {
+        let e = |e: ort::Error| anyhow::anyhow!("{e}");
+        drop(self.sess.run_binding(&self.bind).map_err(e)?);
+        self.bind.synchronize_outputs().map_err(e)
+    }
+}
+
+/// CUDA-graph replays for the lattice nets (`LATTICE_CUDA_GRAPH=1`;
+/// TensorRT, trunk-gather nets): one graph per row-count bucket and tier.
+/// A call goes to the smallest bucket it fits, its real rows copied over
+/// the bucket's buffers; the rows past them keep an earlier call's (valid)
+/// inputs, and their outputs are not read. Calls no bucket fits use the
+/// plain sessions. Replays skip the per-kernel launch cost that dominates
+/// small calls (2026-10-14: 16 rows 3.05 -> 1.08 ms, 128 rows 4.42 -> 2.44
+/// ms, copies included).
+struct Graphs {
+    cuda: Cuda,
+    g1: Vec<Graph>,
+    g2: Vec<Graph>,
+    c: usize,
+    _alloc: ort::memory::Allocator,
+}
+
+/// `LATTICE_CG1` / `LATTICE_CG2`: the buckets' row counts (comma-separated;
+/// tier 1 16..256, tier 2 16..1024: self-play's tier-2 calls run to ~1000
+/// rows, its tier-1 calls under 64); `LATTICE_CG_KIDS`: tier-2 kids per
+/// bucket row (default 48).
+fn cg_buckets(var: &str) -> Vec<usize> {
+    std::env::var(var)
+        .ok()
+        .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_else(|| {
+            if var == "LATTICE_CG2" {
+                vec![16, 32, 64, 128, 256, 512, 1024]
+            } else {
+                vec![16, 32, 64, 128, 256]
+            }
+        })
+}
+
+fn cg_kids_per_row() -> usize {
+    std::env::var("LATTICE_CG_KIDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(48)
+}
+
+pub fn cuda_graph_on() -> bool {
+    std::env::var("LATTICE_CUDA_GRAPH").is_ok_and(|v| v == "1")
+}
+
+impl Graphs {
+    /// Build every bucket's session on one engine per tier (profile 1 row
+    /// up to the largest bucket, cached beside the plain engine), bind its
+    /// buffers, fill them with valid inputs and capture its graph.
+    fn build(dir: &Path, fp16: bool, c: usize) -> Result<Self> {
+        use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType};
+        use ort::value::Tensor;
+        let e = |e: ort::Error| anyhow::anyhow!("{e}");
+        let b1 = cg_buckets("LATTICE_CG1");
+        let b2 = cg_buckets("LATTICE_CG2");
+        let kpr = cg_kids_per_row();
+        let m1 = *b1.iter().max().unwrap_or(&16);
+        let m2 = *b2.iter().max().unwrap_or(&16);
+        let p1 = |b: usize| format!("ridx:{b}x{MAX_ACTIVE},rscal:{b}x{N_SCALARS}");
+        let p2 = |b: usize, t: usize| {
+            format!("hs:{b}x{c}x7x7,hidx:{b},nidx:{b}x{MAX_ACTIVE},nscal:{b}x{N_SCALARS},kid:{t}")
+        };
+        let mk1 = || {
+            let p = dir.join("tier1.onnx");
+            let cache = dir
+                .join("tier1_cg.trt_cache")
+                .to_string_lossy()
+                .into_owned();
+            crate::ort_net::build_trt_profile_graph(
+                &p,
+                fp16,
+                &cache,
+                &p1(1),
+                &p1(m1.min(128)),
+                &p1(m1),
+                true,
+            )
+        };
+        let mk2 = || {
+            let p = dir.join("tier2.onnx");
+            let cache = dir
+                .join("tier2_cg.trt_cache")
+                .to_string_lossy()
+                .into_owned();
+            crate::ort_net::build_trt_profile_graph(
+                &p,
+                fp16,
+                &cache,
+                &p2(1, 1),
+                &p2(m2.min(128), m2.min(128) * kpr),
+                &p2(m2, m2 * kpr),
+                true,
+            )
+        };
+        let cuda = Cuda::load()?;
+        let first = mk1()?;
+        let mem = MemoryInfo::new(
+            AllocationDevice::CUDA,
+            0,
+            AllocatorType::Device,
+            MemoryType::Default,
+        )
+        .map_err(e)?;
+        let alloc = Allocator::new(&first, mem).map_err(e)?;
+        let hw = c * CELLS;
+        let mut first = Some(first);
+        let mut g1 = Vec::new();
+        for &b in &b1 {
+            let sess = match first.take() {
+                Some(s) => s,
+                None => mk1()?,
+            };
+            let mut ridx = Tensor::<i32>::new(&alloc, [b, MAX_ACTIVE]).map_err(e)?;
+            let mut rscal = Tensor::<f32>::new(&alloc, [b, N_SCALARS]).map_err(e)?;
+            let mut v1 = Tensor::<f32>::new(&alloc, [b]).map_err(e)?;
+            let mut h = Tensor::<f16>::new(&alloc, [b, c, 7, 7]).map_err(e)?;
+            let mut dev = HashMap::new();
+            dev.insert("ridx", ridx.data_ptr_mut() as usize);
+            dev.insert("rscal", rscal.data_ptr_mut() as usize);
+            dev.insert("v1", v1.data_ptr_mut() as usize);
+            dev.insert("h", h.data_ptr_mut() as usize);
+            cuda.h2d(dev["ridx"], &vec![SPARSE_DIM as i32; b * MAX_ACTIVE])?;
+            cuda.h2d(dev["rscal"], &vec![0f32; b * N_SCALARS])?;
+            cuda.sync()?;
+            let mut bind = sess.create_binding().map_err(e)?;
+            bind.bind_input("ridx", &ridx).map_err(e)?;
+            bind.bind_input("rscal", &rscal).map_err(e)?;
+            bind.bind_output("v1", v1).map_err(e)?;
+            bind.bind_output("h", h).map_err(e)?;
+            let mut g = Graph {
+                rows: b,
+                kids: 0,
+                trunks: 0,
+                sess,
+                bind,
+                dev,
+                _keep: vec![ridx.into_dyn(), rscal.into_dyn()],
+            };
+            // The first runs are regular; capture happens on a later one.
+            for _ in 0..3 {
+                g.run()?;
+            }
+            g1.push(g);
+        }
+        let mut g2 = Vec::new();
+        for &b in &b2 {
+            let sess = mk2()?;
+            let t = b * kpr;
+            let has_energy = sess.outputs().iter().any(|o| o.name() == "energy");
+            let mut hs = Tensor::<f16>::new(&alloc, [b, c, 7, 7]).map_err(e)?;
+            let mut hidx = Tensor::<i32>::new(&alloc, [b]).map_err(e)?;
+            let mut nidx = Tensor::<i32>::new(&alloc, [b, MAX_ACTIVE]).map_err(e)?;
+            let mut nscal = Tensor::<f32>::new(&alloc, [b, N_SCALARS]).map_err(e)?;
+            let mut kid = Tensor::<i32>::new(&alloc, [t]).map_err(e)?;
+            let mut logit = Tensor::<f32>::new(&alloc, [t]).map_err(e)?;
+            let mut value = Tensor::<f32>::new(&alloc, [t]).map_err(e)?;
+            let mut v2 = Tensor::<f32>::new(&alloc, [b]).map_err(e)?;
+            let mut dev = HashMap::new();
+            dev.insert("hs", hs.data_ptr_mut() as usize);
+            dev.insert("hidx", hidx.data_ptr_mut() as usize);
+            dev.insert("nidx", nidx.data_ptr_mut() as usize);
+            dev.insert("nscal", nscal.data_ptr_mut() as usize);
+            dev.insert("kid", kid.data_ptr_mut() as usize);
+            dev.insert("logit", logit.data_ptr_mut() as usize);
+            dev.insert("value", value.data_ptr_mut() as usize);
+            dev.insert("v2", v2.data_ptr_mut() as usize);
+            cuda.h2d(dev["hs"], &vec![f16::ZERO; b * hw])?;
+            cuda.h2d(dev["hidx"], &vec![0i32; b])?;
+            cuda.h2d(dev["nidx"], &vec![SPARSE_DIM as i32; b * MAX_ACTIVE])?;
+            cuda.h2d(dev["nscal"], &vec![0f32; b * N_SCALARS])?;
+            cuda.h2d(dev["kid"], &vec![0i32; t])?;
+            cuda.sync()?;
+            let mut bind = sess.create_binding().map_err(e)?;
+            bind.bind_input("hs", &hs).map_err(e)?;
+            bind.bind_input("hidx", &hidx).map_err(e)?;
+            bind.bind_input("nidx", &nidx).map_err(e)?;
+            bind.bind_input("nscal", &nscal).map_err(e)?;
+            bind.bind_input("kid", &kid).map_err(e)?;
+            bind.bind_output("logit", logit).map_err(e)?;
+            bind.bind_output("value", value).map_err(e)?;
+            bind.bind_output("v2", v2).map_err(e)?;
+            if has_energy {
+                let mut en = Tensor::<f32>::new(&alloc, [b]).map_err(e)?;
+                dev.insert("energy", en.data_ptr_mut() as usize);
+                bind.bind_output("energy", en).map_err(e)?;
+            }
+            let mut g = Graph {
+                rows: b,
+                kids: t,
+                trunks: b,
+                sess,
+                bind,
+                dev,
+                _keep: vec![
+                    hs.into_dyn(),
+                    hidx.into_dyn(),
+                    nidx.into_dyn(),
+                    nscal.into_dyn(),
+                    kid.into_dyn(),
+                ],
+            };
+            for _ in 0..3 {
+                g.run()?;
+            }
+            g2.push(g);
+        }
+        g1.sort_by_key(|g| g.rows);
+        g2.sort_by_key(|g| g.rows);
+        Ok(Graphs {
+            cuda,
+            g1,
+            g2,
+            c,
+            _alloc: alloc,
+        })
+    }
+
+    /// Tier 1 on the smallest bucket with room for `n1` rows, if any:
+    /// (values, trunk images).
+    fn tier1(
+        &mut self,
+        n1: usize,
+        ridx: &[i32],
+        rscal: &[f32],
+    ) -> Result<Option<(Vec<f32>, Vec<f16>)>> {
+        let Some(g) = self.g1.iter_mut().find(|g| g.rows >= n1) else {
+            return Ok(None);
+        };
+        let hw = self.c * CELLS;
+        self.cuda.h2d(g.dev["ridx"], ridx)?;
+        self.cuda.h2d(g.dev["rscal"], rscal)?;
+        self.cuda.sync()?;
+        g.run()?;
+        let mut v1 = vec![0f32; n1];
+        let mut h = vec![f16::ZERO; n1 * hw];
+        self.cuda.d2h(&mut v1, g.dev["v1"])?;
+        self.cuda.d2h(&mut h, g.dev["h"])?;
+        self.cuda.sync()?;
+        Ok(Some((v1, h)))
+    }
+
+    /// Tier 2 on the smallest bucket with room, if any: (logits, values,
+    /// node values, energies or NaN).
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn tier2(
+        &mut self,
+        n2: usize,
+        hs: &[f16],
+        hidx: &[i32],
+        nidx: &[i32],
+        nscal: &[f32],
+        kid: &[i32],
+    ) -> Result<Option<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)>> {
+        let hw = self.c * CELLS;
+        let nh = hs.len() / hw;
+        let t = kid.len();
+        let Some(g) = self
+            .g2
+            .iter_mut()
+            .find(|g| g.rows >= n2 && g.kids >= t && g.trunks >= nh)
+        else {
+            return Ok(None);
+        };
+        let cu = &self.cuda;
+        cu.h2d(g.dev["hs"], hs)?;
+        cu.h2d(g.dev["hidx"], hidx)?;
+        cu.h2d(g.dev["nidx"], nidx)?;
+        cu.h2d(g.dev["nscal"], nscal)?;
+        cu.h2d(g.dev["kid"], kid)?;
+        cu.sync()?;
+        g.run()?;
+        let mut logit = vec![0f32; t];
+        let mut value = vec![0f32; t];
+        let mut v2 = vec![0f32; n2];
+        cu.d2h(&mut logit, g.dev["logit"])?;
+        cu.d2h(&mut value, g.dev["value"])?;
+        cu.d2h(&mut v2, g.dev["v2"])?;
+        let energy = match g.dev.get("energy") {
+            Some(&p) => {
+                let mut en = vec![0f32; n2];
+                cu.d2h(&mut en, p)?;
+                en
+            }
+            None => vec![f32::NAN; n2],
+        };
+        cu.sync()?;
+        Ok(Some((logit, value, v2, energy)))
+    }
+}
+
+/// Graph replays served (tier 1, tier 2) and calls that fell back to the
+/// plain sessions (tier 1, tier 2).
+pub static CG_CALLS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// [`CG_CALLS`] so far, for status lines (empty with graphs off).
+pub fn cg_report() -> String {
+    let c: Vec<u64> = CG_CALLS.iter().map(|x| x.load(Relaxed)).collect();
+    if c.iter().all(|&x| x == 0) {
+        return String::new();
+    }
+    format!(
+        "; CUDA graphs: tier 1 {} replays + {} plain, tier 2 {} + {}",
+        c[0], c[2], c[1], c[3]
+    )
 }
 
 /// Rows a call waits for (`LATTICE_MIN_ROWS`, default 1024) and the
@@ -307,13 +807,23 @@ fn batch_wait() -> std::time::Duration {
     }))
 }
 
-fn runner(mut s1: Session, mut s2: Session, c: usize, gather: bool, q: &Queue) {
+fn runner(
+    mut s1: Session,
+    mut s2: Session,
+    mut graphs: Option<Graphs>,
+    c: usize,
+    gather: bool,
+    q: &Queue,
+) {
     loop {
         let mut jobs = Vec::new();
         {
             let mut g = q.q.lock().unwrap_or_else(|p| p.into_inner());
             while g.is_empty() {
                 if q.closed.load(std::sync::atomic::Ordering::Acquire) {
+                    // TensorRT sessions can abort the process at teardown
+                    // (see `ort_net::OrtNet`'s drop): leak the graphs'.
+                    std::mem::forget(graphs.take());
                     return;
                 }
                 g = q.cv.wait(g).unwrap_or_else(|p| p.into_inner());
@@ -354,8 +864,11 @@ fn runner(mut s1: Session, mut s2: Session, c: usize, gather: bool, q: &Queue) {
             all.append(j.batch);
         }
         let rows = all.rows();
+        hist_add(0, all.n1);
+        hist_add(1, all.kids.len());
+        hist_add(2, all.kids.iter().map(Vec::len).sum());
         RUN_PROF[0].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
-        match run_batch(&mut s1, &mut s2, c, gather, all) {
+        match run_batch(&mut s1, &mut s2, graphs.as_mut(), c, gather, all) {
             Ok(o) => {
                 let t2 = std::time::Instant::now();
                 RUN_PROF[4].fetch_add(1, Relaxed);
@@ -451,8 +964,15 @@ impl OrtLatticeEval {
                 p2(1024, 32 * 1024, 64),
                 p2(MAX_ROWS, MAX_TOTAL_KIDS, MAX_ROWS),
             )?;
+            let graphs = if ep == "trt" && gather && cuda_graph_on() {
+                Some(Graphs::build(dir, fp16, c)?)
+            } else {
+                None
+            };
             let q = queue.clone();
-            hs.push(std::thread::spawn(move || runner(s1, s2, c, gather, &q)));
+            hs.push(std::thread::spawn(move || {
+                runner(s1, s2, graphs, c, gather, &q)
+            }));
         }
         Ok(OrtLatticeEval {
             queue,
@@ -692,7 +1212,7 @@ mod tests {
         for round in 0..32 {
             for (i, &(n1, n2, k)) in shapes.iter().enumerate() {
                 let t0 = std::time::Instant::now();
-                run_batch(&mut s1, &mut s2, c, gather, batch(n1, n2, k)).unwrap();
+                run_batch(&mut s1, &mut s2, None, c, gather, batch(n1, n2, k)).unwrap();
                 if round >= 2 {
                     times[i].push(t0.elapsed().as_secs_f64() * 1e3);
                 }
@@ -705,6 +1225,214 @@ mod tests {
                 t[t.len() / 2]
             );
         }
+    }
+
+    /// The runner's CUDA-graph path against the plain sessions on random
+    /// batches shaped like self-play's (tier-1 rows, tier-2 rows on given
+    /// trunks shared between rows and on the batch's own tier-1 rows,
+    /// 1..64 kids per row), timing both. `LATTICE_DIR` names the nets;
+    /// `LATTICE_CG1` / `LATTICE_CG2` / `LATTICE_CG_KIDS` the buckets.
+    #[test]
+    #[ignore]
+    fn cuda_graph_runner_parity() {
+        let Ok(dir) = std::env::var("LATTICE_DIR") else {
+            eprintln!("set LATTICE_DIR");
+            return;
+        };
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("ort=warn"))
+            .try_init();
+        let dir = Path::new(&dir);
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("lattice.json")).unwrap())
+                .unwrap();
+        let c = meta["c_trunk"].as_u64().unwrap() as usize;
+        assert!(meta["trunk_gather"].as_bool().unwrap_or(false));
+        let slots = if meta["lview"].as_bool().unwrap_or(false) {
+            crate::lview::NET_SLOTS
+        } else {
+            SLOTS
+        };
+        let p1 = |b: usize| format!("ridx:{b}x{MAX_ACTIVE},rscal:{b}x{N_SCALARS}");
+        let p2 = |b: usize, t: usize, u: usize| {
+            format!("hs:{u}x{c}x7x7,hidx:{b},nidx:{b}x{MAX_ACTIVE},nscal:{b}x{N_SCALARS},kid:{t}")
+        };
+        let build = |name: &str, min: String, opt: String, max: String| {
+            let p = dir.join(name);
+            let cache = p.with_extension("trt_cache").to_string_lossy().into_owned();
+            crate::ort_net::build_trt_profile(&p, true, &cache, &min, &opt, &max).unwrap()
+        };
+        let mut s1 = build("tier1.onnx", p1(1), p1(128), p1(MAX_ROWS));
+        let mut s2 = build(
+            "tier2.onnx",
+            p2(1, 1, 1),
+            p2(1024, 32 * 1024, 64),
+            p2(MAX_ROWS, MAX_TOTAL_KIDS, MAX_ROWS),
+        );
+        let t0 = std::time::Instant::now();
+        let mut graphs = Graphs::build(dir, true, c).unwrap();
+        eprintln!(
+            "graphs built in {:.1}s: tier 1 {:?}, tier 2 {:?}",
+            t0.elapsed().as_secs_f64(),
+            graphs.g1.iter().map(|g| g.rows).collect::<Vec<_>>(),
+            graphs
+                .g2
+                .iter()
+                .map(|g| (g.rows, g.kids))
+                .collect::<Vec<_>>()
+        );
+        let mut rng = 4242u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let trunks: Vec<Trunk> = (0..8)
+            .map(|_| {
+                (0..c * CELLS)
+                    .map(|_| f16::from_f32((next() % 2000) as f32 / 1000.0 - 1.0))
+                    .collect::<Vec<_>>()
+                    .into()
+            })
+            .collect();
+        // (tier-1 rows, tier-2 rows), some past every bucket.
+        let shapes = [
+            (5, 0),
+            (0, 7),
+            (12, 30),
+            (40, 100),
+            (100, 0),
+            (0, 200),
+            (130, 250),
+            (300, 20),
+            (0, 600),
+            (3, 3),
+        ];
+        let mut worst = 0f32;
+        let (mut tp, mut tg) = (
+            vec![Vec::new(); shapes.len()],
+            vec![Vec::new(); shapes.len()],
+        );
+        for round in 0..12 {
+            for (si, &(n1, n2)) in shapes.iter().enumerate() {
+                // One batch's contents, built twice (Batch is not Clone).
+                let seed = next();
+                let mk = |seed: u64| {
+                    let mut r = seed | 1;
+                    let mut nx = move || {
+                        r ^= r << 13;
+                        r ^= r >> 7;
+                        r ^= r << 17;
+                        r
+                    };
+                    let mut b = Batch {
+                        slots,
+                        n1,
+                        ..Default::default()
+                    };
+                    for _ in 0..n1 {
+                        for i in 0..MAX_ACTIVE {
+                            b.ridx.push(if i < 14 {
+                                (nx() % SPARSE_DIM as u64) as i32
+                            } else {
+                                SPARSE_DIM as i32
+                            });
+                        }
+                        for _ in 0..N_SCALARS {
+                            b.rscal.push((nx() % 1000) as f32 / 1000.0);
+                        }
+                    }
+                    for _ in 0..n2 {
+                        b.trunk.push(if n1 > 0 && nx() % 3 == 0 {
+                            TrunkSrc::Row((nx() % n1 as u64) as usize)
+                        } else {
+                            TrunkSrc::Given(trunks[(nx() % 8) as usize].clone())
+                        });
+                        for i in 0..MAX_ACTIVE {
+                            b.nidx.push(if i < 14 {
+                                (nx() % SPARSE_DIM as u64) as i32
+                            } else {
+                                SPARSE_DIM as i32
+                            });
+                        }
+                        for _ in 0..N_SCALARS {
+                            b.nscal.push((nx() % 1000) as f32 / 1000.0);
+                        }
+                        let k = 1 + (nx() % 64) as usize;
+                        b.kids.push(
+                            (0..k)
+                                .map(|_| (nx() % (CELLS * slots) as u64) as i32)
+                                .collect(),
+                        );
+                    }
+                    b
+                };
+                let t0 = std::time::Instant::now();
+                let want = run_batch(&mut s1, &mut s2, None, c, true, mk(seed)).unwrap();
+                let t1 = std::time::Instant::now();
+                let got =
+                    run_batch(&mut s1, &mut s2, Some(&mut graphs), c, true, mk(seed)).unwrap();
+                let t2 = std::time::Instant::now();
+                if round >= 2 {
+                    tp[si].push((t1 - t0).as_secs_f64() * 1e3);
+                    tg[si].push((t2 - t1).as_secs_f64() * 1e3);
+                }
+                let diff = |a: &[f32], b: &[f32]| {
+                    assert_eq!(a.len(), b.len());
+                    a.iter()
+                        .zip(b)
+                        .map(|(x, y)| {
+                            if x.is_nan() && y.is_nan() {
+                                0.0
+                            } else {
+                                (x - y).abs() / (1.0 + y.abs())
+                            }
+                        })
+                        .fold(0f32, f32::max)
+                };
+                let flat = |v: &[Vec<f32>]| v.concat();
+                let hflat = |v: &[Trunk]| -> Vec<f32> {
+                    v.iter()
+                        .flat_map(|t| t.iter().map(|x| x.to_f32()))
+                        .collect()
+                };
+                let d = [
+                    diff(&got.v1, &want.v1),
+                    diff(&hflat(&got.h), &hflat(&want.h)),
+                    diff(&flat(&got.logit), &flat(&want.logit)),
+                    diff(&flat(&got.value), &flat(&want.value)),
+                    diff(&got.v2, &want.v2),
+                    diff(&got.energy, &want.energy),
+                ];
+                let m = d.iter().copied().fold(0f32, f32::max);
+                if m > 2e-2 {
+                    eprintln!(
+                        "round {round} shape ({n1}, {n2}): diffs v1/h/logit/value/v2/energy {d:?}"
+                    );
+                }
+                worst = worst.max(m);
+            }
+        }
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[v.len() / 2]
+        };
+        for (i, &(n1, n2)) in shapes.iter().enumerate() {
+            eprintln!(
+                "tier-1 rows {n1:4}, tier-2 rows {n2:4}: plain {:6.2} ms, graph {:6.2} ms",
+                med(&mut tp[i]),
+                med(&mut tg[i])
+            );
+        }
+        let cg: Vec<u64> = CG_CALLS.iter().map(|x| x.load(Relaxed)).collect();
+        eprintln!(
+            "graph calls tier 1 {} / tier 2 {}, fallbacks {} / {}; worst relative diff {worst:.2e}",
+            cg[0], cg[1], cg[2], cg[3]
+        );
+        assert!(cg[0] > 0 && cg[1] > 0, "no graph replays");
+        assert!(worst < 5e-2, "graph path disagrees with the plain sessions");
+        std::mem::forget(graphs);
     }
 
     /// CUDA-graph feasibility on the tier-1 net (2026-10-14, after the driver
