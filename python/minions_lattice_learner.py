@@ -271,6 +271,12 @@ class T2Net(nn.Module):
         self.kid = nn.Conv2d(ch, 2 * SLOTS, 1)
         self.vconv = nn.Sequential(nn.Conv2d(ch, 4, 1, bias=False), nn.BatchNorm2d(4), nn.ReLU())
         self.vfc = nn.Sequential(nn.Linear(4 * CELLS, 64), nn.ReLU(), nn.Linear(64, self.n_scalar))
+        # --lview: the energy's own head (vfc's third output is unused), so
+        # it can be trained alone (--energy-only) without moving the values.
+        if lview:
+            self.ehead = nn.Sequential(
+                nn.Conv2d(ch, 4, 1, bias=False), nn.BatchNorm2d(4), nn.ReLU(), nn.Flatten(), nn.Linear(4 * CELLS, 64), nn.ReLU(), nn.Linear(64, 1)
+            )
         # Start from uniform priors.
         nn.init.zeros_(self.kid.weight[:SLOTS])
         nn.init.zeros_(self.kid.bias[:SLOTS])
@@ -287,6 +293,8 @@ class T2Net(nn.Module):
         logit = out[:, :SLOTS].reshape(b, SLOTS, CELLS).transpose(1, 2).reshape(b, CELLS * SLOTS)
         vlog = out[:, SLOTS:].reshape(b, SLOTS, CELLS).transpose(1, 2).reshape(b, CELLS * SLOTS)
         sv = self.vfc(self.vconv(y).flatten(1))
+        if self.lview:
+            sv = torch.cat([sv[:, :2], self.ehead(y)], 1)
         return logit, vlog, sv[:, 0], sv[:, 1:]
 
 
@@ -295,8 +303,12 @@ def translate_t2(sd, lview):
     starting point: each kind's slot range takes the old slots, the position
     value starts as the old node value (what tier 1 read with --t1-from-t2),
     the energy at zero, and the input planes as near their old meaning as
-    there is (the decision planes differ; distillation retrains them)."""
-    if not lview or sd["kid.weight"].shape[0] == 2 * LV_SLOTS:
+    there is (the decision planes differ; distillation retrains them).
+    Lattice-view weights from before the energy had its own head get one
+    copied from the value head's layers and its energy output (same outputs)."""
+    if lview and sd["kid.weight"].shape[0] == 2 * LV_SLOTS:
+        return with_ehead(sd)
+    if not lview:
         return sd
     sd = dict(sd)
     for k in ("kid.weight", "kid.bias"):
@@ -328,6 +340,22 @@ def translate_t2(sd, lview):
     new[:, c + 23] = old(15)
     new[:, c + 24] = 0
     sd["inp.0.weight"] = new
+    return with_ehead(sd)
+
+
+def with_ehead(sd):
+    """`T2Net.ehead` for --lview weights without one: the value head's conv,
+    BatchNorm and hidden layer, and the energy row of its output layer."""
+    if "ehead.0.weight" in sd:
+        return sd
+    sd = dict(sd)
+    for k, v in list(sd.items()):
+        if k.startswith("vconv.0.") or k.startswith("vconv.1."):
+            sd["ehead." + k[len("vconv.") :]] = v.clone()
+        elif k.startswith("vfc.0."):
+            sd["ehead.4." + k[len("vfc.0.") :]] = v.clone()
+    sd["ehead.6.weight"] = sd["vfc.2.weight"][2:3].clone()
+    sd["ehead.6.bias"] = sd["vfc.2.bias"][2:3].clone()
     return sd
 
 
@@ -610,6 +638,19 @@ def load_energy(dirs):
     return np.concatenate(rs) if rs else np.zeros(0, E_DTYPE)
 
 
+def root_groups(recs, min_visits):
+    """Only the energy groups whose children's visits total at least
+    `min_visits` (searched roots; interior turns under ~256 visits have one
+    visit per child under progressive widening: uniform targets)."""
+    if min_visits <= 0 or len(recs) == 0:
+        return recs
+    kind = recs["kind"]
+    gid = np.cumsum(kind == 0) - 1
+    ok = gid >= 0
+    tot = np.bincount(gid[ok & (kind == 1)], weights=recs["visits"][ok & (kind == 1)].astype(np.float64), minlength=gid.max() + 1)
+    return recs[ok & (tot[np.maximum(gid, 0)] >= min_visits)]
+
+
 class ESet:
     """Energy groups: a turn start, then its tier-1 children (complete
     declarations) with their visits. Sparse rows on the device."""
@@ -754,6 +795,8 @@ def main():
     ap.add_argument("--energy-tau", type=float, default=0.02)
     ap.add_argument("--energy-batch", type=int, default=64, help="energy groups per step")
     ap.add_argument("--energy-chunk-kids", type=int, default=2048, help="tier 2 runs the energy batch in chunks of whole groups with at most this many children, back-propagating each (same loss; bounds VRAM; 0 = one pass)")
+    ap.add_argument("--energy-min-group-visits", type=int, default=0, help="train and report energy only on groups whose children's visits total at least this (e.g. 800: searched roots only)")
+    ap.add_argument("--energy-only", action="store_true", help="train the energy head (T2Net.ehead) alone, on the energy loss, with everything else frozen and BatchNorm statistics fixed (the other outputs stay exactly as they were); steps = --epochs passes over the energy groups")
     ap.add_argument("--energy-recal-kids", type=int, default=0, help="the same for the BatchNorm re-estimate (no gradients; 0 = one pass)")
     ap.add_argument("--t1-min-visits", type=int, default=0, help="train tier 1 only on value targets searched at least this deep (the holdout keeps them all)")
     ap.add_argument("--t1-root-visits", type=int, default=600, help="holdout also reports tier 1 on targets at least this deep (searched roots)")
@@ -825,7 +868,7 @@ def main():
         tn1.load_state_dict(torch.load(os.path.join(args.teacher, "net.pt"), map_location=dev))
         tch, tbl = (int(v) for v in tm["arch"].split("x"))
         tt2 = T2Net(tn1.stem[0].out_channels, tch, tbl, True).to(dev)
-        tt2.load_state_dict(torch.load(os.path.join(args.teacher, "t2.pt"), map_location=dev))
+        tt2.load_state_dict(translate_t2(torch.load(os.path.join(args.teacher, "t2.pt"), map_location=dev), True))
         ds.teacher = (Trunk(tn1).eval(), tt2.eval())
         ds.teacher_lview = True
         tv1 = RootValue(ds.teacher[0], tt2, args.t1_node).eval()
@@ -839,7 +882,7 @@ def main():
         tt2.load_state_dict(torch.load(os.path.join(args.teacher, "t2.pt"), map_location=dev))
         assert tm.get("t1_from_t2"), "teacher's tier-1 value must be its tier-2 root value"
         ds.teacher = (Trunk(tn1).eval(), tt2.eval())
-    es = ESet(load_energy(args.data), dev) if args.lview else None
+    es = ESet(root_groups(load_energy(args.data), args.energy_min_group_visits), dev) if args.lview else None
     if es is not None:
         eg = torch.arange(es.n, device=dev)
         hoe, tre = eg[eg % args.holdout_every == 0], eg[eg % args.holdout_every != 0]
@@ -935,7 +978,14 @@ def main():
         print(f"averaged {len(args.average)} nets: {' '.join(args.average)}")
         args.epochs = 0
     w0 = {k: v.detach().clone() for k, v in list(net1.state_dict().items()) + [("t2." + k, v) for k, v in t2.state_dict().items()]}
-    if args.freeze_trunk:
+    if args.energy_only:
+        for p in list(net1.parameters()) + list(t2.parameters()):
+            p.requires_grad_(False)
+        params = list(t2.ehead.parameters())
+        for p in params:
+            p.requires_grad_(True)
+        args.bn_recal = 0
+    elif args.freeze_trunk:
         for p in trunk.parameters():
             p.requires_grad_(False)
         params = list(t2.parameters())
@@ -943,6 +993,8 @@ def main():
         params = list(t2.parameters()) + list(net1.parameters())
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.wd)
     steps = 0 if args.average else max(int(args.epochs * len(tr) / args.batch), 1)
+    if args.energy_only:
+        steps = max(int(args.epochs * len(tre) / args.energy_batch), 1)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=max(steps, 1), pct_start=0.05)
     trunk.train(not args.freeze_trunk)
     t2.train()
@@ -950,8 +1002,20 @@ def main():
     if args.freeze_bn:
         for m in bn_all:
             m.eval()
+    if args.energy_only:
+        trunk.eval()
+        t2.eval()
     t0 = time.time()
     for step in range(steps):
+        if args.energy_only:
+            opt.zero_grad(set_to_none=True)
+            le, _ = energy_loss(trunk, t2, es, tre[torch.randint(len(tre), (args.energy_batch,), device=dev)], False,
+                                max_kids=args.energy_chunk_kids, backward_scale=1.0)
+            opt.step()
+            sched.step()
+            if step % max(steps // 10, 1) == 0 or step == steps - 1:
+                print(f"step {step}/{steps} energy {le.item():.4f} ({time.time() - t0:.0f}s)", flush=True)
+            continue
         idx = tr[torch.randint(len(tr), (args.batch,), device=dev)]
         lp, lv, ln, _ = losses(trunk, t2, ds, idx, grad_trunk=not (args.freeze_trunk or args.t2_detach))
         if tv1 is not None:
